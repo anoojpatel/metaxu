@@ -3,7 +3,6 @@
 from enum import Enum, auto
 import threading
 from queue import Queue
-from vm_manager import register_vm, get_vm_by_thread_id
 
 class Opcode(Enum):
     # Basic opcodes
@@ -14,6 +13,8 @@ class Opcode(Enum):
     SUB = auto()
     MUL = auto()
     DIV = auto()
+    CREATE_FUNC = auto()
+    CREATE_CLOSURE = auto()
     CALL_FUNC = auto()
     RETURN = auto()
     # Ownership
@@ -58,7 +59,22 @@ class Instruction:
     def __repr__(self):
         return f"{self.opcode.name} {', '.join(map(str, self.operands))}"
 
+class Frame:
+    def __init__(self, return_address, scope_name, environment=None):
+        self.return_address = return_address
+        self.scope_name = scope_name
+        self.local_vars = {}
+        self.resources = []  # List of resources to deallocate
+        if environment:
+            self.local_vars.update(environment)
+
+class FunctionObject:
+    def __init__(self, code_label, environment):
+        self.code_label = code_label  # Label to jump to
+        self.environment = environment  # Captured variables
+
 class TapeVM:
+    """ An Instruction TapeVM with a Stack"""
     def __init__(self, instructions, thread_id=None, message_queue=None):
         self.instructions = instructions
         self.pc = 0  # Program counter
@@ -67,6 +83,7 @@ class TapeVM:
         self.functions = {}
         self.labels = {}
         self.call_stack = []
+        self.frames = []
         self.effect_handlers = {}
         self.thread_id = thread_id or generate_thread_id()
         self.message_queue = message_queue or Queue()
@@ -91,10 +108,17 @@ class TapeVM:
         if opcode == Opcode.LOAD_CONST:
             self.stack.append(instr.operands[0])
         elif opcode == Opcode.LOAD_VAR:
-            value = self.vars.get(instr.operands[0], 0)
-            self.stack.append(value)
+            name = instr.operands[0]
+            for frame in reversed(self.frames):
+                if name in frame.local_vars:
+                    self.stack.append(frame.local_vars[name])
+                    break
+            else:
+                raise Exception(f"Variable '{name}' not found")            
         elif opcode == Opcode.STORE_VAR:
-            value = self.stack.pop()
+            name = instr.operands[0]
+            self.frames[-1].local_vars[name] = self.stack.pop()
+            self.pc += 1
             self.vars[instr.operands[0]] = value
         elif opcode == Opcode.ADD:
             right = self.stack.pop()
@@ -112,18 +136,37 @@ class TapeVM:
             right = self.stack.pop()
             left = self.stack.pop()
             self.stack.append(left // right)
+        if opcode == OpCode.CREATE_FUNC:
+            label = instr.operands[0]
+            func_obj = FunctionObject(label, {})
+            self.stack.append(func_obj)
+            self.pc += 1
+
+        elif opcode == OpCode.CREATE_CLOSURE:
+            label = instr.operands[0]
+            num_captured = instr.operands[1]
+            captured_vars = [self.stack.pop() for _ in range(num_captured)][::-1]
+            environment = {f'var_{i}': val for i, val in enumerate(captured_vars)}
+            func_obj = FunctionObject(label, environment)
+            self.stack.append(func_obj)
+            self.pc += 1
+            
         elif opcode == Opcode.CALL_FUNC:
-            func_name = instr.operands[0]
-            func_instructions = self.functions.get(func_name)
-            if func_instructions is None:
-                raise Exception(f"Function '{func_name}' not defined")
-            # Save current state
-            self.call_stack.append((self.pc, self.vars.copy(), self.stack.copy()))
-            # Set up new state
-            self.pc = -1
-            self.instructions = func_instructions
-            self.vars = {}
-            self.stack = []
+            num_args = instr.operands[0]
+            args = [self.stack.pop() for _ in range(num_args)][::-1]
+            func_obj = self.stack.pop()
+            if not isinstance(func_obj, FunctionObject):
+                raise Exception("Attempted to call a non-function object")
+            # Save current execution state
+            return_address = self.pc + 1
+            self.frames.append(Frame(return_address, func_obj.code_label, func_obj.environment))
+            # Set up local variables for the function
+            frame = self.frames[-1]
+            # Store arguments as local variables
+            for i, arg in enumerate(args):
+                frame.local_vars[f'arg_{i}'] = arg
+            # Jump to function code
+            self.pc = self.labels[func_obj.code_label]
         elif opcode == Opcode.RETURN:
             # Restore previous state
             self.pc, self.vars, self.stack = self.call_stack.pop()
@@ -208,6 +251,9 @@ class TapeVM:
             label = instr.operands[0]
             if label not in self.labels:
                 raise Exception(f"Unknown label: {label}")
+            return_address = self.pc + 1
+            scope_name = label  # Use label as scope name
+            self.frames.append(Frame(return_address, scope_name))
             self.pc = self.labels[label]
         elif opcode == 'END':
             # Pop the current frame and return if frames are used
@@ -252,7 +298,13 @@ class TapeVM:
         self.call_stack = continuation['call_stack']
         self.stack.append(value)
 
-
+    def deallocate_frame(self, frame):
+        # Clear local variables
+        frame.local_vars.clear()
+        # Deallocate resources
+        for resource in frame.resources:
+            resource.deallocate()
+        # Additional cleanup if necessary
 
 vm_registry = {}
 thread_id_counter = 0

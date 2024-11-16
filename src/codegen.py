@@ -10,9 +10,22 @@ class CodeGenerator:
         self.instructions = []
         self.symbol_table = SymbolTable()
         self.type_checker = TypeChecker()
+        self.scope_stack = []
         self.function_counter = 0
+        self.label_counter = 0
         self.functions = {}
         self.gpu_kernels = {}
+
+    def new_label(self, prefix="label"):
+        label = f"{prefix}_{self.label_counter}"
+        self.label_counter += 1
+        return label
+
+    def enter_scope(self, scope_name):
+        self.scope_stack.append(scope_name)
+
+    def exit_scope(self):
+        return self.scope_stack.pop()
 
     def generate(self, node):
         method_name = f'gen_{type(node).__name__}'
@@ -61,7 +74,20 @@ class CodeGenerator:
                 self.instructions.append(Instruction(Opcode.MUL))
             elif node.operator == '/':
                 self.instructions.append(Instruction(Opcode.DIV))
+    
+    def gen_Block(self, node):
+        """
+        Generate VM instructions for a block of code.
+        """
+        # Optionally enter a new scope if your language supports block scopes
+        self.enter_scope('block')
 
+        for statement in node.statements:
+            self.generate(statement)
+
+        # Optionally exit the scope
+        self.exit_scope()
+        
     def gen_FunctionDeclaration(self, node):
         func_label = f"func_{node.name}"
         # Save current instructions and symbol table
@@ -87,11 +113,66 @@ class CodeGenerator:
             gpu_code = self.generate_gpu_code(node)
             self.gpu_kernels[node.name] = gpu_code
 
+    def gen_FunctionDefinition(self, node):
+        function_label = node.name
+        # Generate function object creation
+        self.instructions.append(Instruction(Opcode.CREATE_FUNC, function_label))
+        # Store the function object in the environment or variable
+        self.instructions.append(Instruction(OpCode.STORE_VAR, node.name))
+
+        # Generate the function code
+        self.enter_scope(function_label)
+        self.instructions.append(Instruction(OpCode.LABEL, function_label))
+        # Function parameters are handled here
+        self.gen_FunctionBody(node)
+        self.exit_scope()
+        self.instructions.append(Instruction(OpCode.END))
+
+    def gen_FunctionBody(self, node):
+        """
+        Generate VM instructions for the body of a function.
+        """
+        # Handle function parameters
+        for param in node.parameters:
+            # Store each parameter as a local variable
+            self.instructions.append(Instruction(OpCode.POP))
+            self.instructions.append(Instruction(OpCode.STORE_VAR, param.name))
+
+        # Generate instructions for the function's statements
+        self.gen_Block(node.body)
+
     def gen_FunctionCall(self, node):
+        # Generate code for the function expression
+        self.generate(node.function_expr)
+        # Push arguments onto the stack
         for arg in node.arguments:
             self.generate(arg)
-        self.instructions.append(Instruction(Opcode.CALL_FUNC, node.name))
+            self.instructions.append(Instruction(Opcode.PUSH))
 
+        # Call the function
+        self.instructions.append(Instruction(Opcode.CALL_FUNC, len(node.arguments)))
+
+    def gen_Closure(self, node):
+        # Identify captured variables
+        captured_vars = self.get_captured_variables(node)
+        # Generate code to capture variables
+        for var in captured_vars:
+            self.instructions.append(Instruction(OpCode.LOAD_VAR, var))
+            self.instructions.append(Instruction(OpCode.PUSH))
+        # Create the function object with captured environment
+        function_label = self.new_label('lambda')
+        self.instructions.append(Instruction(OpCode.CREATE_CLOSURE, function_label, len(captured_vars)))
+        # Store the closure
+        self.instructions.append(Instruction(OpCode.STORE_VAR, node.name))
+
+        # Generate the function code
+        self.enter_scope(function_label)
+        self.instructions.append(Instruction(OpCode.LABEL, function_label))
+        # Function parameters and body
+        self.gen_FunctionBody(node)
+        self.exit_scope()
+        self.instructions.append(Instruction(OpCode.END))
+    
     def gen_StructInstantiation(self, node):
         for field_name, expr in node.field_initializers.items():
             self.generate(expr)
@@ -111,11 +192,37 @@ class CodeGenerator:
         self.generate(node.function_expression)
         self.instructions.append(Instruction(Opcode.SPAWN_THREAD))
 
+    def gen_EffectHandler(self, effect_name, handler_node):
+        handler_label = f"{effect_name}_handler"
+        self.enter_scope(handler_label)
+        self.instructions.append(Instruction(Opcode.LABEL, handler_label))
+
+        # Generate code for the handler body
+        self.gen_Block(handler_node.body)
+
+        # Exit scope and generate END
+        self.exit_scope()
+        self.instructions.append(Instruction(OpCode.END))
+
     def gen_PerformEffect(self, node):
-        # Generate code for effect arguments
-        for arg in node.arguments:
+        # Generate code for arguments
+        for arg in node.args:
             self.generate(arg)
-        self.instructions.append(Instruction(Opcode.PERFORM_EFFECT, node.effect_name, len(node.arguments)))
+            self.instructions.append(Instruction('PUSH'))
+
+        # Generate unique labels for continuation and effect handler
+        continuation_label = self.new_label("cont")
+        effect_handler_label = f"{node.effect_name}_handler"
+
+        # Jump to effect handler
+        self.instructions.append(Instruction('JUMP', effect_handler_label))
+
+        # Place continuation label
+        self.instructions.append(Instruction('LABEL', continuation_label))
+        # Generate code for effect arguments
+        # for arg in node.arguments:
+        #    self.generate(arg)
+        # self.instructions.append(Instruction(Opcode.PERFORM_EFFECT, node.effect_name, len(node.arguments)))
 
     def gen_HandleEffect(self, node):
         handler_label = f"handler_{node.effect_name}_{self.function_counter}"
