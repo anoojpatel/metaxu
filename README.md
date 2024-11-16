@@ -1,7 +1,7 @@
 # Metaxu
 A self-hosted Low level functional-style programming language 🌀 
 ## Structure
-A language currently will be compiled (very slowly) in Python into a TapeVM. This lowered Tape IR will  
+The language currently will be compiled (very slowly) in Python into a TapeVM. This lowered Tape IR will  
 then emit to a bespoke C program. As the syntax, ergonomics and safety is matured, we will reimplement 
 the compiler in pure Metaxu. The goal is to design a language that is fast, fun and safe. The metric  
 will be how "fun" will it be to write a compiler for itself.
