@@ -45,6 +45,23 @@ class CodeGenerator:
         symbol = Symbol(node.name, self.type_checker.check(node.expression))
         self.symbol_table.define(node.name, symbol)
 
+     def gen_LetStatement(self, node):
+        self.generate(node.expression)
+        self.instructions.append(Instruction(Opcode.STORE_VAR, node.name))
+
+    def gen_VariableDeclaration(self, node):
+        # Generate code for the initializer expression
+        self.generate(node.initializer)
+        # Store the value in a local variable
+        self.instructions.append(Instruction(OpCode.STORE_VAR, node.name))
+
+    def gen_Return(self, node):
+        # Generate code for the return expression
+        self.generate(node.expression)
+        # The return value should be on the stack
+        # Generate 'END' to exit the function
+        self.instructions.append(Instruction(Opcode.END))
+
     def gen_Literal(self, node):
         self.instructions.append(Instruction(Opcode.LOAD_CONST, node.value))
 
