@@ -1,0 +1,22 @@
+[project]
+name = "metaxu"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "beartype>=0.19.0",
+    "llvmlite>=0.43.0",
+    "ply>=3.11",
+]
+
+[dependency-groups]
+dev = [
+    "pylsp-mypy>=0.6.9",
+    "pytest>=8.3.3",
+    "python-lsp-server>=1.12.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
