@@ -34,7 +34,9 @@ class Opcode(Enum):
     SEND_MESSAGE = auto()
     RECEIVE_MESSAGE = auto()
     # Effects
-    PERFORM_EFFECT = auto()
+    CREATE_CONTINUATION = auto()
+    CALL_EFFECT_HANDLER = auto()
+    INVOKE_CONTINUATION = auto()
     SET_HANDLER = auto()
     UNSET_HANDLER = auto()
     RESUME = auto()
@@ -170,28 +172,57 @@ class TapeVM:
             threading.Thread(target=new_thread_vm.run).start()
             # Push thread ID onto the stack
             self.stack.append(new_thread_vm.thread_id)
-        elif opcode == Opcode.PERFORM_EFFECT:
+        # TODO: Remove explicit effect handling in favor of compiled jumps to labels
+        if opcode == Opcode.CREATE_CONTINUATION:
+                continuation_label = instr.operands[0]
+                # Save the continuation (instructions after current pc)
+                continuation_instructions = self.instructions[self.pc + 1:]
+                self.continuations[continuation_label] = continuation_instructions
+                self.pc += 1  # Move to next instruction
+        # TODO: Remove explicit effect handling in favor of compiled jumps to labels
+        elif opcode == Opcode.CALL_EFFECT_HANDLER:
             effect_name = instr.operands[0]
             arg_count = instr.operands[1]
+            continuation_label = instr.operands[2]
             args = [self.stack.pop() for _ in range(arg_count)][::-1]
-            if effect_name in self.effect_handlers:
-                continuation = self.create_continuation()
-                handler_instructions = self.effect_handlers[effect_name]
-                handler_vm = TapeVM(
-                    handler_instructions,
-                    message_queue=self.message_queue,
-                    functions=self.functions,
-                    labels=self.labels,
-                    effect_handlers=self.effect_handlers.copy()
-                )
-                handler_vm.stack = args + [continuation]
-                handler_vm.vars = self.vars.copy()
-                handler_vm.run()
-                result = handler_vm.stack.pop()
-                self.stack.append(result)
-            else:
-                raise Exception(f"No handler for effect '{effect_name}'")
-        # Implement other opcodes...
+            # Retrieve the effect handler
+            handler = self.effect_handlers.get(effect_name)
+            if handler is None:
+                raise Exception(f"Unknown effect: {effect_name}")
+            # Call the effect handler, passing the continuation
+            handler(self, *args, continuation_label)
+            # Effect handler is responsible for invoking continuation
+            break  # Stop execution; effect handler resumes as needed
+        elif opcode == Opcode.LABEL:
+            # No action needed; labels are markers
+            self.pc += 1
+        elif opcode == Opcode.INVOKE_CONTINUATION:
+            continuation_label = instr.operands[0]
+            continuation_instructions = self.continuations.get(continuation_label)
+            if continuation_instructions is None:
+                raise Exception(f"Unknown continuation: {continuation_label}")
+            # Replace instructions and reset pc
+            self.instructions = continuation_instructions
+            self.pc = 0
+        if opcode == 'JUMP':
+            label = instr.operands[0]
+            if label not in self.labels:
+                raise Exception(f"Unknown label: {label}")
+            self.pc = self.labels[label]
+        elif opcode == 'END':
+            # Pop the current frame and return if frames are used
+            if not self.frames:
+                raise Exception("Frame stack underflow!")
+            frame = self.frames.pop()
+            self.pc = self.frame.return_address
+        elif opcode == 'PUSH':
+            value = self.stack.pop()
+            self.stack.append(value)
+            self.pc += 1
+        elif opcode == 'POP':
+            self.stack.pop()
+            self.pc += 1        
+        # TODO: Implement other opcodes...
         else:
             raise Exception(f"Unknown opcode {opcode}")
 
