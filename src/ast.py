@@ -1,5 +1,3 @@
-# ast.py
-
 class Node:
     pass
 
@@ -12,6 +10,27 @@ class Statement(Node):
 
 class Expression(Node):
     pass
+
+class LetStatement(Node):
+    def __init__(self, name, expression, mutable=False):
+        self.name = name
+        self.expression = expression
+        self.mutable = mutable
+
+class ReturnStatement(Node):
+    def __init__(self, expression):
+        self.expression = expression
+
+class IfStatement(Node):
+    def __init__(self, condition, then_body, else_body):
+        self.condition = condition
+        self.then_body = then_body
+        self.else_body = else_body
+
+class WhileStatement(Node):
+    def __init__(self, condition, body):
+        self.condition = condition
+        self.body = body
 
 # --- Basic Expressions and Statements ---
 
@@ -33,6 +52,12 @@ class BinaryOperation(Expression):
         self.left = left
         self.operator = operator
         self.right = right
+        
+
+class WhileStatement(Node):
+    def __init__(self, condition, body):
+        self.condition = condition
+        self.body = body
 
 class FunctionDeclaration(Statement):
     def __init__(self, name, params, body, is_kernel=False):
