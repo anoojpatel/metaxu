@@ -1,0 +1,72 @@
+// Module declaration
+module math {
+    // Basic math functions
+    fn add(x: int, y: int) -> int {
+        return x + y;
+    }
+
+    fn subtract(x: int, y: int) -> int {
+        return x - y;
+    }
+
+    fn multiply(x: int, y: int) -> int {
+        return x * y;
+    }
+
+    fn divide(x: int, y: int) -> int {
+        return x / y;
+    }
+}
+
+// Using modules
+module main {
+    import math;
+    import std.io as io;
+
+    fn main() -> int {
+        let x = 10;
+        let y = 5;
+
+        // Using imported math functions
+        let sum = math.add(x, y);
+        let diff = math.subtract(x, y);
+        let prod = math.multiply(x, y);
+        let quot = math.divide(x, y);
+
+        io.println("Sum: " + sum);
+        io.println("Difference: " + diff);
+        io.println("Product: " + prod);
+        io.println("Quotient: " + quot);
+
+        return 0;
+    }
+}
+
+// Module with relative imports
+module utils.strings {
+    // String utility functions
+    fn concat(a: string, b: string) -> string {
+        return a + b;
+    }
+
+    fn repeat(s: string, n: int) -> string {
+        let result = "";
+        let i = 0;
+        while i < n {
+            result = result + s;
+            i = i + 1;
+        }
+        return result;
+    }
+}
+
+module utils.test {
+    from ..strings import concat, repeat;
+
+    fn test_string_utils() -> bool {
+        let test1 = concat("Hello, ", "World!");
+        let test2 = repeat("*", 5);
+
+        return test1 == "Hello, World!" && test2 == "*****";
+    }
+}
