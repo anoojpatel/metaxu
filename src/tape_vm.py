@@ -73,6 +73,19 @@ class FunctionObject:
         self.code_label = code_label  # Label to jump to
         self.environment = environment  # Captured variables
 
+class Continuation:
+    """Represents a captured continuation"""
+    def __init__(self, pc, instructions, vars, stack, functions, labels, effect_handlers, call_stack, frames):
+        self.pc = pc
+        self.instructions = instructions
+        self.vars = vars.copy()
+        self.stack = stack.copy()
+        self.functions = functions
+        self.labels = labels
+        self.effect_handlers = effect_handlers.copy()
+        self.call_stack = call_stack.copy()
+        self.frames = [frame.copy() for frame in frames]
+
 class TapeVM:
     """ An Instruction TapeVM with a Stack"""
     def __init__(self, instructions, thread_id=None, message_queue=None):
@@ -85,6 +98,7 @@ class TapeVM:
         self.call_stack = []
         self.frames = []
         self.effect_handlers = {}
+        self.continuations = {}
         self.thread_id = thread_id or generate_thread_id()
         self.message_queue = message_queue or Queue()
         register_vm(self)
@@ -136,13 +150,13 @@ class TapeVM:
             right = self.stack.pop()
             left = self.stack.pop()
             self.stack.append(left // right)
-        if opcode == OpCode.CREATE_FUNC:
+        if opcode == Opcode.CREATE_FUNC:
             label = instr.operands[0]
             func_obj = FunctionObject(label, {})
             self.stack.append(func_obj)
             self.pc += 1
 
-        elif opcode == OpCode.CREATE_CLOSURE:
+        elif opcode == Opcode.CREATE_CLOSURE:
             label = instr.operands[0]
             num_captured = instr.operands[1]
             captured_vars = [self.stack.pop() for _ in range(num_captured)][::-1]
@@ -215,39 +229,85 @@ class TapeVM:
             threading.Thread(target=new_thread_vm.run).start()
             # Push thread ID onto the stack
             self.stack.append(new_thread_vm.thread_id)
-        # TODO: Remove explicit effect handling in favor of compiled jumps to labels
         if opcode == Opcode.CREATE_CONTINUATION:
-                continuation_label = instr.operands[0]
-                # Save the continuation (instructions after current pc)
-                continuation_instructions = self.instructions[self.pc + 1:]
-                self.continuations[continuation_label] = continuation_instructions
-                self.pc += 1  # Move to next instruction
-        # TODO: Remove explicit effect handling in favor of compiled jumps to labels
+            continuation_label = instr.operands[0]
+            # Create continuation object capturing current state
+            cont = Continuation(
+                pc=self.pc + 1,
+                instructions=self.instructions,
+                vars=self.vars,
+                stack=self.stack,
+                functions=self.functions,
+                labels=self.labels,
+                effect_handlers=self.effect_handlers,
+                call_stack=self.call_stack,
+                frames=self.frames
+            )
+            # Store continuation
+            self.continuations[continuation_label] = cont
+            self.pc += 1
+
         elif opcode == Opcode.CALL_EFFECT_HANDLER:
             effect_name = instr.operands[0]
             arg_count = instr.operands[1]
             continuation_label = instr.operands[2]
+            
+            # Get arguments and continuation
             args = [self.stack.pop() for _ in range(arg_count)][::-1]
-            # Retrieve the effect handler
+            cont = self.continuations[continuation_label]
+            
+            # Get handler
             handler = self.effect_handlers.get(effect_name)
             if handler is None:
-                raise Exception(f"Unknown effect: {effect_name}")
-            # Call the effect handler, passing the continuation
-            handler(self, *args, continuation_label)
-            # Effect handler is responsible for invoking continuation
-            break  # Stop execution; effect handler resumes as needed
-        elif opcode == Opcode.LABEL:
-            # No action needed; labels are markers
-            self.pc += 1
-        elif opcode == Opcode.INVOKE_CONTINUATION:
-            continuation_label = instr.operands[0]
-            continuation_instructions = self.continuations.get(continuation_label)
-            if continuation_instructions is None:
-                raise Exception(f"Unknown continuation: {continuation_label}")
-            # Replace instructions and reset pc
-            self.instructions = continuation_instructions
-            self.pc = 0
-        if opcode == 'JUMP':
+                raise Exception(f"Unhandled effect: {effect_name}")
+            
+            # Create handler frame
+            handler_frame = Frame(self.pc + 1, f"handler_{effect_name}")
+            self.frames.append(handler_frame)
+            
+            # Push continuation and args
+            self.stack.append(cont)
+            self.stack.extend(args)
+            
+            # Jump to handler
+            self.pc = self.labels[handler]
+
+        elif opcode == Opcode.RESUME:
+            value = self.stack.pop()
+            cont = self.stack.pop()
+            
+            if not isinstance(cont, Continuation):
+                raise Exception("Attempting to resume non-continuation")
+            
+            # Clean up current frame
+            if self.frames:
+                self.deallocate_frame(self.frames[-1])
+                self.frames.pop()
+            
+            # Restore continuation state
+            self.pc = cont.pc
+            self.instructions = cont.instructions
+            self.vars = cont.vars
+            self.stack = cont.stack
+            self.functions = cont.functions
+            self.labels = cont.labels
+            self.effect_handlers = cont.effect_handlers
+            self.call_stack = cont.call_stack
+            self.frames = cont.frames
+            
+            # Push resume value
+            self.stack.append(value)
+
+        elif opcode == Opcode.SET_HANDLER:
+            effect_name = instr.operands[0]
+            handler_label = instr.operands[1]
+            self.effect_handlers[effect_name] = handler_label
+
+        elif opcode == Opcode.UNSET_HANDLER:
+            effect_name = instr.operands[0]
+            self.effect_handlers.pop(effect_name, None)
+
+        elif opcode == Opcode.JUMP:
             label = instr.operands[0]
             if label not in self.labels:
                 raise Exception(f"Unknown label: {label}")
@@ -255,56 +315,32 @@ class TapeVM:
             scope_name = label  # Use label as scope name
             self.frames.append(Frame(return_address, scope_name))
             self.pc = self.labels[label]
-        elif opcode == 'END':
+        elif opcode == Opcode.END:
             # Pop the current frame and return if frames are used
             if not self.frames:
                 raise Exception("Frame stack underflow!")
             frame = self.frames.pop()
             self.pc = self.frame.return_address
-        elif opcode == 'PUSH':
+        elif opcode == Opcode.PUSH:
             value = self.stack.pop()
             self.stack.append(value)
             self.pc += 1
-        elif opcode == 'POP':
+        elif opcode == Opcode.POP:
             self.stack.pop()
             self.pc += 1        
         # TODO: Implement other opcodes...
         else:
             raise Exception(f"Unknown opcode {opcode}")
 
-    def create_continuation(self):
-        # Capture current state
-        continuation = {
-            'pc': self.pc,
-            'instructions': self.instructions,
-            'vars': self.vars.copy(),
-            'stack': self.stack.copy(),
-            'functions': self.functions,
-            'labels': self.labels,
-            'effect_handlers': self.effect_handlers.copy(),
-            'call_stack': self.call_stack.copy(),
-        }
-        return continuation
-
-    def resume_continuation(self, continuation, value):
-        # Restore state
-        self.pc = continuation['pc']
-        self.instructions = continuation['instructions']
-        self.vars = continuation['vars']
-        self.stack = continuation['stack']
-        self.functions = continuation['functions']
-        self.labels = continuation['labels']
-        self.effect_handlers = continuation['effect_handlers']
-        self.call_stack = continuation['call_stack']
-        self.stack.append(value)
-
     def deallocate_frame(self, frame):
-        # Clear local variables
-        frame.local_vars.clear()
-        # Deallocate resources
+        """Clean up resources when exiting a frame"""
+        # Release any borrowed resources
         for resource in frame.resources:
-            resource.deallocate()
-        # Additional cleanup if necessary
+            if isinstance(resource, Continuation):
+                # Clean up captured state
+                resource.vars.clear()
+                resource.stack.clear()
+            # Handle other resource types as needed
 
 vm_registry = {}
 thread_id_counter = 0
@@ -324,4 +360,3 @@ def register_vm(vm):
 def get_vm_by_thread_id(thread_id):
     with vm_registry_lock:
         return vm_registry.get(thread_id)
-
