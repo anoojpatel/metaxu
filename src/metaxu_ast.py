@@ -354,20 +354,88 @@ class TypeAlias(Node):
 # Module imports
 class Import(Node):
     """Import entire module"""
-    def __init__(self, module_path, alias=None):
-        self.module_path = module_path  # e.g. ["std", "io"] for 'import std.io'
-        self.alias = alias  # e.g. 'as io' in 'import std.io as io'
+    def __init__(self, module_path, alias=None, is_public=False):
+        """
+        Args:
+            module_path (list[str]): List of module path components, e.g. ["std", "io"] for 'import std.io'
+            alias (str, optional): Optional alias for the imported module, e.g. 'io' in 'import std.io as io'
+            is_public (bool): Whether this import should be re-exported from the module
+        """
+        self.module_path = module_path
+        self.alias = alias
+        self.is_public = is_public
 
 class FromImport(Node):
     """Import specific items from a module"""
-    def __init__(self, module_path, names, relative_level=0):
-        self.module_path = module_path  # e.g. ["std", "io"] for 'from std.io import ...'
-        self.names = names  # [(name, alias), ...] for 'import x as y, z'
-        self.relative_level = relative_level  # Number of dots for relative imports, e.g. 2 for '..module'
+    def __init__(self, module_path, names, relative_level=0, is_public=False):
+        """
+        Args:
+            module_path (list[str]): List of module path components, e.g. ["std", "io"] for 'from std.io import ...'
+            names (list[tuple[str, str]]): List of (name, alias) tuples, e.g. [("x", "y"), ("z", None)] for 'import x as y, z'
+            relative_level (int): Number of dots for relative imports, e.g. 2 for '..module'
+            is_public (bool): Whether these imports should be re-exported from the module
+        """
+        self.module_path = module_path
+        self.names = names
+        self.relative_level = relative_level
+        self.is_public = is_public
 
-class Module(Node):
-    """A module containing statements"""
-    def __init__(self, name, statements, docstring=None):
-        self.name = name
+class VisibilityRules(Node):
+    def __init__(self, rules):
+        self.rules = rules  # Dictionary mapping identifiers to visibility levels
+
+    def __str__(self):
+        rules_str = ", ".join(f"{id}: {vis}" for id, vis in self.rules.items())
+        return f"VisibilityRules({rules_str})"
+
+class ModuleBody(Node):
+    """Container for module contents including docstring, exports, and visibility rules"""
+    def __init__(self, statements, docstring=None, exports=None, visibility_rules=None):
+        """
+        Args:
+            statements (list[Node]): List of statements in the module
+            docstring (str, optional): Optional module documentation
+            exports (list[tuple[str, str]], optional): List of (name, alias) tuples for exported symbols
+            visibility_rules (dict[str, str], optional): Visibility rules for module items
+        """
         self.statements = statements
         self.docstring = docstring
+        self.exports = exports if exports is not None else []
+        self.visibility_rules = visibility_rules
+
+    def __str__(self):
+        return f"ModuleBody(statements={self.statements}, docstring={self.docstring}, exports={self.exports}, visibility_rules={self.visibility_rules})"
+
+class Module(Node):
+    """A module containing statements and declarations"""
+    def __init__(self, name, body):
+        """
+        Args:
+            name (str): Fully qualified module name, e.g. "std.io"
+            body (ModuleBody): Module contents
+        """
+        self.name = name
+        self.body = body
+
+    def __str__(self):
+        return f"Module(name={self.name}, body={self.body})"
+
+class RelativePath(Node):
+    """Represents a relative module path like '.module' or '...module'"""
+    def __init__(self, level, path):
+        """
+        Args:
+            level (int): Number of dots in the relative path (1 for '.', 2 for '..', etc.)
+            path (str): The module path after the dots
+        """
+        self.level = level
+        self.path = path
+
+class QualifiedName(Expression):
+    def __init__(self, parts):
+        self.parts = parts
+
+class QualifiedFunctionCall(Expression):
+    def __init__(self, parts, arguments):
+        self.parts = parts
+        self.arguments = arguments if arguments is not None else []

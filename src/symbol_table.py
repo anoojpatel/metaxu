@@ -52,72 +52,73 @@ class SymbolTable:
         else:
             search_paths = self.module_search_paths
 
-        # Convert module path to file path
-        file_path = Path(*module_path).with_suffix('.mx')
-        
-        # Search in all possible locations
+        # Construct possible file paths
+        module_file = Path(*module_path).with_suffix('.mx')
         for search_path in search_paths:
-            full_path = search_path / file_path
+            full_path = search_path / module_file
             if full_path.exists():
                 return full_path
         return None
 
-    def import_module(self, module_path: List[str], alias: Optional[str] = None, relative_level: int = 0) -> Optional[str]:
-        """Import a module and return its qualified name"""
+    def lookup_module(self, module_path: str) -> Optional[ModuleInfo]:
+        """Look up a module by its dot-separated path"""
+        return self.modules.get(module_path)
+
+    def import_module(self, module_path: List[str], alias: Optional[str] = None) -> None:
+        """Import a module and add it to current scope"""
+        # Convert path to string for module map
+        module_name = '.'.join(module_path)
+        
+        # Check if already imported
+        if module_name in self.modules and self.modules[module_name].is_loaded:
+            return
+
         # Resolve module file path
-        file_path = self.resolve_module_path(module_path, relative_level)
+        file_path = self.resolve_module_path(module_path)
         if not file_path:
-            raise ImportError(f"Module not found: {'.'.join(module_path)}")
+            raise ImportError(f"Module '{module_name}' not found")
 
-        # Generate qualified name
-        qualified_name = '.'.join(module_path)
-        if alias:
-            module_name = alias
-        else:
-            module_name = module_path[-1]
-
-        # Add to current module's imports
-        if self.current_module:
-            self.modules[self.current_module].imports.add(file_path)
-
-        # Add module to symbol table if not already present
-        if qualified_name not in self.modules:
-            self.modules[qualified_name] = ModuleInfo(
+        # Create module info if doesn't exist
+        if module_name not in self.modules:
+            self.modules[module_name] = ModuleInfo(
                 path=file_path,
                 symbols={},
                 imports=set(),
                 is_loaded=False
             )
 
-        # Add module symbol to current scope
-        self.add_symbol(module_name, Symbol(
-            name=module_name,
-            symbol_type=None,  # Modules don't have a type
-            mode="global",
-            qualified_name=qualified_name
-        ))
+        # Load module if not loaded
+        if not self.modules[module_name].is_loaded:
+            self._load_module(module_name, file_path)
 
-        return qualified_name
+        # Add to current scope under alias or last component
+        scope_name = alias or module_path[-1]
+        self.define(scope_name, Symbol(scope_name, self.modules[module_name]))
 
-    def import_names(self, module_path: List[str], names: List[Tuple[str, Optional[str]]], relative_level: int = 0):
+    def import_names(self, module_path: List[str], names: List[Tuple[str, Optional[str]]],
+                    relative_level: int = 0) -> None:
         """Import specific names from a module"""
-        qualified_name = self.import_module(module_path, None, relative_level)
-        if not qualified_name:
-            return
+        # Convert path to string for module map
+        module_name = '.'.join(module_path)
+        
+        # Import the module first
+        self.import_module(module_path)
+        module_info = self.modules[module_name]
 
-        module_info = self.modules[qualified_name]
+        # Import each name
         for name, alias in names:
             if name not in module_info.symbols:
-                raise ImportError(f"Cannot import name '{name}' from '{qualified_name}'")
+                raise ImportError(f"Cannot import name '{name}' from '{module_name}'")
             
-            symbol = module_info.symbols[name]
-            local_name = alias or name
-            self.add_symbol(local_name, Symbol(
-                name=local_name,
-                symbol_type=symbol.symbol_type,
-                mode=symbol.mode,
-                qualified_name=f"{qualified_name}.{name}"
-            ))
+            # Add to current scope under alias or original name
+            scope_name = alias or name
+            self.define(scope_name, module_info.symbols[name])
+
+    def _load_module(self, module_name: str, file_path: Path) -> None:
+        """Load a module from file"""
+        # This would be implemented to parse and type check the module file
+        # For now, just mark as loaded
+        self.modules[module_name].is_loaded = True
 
     def enter_scope(self):
         """Enter a new scope"""
@@ -125,14 +126,15 @@ class SymbolTable:
 
     def exit_scope(self):
         """Exit current scope"""
-        self.scopes.pop()
+        if len(self.scopes) > 1:
+            self.scopes.pop()
 
-    def add_symbol(self, name: str, symbol: 'Symbol'):
-        """Add a symbol to the current scope"""
+    def define(self, name: str, symbol: 'Symbol'):
+        """Define a symbol in current scope"""
         self.scopes[-1][name] = symbol
 
     def lookup(self, name: str) -> Optional['Symbol']:
-        """Lookup a symbol in the current scope and its parents"""
+        """Look up a symbol in all scopes"""
         for scope in reversed(self.scopes):
             if name in scope:
                 return scope[name]

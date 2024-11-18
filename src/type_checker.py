@@ -1,5 +1,6 @@
-from type_defs import *
-from metaxu_ast import *
+from typing import Dict, List, Optional, Union, Any
+from dataclasses import dataclass
+import metaxu_ast as ast
 from symbol_table import SymbolTable, Symbol
 
 class TypeChecker:
@@ -9,23 +10,60 @@ class TypeChecker:
         self.borrow_checker = BorrowChecker(self.symbol_table)
 
     def check(self, node):
-        method_name = f'visit_{type(node).__name__}'
-        method = getattr(self, method_name, self.visit_generic)
+        method = getattr(self, f'visit_{node.__class__.__name__}', self.visit_generic)
         return method(node)
 
     def visit_generic(self, node):
         if hasattr(node, '__dict__'):
             for value in node.__dict__.values():
-                if isinstance(value, Node):
+                if isinstance(value, ast.Node):
                     self.check(value)
                 elif isinstance(value, list):
                     for item in value:
-                        if isinstance(item, Node):
+                        if isinstance(item, ast.Node):
                             self.check(item)
         else:
             pass
 
-    # Implement visit methods for different AST nodes, checking types and ownership
+    def visit_Variable(self, node):
+        """Type check variable references"""
+        symbol = self.symbol_table.lookup(node.name)
+        if not symbol:
+            self.errors.append(f"Name '{node.name}' not found")
+            return None
+        return symbol.type
+
+    def visit_Import(self, node):
+        """Type check module imports"""
+        # Check if module exists
+        module_path = '.'.join(node.module_path)
+        module = self.symbol_table.lookup_module(module_path)
+        if not module:
+            self.errors.append(f"Module '{module_path}' not found")
+            return None
+
+        # Add module to current scope
+        alias = node.alias or node.module_path[-1]
+        self.symbol_table.define(alias, Symbol(alias, module))
+        return None
+
+    def visit_FromImport(self, node):
+        """Type check from-import statements"""
+        # Check if module exists
+        module_path = '.'.join(node.module_path)
+        module = self.symbol_table.lookup_module(module_path)
+        if not module:
+            self.errors.append(f"Module '{module_path}' not found")
+            return None
+
+        # Import specific names
+        for name, alias in node.names:
+            if name not in module.symbols:
+                self.errors.append(f"Name '{name}' not found in module '{module_path}'")
+                continue
+            target_name = alias or name
+            self.symbol_table.define(target_name, module.symbols[name])
+        return None
 
     def visit_Assignment(self, node):
         expr_type = self.check(node.expression)
@@ -40,16 +78,6 @@ class TypeChecker:
             self.errors.append(f"Type mismatch: {left_type} and {right_type}")
             return None
         return left_type
-
-    def visit_Variable(self, node):
-        symbol = self.symbol_table.lookup(node.name)
-        if symbol:
-            if not symbol.is_valid():
-                self.errors.append(f"Variable '{node.name}' is invalid (moved or invalidated)")
-            return symbol.type
-        else:
-            self.errors.append(f"Variable '{node.name}' not defined")
-            return None
 
     def visit_VariableDeclaration(self, node):
         """Handle variable declarations with mode annotations"""
@@ -77,7 +105,7 @@ class TypeChecker:
 
         if target_symbol.mode == "local":
             # Check if value would escape its region
-            if isinstance(node.value, Variable):
+            if isinstance(node.value, ast.Variable):
                 value_symbol = self.symbol_table.lookup(node.value.name)
                 if value_symbol:
                     self.borrow_checker.check_locality(node.value.name)
@@ -112,7 +140,7 @@ class TypeChecker:
         self.borrow_checker.exit_region()
         
         # Create a new local value in the outer region
-        if isinstance(node.expression, Variable):
+        if isinstance(node.expression, ast.Variable):
             var_name = node.expression.name
             symbol = self.symbol_table.lookup(var_name)
             if symbol:
@@ -168,7 +196,7 @@ class TypeChecker:
         self.borrow_checker.exit_scope()
         self.borrow_checker.exit_region()
 
-        return FunctionType(param_types, return_type)
+        return ast.FunctionType(param_types, return_type)
 
     def visit_Block(self, node):
         # Enter a new scope for the block
@@ -182,7 +210,7 @@ class TypeChecker:
         
     def visit_VariableAssignment(self, node):
     # For assignments like p.x = value
-        if isinstance(node.target, FieldAccess):
+        if isinstance(node.target, ast.FieldAccess):
             struct_name = node.target.expression.name
             field_name = node.target.field_name
             full_name = f"{struct_name}.{field_name}"
@@ -191,7 +219,7 @@ class TypeChecker:
             
     def visit_Reference(self, node):
     # For expressions like &p.x
-        if isinstance(node.expression, FieldAccess):
+        if isinstance(node.expression, ast.FieldAccess):
             struct_name = node.expression.expression.name
             field_name = node.expression.field_name
             full_name = f"{struct_name}.{field_name}"
@@ -221,16 +249,16 @@ class TypeChecker:
             params = []
             for param in op.params:
                 param_type = self.check(param.type_annotation)
-                params.append(Parameter(param.name, param_type))
+                params.append(ast.Parameter(param.name, param_type))
             
             # Check return type
             return_type = self.check(op.return_type) if op.return_type else None
             
-            operations.append(EffectOperation(
+            operations.append(ast.EffectOperation(
                 op.name, params, return_type, op.type_params
             ))
 
-        effect_type = EffectType(node.name, operations, node.type_params)
+        effect_type = ast.EffectType(node.name, operations, node.type_params)
         self.symbol_table.define(node.name, Symbol(node.name, effect_type))
         return effect_type
 
@@ -238,7 +266,7 @@ class TypeChecker:
         """Type check handle expressions with proper resource tracking"""
         # Check effect type
         effect_type = self.check(node.effect)
-        if not isinstance(effect_type, EffectType):
+        if not isinstance(effect_type, ast.EffectType):
             self.errors.append(f"Cannot handle non-effect type: {effect_type}")
             return None
 
@@ -262,7 +290,7 @@ class TypeChecker:
 
             # Check continuation parameter type
             cont_param = handler.params[-1]
-            cont_type = ContinuationType(op.return_type, effect_type)
+            cont_type = ast.ContinuationType(op.return_type, effect_type)
             self.symbol_table.define(cont_param.name, Symbol(cont_param.name, cont_type))
 
             # Check handler body
@@ -285,7 +313,7 @@ class TypeChecker:
         """Type check perform expressions"""
         # Check effect operation exists
         effect_type = self.check(node.effect)
-        if not isinstance(effect_type, EffectType):
+        if not isinstance(effect_type, ast.EffectType):
             self.errors.append(f"Cannot perform non-effect type: {effect_type}")
             return None
 
@@ -312,21 +340,7 @@ class TypeChecker:
 
         return op.return_type
 
-    def visit_Import(self, node: ast.Import):
-        """Type check an import statement"""
-        try:
-            self.symbol_table.import_module(node.module_path, node.alias)
-        except ImportError as e:
-            self.errors.append(str(e))
-
-    def visit_FromImport(self, node: ast.FromImport):
-        """Type check a from-import statement"""
-        try:
-            self.symbol_table.import_names(node.module_path, node.names, node.relative_level)
-        except ImportError as e:
-            self.errors.append(str(e))
-
-    def visit_Module(self, node: ast.Module):
+    def visit_Module(self, node):
         """Type check a module"""
         # Enter module scope
         self.symbol_table.enter_module(node.name, node.path)
@@ -338,21 +352,21 @@ class TypeChecker:
         # Exit module scope
         self.symbol_table.exit_module()
 
-    def visit_Name(self, node: ast.Name):
+    def visit_Name(self, node):
         """Type check a name node, handling qualified names"""
         if isinstance(node.id, list):  # Qualified name (e.g. std.io.println)
             # Look up the first part (module)
             symbol = self.symbol_table.lookup(node.id[0])
             if not symbol:
                 self.errors.append(f"Module '{node.id[0]}' not found")
-                return ErrorType()
+                return ast.ErrorType()
             
             # Look up subsequent parts in the module's symbols
             current = symbol
             for part in node.id[1:]:
                 if not hasattr(current, 'symbols') or part not in current.symbols:
                     self.errors.append(f"Cannot find '{part}' in module '{current.name}'")
-                    return ErrorType()
+                    return ast.ErrorType()
                 current = current.symbols[part]
             
             return current.type
@@ -361,36 +375,36 @@ class TypeChecker:
             symbol = self.symbol_table.lookup(node.id)
             if not symbol:
                 self.errors.append(f"Name '{node.id}' not found")
-                return ErrorType()
+                return ast.ErrorType()
             return symbol.type
 
     def check_mode_compatibility(self, expected_mode, actual_mode):
         # Check uniqueness compatibility
-        if expected_mode.uniqueness.mode == UniquenessMode.UNIQUE:
-            if actual_mode.uniqueness.mode != UniquenessMode.UNIQUE:
+        if expected_mode.uniqueness.mode == ast.UniquenessMode.UNIQUE:
+            if actual_mode.uniqueness.mode != ast.UniquenessMode.UNIQUE:
                 return False
-        elif expected_mode.uniqueness.mode == UniquenessMode.EXCLUSIVE:
-            if actual_mode.uniqueness.mode not in [UniquenessMode.UNIQUE, UniquenessMode.EXCLUSIVE]:
+        elif expected_mode.uniqueness.mode == ast.UniquenessMode.EXCLUSIVE:
+            if actual_mode.uniqueness.mode not in [ast.UniquenessMode.UNIQUE, ast.UniquenessMode.EXCLUSIVE]:
                 return False
 
         # Check locality compatibility
-        if expected_mode.locality.mode == LocalityMode.LOCAL:
-            if actual_mode.locality.mode != LocalityMode.LOCAL:
+        if expected_mode.locality.mode == ast.LocalityMode.LOCAL:
+            if actual_mode.locality.mode != ast.LocalityMode.LOCAL:
                 return False
 
         # Check linearity compatibility
-        if expected_mode.linearity.mode == LinearityMode.ONCE:
-            if actual_mode.linearity.mode != LinearityMode.ONCE:
+        if expected_mode.linearity.mode == ast.LinearityMode.ONCE:
+            if actual_mode.linearity.mode != ast.LinearityMode.ONCE:
                 return False
-        elif expected_mode.linearity.mode == LinearityMode.SEPARATE:
-            if actual_mode.linearity.mode not in [LinearityMode.ONCE, LinearityMode.SEPARATE]:
+        elif expected_mode.linearity.mode == ast.LinearityMode.SEPARATE:
+            if actual_mode.linearity.mode not in [ast.LinearityMode.ONCE, ast.LinearityMode.SEPARATE]:
                 return False
 
         return True
 
     def visit_FunctionCall(self, node):
         func_type = self.check(node.function)
-        if not isinstance(func_type, FunctionType):
+        if not isinstance(func_type, ast.FunctionType):
             self.errors.append(f"Cannot call non-function type {func_type}")
             return None
 
@@ -401,7 +415,7 @@ class TypeChecker:
 
         for arg, param_type in zip(node.arguments, func_type.param_types):
             arg_type = self.check(arg)
-            if isinstance(param_type, ModeType):
+            if isinstance(param_type, ast.ModeType):
                 if not self.check_mode_compatibility(param_type, arg_type):
                     self.errors.append(f"Mode mismatch: expected {param_type}, got {arg_type}")
                     return None
@@ -410,7 +424,7 @@ class TypeChecker:
 
     def visit_FieldAccess(self, node):
         base_type = self.check(node.base)
-        if not isinstance(base_type, StructType):
+        if not isinstance(base_type, ast.StructType):
             self.errors.append(f"Cannot access field of non-struct type {base_type}")
             return None
 
@@ -453,12 +467,12 @@ class TypeChecker:
     def is_recursive(self, type_def):
         """Check if a type definition is recursive"""
         def contains_self_reference(type_expr):
-            if isinstance(type_expr, BasicType):
+            if isinstance(type_expr, ast.BasicType):
                 return type_expr.name == type_def.name
-            elif isinstance(type_expr, TypeApplication):
-                return (isinstance(type_expr.base_type, BasicType) and 
+            elif isinstance(type_expr, ast.TypeApplication):
+                return (isinstance(type_expr.base_type, ast.BasicType) and 
                        type_expr.base_type.name == type_def.name)
-            elif isinstance(type_expr, TypeParameter):
+            elif isinstance(type_expr, ast.TypeParameter):
                 return False
             else:
                 return any(contains_self_reference(t) for t in type_expr.get_contained_types())
@@ -466,21 +480,21 @@ class TypeChecker:
 
     def check_positivity(self, type_def, type_expr, positive=True):
         """Check that recursive references only occur in positive positions"""
-        if isinstance(type_expr, BasicType):
+        if isinstance(type_expr, ast.BasicType):
             # Self-reference in negative position is not allowed
             if type_expr.name == type_def.name and not positive:
                 return False
             return True
-        elif isinstance(type_expr, TypeApplication):
-            if isinstance(type_expr.base_type, BasicType):
+        elif isinstance(type_expr, ast.TypeApplication):
+            if isinstance(type_expr.base_type, ast.BasicType):
                 if type_expr.base_type.name == type_def.name and not positive:
                     return False
             # Check type arguments in same position
             return all(self.check_positivity(type_def, arg, positive) 
                       for arg in type_expr.type_args)
-        elif isinstance(type_expr, TypeParameter):
+        elif isinstance(type_expr, ast.TypeParameter):
             return True
-        elif isinstance(type_expr, FunctionType):
+        elif isinstance(type_expr, ast.FunctionType):
             # Parameter types are in negative position
             return (all(self.check_positivity(type_def, param_type, not positive) 
                        for param_type in type_expr.param_types) and
@@ -511,15 +525,15 @@ class TypeChecker:
 
     def resolve_type(self, type_expr, env):
         """Resolve a type expression to its definition"""
-        if isinstance(type_expr, BasicType):
+        if isinstance(type_expr, ast.BasicType):
             if type_expr.name in env:
                 return env[type_expr.name]
             raise TypeError(f"Undefined type {type_expr.name}")
-        elif isinstance(type_expr, TypeParameter):
+        elif isinstance(type_expr, ast.TypeParameter):
             if type_expr.name in env:
                 return env[type_expr.name]
             raise TypeError(f"Undefined type parameter {type_expr.name}")
-        elif isinstance(type_expr, TypeApplication):
+        elif isinstance(type_expr, ast.TypeApplication):
             base = self.resolve_type(type_expr.base_type, env)
             return self.substitute_type_params(base, type_expr.type_args, env)
         return type_expr
@@ -531,17 +545,17 @@ class TypeChecker:
 
     def apply_substitution(self, type_expr, subst, env):
         """Apply a type parameter substitution to a type expression"""
-        if isinstance(type_expr, BasicType):
+        if isinstance(type_expr, ast.BasicType):
             return type_expr
-        elif isinstance(type_expr, TypeParameter):
+        elif isinstance(type_expr, ast.TypeParameter):
             if type_expr.name in subst:
                 return subst[type_expr.name]
             return type_expr
-        elif isinstance(type_expr, TypeApplication):
+        elif isinstance(type_expr, ast.TypeApplication):
             base = self.apply_substitution(type_expr.base_type, subst, env)
             args = [self.apply_substitution(arg, subst, env) 
                    for arg in type_expr.type_args]
-            return TypeApplication(base, args)
+            return ast.TypeApplication(base, args)
         else:
             return type_expr.map_types(lambda t: self.apply_substitution(t, subst, env))
 
@@ -660,25 +674,25 @@ class BorrowChecker:
 
     def visit_Assignment(self, node):
         """Handle assignments checking locality"""
-        if isinstance(node.value, Variable):
+        if isinstance(node.value, ast.Variable):
             self.check_locality(node.value.name)
         self.visit_generic(node)
 
     def visit_FunctionCall(self, node):
         """Handle function calls checking locality of arguments"""
         for arg in node.args:
-            if isinstance(arg, Variable):
+            if isinstance(arg, ast.Variable):
                 self.check_locality(arg.name)
         self.visit_generic(node)
 
     def visit_generic(self, node):
         if hasattr(node, '__dict__'):
             for value in node.__dict__.values():
-                if isinstance(value, Node):
+                if isinstance(value, ast.Node):
                     self.visit(value)
                 elif isinstance(value, list):
                     for item in value:
-                        if isinstance(item, Node):
+                        if isinstance(item, ast.Node):
                             self.visit(item)
         else:
             pass

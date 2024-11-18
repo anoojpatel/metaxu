@@ -1,9 +1,11 @@
 import ply.lex as lex
 
 class Lexer:
+    # A string containing ignored characters (spaces and tabs)
+    t_ignore = ' \t'
+
     # Reserved words
     reserved = {
-        'function': 'FUNCTION',
         'effect': 'EFFECT',
         'struct': 'STRUCT',
         'enum': 'ENUM',
@@ -38,9 +40,22 @@ class Lexer:
         'separate': 'SEPARATE',
         'many': 'MANY',
         'borrow': 'BORROW',
+        # Module-related keywords
         'import': 'IMPORT',
         'from': 'FROM',
         'as': 'AS',
+        'module': 'MODULE',
+        'export': 'EXPORT',
+        'use': 'USE',
+        'public': 'PUBLIC',
+        'private': 'PRIVATE',
+        'protected': 'PROTECTED',
+        'visibility': 'VISIBILITY',
+        'some': 'SOME',
+        'none': 'NONE',
+        'box': 'BOX',
+        'option': 'OPTION',
+        'vector': 'VECTOR'
     }
 
     # List of token names
@@ -48,135 +63,40 @@ class Lexer:
         'IDENTIFIER', 'NUMBER', 'FLOAT', 'STRING',
         'PLUS', 'MINUS', 'TIMES', 'DIVIDE',
         'LPAREN', 'RPAREN', 'LBRACE', 'RBRACE', 'LBRACKET', 'RBRACKET',
-        'SEMICOLON', 'COLON', 'COMMA', 'DOT', 'EQUALS', 'ARROW', 'BACKSLASH',
-        'AMPERSAND', 'PIPE', 'UNDERSCORE', 'DOUBLECOLON', 'AT',
-        'PLUS_EQUALS', 'MINUS_EQUALS', 'TIMES_EQUALS', 'DIVIDE_EQUALS',
-        'DOUBLE_PLUS', 'DOUBLE_MINUS', 'DOUBLE_ARROW',
+        'EQUALS', 'SEMICOLON', 'COLON', 'COMMA', 'DOT', 'TRIPLE_DOT',
+        'DOUBLE_COLON', 'ARROW', 'BACKSLASH', 'AT', 'AMPERSAND',
+        'LESS', 'GREATER'
     ] + list(reserved.values())
 
     # Regular expression rules for simple tokens
-    def t_PLUS(self, t):
-        r'\+'
-        return t
+    t_PLUS = r'\+'
+    t_MINUS = r'-'
+    t_TIMES = r'\*'
+    t_DIVIDE = r'/'
+    t_LPAREN = r'\('
+    t_RPAREN = r'\)'
+    t_LBRACE = r'\{'
+    t_RBRACE = r'\}'
+    t_LBRACKET = r'\['
+    t_RBRACKET = r'\]'
+    t_EQUALS = r'='
+    t_SEMICOLON = r';'
+    t_COLON = r':'
+    t_COMMA = r','
+    t_DOT = r'\.'
+    t_TRIPLE_DOT = r'\.\.\.'
+    t_DOUBLE_COLON = r'::'
+    t_ARROW = r'->'
+    t_BACKSLASH = r'\\'
+    t_AT = r'@'
+    t_AMPERSAND = r'&'
+    t_LESS = r'<'
+    t_GREATER = r'>'
 
-    def t_MINUS(self, t):
-        r'-'
-        return t
-
-    def t_TIMES(self, t):
-        r'\*'
-        return t
-
-    def t_DIVIDE(self, t):
-        r'/'
-        return t
-
-    def t_LPAREN(self, t):
-        r'\('
-        return t
-
-    def t_RPAREN(self, t):
-        r'\)'
-        return t
-
-    def t_LBRACE(self, t):
-        r'\{'
-        return t
-
-    def t_RBRACE(self, t):
-        r'\}'
-        return t
-
-    def t_LBRACKET(self, t):
-        r'\['
-        return t
-
-    def t_RBRACKET(self, t):
-        r'\]'
-        return t
-
-    def t_SEMICOLON(self, t):
-        r';'
-        return t
-
-    def t_COLON(self, t):
-        r':'
-        return t
-
-    def t_COMMA(self, t):
-        r','
-        return t
-
-    def t_DOT(self, t):
-        r'\.'
-        return t
-
-    def t_EQUALS(self, t):
-        r'='
-        return t
-
-    def t_ARROW(self, t):
-        r'->'
-        return t
-
-    def t_BACKSLASH(self, t):
-        r'\\'
-        return t
-
-    def t_AMPERSAND(self, t):
-        r'&'
-        return t
-
-    def t_PIPE(self, t):
-        r'\|'
-        return t
-
-    def t_UNDERSCORE(self, t):
-        r'_'
-        return t
-
-    def t_DOUBLECOLON(self, t):
-        r'::'
-        return t
-
-    def t_AT(self, t):
-        r'@'
-        return t
-
-    def t_PLUS_EQUALS(self, t):
-        r'\+='
-        return t
-
-    def t_MINUS_EQUALS(self, t):
-        r'-='
-        return t
-
-    def t_TIMES_EQUALS(self, t):
-        r'\*='
-        return t
-
-    def t_DIVIDE_EQUALS(self, t):
-        r'/='
-        return t
-
-    def t_DOUBLE_PLUS(self, t):
-        r'\+\+'
-        return t
-
-    def t_DOUBLE_MINUS(self, t):
-        r'--'
-        return t
-
-    def t_DOUBLE_ARROW(self, t):
-        r'=>'
-        return t
-
-    # Ignored characters
-    t_ignore = ' \t'
-
-    def t_FLOAT(self, t):
-        r'\d+\.\d+'
-        t.value = float(t.value)
+    # Regular expression rules with actions
+    def t_IDENTIFIER(self, t):
+        r'[a-zA-Z_][a-zA-Z_0-9]*'
+        t.type = self.reserved.get(t.value, 'IDENTIFIER')
         return t
 
     def t_NUMBER(self, t):
@@ -184,24 +104,34 @@ class Lexer:
         t.value = int(t.value)
         return t
 
+    def t_FLOAT(self, t):
+        r'\d*\.\d+'
+        t.value = float(t.value)
+        return t
+
     def t_STRING(self, t):
-        r'"([^"\\]|\\.)*"'
+        r'"[^"]*"'
         t.value = t.value[1:-1]  # Remove quotes
         return t
 
-    def t_IDENTIFIER(self, t):
-        r'[a-zA-Z_][a-zA-Z0-9_]*'
-        t.type = self.reserved.get(t.value, 'IDENTIFIER')
-        return t
 
+    # Comments
+    def t_COMMENT(self, t):
+        r'//.*'
+        pass
+
+    # Define a rule so we can track line numbers
     def t_newline(self, t):
         r'\n+'
         t.lexer.lineno += len(t.value)
+ 
 
+    # Error handling rule
     def t_error(self, t):
-        print(f"Illegal character '{t.value[0]}'")
+        print(f"Illegal character '{t.value[0]}' at line {t.lexer.lineno}")
         t.lexer.skip(1)
 
+    # Build the lexer
     def __init__(self):
         self.lexer = lex.lex(module=self)
 
