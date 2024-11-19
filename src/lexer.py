@@ -23,6 +23,13 @@ class Lexer:
         'kernel': 'KERNEL',
         'to_device': 'TO_DEVICE',
         'from_device': 'FROM_DEVICE',
+        # Control flow keywords
+        'return': 'RETURN',
+        'if': 'IF',
+        'else': 'ELSE',
+        'while': 'WHILE',
+        'for': 'FOR',
+        'let': 'LET',
         # Interface and implementation keywords
         'interface': 'INTERFACE',
         'impl': 'IMPL',
@@ -64,7 +71,7 @@ class Lexer:
         'PLUS', 'MINUS', 'TIMES', 'DIVIDE',
         'LPAREN', 'RPAREN', 'LBRACE', 'RBRACE', 'LBRACKET', 'RBRACKET',
         'EQUALS', 'SEMICOLON', 'COLON', 'COMMA', 'DOT', 'TRIPLE_DOT',
-        'DOUBLE_COLON', 'ARROW', 'BACKSLASH', 'AT', 'AMPERSAND',
+        'DOUBLECOLON', 'ARROW', 'BACKSLASH', 'AT', 'AMPERSAND',
         'LESS', 'GREATER'
     ] + list(reserved.values())
 
@@ -85,7 +92,7 @@ class Lexer:
     t_COMMA = r','
     t_DOT = r'\.'
     t_TRIPLE_DOT = r'\.\.\.'
-    t_DOUBLE_COLON = r'::'
+    t_DOUBLECOLON = r'::'
     t_ARROW = r'->'
     t_BACKSLASH = r'\\'
     t_AT = r'@'
