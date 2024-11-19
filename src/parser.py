@@ -3,22 +3,22 @@ from lexer import Lexer
 import metaxu_ast as ast
 
 class Parser:
-    tokens = Lexer.tokens  # Add tokens at class level
-    
     def __init__(self):
         self.lexer = Lexer()
+        self.tokens = self.lexer.tokens
+        self.module_names = set()
         self.parser = yacc.yacc(module=self)
 
     def parse(self, data):
-        self.lexer.input(data)
+        self.module_names.clear()  # Reset module names for each parse
         try:
-            result = self.parser.parse(lexer=self.lexer.lexer)
+            result = self.parser.parse(data, lexer=self.lexer)
             if result is None:
                 return ast.Program([])  # Return empty program instead of None
             return result
         except Exception as e:
-            print(f"Error during parsing: {str(e)}")
-            return ast.Program([])  # Return empty program on error
+            print(f"Error during parsing: {e}")
+            raise
 
     def p_program(self, p):
         '''program : statement_list'''
@@ -36,9 +36,11 @@ class Parser:
         else:
             p[0] = [p[1]] if p[1] is not None else []
 
-    def p_statement(self,p):
-        '''statement : expression
-                    | expression SEMICOLON
+    def p_statement(self, p):
+        '''statement : expression SEMICOLON
+                    | let_statement
+                    | return_statement
+                    | block
                     | assignment
                     | assignment SEMICOLON
                     | function_declaration
@@ -52,18 +54,45 @@ class Parser:
                     | from_import_statement
                     | module_declaration
                     | visibility_block'''
+        if len(p) == 3 and isinstance(p[1], ast.Expression):
+            p[0] = ast.ExpressionStatement(p[1])
+        else:
+            p[0] = p[1]
+
+    def p_let_statement(self, p):
+        '''let_statement : LET IDENTIFIER EQUALS expression SEMICOLON'''
+        p[0] = ast.LetStatement(name=p[2], expression=p[4])
+
+    def p_return_statement(self, p):
+        '''return_statement : RETURN expression_or_empty SEMICOLON'''
+        p[0] = ast.ReturnStatement(p[2])
+
+    def p_expression_or_empty(self, p):
+        '''expression_or_empty : expression
+                             | empty'''
         p[0] = p[1]
 
     def p_module_declaration(self, p):
         '''module_declaration : MODULE module_path LBRACE module_body RBRACE
                             | MODULE module_path LBRACE RBRACE
                             | MODULE module_path SEMICOLON'''
-        if len(p) == 6:  # Full module with body
-            p[0] = ast.Module(name=p[2], body=p[4])
-        elif len(p) == 5:  # Empty module
-            p[0] = ast.Module(name=p[2], body=ast.ModuleBody(statements=[]))
-        else:  # Module declaration only
-            p[0] = ast.Module(name=p[2], body=ast.ModuleBody(statements=[]))
+        module_name = p[2]
+        if module_name in self.module_names:
+            raise Exception(f"Duplicate module name: {module_name}")
+        self.module_names.add(module_name)
+
+        if len(p) == 6:
+            p[0] = ast.Module(name=module_name, body=p[4])
+        else:
+            p[0] = ast.Module(name=module_name, body=ast.Block([]))
+
+    def p_module_path(self, p):
+        '''module_path : IDENTIFIER
+                      | module_path DOT IDENTIFIER'''
+        if len(p) == 2:
+            p[0] = p[1]
+        else:
+            p[0] = f"{p[1]}.{p[3]}"
 
     def p_module_body(self, p):
         '''module_body : docstring_opt exports_opt statement_list'''
@@ -128,14 +157,6 @@ class Parser:
                           | PRIVATE
                           | PROTECTED'''
         p[0] = p[1].lower()
-
-    def p_module_path(self,p):
-        '''module_path : IDENTIFIER
-                    | module_path DOT IDENTIFIER'''
-        if len(p) == 2:
-            p[0] = p[1]
-        else:
-            p[0] = p[1] + '.' + p[3]
 
     def p_import_statement(self, p):
         '''import_statement : PUBLIC IMPORT module_path SEMICOLON
@@ -213,7 +234,9 @@ class Parser:
                     | handle_expression
                     | spawn_expression
                     | exclave_expression
-                    | borrow_expression'''
+                    | borrow_expression
+                    | qualified_name
+                    | variant_instantiation'''
         if len(p) == 2:
             p[0] = p[1]
         elif len(p) == 4:
@@ -247,8 +270,8 @@ class Parser:
                 | move_expression
                 | borrow_shared_expression
                 | borrow_unique_expression
-                | variant_instantiation
-                | qualified_name'''
+                | qualified_name
+                | variant_instantiation'''
         if isinstance(p[1], (int, float)):
             p[0] = ast.Literal(p[1])
         elif isinstance(p[1], str):
@@ -260,14 +283,17 @@ class Parser:
         '''function_call : IDENTIFIER LPAREN argument_list RPAREN
                         | qualified_name LPAREN argument_list RPAREN'''
         if isinstance(p[1], str):
-            p[0] = ast.FunctionCall(p[1], p[3])
+            p[0] = ast.QualifiedFunctionCall([p[1]], p[3])
         else:
             p[0] = ast.QualifiedFunctionCall(p[1].parts, p[3])
 
     def p_qualified_name(self, p):
-        '''qualified_name : IDENTIFIER DOT IDENTIFIER
+        '''qualified_name : IDENTIFIER
+                        | IDENTIFIER DOT IDENTIFIER
                         | qualified_name DOT IDENTIFIER'''
-        if len(p) == 4 and isinstance(p[1], str):
+        if len(p) == 2:
+            p[0] = ast.QualifiedName([p[1]])
+        elif len(p) == 4 and isinstance(p[1], str):
             p[0] = ast.QualifiedName([p[1], p[3]])
         else:
             p[0] = ast.QualifiedName(p[1].parts + [p[3]])
@@ -372,90 +398,95 @@ class Parser:
         p[0] = p[2]
 
     def p_struct_definition(self, p):
-        '''struct_definition : STRUCT IDENTIFIER LBRACE struct_fields RBRACE'''
-        p[0] = ast.StructDefinition(p[2], p[4])
+        '''struct_definition : STRUCT IDENTIFIER LBRACE struct_fields RBRACE
+                           | STRUCT IDENTIFIER IMPLEMENTS IDENTIFIER LBRACE struct_fields method_impl_list RBRACE'''
+        if len(p) == 6:
+            p[0] = ast.StructDefinition(name=p[2], fields=p[4])
+        else:
+            p[0] = ast.StructDefinition(name=p[2], fields=p[6], implements=p[4], methods=p[7])
 
     def p_struct_fields(self, p):
         '''struct_fields : struct_fields struct_field
-                        | struct_field'''
+                        | struct_field
+                        | empty'''
         if len(p) == 3:
             p[0] = p[1] + [p[2]]
+        elif len(p) == 2 and p[1] is None:  # empty
+            p[0] = []
         else:
             p[0] = [p[1]]
 
-    def p_struct_instantiation(self, p):
-        '''struct_instantiation : IDENTIFIER LBRACE field_assignments RBRACE'''
-        p[0] = ast.StructInstantiation(p[1], p[3])
-
-    def p_field_assignments(self, p):
-        '''field_assignments : field_assignments field_assignment
-                            | field_assignment'''
-        if len(p) == 3:
-            p[0] = {**p[1], **p[2]}
-        else:
-            p[0] = p[1]
-
-    def p_field_assignment(self, p):
-        '''field_assignment : IDENTIFIER EQUALS expression SEMICOLON'''
-        p[0] = {p[1]: p[3]}
-
-    def p_field_access(self, p):
-        '''field_access : expression DOT IDENTIFIER
-                       | field_access DOT IDENTIFIER'''
-        if isinstance(p[1], ast.QualifiedName):
-            p[0] = ast.QualifiedName(p[1].parts + [p[3]])
-        elif isinstance(p[1], ast.Variable):
-            p[0] = ast.QualifiedName([p[1].name, p[3]])
-        else:
-            p[0] = ast.FieldAccess(p[1], p[3])
+    def p_struct_field(self, p):
+        '''struct_field : visibility_modifier IDENTIFIER COLON type_specification
+                       | visibility_modifier IDENTIFIER EQUALS expression
+                       | IDENTIFIER COLON type_specification
+                       | IDENTIFIER EQUALS expression'''
+        if len(p) == 5:
+            if p[3] == ':':
+                p[0] = ast.StructField(name=p[2], type_expr=p[4], visibility=p[1])
+            else:  # p[3] == '='
+                p[0] = ast.StructField(name=p[2], value=p[4], visibility=p[1])
+        else:  # len(p) == 4
+            if p[2] == ':':
+                p[0] = ast.StructField(name=p[1], type_expr=p[3])
+            else:  # p[2] == '='
+                p[0] = ast.StructField(name=p[1], value=p[3])
 
     def p_enum_definition(self, p):
-        '''enum_definition : ENUM IDENTIFIER LBRACE variant_definitions RBRACE'''
+        '''enum_definition : ENUM IDENTIFIER LBRACE variant_list RBRACE'''
         p[0] = ast.EnumDefinition(p[2], p[4])
 
-    def p_variant_definitions(self, p):
-        '''variant_definitions : variant_definitions variant_definition
-                            | variant_definition'''
-        if len(p) == 3:
-            p[0] = p[1] + [p[2]]
-        else:
+    def p_variant_list(self, p):
+        '''variant_list : variant_definition
+                       | variant_list variant_definition'''
+        if len(p) == 2:
             p[0] = [p[1]]
+        else:
+            p[0] = p[1] + [p[2]]
 
     def p_variant_definition(self, p):
-        '''variant_definition : IDENTIFIER variant_fields SEMICOLON'''
-        p[0] = ast.VariantDefinition(p[1], p[2])
+        '''variant_definition : IDENTIFIER LPAREN variant_fields RPAREN SEMICOLON
+                            | IDENTIFIER SEMICOLON'''
+        if len(p) == 6:
+            p[0] = ast.VariantDefinition(p[1], p[3])
+        else:
+            p[0] = ast.VariantDefinition(p[1], [])
 
     def p_variant_fields(self, p):
-        '''variant_fields : LPAREN variant_field_list RPAREN
+        '''variant_fields : variant_field
+                        | variant_fields COMMA variant_field
                         | empty'''
-        if len(p) == 4:
-            p[0] = p[2]
+        if len(p) == 2:
+            if p[1] is None:
+                p[0] = []
+            else:
+                p[0] = [p[1]]
         else:
-            p[0] = []
-
-    def p_variant_field_list(self, p):
-        '''variant_field_list : variant_field_list COMMA variant_field
-                            | variant_field'''
-        if len(p) == 4:
             p[0] = p[1] + [p[3]]
-        else:
-            p[0] = [p[1]]
 
     def p_variant_field(self, p):
         '''variant_field : IDENTIFIER COLON type_specification'''
         p[0] = (p[1], p[3])
 
     def p_variant_instantiation(self, p):
-        '''variant_instantiation : IDENTIFIER DOT IDENTIFIER variant_field_values'''
-        p[0] = ast.VariantInstance(p[1], p[3], p[4])
-
-    def p_variant_field_values(self, p):
-        '''variant_field_values : LPAREN field_assignments RPAREN
-                                | empty'''
-        if len(p) == 4:
-            p[0] = p[2]
+        '''variant_instantiation : IDENTIFIER DOUBLECOLON IDENTIFIER LPAREN field_assignments RPAREN
+                                | IDENTIFIER DOUBLECOLON IDENTIFIER LPAREN RPAREN'''
+        if len(p) == 7:
+            p[0] = ast.VariantInstance(p[1], p[3], p[5])
         else:
-            p[0] = {}
+            p[0] = ast.VariantInstance(p[1], p[3], [])
+
+    def p_field_assignments(self, p):
+        '''field_assignments : field_assignment
+                           | field_assignments COMMA field_assignment'''
+        if len(p) == 2:
+            p[0] = [p[1]]
+        else:
+            p[0] = p[1] + [p[3]]
+
+    def p_field_assignment(self, p):
+        '''field_assignment : IDENTIFIER EQUALS expression'''
+        p[0] = (p[1], p[3])
 
     def p_match_expression(self, p):
         '''match_expression : MATCH expression LBRACE match_cases RBRACE'''
@@ -498,61 +529,51 @@ class Parser:
         '''effect_operation : IDENTIFIER DOT IDENTIFIER LPAREN argument_list RPAREN'''
         p[0] = ast.EffectOperation(p[1], p[3], p[5])
 
-    def p_struct_field(self, p):
-        '''struct_field : visibility_modifier IDENTIFIER COLON type_specification
-                       | visibility_modifier IDENTIFIER EQUALS expression
-                       | IDENTIFIER COLON type_specification
-                       | IDENTIFIER EQUALS expression'''
+    def p_struct_instantiation(self, p):
+        '''struct_instantiation : IDENTIFIER LBRACE field_assignments RBRACE
+                               | qualified_name LPAREN argument_list RPAREN
+                               | qualified_name LBRACE field_assignments RBRACE'''
         if len(p) == 5:
-            p[0] = ast.StructField(p[2], p[4], p[1])
+            if p[2] == '(':  # Function-style constructor
+                p[0] = ast.QualifiedFunctionCall(p[1].parts, p[3])
+            else:  # Record-style constructor
+                if isinstance(p[1], ast.QualifiedName):
+                    p[0] = ast.StructInstantiation(p[1], p[3])
+                else:
+                    p[0] = ast.StructInstantiation(ast.QualifiedName([p[1]]), p[3])
+
+    def p_field_access(self, p):
+        '''field_access : expression DOT IDENTIFIER
+                       | field_access DOT IDENTIFIER'''
+        if isinstance(p[1], ast.QualifiedName):
+            # Convert QualifiedName to field access
+            p[0] = ast.FieldAccess(p[1].parts[0], p[1].parts[1:] + [p[3]])
+        elif isinstance(p[1], ast.FieldAccess):
+            # Append to existing field access
+            p[0] = ast.FieldAccess(p[1].base, p[1].fields + [p[3]])
         else:
-            p[0] = ast.StructField(p[1], p[3], None)  # No visibility modifier
+            # Start new field access
+            p[0] = ast.FieldAccess(p[1], [p[3]])
 
-    def p_visibility_modifier(self, p):
-        '''visibility_modifier : PUBLIC
-                             | PRIVATE
-                             | PROTECTED'''
-        p[0] = p[1]
-
-    def p_move_expression(self, p):
-        '''move_expression : MOVE LPAREN IDENTIFIER RPAREN'''
-        p[0] = ast.Move(p[3])
-
-    def p_borrow_shared_expression(self, p):
-        '''borrow_shared_expression : AMPERSAND IDENTIFIER'''
-        p[0] = ast.BorrowShared(p[2])
-
-    def p_borrow_unique_expression(self, p):
-        '''borrow_unique_expression : AMPERSAND MUT IDENTIFIER'''
-        p[0] = ast.BorrowUnique(p[3])
-
-    def p_spawn_expression(self, p):
-        '''spawn_expression : SPAWN LPAREN expression RPAREN'''
-        p[0] = ast.SpawnExpression(p[3])
-
-    def p_vector_literal(self, p):
-        '''vector_literal : VECTOR LBRACKET IDENTIFIER COMMA NUMBER RBRACKET LPAREN element_list RPAREN'''
-        p[0] = ast.VectorLiteral(p[3], p[5], p[8])
-
-    def p_element_list(self, p):
-        '''element_list : element_list COMMA expression
-                        | expression'''
-        if len(p) == 4:
-            p[0] = p[1] + [p[3]]
+    def p_method_impl_list(self, p):
+        '''method_impl_list : method_implementation
+                        | method_impl_list method_implementation
+                        | empty'''
+        if len(p) == 2:
+            if p[1] is None:  # empty
+                p[0] = []
+            else:
+                p[0] = [p[1]]
         else:
-            p[0] = [p[1]]
+            p[0] = p[1] + [p[2]]
 
-    def p_to_device(self, p):
-        '''expression : TO_DEVICE LPAREN IDENTIFIER RPAREN'''
-        p[0] = ast.ToDevice(p[3])
-
-    def p_from_device(self, p):
-        '''expression : FROM_DEVICE LPAREN IDENTIFIER RPAREN'''
-        p[0] = ast.FromDevice(p[3])
-
-    def p_empty(self, p):
-        'empty :'
-        pass
+    def p_method_implementation(self, p):
+        '''method_implementation : FN IDENTIFIER type_params_opt LPAREN param_list_opt RPAREN ARROW type_expression block
+                               | FN IDENTIFIER type_params_opt LPAREN param_list_opt RPAREN block'''
+        if len(p) == 9:
+            p[0] = ast.MethodImplementation(p[2], p[5], p[8], type_params=p[3])
+        else:
+            p[0] = ast.MethodImplementation(p[2], p[5], p[7], type_params=p[3], return_type=p[8])
 
     def p_interface_definition(self, p):
         '''interface_definition : INTERFACE IDENTIFIER type_params_opt LBRACE method_list RBRACE
@@ -579,8 +600,12 @@ class Parser:
             p[0] = ast.MethodDefinition(p[2], p[5], None, type_params=p[3])
 
     def p_implementation(self, p):
-        '''implementation : IMPL type_params_opt interface_type FOR type_expression where_clause_opt LBRACE method_impl_list RBRACE'''
-        p[0] = ast.Implementation(p[3], p[5], p[2], p[8], where_clause=p[6])
+        '''implementation : IMPL type_params_opt interface_type FOR type_expression where_clause_opt LBRACE method_impl_list RBRACE
+                        | IMPL interface_type LBRACE method_impl_list RBRACE'''
+        if len(p) == 9:
+            p[0] = ast.Implementation(p[3], p[5], p[2], p[8], where_clause=p[6])
+        else:
+            p[0] = ast.Implementation(p[2], None, None, p[4])
 
     def p_interface_type(self, p):
         '''interface_type : IDENTIFIER
@@ -589,18 +614,6 @@ class Parser:
             p[0] = ast.InterfaceType(p[1], None)
         else:
             p[0] = ast.InterfaceType(p[1], p[3])
-
-    def p_method_impl_list(self, p):
-        '''method_impl_list : method_implementation
-                        | method_impl_list method_implementation'''
-        if len(p) == 2:
-            p[0] = [p[1]]
-        else:
-            p[0] = p[1] + [p[2]]
-
-    def p_method_implementation(self, p):
-        '''method_implementation : FN IDENTIFIER type_params_opt LPAREN param_list_opt RPAREN block'''
-        p[0] = ast.MethodImplementation(p[2], p[5], p[7], type_params=p[3])
 
     def p_where_clause(self, p):
         '''where_clause : WHERE type_constraint_list'''
@@ -729,12 +742,15 @@ class Parser:
         p[0] = ast.HandleCase(p[1], p[3], p[6])
 
     def p_type_specification(self, p):
-        '''type_specification : COLON type_expression
-                            | COLON type_expression WHERE type_constraints'''
-        if len(p) == 3:
-            p[0] = ast.TypeSpecification(p[2], None)
-        else:
-            p[0] = ast.TypeSpecification(p[2], p[4])
+        '''type_specification : type_expression
+                            | type_specification DOT IDENTIFIER
+                            | type_specification LBRACKET type_specification RBRACKET'''
+        if len(p) == 2:
+            p[0] = p[1]
+        elif p[2] == '.':
+            p[0] = ast.QualifiedType(p[1], p[3])
+        else:  # p[2] == '['
+            p[0] = ast.ArrayType(p[1], p[3])
 
     def p_type_constraints(self, p):
         '''type_constraints : type_constraint
@@ -755,6 +771,52 @@ class Parser:
     def p_visibility_block(self, p):
         '''visibility_block : VISIBILITY LBRACE visibility_rule_list RBRACE'''
         p[0] = ast.VisibilityRules(rules=p[3])
+
+    def p_visibility_modifier(self, p):
+        '''visibility_modifier : PUBLIC
+                             | PRIVATE
+                             | PROTECTED'''
+        p[0] = p[1]
+
+    def p_move_expression(self, p):
+        '''move_expression : MOVE LPAREN IDENTIFIER RPAREN'''
+        p[0] = ast.Move(p[3])
+
+    def p_borrow_shared_expression(self, p):
+        '''borrow_shared_expression : AMPERSAND IDENTIFIER'''
+        p[0] = ast.BorrowShared(p[2])
+
+    def p_borrow_unique_expression(self, p):
+        '''borrow_unique_expression : AMPERSAND MUT IDENTIFIER'''
+        p[0] = ast.BorrowUnique(p[3])
+
+    def p_spawn_expression(self, p):
+        '''spawn_expression : SPAWN LPAREN expression RPAREN'''
+        p[0] = ast.SpawnExpression(p[3])
+
+    def p_vector_literal(self, p):
+        '''vector_literal : VECTOR LBRACKET IDENTIFIER COMMA NUMBER RBRACKET LPAREN element_list RPAREN'''
+        p[0] = ast.VectorLiteral(p[3], p[5], p[8])
+
+    def p_element_list(self, p):
+        '''element_list : element_list COMMA expression
+                        | expression'''
+        if len(p) == 4:
+            p[0] = p[1] + [p[3]]
+        else:
+            p[0] = [p[1]]
+
+    def p_to_device(self, p):
+        '''expression : TO_DEVICE LPAREN IDENTIFIER RPAREN'''
+        p[0] = ast.ToDevice(p[3])
+
+    def p_from_device(self, p):
+        '''expression : FROM_DEVICE LPAREN IDENTIFIER RPAREN'''
+        p[0] = ast.FromDevice(p[3])
+
+    def p_empty(self, p):
+        'empty :'
+        pass
 
     def p_error(self, p):
         if p:

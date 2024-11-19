@@ -21,6 +21,9 @@ class ReturnStatement(Node):
     def __init__(self, expression):
         self.expression = expression
 
+    def __repr__(self):
+        return f"ReturnStatement({self.expression})"
+
 class IfStatement(Node):
     def __init__(self, condition, then_body, else_body):
         self.condition = condition
@@ -133,19 +136,37 @@ class BorrowUnique(Expression):
 
 # Structs and Enums
 class StructDefinition(Node):
-    def __init__(self, name, fields):
+    def __init__(self, name, fields, implements=None, methods=None):
         self.name = name
-        self.fields = fields  # List of StructFieldDefinition
+        self.fields = fields
+        self.implements = implements
+        self.methods = methods if methods is not None else []
 
-class StructInstantiation(Expression):
-    def __init__(self, struct_name, field_values):
-        self.struct_name = struct_name
-        self.field_values = field_values  # Dict of field_name: expression
+class StructField(Node):
+    def __init__(self, name, type_expr=None, value=None, visibility=None):
+        self.name = name
+        self.type_expr = type_expr
+        self.value = value
+        self.visibility = visibility
 
-class FieldAccess(Expression):
-    def __init__(self, struct_expression, field_name):
-        self.struct_expression = struct_expression
-        self.field_name = field_name
+class StructInstantiation(Node):
+    def __init__(self, struct_name, field_assignments):
+        super().__init__()
+        self.struct_name = struct_name  # QualifiedName
+        self.field_assignments = field_assignments  # List of (field_name, value) tuples
+
+    def __str__(self):
+        fields_str = ", ".join(f"{field}={value}" for field, value in self.field_assignments)
+        return f"{self.struct_name}{{{fields_str}}}"
+
+class FieldAccess(Node):
+    def __init__(self, base, fields):
+        super().__init__()
+        self.base = base  # Expression
+        self.fields = fields  # List of field names
+
+    def __str__(self):
+        return f"{self.base}.{'.'.join(self.fields)}"
 
 class EnumDefinition(Statement):
     def __init__(self, name, variants):
@@ -290,6 +311,12 @@ class TypeApplication(TypeExpression):
         self.base_type = base_type  # The generic type being instantiated
         self.type_args = type_args  # List of type arguments
 
+class InterfaceType(TypeExpression):
+    """Represents a reference to an interface type"""
+    def __init__(self, name, type_args=None):
+        self.name = name
+        self.type_args = type_args or []
+
 class TypeDefinition(Statement):
     """Top-level type definition"""
     def __init__(self, name, type_params, body, modes=None):
@@ -326,11 +353,12 @@ class Implementation(Node):
 
 class MethodImplementation(Node):
     """Concrete implementation of an interface method"""
-    def __init__(self, name, params, body, type_params=None):
+    def __init__(self, name, params, body, type_params=None, return_type=None):
         self.name = name
         self.params = params  # List of Parameter
         self.body = body  # Block of statements
         self.type_params = type_params or []  # List of TypeParameter
+        self.return_type = return_type  # Optional return type
 
 class WhereClause(Node):
     """Type constraints in implementations and generic functions"""
@@ -408,17 +436,35 @@ class ModuleBody(Node):
 
 class Module(Node):
     """A module containing statements and declarations"""
-    def __init__(self, name, body):
+    def __init__(self, name, body, parent=None):
         """
         Args:
-            name (str): Fully qualified module name, e.g. "std.io"
+            name (str): Module name (not fully qualified)
             body (ModuleBody): Module contents
+            parent (Module, optional): Parent module if this is a nested module
         """
         self.name = name
         self.body = body
+        self.parent = parent
+        self._children = {}  # Map of child module names to Module objects
+
+    def add_child(self, child_module):
+        """Add a child module to this module"""
+        self._children[child_module.name] = child_module
+        child_module.parent = self
+
+    def get_child(self, name):
+        """Get a child module by name"""
+        return self._children.get(name)
+
+    def get_full_name(self):
+        """Get the fully qualified module name"""
+        if self.parent:
+            return f"{self.parent.get_full_name()}.{self.name}"
+        return self.name
 
     def __str__(self):
-        return f"Module(name={self.name}, body={self.body})"
+        return f"Module(name={self.get_full_name()}, body={self.body})"
 
 class RelativePath(Node):
     """Represents a relative module path like '.module' or '...module'"""
@@ -431,11 +477,19 @@ class RelativePath(Node):
         self.level = level
         self.path = path
 
-class QualifiedName(Expression):
+class QualifiedName(Node):
     def __init__(self, parts):
-        self.parts = parts
+        super().__init__()
+        self.parts = parts  # List of name parts
 
-class QualifiedFunctionCall(Expression):
+    def __str__(self):
+        return '.'.join(self.parts)
+
+class QualifiedFunctionCall(Node):
     def __init__(self, parts, arguments):
-        self.parts = parts
-        self.arguments = arguments if arguments is not None else []
+        super().__init__()
+        self.parts = parts  # List of name parts
+        self.arguments = arguments  # List of expressions
+
+    def __str__(self):
+        return f"{'.'.join(self.parts)}({', '.join(str(arg) for arg in self.arguments)})"
