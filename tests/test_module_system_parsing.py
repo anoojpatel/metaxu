@@ -292,8 +292,8 @@ class TestModuleSystem(unittest.TestCase):
         
         # Verify qualified name resolution
         let_stmt = test_func.body[0]
-        self.assertIsInstance(let_stmt.expression, ast.QualifiedFunctionCall)
-        self.assertEqual(let_stmt.expression.parts, ["math", "BasicCalc"])
+        self.assertIsInstance(let_stmt.initializer, ast.QualifiedFunctionCall)
+        self.assertEqual(let_stmt.initializer.parts, ["math", "BasicCalc"])
 
     def test_variant_instantiation(self):
         """Test that variant instantiation with :: is parsed correctly while module function calls with . work"""
@@ -324,7 +324,7 @@ class TestModuleSystem(unittest.TestCase):
         
         # Check variant instantiation
         let_stmt = func.body[0]
-        variant_inst = let_stmt.expression
+        variant_inst = let_stmt.initializer
         self.assertIsInstance(variant_inst, ast.VariantInstance)
         self.assertEqual(variant_inst.enum_name, "Color")
         self.assertEqual(variant_inst.variant_name, "RGB")

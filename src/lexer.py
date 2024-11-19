@@ -34,6 +34,7 @@ class Lexer:
         'interface': 'INTERFACE',
         'impl': 'IMPL',
         'for': 'FOR',
+        'in': 'IN',
         'where': 'WHERE',
         'extends': 'EXTENDS',
         'implements': 'IMPLEMENTS',
@@ -67,7 +68,7 @@ class Lexer:
 
     # List of token names
     tokens = [
-        'IDENTIFIER', 'NUMBER', 'FLOAT', 'STRING',
+        'IDENTIFIER', 'NUMBER', 'FLOAT', 'STRING', 'BOOL',
         'PLUS', 'MINUS', 'TIMES', 'DIVIDE',
         'LPAREN', 'RPAREN', 'LBRACE', 'RBRACE', 'LBRACKET', 'RBRACKET',
         'EQUALS', 'SEMICOLON', 'COLON', 'COMMA', 'DOT', 'TRIPLE_DOT',
@@ -103,7 +104,8 @@ class Lexer:
     # Regular expression rules with actions
     def t_IDENTIFIER(self, t):
         r'[a-zA-Z_][a-zA-Z_0-9]*'
-        t.type = self.reserved.get(t.value, 'IDENTIFIER')
+        # Check for reserved words
+        t.type = self.reserved.get(t.value, 'IDENTIFIER') 
         return t
 
     def t_NUMBER(self, t):
@@ -114,6 +116,10 @@ class Lexer:
     def t_FLOAT(self, t):
         r'\d*\.\d+'
         t.value = float(t.value)
+        return t
+    def t_BOOL(self, t):
+        r'(true|false)'
+        t.value = True if t.value == 'true' else False
         return t
 
     def t_STRING(self, t):
@@ -131,7 +137,6 @@ class Lexer:
     def t_newline(self, t):
         r'\n+'
         t.lexer.lineno += len(t.value)
- 
 
     # Error handling rule
     def t_error(self, t):
