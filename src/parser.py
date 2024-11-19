@@ -37,34 +37,62 @@ class Parser:
             p[0] = [p[1]] if p[1] is not None else []
 
     def p_statement(self, p):
-        '''statement : expression SEMICOLON
+        '''statement : return_statement
+                    | let_statement SEMICOLON
                     | let_statement
-                    | return_statement
+                    | for_statement
                     | block
-                    | assignment
                     | assignment SEMICOLON
+                    | assignment
                     | function_declaration
                     | struct_definition
                     | enum_definition
-                    | type_definition
                     | type_definition SEMICOLON
+                    | type_definition
                     | interface_definition
                     | implementation
                     | import_statement
                     | from_import_statement
                     | module_declaration
-                    | visibility_block'''
-        if len(p) == 3 and isinstance(p[1], ast.Expression):
-            p[0] = ast.ExpressionStatement(p[1])
+                    | visibility_block
+                    | expression SEMICOLON
+                    | expression'''
+        if len(p) == 3 and isinstance(p[1], ast.LetStatement):
+            p[0] = p[1]  # Let statement with semicolon
+        elif len(p) == 3 and isinstance(p[1], ast.Assignment):
+            p[0] = p[1]  # Assignment with semicolon
         else:
-            p[0] = p[1]
+            p[0] = p[1]  # All other statements
+
+    def p_lambda_statement(self, p):
+        '''lambda_statement : lambda_expression SEMICOLON
+                          | lambda_expression'''
+        p[0] = p[1]
+
+    def p_for_statement(self, p):
+        '''for_statement : FOR IDENTIFIER IN expression LBRACE statement_list RBRACE'''
+        p[0] = ast.ForStatement(p[2], p[4], p[6])
 
     def p_let_statement(self, p):
-        '''let_statement : LET IDENTIFIER EQUALS expression SEMICOLON'''
-        p[0] = ast.LetStatement(name=p[2], expression=p[4])
+        '''let_statement : LET reference_mode IDENTIFIER EQUALS expression SEMICOLON
+                        | LET MUT IDENTIFIER EQUALS expression SEMICOLON
+                        | LET IDENTIFIER EQUALS expression SEMICOLON
+                        | LET reference_mode IDENTIFIER EQUALS expression
+                        | LET MUT IDENTIFIER EQUALS expression
+                        | LET IDENTIFIER EQUALS expression'''
+        
+        # Strip off semicolon if present
+        has_semicolon = p[-1] == ';'
+        effective_length = len(p) - (1 if has_semicolon else 0)
+        
+        if effective_length == 7:  # With reference mode
+            p[0] = ast.LetStatement(identifier=p[3], initializer=p[5], mode=p[2])
+        else:  # Simple let statement
+            p[0] = ast.LetStatement(identifier=p[2], initializer=p[4])
 
     def p_return_statement(self, p):
-        '''return_statement : RETURN expression_or_empty SEMICOLON'''
+        '''return_statement : RETURN expression_or_empty SEMICOLON
+                          | RETURN expression_or_empty'''
         p[0] = ast.ReturnStatement(p[2])
 
     def p_expression_or_empty(self, p):
@@ -219,8 +247,12 @@ class Parser:
             p[0] = (p[1], p[3])
 
     def p_assignment(self, p):
-        '''assignment : IDENTIFIER EQUALS expression'''
-        p[0] = ast.Assignment(p[1], p[3])
+        '''assignment : IDENTIFIER EQUALS expression
+                    | IDENTIFIER EQUALS expression SEMICOLON'''
+        if len(p) == 5:  # With semicolon
+            p[0] = ast.Assignment(p[1], p[3])
+        else:  # Without semicolon
+            p[0] = ast.Assignment(p[1], p[3])
 
     def p_expression(self, p):
         '''expression : term
@@ -228,21 +260,16 @@ class Parser:
                     | expression MINUS term
                     | expression GREATER term
                     | expression LESS term
-                    | lambda_expression
-                    | match_expression
-                    | perform_expression
-                    | handle_expression
-                    | spawn_expression
-                    | exclave_expression
-                    | borrow_expression
-                    | qualified_name
-                    | variant_instantiation'''
+                    | expression TIMES term
+                    | expression DIVIDE term
+                    | LPAREN expression RPAREN'''
         if len(p) == 2:
             p[0] = p[1]
         elif len(p) == 4:
-            p[0] = ast.BinaryOperation(p[1], p[2], p[3])
-        else:
-            p[0] = p[1]
+            if p[1] == '(':
+                p[0] = p[2]
+            else:
+                p[0] = ast.BinaryOperation(p[1], p[2], p[3])
 
     def p_exclave_expression(self, p):
         '''exclave_expression : EXCLAVE expression'''
@@ -250,42 +277,75 @@ class Parser:
 
     def p_term(self, p):
         '''term : factor
-                | term TIMES factor
-                | term DIVIDE factor'''
-        if len(p) == 2:
+                | function_call
+                | lambda_expression
+                | match_expression
+                | perform_expression
+                | handle_expression
+                | spawn_expression
+                | exclave_expression
+                | borrow_expression
+                | qualified_name
+                | variant_instantiation
+                | vector_literal
+                | LPAREN expression RPAREN'''
+        if len(p) == 4 and p[1] == '(':  # Parenthesized expression
+            p[0] = p[2]
+        else:  # All other terms
             p[0] = p[1]
-        else:
-            p[0] = ast.BinaryOperation(p[1], p[2], p[3])
 
     def p_factor(self, p):
         '''factor : NUMBER
                 | FLOAT
                 | STRING
+                | BOOL
+                | NONE
+                | SOME LPAREN expression RPAREN
+                | NONE LPAREN RPAREN
                 | IDENTIFIER
-                | function_call
-                | LPAREN expression RPAREN
-                | vector_literal
-                | struct_instantiation
-                | field_access
-                | move_expression
-                | borrow_shared_expression
-                | borrow_unique_expression
-                | qualified_name
-                | variant_instantiation'''
-        if isinstance(p[1], (int, float)):
-            p[0] = ast.Literal(p[1])
-        elif isinstance(p[1], str):
-            p[0] = ast.Variable(p[1])
-        else:
-            p[0] = p[1]
+                | IDENTIFIER LPAREN argument_list RPAREN
+                | IDENTIFIER LPAREN RPAREN
+                | LPAREN expression RPAREN'''
+        if len(p) == 2:
+            if isinstance(p[1], str):
+                if p[1].lower() == 'true':
+                    p[0] = ast.Literal(True)
+                elif p[1].lower() == 'false':
+                    p[0] = ast.Literal(False)
+                elif p[1].lower() == 'none':
+                    p[0] = ast.NoneExpression()
+                else:
+                    p[0] = ast.Variable(p[1])
+            else:
+                p[0] = ast.Literal(p[1])
+        elif len(p) == 3:
+            p[0] = ast.NoneExpression()
+        elif len(p) == 4:
+            if p[1] == '(':
+                p[0] = p[2]
+            else:
+                p[0] = ast.FunctionCall(p[1], [])
+        elif len(p) == 5:
+            if p[1].lower() == 'some':
+                p[0] = ast.SomeExpression(p[3])
+            else:
+                p[0] = ast.FunctionCall(p[1], p[3] if p[3] is not None else [])
 
     def p_function_call(self, p):
         '''function_call : IDENTIFIER LPAREN argument_list RPAREN
-                        | qualified_name LPAREN argument_list RPAREN'''
-        if isinstance(p[1], str):
-            p[0] = ast.QualifiedFunctionCall([p[1]], p[3])
+                        | IDENTIFIER LPAREN RPAREN
+                        | qualified_name LPAREN argument_list RPAREN
+                        | qualified_name LPAREN RPAREN'''
+        if isinstance(p[1], ast.QualifiedName):
+            if len(p) == 4:  # Empty args
+                p[0] = ast.QualifiedFunctionCall(p[1].parts, [])
+            else:  # With args
+                p[0] = ast.QualifiedFunctionCall(p[1].parts, p[3] if p[3] is not None else [])
         else:
-            p[0] = ast.QualifiedFunctionCall(p[1].parts, p[3])
+            if len(p) == 4:  # Empty args
+                p[0] = ast.FunctionCall(p[1], [])
+            else:  # With args
+                p[0] = ast.FunctionCall(p[1], p[3] if p[3] is not None else [])
 
     def p_qualified_name(self, p):
         '''qualified_name : IDENTIFIER
@@ -293,30 +353,34 @@ class Parser:
                         | qualified_name DOT IDENTIFIER'''
         if len(p) == 2:
             p[0] = ast.QualifiedName([p[1]])
-        elif len(p) == 4 and isinstance(p[1], str):
-            p[0] = ast.QualifiedName([p[1], p[3]])
+        elif len(p) == 4:
+            if isinstance(p[1], ast.QualifiedName):
+                parts = p[1].parts + [p[3]]
+            else:
+                parts = [p[1], p[3]]
+            p[0] = ast.QualifiedName(parts)
         else:
             p[0] = ast.QualifiedName(p[1].parts + [p[3]])
 
     def p_argument_list(self, p):
-        '''argument_list : argument_list COMMA expression
-                        | expression
+        '''argument_list : expression
+                        | argument_list COMMA expression
                         | empty'''
-        if len(p) == 4:
-            p[0] = p[1] + [p[3]]
-        elif len(p) == 2:
-            if p[1] is None:
+        if len(p) == 2:
+            if p[1] is None:  # empty
                 p[0] = []
-            else:
+            else:  # single expression
                 p[0] = [p[1]]
+        else:  # argument_list COMMA expression
+            p[0] = p[1] + [p[3]]
 
     def p_function_declaration(self, p):
         '''function_declaration : FN IDENTIFIER LPAREN parameter_list RPAREN type_annotation LBRACE statement_list RBRACE
                               | FN IDENTIFIER LPAREN parameter_list RPAREN LBRACE statement_list RBRACE'''
         if len(p) == 10:  # With return type
-            p[0] = ast.FunctionDeclaration(p[2], p[4] if p[4] is not None else [], p[8], p[6])
+            p[0] = ast.FunctionDeclaration(p[2], p[4] if p[4] is not None else [], p[8], return_type=p[6])
         else:  # Without return type
-            p[0] = ast.FunctionDeclaration(p[2], p[4] if p[4] is not None else [], p[7], None)
+            p[0] = ast.FunctionDeclaration(p[2], p[4] if p[4] is not None else [], p[7])
 
     def p_parameter_list(self, p):
         '''parameter_list : parameter_list COMMA parameter
@@ -330,12 +394,36 @@ class Parser:
             p[0] = [p[1]]
 
     def p_parameter(self, p):
-        '''parameter : IDENTIFIER COLON type_expression
+        '''parameter : IDENTIFIER COLON mode_type_expression
+                    | reference_mode IDENTIFIER COLON type_expression
                     | IDENTIFIER'''
         if len(p) == 4:
-            p[0] = ast.Parameter(p[1], p[3])
+            p[0] = ast.Parameter(p[1], p[3].base_type, p[3].uniqueness)
+        elif len(p) == 5:
+            p[0] = ast.Parameter(p[2], p[4], p[1])
+        else:  # Just identifier
+            p[0] = ast.Parameter(p[1])
+
+    def p_mode_type_expression(self, p):
+        '''mode_type_expression : reference_mode type_expression
+                               | type_expression'''
+        if len(p) == 3:
+            p[0] = ast.ModeTypeAnnotation(p[2], uniqueness=p[1])
         else:
-            p[0] = ast.Parameter(p[1], None)
+            p[0] = ast.ModeTypeAnnotation(p[1])
+
+    def p_reference_mode(self, p):
+        '''reference_mode : UNIQUE
+                        | SHARED
+                        | EXCLUSIVE
+                        | BORROW SHARED
+                        | BORROW EXCLUSIVE'''
+        if len(p) == 2:
+            p[0] = ast.UniquenessMode(p[1].lower())
+        else:
+            mode = ast.UniquenessMode(p[2].lower())
+            mode.is_borrowed = True
+            p[0] = mode
 
     def p_type_expression(self, p):
         '''type_expression : IDENTIFIER
@@ -343,11 +431,20 @@ class Parser:
                          | function_type
                          | struct_type
                          | enum_type
+                         | array_type
+                         | reference_mode type_expression
                          | LPAREN type_expression RPAREN'''
-        if len(p) == 4:
-            p[0] = p[2]
+        if len(p) == 4:  # Parenthesized or reference mode
+            if p[1] == '(':
+                p[0] = p[2]
+            else:
+                p[0] = ast.TypeApplication("Reference", [p[2]], mode=p[1])
         else:
             p[0] = p[1]
+
+    def p_array_type(self, p):
+        '''array_type : LBRACKET RBRACKET type_expression'''
+        p[0] = ast.TypeApplication("Array", [p[3]])
 
     def p_type_application(self, p):
         '''type_application : IDENTIFIER LESS type_argument_list GREATER'''
@@ -386,16 +483,16 @@ class Parser:
             p[0] = p[1] + [p[3]]
 
     def p_borrow_expression(self, p):
-        '''borrow_expression : BORROW expression
-                           | BORROW IDENTIFIER AS type_expression'''
-        if len(p) == 3:
-            p[0] = ast.BorrowExpression(p[2], None)
-        else:
+        '''borrow_expression : BORROW IDENTIFIER AS type_expression
+                           | BORROW IDENTIFIER'''
+        if len(p) == 5:
             p[0] = ast.BorrowExpression(p[2], p[4])
+        else:
+            p[0] = ast.BorrowExpression(p[2], None)
 
     def p_block(self, p):
         '''block : LBRACE statement_list RBRACE'''
-        p[0] = p[2]
+        p[0] = ast.Block(p[2] if p[2] is not None else [])
 
     def p_struct_definition(self, p):
         '''struct_definition : STRUCT IDENTIFIER LBRACE struct_fields RBRACE
@@ -516,9 +613,31 @@ class Parser:
         else:
             p[0] = ast.SomeExpression(p[3])
 
+    def p_lambda_body(self, p):
+        '''lambda_body : LBRACE statement_list RBRACE
+                      | LBRACE statement_list RBRACE SEMICOLON
+                      | expression SEMICOLON
+                      | expression'''
+        if len(p) == 4:  # Block without semicolon
+            p[0] = ast.Block(p[2] if p[2] is not None else [])
+        elif len(p) == 5:  # Block with semicolon
+            p[0] = ast.Block(p[2] if p[2] is not None else [])
+        else:  # Expression with or without semicolon
+            p[0] = p[1]
+
     def p_lambda_expression(self, p):
-        '''lambda_expression : BACKSLASH parameter_list ARROW expression'''
-        p[0] = ast.LambdaExpression(p[2], p[4])
+        '''lambda_expression : FN LPAREN parameter_list RPAREN ARROW type_expression lambda_body
+                           | FN LPAREN parameter_list RPAREN ARROW lambda_body
+                           | FN LPAREN RPAREN ARROW type_expression lambda_body
+                           | FN LPAREN RPAREN ARROW lambda_body'''
+        if len(p) == 7 and p[3] != ')':  # With params, no return type
+            p[0] = ast.LambdaExpression(p[3] if p[3] is not None else [], p[6])
+        elif len(p) == 8:  # With params and return type
+            p[0] = ast.LambdaExpression(p[3] if p[3] is not None else [], p[7], return_type=p[6])
+        elif len(p) == 7:  # No params, with return type
+            p[0] = ast.LambdaExpression([], p[6], return_type=p[5])
+        else:  # No params, no return type
+            p[0] = ast.LambdaExpression([], p[5])
 
     def p_perform_expression(self, p):
         '''perform_expression : PERFORM effect_operation
@@ -673,8 +792,18 @@ class Parser:
             p[0] = p[1] + [p[3]]
 
     def p_function_type(self, p):
-        '''function_type : LPAREN type_list RPAREN ARROW type_expression'''
-        p[0] = ast.FunctionType(p[2], p[5])
+        '''function_type : FN BACKSLASH LPAREN type_list RPAREN ARROW type_expression
+                        | FN LPAREN type_list RPAREN ARROW type_expression
+                        | FN BACKSLASH LPAREN RPAREN ARROW type_expression
+                        | FN LPAREN RPAREN ARROW type_expression'''
+        if len(p) == 8:  # With params and backslash
+            p[0] = ast.FunctionType(p[4], p[7])
+        elif len(p) == 7:  # With params, no backslash
+            p[0] = ast.FunctionType(p[3], p[6])
+        elif len(p) == 7:  # No params, with backslash
+            p[0] = ast.FunctionType([], p[6])
+        else:  # No params, no backslash
+            p[0] = ast.FunctionType([], p[5])
 
     def p_struct_type(self, p):
         '''struct_type : STRUCT LBRACE struct_field_list RBRACE'''
@@ -795,12 +924,19 @@ class Parser:
         p[0] = ast.SpawnExpression(p[3])
 
     def p_vector_literal(self, p):
-        '''vector_literal : VECTOR LBRACKET IDENTIFIER COMMA NUMBER RBRACKET LPAREN element_list RPAREN'''
-        p[0] = ast.VectorLiteral(p[3], p[5], p[8])
+        '''vector_literal : VECTOR LBRACKET IDENTIFIER COMMA NUMBER RBRACKET LPAREN element_list RPAREN
+                        | VECTOR LBRACKET IDENTIFIER COMMA NUMBER RBRACKET
+                        | VECTOR LBRACKET IDENTIFIER RBRACKET'''
+        if len(p) == 10:  # Full form with element list
+            p[0] = ast.VectorLiteral(p[3], p[5], p[8])
+        elif len(p) == 7:  # With size but no elements
+            p[0] = ast.VectorLiteral(p[3], p[5], [])
+        else:  # Just type
+            p[0] = ast.VectorLiteral(p[3], None, [])
 
     def p_element_list(self, p):
         '''element_list : element_list COMMA expression
-                        | expression'''
+                       | expression'''
         if len(p) == 4:
             p[0] = p[1] + [p[3]]
         else:
@@ -814,13 +950,21 @@ class Parser:
         '''expression : FROM_DEVICE LPAREN IDENTIFIER RPAREN'''
         p[0] = ast.FromDevice(p[3])
 
+
     def p_empty(self, p):
         'empty :'
         pass
 
     def p_error(self, p):
         if p:
-            print(f"Syntax error at line {p.lineno}, position {p.lexpos}: Unexpected token {p.type}")
+            print(f"Syntax error at token {p.type}, value '{p.value}', line {p.lineno}, position {p.lexpos}")
+            # Print the next few tokens to help with debugging
+            tok = self.parser.token()
+            print("Next tokens:")
+            for _ in range(5):  # Print next 5 tokens
+                if tok:
+                    print(f"  {tok.type}: {tok.value}")
+                    tok = self.parser.token()
         else:
             print("Syntax error at EOF")
         # Don't return None here, instead raise an exception to be caught by parse()

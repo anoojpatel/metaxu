@@ -12,10 +12,10 @@ class Expression(Node):
     pass
 
 class LetStatement(Node):
-    def __init__(self, name, expression, mutable=False):
-        self.name = name
-        self.expression = expression
-        self.mutable = mutable
+    def __init__(self, identifier, initializer, mode=None):
+        self.identifier = identifier
+        self.initializer = initializer
+        self.mode = mode
 
 class ReturnStatement(Node):
     def __init__(self, expression):
@@ -34,6 +34,12 @@ class WhileStatement(Node):
     """While loop control structure"""
     def __init__(self, condition, body):
         self.condition = condition
+        self.body = body
+
+class ForStatement(Statement):
+    def __init__(self, iterator, iterable, body):
+        self.iterator = iterator
+        self.iterable = iterable
         self.body = body
 
 # --- Basic Expressions and Statements ---
@@ -59,10 +65,11 @@ class BinaryOperation(Expression):
         
 
 class FunctionDeclaration(Statement):
-    def __init__(self, name, params, body, is_kernel=False):
+    def __init__(self, name, params, body, return_type=None, is_kernel=False):
         self.name = name
         self.params = params
         self.body = body
+        self.return_type = return_type
         self.is_kernel = is_kernel
 
 class FunctionCall(Expression):
@@ -101,9 +108,10 @@ class VariantPattern(Pattern):
 
 # Higher-Order Functions
 class LambdaExpression(Expression):
-    def __init__(self, params, body):
+    def __init__(self, params, body, return_type=None):
         self.params = params
         self.body = body
+        self.return_type = return_type
 
 # Algebraic Effects
 class PerformEffect(Expression):
@@ -191,8 +199,9 @@ class SpawnExpression(Expression):
 
 # SIMD and GPU
 class VectorLiteral(Expression):
-    def __init__(self, base_type, elements):
+    def __init__(self, base_type, size, elements):
         self.base_type = base_type
+        self.size = size
         self.elements = elements  # List of expressions
 
 class KernelAnnotation(Node):
@@ -224,10 +233,10 @@ class LocalParameter(Node):
 
 # Function Parameters
 class Parameter(Node):
-    def __init__(self, name, type_annotation, mode_annotation=None):
+    def __init__(self, name, type=None, mode=None):
         self.name = name
-        self.type_annotation = type_annotation
-        self.mode_annotation = mode_annotation
+        self.type = type
+        self.mode = mode
 
 # Mode System
 class ModeAnnotation(Node):
@@ -324,6 +333,11 @@ class TypeDefinition(Statement):
         self.type_params = type_params or []
         self.body = body
         self.modes = modes or []
+
+class FunctionType(TypeExpression):
+    def __init__(self, param_types, return_type):
+        self.param_types = param_types
+        self.return_type = return_type
 
 # Interface and Implementation
 class InterfaceDefinition(Node):
@@ -493,3 +507,11 @@ class QualifiedFunctionCall(Node):
 
     def __str__(self):
         return f"{'.'.join(self.parts)}({', '.join(str(arg) for arg in self.arguments)})"
+
+class Block(Node):
+    def __init__(self, statements):
+        super().__init__()
+        self.statements = statements if statements is not None else []
+
+    def __repr__(self):
+        return f"Block({self.statements})"
