@@ -1,0 +1,180 @@
+# Example 9: SIMD Effects
+# This example demonstrates how Metaxu uses algebraic effects to handle SIMD operations
+# Note that these features have not been implemented yet!!!
+
+from std.simd import SimdOp, SimdRegister, SimdIntrinsic;
+from std.arch import Target;
+from std.effects import Effect, handle, perform, resume;
+
+# Define SIMD capability effect
+effect SimdCapability {
+    # Query hardware capabilities
+    detect_features() -> SimdFeatureSet
+    
+    # Core SIMD operations
+    vector_load<T>(ptr: *T, align: int) -> SimdRegister<T>
+    vector_store<T>(reg: SimdRegister<T>, ptr: *T, align: int)
+    vector_add<T>(a: SimdRegister<T>, b: SimdRegister<T>) -> SimdRegister<T>
+    vector_mul<T>(a: SimdRegister<T>, b: SimdRegister<T>) -> SimdRegister<T>
+    vector_fma<T>(a: SimdRegister<T>, b: SimdRegister<T>, c: SimdRegister<T>) -> SimdRegister<T>
+    horizontal_add<T>(reg: SimdRegister<T>) -> T
+}
+
+# Hardware feature set
+struct SimdFeatureSet {
+    has_avx: bool,
+    has_fma: bool,
+    vector_width: int,
+}
+
+# Enhanced vector trait with effect tracking
+trait SimdAwareVector<T, const N: int> {
+    # Basic operations that may use SIMD
+    fn load_aligned(ptr: *T) -> Self performs SimdCapability;
+    fn store_aligned(self, ptr: *T) performs SimdCapability;
+    
+    # SIMD operations with explicit effect handling
+    fn add_simd(self, other: Self) -> Self performs SimdCapability;
+    fn mul_simd(self, other: Self) -> Self performs SimdCapability;
+    fn fma_simd(self, a: Self, b: Self) -> Self performs SimdCapability;
+    fn sum(self) -> T performs SimdCapability;
+}
+
+# Implement SIMD-aware operations for 4-element float vector
+implement SimdAwareVector<float, 4> for vector[float,4] {
+    fn load_aligned(ptr: *float) -> Self performs SimdCapability {
+        let features = perform SimdCapability.detect_features();
+        let reg = perform SimdCapability.vector_load(ptr, features.vector_width / 8);
+        unsafe { SimdIntrinsic.register_to_vector(reg) }
+    }
+    
+    fn store_aligned(self, ptr: *float) performs SimdCapability {
+        let features = perform SimdCapability.detect_features();
+        let reg = unsafe { SimdIntrinsic.vector_to_register(self) };
+        perform SimdCapability.vector_store(reg, ptr, features.vector_width / 8);
+    }
+    
+    fn add_simd(self, other: Self) -> Self performs SimdCapability {
+        let reg_a = unsafe { SimdIntrinsic.vector_to_register(self) };
+        let reg_b = unsafe { SimdIntrinsic.vector_to_register(other) };
+        let result = perform SimdCapability.vector_add(reg_a, reg_b);
+        unsafe { SimdIntrinsic.register_to_vector(result) }
+    }
+    
+    fn mul_simd(self, other: Self) -> Self performs SimdCapability {
+        let reg_a = unsafe { SimdIntrinsic.vector_to_register(self) };
+        let reg_b = unsafe { SimdIntrinsic.vector_to_register(other) };
+        let result = perform SimdCapability.vector_mul(reg_a, reg_b);
+        unsafe { SimdIntrinsic.register_to_vector(result) }
+    }
+    
+    fn fma_simd(self, a: Self, b: Self) -> Self performs SimdCapability {
+        let features = perform SimdCapability.detect_features();
+        if features.has_fma {
+            let reg_x = unsafe { SimdIntrinsic.vector_to_register(self) };
+            let reg_a = unsafe { SimdIntrinsic.vector_to_register(a) };
+            let reg_b = unsafe { SimdIntrinsic.vector_to_register(b) };
+            let result = perform SimdCapability.vector_fma(reg_x, reg_a, reg_b);
+            unsafe { SimdIntrinsic.register_to_vector(result) }
+        } else {
+            # Fallback implementation when FMA not available
+            self * a + b
+        }
+    }
+    
+    fn sum(self) -> float performs SimdCapability {
+        let reg = unsafe { SimdIntrinsic.vector_to_register(self) };
+        perform SimdCapability.horizontal_add(reg)
+    }
+}
+
+# AVX2 handler for modern x86 processors
+fn with_avx2<T, E>(f: fn() -> T performs SimdCapability | E) -> T performs E {
+    handle f() {
+        perform SimdCapability.detect_features() => {
+            resume(SimdFeatureSet {
+                has_avx: true,
+                has_fma: true,
+                vector_width: 256
+            })
+        }
+        
+        perform SimdCapability.vector_add(a, b) => {
+            # Maps to vaddps ymm0, ymm1, ymm2
+            unsafe {
+                resume(SimdIntrinsic.add_ps_256(a, b))
+            }
+        }
+        
+        perform SimdCapability.vector_fma(a, b, c) => {
+            # Maps to vfmadd231ps ymm0, ymm1, ymm2
+            unsafe {
+                resume(SimdIntrinsic.fma_ps_256(a, b, c))
+            }
+        }
+        
+        perform SimdCapability.horizontal_add(reg) => {
+            # Maps to vhaddps + vextractf128
+            unsafe {
+                resume(SimdIntrinsic.horizontal_add_ps_256(reg))
+            }
+        }
+    }
+}
+
+# SSE fallback handler for older processors
+fn with_sse<T, E>(f: fn() -> T performs SimdCapability | E) -> T performs E {
+    handle f() {
+        perform SimdCapability.detect_features() => {
+            resume(SimdFeatureSet {
+                has_avx: false,
+                has_fma: false,
+                vector_width: 128
+            })
+        }
+        
+        perform SimdCapability.vector_add(a, b) => {
+            # Maps to addps xmm0, xmm1
+            unsafe {
+                resume(SimdIntrinsic.add_ps_128(a, b))
+            }
+        }
+        
+        perform SimdCapability.vector_fma(a, b, c) => {
+            # Emulate FMA with separate mul/add
+            unsafe {
+                let tmp = SimdIntrinsic.mul_ps_128(a, b);
+                resume(SimdIntrinsic.add_ps_128(tmp, c))
+            }
+        }
+        
+        perform SimdCapability.horizontal_add(reg) => {
+            # Maps to haddps
+            unsafe {
+                resume(SimdIntrinsic.horizontal_add_ps_128(reg))
+            }
+        }
+    }
+}
+
+# Example usage showing effect handling
+fn main() {
+    # Create test vectors
+    let v1 = vector[float,4](1.0, 2.0, 3.0, 4.0);
+    let v2 = vector[float,4](2.0, 3.0, 4.0, 5.0);
+    let v3 = vector[float,4](0.5, 1.0, 1.5, 2.0);
+    
+    # Try with AVX2 first
+    with_avx2(fn\() -> float performs SimdCapability {
+        # This will use AVX2 instructions
+        let result = v1.fma_simd(v2, v3);
+        print("Sum using AVX2: {}", result.sum());
+    });
+    
+    # Fallback to SSE
+    with_sse(fn\() -> float performs SimdCapability {
+        # This will use SSE instructions
+        let result = v1.fma_simd(v2, v3);
+        print("Sum using SSE: {}", result.sum());
+    });
+}

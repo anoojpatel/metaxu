@@ -1,0 +1,146 @@
+# Example 7: SIMD Compilation
+# This example shows how Metaxu code compiles to SIMD instructions
+# Note that these features have not been implemented yet!!!
+
+# Import SIMD primitives
+from std.simd import SimdOp, SimdRegister, SimdIntrinsic;
+from std.arch import Target;
+
+# Low-level SIMD operations trait
+trait SimdVector<T, const N: int> {
+    # Load/store operations
+    fn load_aligned(ptr: *T) -> Self;
+    fn store_aligned(self, ptr: *T);
+    
+    # SIMD operations
+    fn add_simd(self, other: Self) -> Self;
+    fn mul_simd(self, other: Self) -> Self;
+    fn fma_simd(self, a: Self, b: Self) -> Self;  # Fused multiply-add
+    fn horizontal_sum(self) -> T;
+}
+
+# Implement SIMD operations for 4-element float vector
+# This will compile to actual SIMD instructions on the target architecture
+implement SimdVector<float, 4> for vector[float,4] {
+    # Load 4 floats aligned to 16-byte boundary
+    fn load_aligned(ptr: *float) -> Self performs SimdOp {
+        unsafe {
+            # Compiles to: vmovaps xmm0, [rdi]
+            SimdIntrinsic.load_ps(ptr)
+        }
+    }
+    
+    # Store 4 floats aligned to 16-byte boundary
+    fn store_aligned(self, ptr: *float) performs SimdOp {
+        unsafe {
+            # Compiles to: vmovaps [rdi], xmm0
+            SimdIntrinsic.store_ps(ptr, self)
+        }
+    }
+    
+    # Add two vectors using SIMD
+    fn add_simd(self, other: Self) -> Self performs SimdOp {
+        unsafe {
+            # Compiles to: vaddps xmm0, xmm0, xmm1
+            SimdIntrinsic.add_ps(self, other)
+        }
+    }
+    
+    # Multiply two vectors using SIMD
+    fn mul_simd(self, other: Self) -> Self performs SimdOp {
+        unsafe {
+            # Compiles to: vmulps xmm0, xmm0, xmm1
+            SimdIntrinsic.mul_ps(self, other)
+        }
+    }
+    
+    # Fused multiply-add: (self * a) + b
+    fn fma_simd(self, a: Self, b: Self) -> Self performs SimdOp {
+        unsafe {
+            # Compiles to: vfmadd231ps xmm0, xmm1, xmm2
+            SimdIntrinsic.fmadd_ps(self, a, b)
+        }
+    }
+    
+    # Sum all elements using SIMD horizontal add
+    fn horizontal_sum(self) -> float performs SimdOp {
+        unsafe {
+            # Compiles to sequence:
+            # vhaddps xmm0, xmm0, xmm0
+            # vhaddps xmm0, xmm0, xmm0
+            SimdIntrinsic.hadd_ps(
+                SimdIntrinsic.hadd_ps(self, self),
+                SimdIntrinsic.setzero_ps()
+            ).extract(0)
+        }
+    }
+}
+
+# Example of how high-level operations compile to SIMD
+fn dot_product(a: vector[float,4], b: vector[float,4]) -> float {
+    # This entire function compiles to just:
+    # vmulps xmm0, xmm0, xmm1    ; multiply vectors
+    # vhaddps xmm0, xmm0, xmm0   ; horizontal add
+    # vhaddps xmm0, xmm0, xmm0   ; horizontal add
+    (a * b).sum()
+}
+
+# Matrix multiplication with SIMD
+fn matrix_multiply(
+    a: vector[vector[float,4],4],
+    b: vector[vector[float,4],4]
+) -> vector[vector[float,4],4] {
+    # This will use:
+    # - Aligned loads/stores
+    # - SIMD multiplication
+    # - FMA for accumulation
+    # - Loop unrolling
+    # - Register blocking
+    
+    let bt = b.transpose();  # Transpose for better memory access
+    
+    vector[vector[float,4],4](
+        vector[float,4](
+            # Each dot product uses SIMD
+            row.dot(col) for col in bt
+        ) for row in a
+    )
+}
+
+# Vectorized array operations
+fn vectorized_operation(arr: &[float], n: int) {
+    # Process 4 elements at a time using SIMD
+    for i in (0..n).step(4) {
+        unsafe {
+            # Load 4 elements
+            let v = vector[float,4].load_aligned(&arr[i]);
+            
+            # Compute (x * 2 + 1) ^ 2
+            let result = v
+                .mul_simd(vector[float,4].filled(2.0))
+                .add_simd(vector[float,4].filled(1.0))
+                .mul_simd(v);
+            
+            # Store result
+            result.store_aligned(&arr[i]);
+        }
+    }
+}
+
+# Example showing generated assembly
+fn example() {
+    let a = vector[float,4](1.0, 2.0, 3.0, 4.0);
+    let b = vector[float,4](2.0, 3.0, 4.0, 5.0);
+    
+    # Compiles to:
+    # vmovaps xmm0, [a]      ; load a
+    # vmovaps xmm1, [b]      ; load b
+    # vmulps xmm0, xmm0, xmm1  ; multiply
+    # vaddps xmm1, xmm0, xmm0  ; add to itself
+    # vmovaps [result], xmm1   ; store result
+    let result = (a * b) + (a * b);
+    
+    # Use FMA for better performance
+    # vfmadd231ps xmm0, xmm1, xmm1
+    let fma_result = a.fma_simd(b, b);
+}

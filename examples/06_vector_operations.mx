@@ -1,0 +1,262 @@
+# Example 6: Vector Operations
+# This example demonstrates Metaxu's vector system with SIMD optimizations
+# Note that these features have not been implemented yet!!!
+
+# Import standard vector operations
+from std.simd import SimdOp, SimdRegister, SimdIntrinsic;
+from std.effects import Effect, handle, perform, resume;
+from std.math import sqrt, sin, cos;
+
+# Define SIMD effect
+effect SimdOp {
+    # Core vector operations with SIMD support
+    try_vectorize<T,U,const N: int>(v: vector[T,N], f: fn(T) -> U) -> Option<vector[U,N]>;
+    try_horizontal<T,const N: int>(v: vector[T,N], f: fn(T,T) -> T) -> Option<T>;
+}
+
+# Define vector traits
+trait VectorOps<T, const N: int> {
+    # Element-wise operations
+    fn map<U>(self, f: fn(T) -> U) -> vector[U,N];
+    fn zip<U,V>(self, other: vector[U,N], f: fn(T,U) -> V) -> vector[V,N];
+    
+    # Reductions
+    fn reduce(self, f: fn(T,T) -> T) -> T;
+    fn fold<U>(self, init: U, f: fn(U,T) -> U) -> U;
+}
+
+# Implement vector operations
+implement<T, const N: int> VectorOps<T,N> for vector[T,N] {
+    # Map operation with SIMD effect
+    fn map<U>(self, f: fn(T) -> U) -> vector[U,N] performs SimdOp {
+        # Try SIMD optimization first
+        match perform SimdOp.try_vectorize(self, f) {
+            Some(result) -> result,
+            None -> vector[U,N](f(x) for x in self)
+        }
+    }
+    
+    # Zip operation with SIMD effect
+    fn zip<U,V>(self, other: vector[U,N], f: fn(T,U) -> V) -> vector[V,N] performs SimdOp {
+        # Try SIMD optimization first
+        match perform SimdOp.try_vectorize(self, fn(x: T) -> V { f(x, other[i]) }) {
+            Some(result) -> result,
+            None -> vector[V,N](f(a, b) for (a, b) in (self, other))
+        }
+    }
+    
+    # Reduction with SIMD effect
+    fn reduce(self, f: fn(T,T) -> T) -> T performs SimdOp {
+        # Try SIMD horizontal operations
+        match perform SimdOp.try_horizontal(self, f) {
+            Some(result) -> result,
+            None -> {
+                # Fallback to scalar reduction
+                let mut result = self[0];
+                for i in 1..N {
+                    result = f(result, self[i]);
+                }
+                result
+            }
+        }
+    }
+    
+    # Fold with accumulator (uses SIMD when possible)
+    fn fold<U>(self, init: U, f: fn(U,T) -> U) -> U performs SimdOp {
+        # Try to use SIMD for compatible types
+        if type_of(U) == type_of(T) {
+            match perform SimdOp.try_horizontal(self, f as fn(T,T) -> T) {
+                Some(reduced) -> f(init, reduced),
+                None -> {
+                    # Fallback to scalar fold
+                    let mut acc = init;
+                    for x in self {
+                        acc = f(acc, x);
+                    }
+                    acc
+                }
+            }
+        } else {
+            # Different types, use scalar fold
+            let mut acc = init;
+            for x in self {
+                acc = f(acc, x);
+            }
+            acc
+        }
+    }
+}
+
+# Specialized floating point vector operations
+implement<const N: int> vector[float,N] {
+    # Basic operations (all use SIMD)
+    fn sum(self) -> float performs SimdOp {
+        self.reduce((a, b) -> a + b)
+    }
+    
+    fn prod(self) -> float performs SimdOp {
+        self.reduce((a, b) -> a * b)
+    }
+    
+    fn mean(self) -> float performs SimdOp {
+        self.sum() / N as float
+    }
+    
+    fn dot(self, other: vector[float,N]) -> float performs SimdOp {
+        (self * other).sum()  # Uses SIMD multiply and horizontal add
+    }
+    
+    fn norm(self) -> float performs SimdOp {
+        sqrt(self.dot(self))
+    }
+    
+    # Element-wise operations with broadcasting
+    fn scale(self, factor: float) -> vector[float,N] performs SimdOp {
+        self * factor  # Broadcasts scalar to vector
+    }
+    
+    fn normalize(self) -> vector[float,N] performs SimdOp {
+        self / self.norm()  # Broadcasts scalar to vector
+    }
+}
+
+# Matrix operations (2D vectors)
+implement<T, const M: int, const N: int> vector[vector[T,N],M] {
+    # Matrix transpose
+    fn transpose(self) -> vector[vector[T,M],N] {
+        vector[vector[T,M],N](
+            vector[T,M](self[j][i] for j in 0..M)
+            for i in 0..N
+        )
+    }
+    
+    # Matrix multiplication (uses SIMD)
+    fn matmul(self, other: vector[vector[T,N],P]) -> vector[vector[T,P],M]
+    where T: Number {
+        let transposed = other.transpose();
+        vector[vector[T,P],M](
+            vector[T,P](
+                row.dot(col) for col in transposed
+            ) for row in self
+        )
+    }
+}
+
+# SIMD handler for modern x86 processors
+fn with_simd<T, E>(f: fn() -> T performs SimdOp | E) -> T performs E {
+    handle f() {
+        perform SimdOp.try_vectorize(v, f) => {
+            match typeof(T) {
+                float => {
+                    # Use SIMD for floating point
+                    unsafe {
+                        let reg = SimdRegister.from_vector(v);
+                        let result = match f {
+                            fn(x) -> x * x => SimdIntrinsic.mul_ps(reg, reg),
+                            fn(x) -> sqrt(x) => SimdIntrinsic.sqrt_ps(reg),
+                            fn(x) -> sin(x) => SimdIntrinsic.sin_ps(reg),
+                            fn(x) -> cos(x) => SimdIntrinsic.cos_ps(reg),
+                            _ => resume(None) # Non-specialized case
+                        };
+                        resume(Some(result.to_vector()))
+                    }
+                },
+                _ => resume(None) # Non-float types
+            }
+        }
+        
+        perform SimdOp.try_horizontal(v, f) => {
+            match typeof(T) {
+                float => {
+                    # Use SIMD horizontal operations
+                    unsafe {
+                        let reg = SimdRegister.from_vector(v);
+                        let result = match f {
+                            fn(a,b) -> a + b => SimdIntrinsic.horizontal_add_ps(reg),
+                            fn(a,b) -> a * b => SimdIntrinsic.horizontal_mul_ps(reg),
+                            fn(a,b) -> max(a,b) => SimdIntrinsic.horizontal_max_ps(reg),
+                            fn(a,b) -> min(a,b) => SimdIntrinsic.horizontal_min_ps(reg),
+                            _ => resume(None) # Non-specialized case
+                        };
+                        resume(Some(result))
+                    }
+                },
+                _ => resume(None) # Non-float types
+            }
+        }
+    }
+}
+
+# Example usage
+fn main() {
+    # Create vectors with different initialization methods
+    let v1 = vector[float,4](1.0, 2.0, 3.0, 4.0);
+    let v2 = vector[float,4](x * 2.0 for x in 0..4);  # Comprehension
+    let zeros = vector[float,4]();  # Zero-initialized
+    let ones = vector[float,4].filled(1.0);  # Filled with value
+    
+    # Basic operations (all SIMD optimized)
+    let sum = v1 + v2;          # Vector addition
+    let prod = v1 * v2;         # Element-wise multiplication
+    let scaled = v1 * 2.0;      # Scalar multiplication
+    let normalized = v1.normalize();
+    
+    # Slicing and views (zero-cost abstractions)
+    let slice = v1[1:3];        # View of elements 1 and 2
+    let reversed = v1[::-1];    # Reversed view
+    let strided = v1[::2];      # Every other element
+    
+    # Reductions
+    let dot_product = v1.dot(v2);
+    let magnitude = v1.norm();
+    let average = v1.mean();
+    
+    # Matrix operations
+    let mat = vector[vector[float,3],3](  # 3x3 matrix
+        vector[float,3](1.0, 0.0, 0.0),
+        vector[float,3](0.0, 1.0, 0.0),
+        vector[float,3](0.0, 0.0, 1.0)
+    );
+    
+    let vec = vector[float,3](1.0, 2.0, 3.0);
+    let transformed = mat.matmul(vec);  # Matrix-vector multiplication
+    
+    # Custom operations using map/reduce
+    let squares = v1.map(x -> x * x);
+    let sum_squares = squares.sum();
+    let rms = sqrt(sum_squares / 4.0);
+    
+    # Run with SIMD optimization
+    with_simd(fn() -> float performs SimdOp {
+        # These will use SIMD instructions when possible
+        let sum = v1.reduce((a, b) -> a + b);
+        let squares = v1.map(x -> x * x);
+        let product = v1.zip(v2, (a, b) -> a * b);
+        
+        print("Sum: {}, Sum of squares: {}", sum, squares.sum());
+        print("Product with v2: {}", product.sum());
+    });
+    
+    # Non-SIMD operations fall back to scalar
+    let strings = v1.map(x -> x.to_string());  # No SIMD for string conversion
+    
+    # Print results
+    print("Vector v1: " + v1.to_string());
+    print("Vector v2: " + v2.to_string());
+    print("Sum: " + sum.to_string());
+    print("Dot product: " + dot_product.to_string());
+    print("RMS: " + rms.to_string());
+}
+
+# Compile-time size and type checking
+fn static_assert() {
+    # These will cause compile-time errors if dimensions don't match
+    let v1: vector[float,4] = vector[float,4]();
+    let v2: vector[float,3] = vector[float,3]();
+    
+    # Error: Dimension mismatch
+    # let sum = v1 + v2;  # 4D + 3D not allowed
+    
+    # Error: Type mismatch
+    # let mat: vector[vector[int,3],3] = vector[vector[float,3],3]();
+}
