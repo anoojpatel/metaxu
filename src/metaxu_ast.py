@@ -1,9 +1,188 @@
+{{...}}
+class ComptimeError(Exception):
+    """Error during compile-time evaluation"""
+    def __init__(self, message, node=None, note=None):
+        super().__init__(message)
+        self.node = node
+        self.note = note
+
+class ComptimeDiagnostic:
+    """Diagnostic information for compile-time errors"""
+    def __init__(self, message, level="error", node=None, notes=None):
+        self.message = message
+        self.level = level  # "error", "warning", or "note"
+        self.node = node
+        self.notes = notes or []
+    
+    def __str__(self):
+        result = f"{self.level}: {self.message}"
+        if self.node and hasattr(self.node, 'location'):
+            result += f"\n  --> {self.node.location}"
+        for note in self.notes:
+            result += f"\n  note: {note}"
+        return result
+
+class ComptimeContext:
+    """Enhanced context for compile-time execution"""
+    def __init__(self):
+        self.variables = {}
+        self.types = {}
+        self.generated_code = []
+        self.diagnostics = []
+        self.type_cache = {}  # Cache for type reflection
+        self.const_eval_depth = 0  # Track recursion depth
+        self.MAX_EVAL_DEPTH = 100  # Prevent infinite recursion
+    
+    def emit_error(self, message, node=None, notes=None):
+        diag = ComptimeDiagnostic(message, "error", node, notes)
+        self.diagnostics.append(diag)
+        raise ComptimeError(message, node)
+    
+    def emit_warning(self, message, node=None, notes=None):
+        self.diagnostics.append(
+            ComptimeDiagnostic(message, "warning", node, notes)
+        )
+    
+    def enter_const_eval(self):
+        """Track recursion depth for const evaluation"""
+        self.const_eval_depth += 1
+        if self.const_eval_depth > self.MAX_EVAL_DEPTH:
+            self.emit_error("Maximum recursion depth exceeded in compile-time evaluation")
+    
+    def exit_const_eval(self):
+        self.const_eval_depth -= 1
+    
+    def get_or_create_type_info(self, type_node):
+        """Get or create TypeInfo with caching"""
+        key = str(type_node)
+        if key not in self.type_cache:
+            if isinstance(type_node, str):
+                self.type_cache[key] = self.types.get(type_node)
+            else:
+                # Handle complex type nodes (generics, etc)
+                self.type_cache[key] = self.create_type_info(type_node)
+        return self.type_cache[key]
+    
+    def create_type_info(self, type_node):
+        """Create TypeInfo for complex types"""
+        if isinstance(type_node, GenericType):
+            base = self.get_type(type_node.base_type)
+            if not base:
+                self.emit_error(f"Unknown base type: {type_node.base_type}")
+            
+            # Instantiate generic type
+            type_args = [self.get_or_create_type_info(arg) for arg in type_node.type_args]
+            return self.instantiate_generic(base, type_args)
+        
+        return None
+    
+    def instantiate_generic(self, base_type, type_args):
+        """Create concrete type from generic type"""
+        if len(base_type.type_params) != len(type_args):
+            self.emit_error(
+                f"Wrong number of type arguments for {base_type.name}. "
+                f"Expected {len(base_type.type_params)}, got {len(type_args)}"
+            )
+        
+        # Create new type with substituted type parameters
+        name = f"{base_type.name}<{','.join(str(arg) for arg in type_args)}>"
+        fields = []
+        
+        # Substitute type parameters in fields
+        type_param_map = dict(zip(base_type.type_params, type_args))
+        for field in base_type.fields:
+            new_type = self.substitute_type_params(field.type_info, type_param_map)
+            fields.append(FieldInfo(field.name, new_type, field.modifiers))
+        
+        return TypeInfo(name, fields, base_type.interfaces)
+    
+    def substitute_type_params(self, type_info, type_param_map):
+        """Substitute type parameters in a type"""
+        if isinstance(type_info, TypeParam):
+            return type_param_map.get(type_info.name, type_info)
+        elif isinstance(type_info, GenericType):
+            args = [self.substitute_type_params(arg, type_param_map) 
+                   for arg in type_info.type_args]
+            return GenericType(type_info.base_type, args)
+        return type_info
+
 class Node:
-    pass
+    def __init__(self):
+        self.parent = None
+        self.scope = None  # For tracking lexical scope
+        self.location = None  # For source locations
+    
+    def add_child(self, child):
+        """Add a child node and set its parent"""
+        if hasattr(child, 'parent'):
+            child.parent = self
+        return child
+    
+    def replace_with(self, new_node):
+        """Replace this node with another in the AST"""
+        if not self.parent:
+            return False
+        
+        # Find this node in parent's children
+        for attr in vars(self.parent):
+            value = getattr(self.parent, attr)
+            if value is self:
+                # Direct reference
+                setattr(self.parent, attr, new_node)
+                new_node.parent = self.parent
+                return True
+            elif isinstance(value, list):
+                # List of nodes
+                try:
+                    idx = value.index(self)
+                    value[idx] = new_node
+                    new_node.parent = self.parent
+                    return True
+                except ValueError:
+                    continue
+        return False
+    
+    def insert_after(self, new_nodes):
+        """Insert nodes after this one in the parent's list"""
+        if not self.parent:
+            return False
+        
+        # Find this node in parent's lists
+        for attr in vars(self.parent):
+            value = getattr(self.parent, attr)
+            if isinstance(value, list):
+                try:
+                    idx = value.index(self)
+                    # Insert all new nodes after this one
+                    for i, node in enumerate(new_nodes, 1):
+                        value.insert(idx + i, node)
+                        node.parent = self.parent
+                    return True
+                except ValueError:
+                    continue
+        return False
+    
+    def get_scope(self):
+        """Get the nearest scope containing this node"""
+        node = self
+        while node:
+            if node.scope:
+                return node.scope
+            node = node.parent
+        return None
 
 class Program(Node):
     def __init__(self, statements):
-        self.statements = statements
+        super().__init__()
+        self.statements = [self.add_child(stmt) for stmt in statements]
+        self.scope = Scope(parent=None)  # Global scope
+    
+    def add_statements(self, new_stmts, position=-1):
+        """Add statements at specific position (-1 for end)"""
+        if position < 0:
+            position = len(self.statements)
+        for i, stmt in enumerate(new_stmts):
+            self.statements.insert(position + i, self.add_child(stmt))
 
 class Statement(Node):
     pass
@@ -42,15 +221,59 @@ class ForStatement(Statement):
         self.iterable = iterable
         self.body = body
 
+class Block(Node):
+    def __init__(self, statements=None):
+        super().__init__()
+        self.statements = [self.add_child(stmt) for stmt in (statements or [])]
+        self.scope = Scope(parent=None)  # Will be set when added to AST
+    
+    def add_statements(self, new_stmts, position=-1):
+        """Add statements at specific position (-1 for end)"""
+        if position < 0:
+            position = len(self.statements)
+        for i, stmt in enumerate(new_stmts):
+            self.statements.insert(position + i, self.add_child(stmt))
+
+class Scope:
+    """Represents a lexical scope in the program"""
+    def __init__(self, parent=None):
+        self.parent = parent
+        self.symbols = {}
+        self.children = []
+        if parent:
+            parent.children.append(self)
+    
+    def add_symbol(self, name, symbol):
+        self.symbols[name] = symbol
+    
+    def lookup(self, name):
+        """Look up a symbol in this scope or parent scopes"""
+        current = self
+        while current:
+            if name in current.symbols:
+                return current.symbols[name]
+            current = current.parent
+        return None
+
 # --- Basic Expressions and Statements ---
 
 class Literal(Expression):
     def __init__(self, value):
         self.value = value
 
+    def eval(self, context):
+        type_name = "int" if isinstance(self.value, int) else \
+                   "float" if isinstance(self.value, float) else \
+                   "bool" if isinstance(self.value, bool) else \
+                   "String"
+        return ComptimeValue(self.value, context.get_type(type_name))
+
 class Variable(Expression):
     def __init__(self, name):
         self.name = name
+
+    def eval(self, context):
+        return context.get_variable(self.name)
 
 class Assignment(Statement):
     def __init__(self, name, expression):
@@ -62,7 +285,22 @@ class BinaryOperation(Expression):
         self.left = left
         self.operator = operator
         self.right = right
+
+    def eval(self, context):
+        left = self.left.eval(context)
+        right = self.right.eval(context)
         
+        # Implement basic operations
+        if self.operator == '+':
+            value = left.value + right.value
+        elif self.operator == '-':
+            value = left.value - right.value
+        elif self.operator == '*':
+            value = left.value * right.value
+        elif self.operator == '/':
+            value = left.value / right.value
+        
+        return ComptimeValue(value, left.type_info)
 
 class FunctionDeclaration(Statement):
     def __init__(self, name, params, body, return_type=None, is_kernel=False):
@@ -76,6 +314,14 @@ class FunctionCall(Expression):
     def __init__(self, name, arguments):
         self.name = name
         self.arguments = arguments
+
+    def eval(self, context):
+        fn = context.get_variable(self.name)
+        if not fn or not hasattr(fn, 'eval'):
+            raise Exception(f"Cannot evaluate function {self.name} at compile time")
+        
+        args = [arg.eval(context) for arg in self.arguments]
+        return fn.eval(context, args)
 
 # --- Advanced Features ---
 
@@ -109,9 +355,30 @@ class VariantPattern(Pattern):
 # Higher-Order Functions
 class LambdaExpression(Expression):
     def __init__(self, params, body, return_type=None):
+        super().__init__()
         self.params = params
         self.body = body
         self.return_type = return_type
+        self.captured_vars = set()  # Set of variable names captured from outer scope
+        self.capture_modes = {}     # Map of variable name to capture mode (borrow/borrow_mut)
+        self.scope = None          # Reference to the scope where lambda is defined
+        self.linearity = LinearityMode.MANY  # Default to most permissive mode
+
+    def add_capture(self, var_name, mode='borrow'):
+        """Record a captured variable and its capture mode"""
+        if mode not in ('borrow', 'borrow_mut'):
+            raise ValueError(f"Invalid capture mode: {mode}")
+        self.captured_vars.add(var_name)
+        self.capture_modes[var_name] = mode
+        # If we capture any mutable references, we must be separate
+        if mode == 'borrow_mut':
+            self.linearity = LinearityMode.SEPARATE
+
+    def __str__(self):
+        params_str = ", ".join(str(p) for p in self.params)
+        captures_str = ", ".join(f"{v}[{self.capture_modes[v]}]" for v in sorted(self.captured_vars))
+        lin = f" @ {self.linearity}" if self.linearity != LinearityMode.MANY else ""
+        return f"lambda[captures: {captures_str}]({params_str}) -> {self.return_type or 'auto'}{lin}"
 
 # Algebraic Effects
 class PerformEffect(Expression):
@@ -166,6 +433,17 @@ class StructInstantiation(Node):
     def __str__(self):
         fields_str = ", ".join(f"{field}={value}" for field, value in self.field_assignments)
         return f"{self.struct_name}{{{fields_str}}}"
+
+    def eval(self, context):
+        type_info = context.get_type(self.struct_name.parts[-1])
+        if not type_info:
+            raise Exception(f"Type {self.struct_name.parts[-1]} not found")
+        
+        fields = {}
+        for field, value in self.field_assignments:
+            fields[field] = value.eval(context)
+        
+        return ComptimeValue(fields, type_info)
 
 class FieldAccess(Node):
     def __init__(self, base, fields):
@@ -223,6 +501,9 @@ class LocalDeclaration(Node):
         self.type_annotation = type_annotation
 
 class ExclaveExpression(Expression):
+    """Promotes expression up to caller scope. Must check if expression isn't
+    only local to callee scope. Otherwise we will escape and leak after stack
+    unwinding."""
     def __init__(self, expression):
         self.expression = expression
 
@@ -264,12 +545,12 @@ class LocalityMode(Node):
         self.mode = mode
 
 class LinearityMode(Node):
-    ONCE = "once"
-    SEPARATE = "separate"
     MANY = "many"
+    SEPARATE = "separate"
+    ONCE = "once"
 
     def __init__(self, mode):
-        if mode not in [self.ONCE, self.SEPARATE, self.MANY]:
+        if mode not in [self.MANY, self.SEPARATE, self.ONCE]:
             raise ValueError(f"Invalid linearity mode: {mode}")
         self.mode = mode
 
@@ -335,11 +616,20 @@ class TypeDefinition(Statement):
         self.modes = modes or []
 
 class FunctionType(TypeExpression):
-    def __init__(self, param_types, return_type):
+    def __init__(self, param_types, return_type, linearity=LinearityMode.MANY):
+        super().__init__()
         self.param_types = param_types
         self.return_type = return_type
+        self.linearity = linearity  # Track function's linearity mode
 
-# Interface and Implementation
+    def __str__(self):
+        params = ", ".join(str(t) for t in self.param_types)
+        lin = f" @ {self.linearity}" if self.linearity != LinearityMode.MANY else "" 
+        if self.linearity:
+            return f"(({params}) -> {self.return_type}){lin}"  
+        else:
+            return f"(({params}) -> {self.return_type})"
+
 class InterfaceDefinition(Node):
     """Interface definition with methods and associated types"""
     def __init__(self, name, type_params, methods, extends=None):
@@ -508,10 +798,314 @@ class QualifiedFunctionCall(Node):
     def __str__(self):
         return f"{'.'.join(self.parts)}({', '.join(str(arg) for arg in self.arguments)})"
 
-class Block(Node):
+class ComptimeBlock(Node):
     def __init__(self, statements):
-        super().__init__()
-        self.statements = statements if statements is not None else []
+        self.statements = statements
+    
+    def eval(self, context):
+        """Evaluate this block at compile time"""
+        result = None
+        for stmt in self.statements:
+            if hasattr(stmt, 'eval'):
+                result = stmt.eval(context)
+        return result
 
-    def __repr__(self):
-        return f"Block({self.statements})"
+class ComptimeFunction(FunctionDeclaration):
+    def __init__(self, name, type_params, params, return_type, body, is_comptime=True):
+        super().__init__(name, params, body, return_type)
+        self.type_params = type_params
+        self.is_comptime = is_comptime
+    
+    def eval(self, context, args):
+        """Execute this function at compile time"""
+        # Create new scope
+        new_context = ComptimeContext()
+        new_context.variables = context.variables.copy()
+        new_context.types = context.types
+        
+        # Bind arguments
+        for param, arg in zip(self.params, args):
+            new_context.add_variable(param.name, arg)
+        
+        # Execute body
+        return self.body.eval(new_context)
+
+class TypeInfo(Node):
+    def __init__(self, name, fields=None, interfaces=None, variants=None):
+        super().__init__()
+        self.name = name
+        self.fields = fields or []
+        self.interfaces = interfaces or []
+        self.variants = variants or []  # For enums
+    
+    def get_field(self, name):
+        return next((f for f in self.fields if f.name == name), None)
+    
+    def implements(self, interface):
+        return interface in self.interfaces
+    
+    def is_enum(self):
+        return bool(self.variants)
+
+class EnumVariant:
+    def __init__(self, name, fields=None):
+        self.name = name
+        self.fields = fields or []  # List of FieldInfo
+
+class FieldInfo(Node):
+    def __init__(self, name, type_info, modifiers=None):
+        self.name = name
+        self.type_info = type_info
+        self.modifiers = modifiers or []
+    
+    def is_reference(self):
+        return any(mod in ["unique", "shared", "exclusive"] for mod in self.modifiers)
+    
+    def is_copy(self):
+        return not self.is_reference() and self.type_info.is_copy
+
+class ComptimeValue:
+    """Represents a value known at compile time"""
+    def __init__(self, value, type_info):
+        self.value = value
+        self.type_info = type_info
+    
+    def __str__(self):
+        return str(self.value)
+
+    def matches_pattern(self, pattern, context):
+        """Check if this value matches a pattern"""
+        if isinstance(pattern, TypePattern):
+            if not isinstance(self.value, TypeInfo):
+                return False
+            return pattern.matches(self.value, context)
+        elif isinstance(pattern, LiteralPattern):
+            return self.value == pattern.value
+        return False
+
+class GetType(Node):
+    """Special compile-time function to get type information"""
+    def __init__(self, type_name):
+        self.type_name = type_name
+    
+    def eval(self, context):
+        type_info = context.get_type(self.type_name)
+        if not type_info:
+            raise Exception(f"Type {self.type_name} not found")
+        return ComptimeValue(type_info, context.get_type("Type"))
+
+class TypePattern(Node):
+    """Base class for type patterns"""
+    def matches(self, type_info, context):
+        raise NotImplementedError
+
+class TypeNamePattern(TypePattern):
+    """Matches a type by name"""
+    def __init__(self, name):
+        super().__init__()
+        self.name = name
+    
+    def matches(self, type_info, context):
+        return type_info.name == self.name
+
+class GenericTypePattern(TypePattern):
+    """Matches a generic type with specific type arguments"""
+    def __init__(self, base_type, type_args):
+        super().__init__()
+        self.base_type = base_type
+        self.type_args = type_args
+    
+    def matches(self, type_info, context):
+        if not isinstance(type_info, GenericType):
+            return False
+        if type_info.base_type != self.base_type:
+            return False
+        return all(
+            pattern.matches(arg, context)
+            for pattern, arg in zip(self.type_args, type_info.type_args)
+        )
+
+class TypeVarPattern(TypePattern):
+    """Pattern variable that captures a type"""
+    def __init__(self, name):
+        super().__init__()
+        self.name = name
+    
+    def matches(self, type_info, context):
+        # Always matches and captures the type
+        context.add_variable(self.name, ComptimeValue(type_info, context.get_type("Type")))
+        return True
+
+class StructPattern(TypePattern):
+    """Matches a struct with specific fields"""
+    def __init__(self, fields=None):
+        super().__init__()
+        self.fields = fields or {}  # Map of field name to TypePattern
+    
+    def matches(self, type_info, context):
+        if not hasattr(type_info, 'fields'):
+            return False
+        
+        # Match specified fields
+        for name, pattern in self.fields.items():
+            field = type_info.get_field(name)
+            if not field or not pattern.matches(field.type_info, context):
+                return False
+        return True
+
+class EnumPattern(TypePattern):
+    """Matches an enum variant"""
+    def __init__(self, variant_name, fields=None):
+        super().__init__()
+        self.variant_name = variant_name
+        self.fields = fields or []  # List of TypePattern for tuple variants
+    
+    def matches(self, type_info, context):
+        if not hasattr(type_info, 'variants'):
+            return False
+        
+        variant = type_info.get_variant(self.variant_name)
+        if not variant:
+            return False
+        
+        if len(self.fields) != len(variant.fields):
+            return False
+        
+        return all(
+            pattern.matches(field.type_info, context)
+            for pattern, field in zip(self.fields, variant.fields)
+        )
+    
+    def get_reachable_variants(self):
+        return {self.variant_name}
+
+class TraitPattern(TypePattern):
+    """Matches any type that implements a trait"""
+    def __init__(self, trait_name):
+        super().__init__()
+        self.trait_name = trait_name
+    
+    def matches(self, type_info, context):
+        return any(
+            iface.name == self.trait_name
+            for iface in type_info.interfaces
+        )
+    
+    def is_exhaustive(self):
+        return False  # Trait patterns are never exhaustive alone
+
+class UnionPattern(TypePattern):
+    """Matches if any sub-pattern matches"""
+    def __init__(self, patterns):
+        super().__init__()
+        self.patterns = patterns
+    
+    def matches(self, type_info, context):
+        for pattern in self.patterns:
+            case_context = ComptimeContext()
+            case_context.types = context.types
+            case_context.variables = context.variables.copy()
+            
+            if pattern.matches(type_info, case_context):
+                # Update captured variables
+                context.variables.update(case_context.variables)
+                return True
+        return False
+    
+    def get_reachable_variants(self):
+        variants = set()
+        for pattern in self.patterns:
+            if hasattr(pattern, 'get_reachable_variants'):
+                variants.update(pattern.get_reachable_variants())
+        return variants
+
+class WildcardPattern(TypePattern):
+    """Matches any type"""
+    def matches(self, type_info, context):
+        return True
+    
+    def is_exhaustive(self):
+        return True
+
+class TypeMatchExpression(Node):
+    """Compile-time pattern matching on types"""
+    def __init__(self, value, cases):
+        super().__init__()
+        self.value = value  # Expression that evaluates to a type
+        self.cases = cases  # List of (pattern, body) tuples
+    
+    def check_exhaustiveness(self, context):
+        """Check if patterns cover all possible cases"""
+        type_value = self.value.eval(context)
+        if not type_value or not isinstance(type_value.value, TypeInfo):
+            context.emit_error("Expected a type value")
+            return False
+        
+        type_info = type_value.value
+        
+        # For enums, check if all variants are covered
+        if hasattr(type_info, 'variants'):
+            covered_variants = set()
+            has_wildcard = False
+            
+            for pattern, _ in self.cases:
+                if isinstance(pattern, WildcardPattern):
+                    has_wildcard = True
+                    break
+                if hasattr(pattern, 'get_reachable_variants'):
+                    covered_variants.update(pattern.get_reachable_variants())
+            
+            if not has_wildcard:
+                all_variants = {v.name for v in type_info.variants}
+                missing = all_variants - covered_variants
+                if missing:
+                    context.emit_error(
+                        f"Non-exhaustive patterns. Missing variants: {', '.join(missing)}",
+                        self,
+                        ["Consider adding patterns for these variants",
+                         "Or add a wildcard pattern '_' to match any remaining cases"]
+                    )
+                    return False
+        
+        return True
+    
+    def eval(self, context):
+        # Check exhaustiveness before evaluation
+        if not self.check_exhaustiveness(context):
+            return None
+        
+        type_value = self.value.eval(context)
+        type_info = type_value.value
+        
+        for pattern, body in self.cases:
+            # Create new context for pattern bindings
+            case_context = ComptimeContext()
+            case_context.types = context.types
+            case_context.variables = context.variables.copy()
+            
+            if pattern.matches(type_info, case_context):
+                # Pattern matched, evaluate body with captured variables
+                context.variables.update(case_context.variables)
+                return body.eval(context)
+        
+        context.emit_error("No pattern matched the type")
+
+def eval_type_match(self, context):
+    """Evaluate a type match expression"""
+    type_value = self.value.eval(context)
+    if not isinstance(type_value.value, TypeInfo):
+        context.emit_error("Expected a type value to match against")
+    
+    type_info = type_value.value
+    for pattern, body in self.cases:
+        case_context = ComptimeContext()
+        case_context.types = context.types
+        case_context.variables = context.variables.copy()
+        
+        if pattern.matches(type_info, case_context):
+            # Update captured variables
+            context.variables.update(case_context.variables)
+            return body.eval(context)
+    
+    context.emit_error("No pattern matched the type")
+{{...}}

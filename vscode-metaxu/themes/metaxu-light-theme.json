@@ -1,0 +1,102 @@
+{
+    "name": "Metaxu Light",
+    "type": "light",
+    "colors": {
+        "editor.background": "#FFFFFF",
+        "editor.foreground": "#000000"
+    },
+    "tokenColors": [
+        {
+            "scope": "keyword.control.metaxu",
+            "settings": {
+                "foreground": "#AF00DB",
+                "fontStyle": "bold"
+            }
+        },
+        {
+            "scope": "storage.modifier.metaxu",
+            "settings": {
+                "foreground": "#D03232",
+                "fontStyle": "italic bold"
+            }
+        },
+        {
+            "scope": "entity.name.type.metaxu",
+            "settings": {
+                "foreground": "#267F99"
+            }
+        },
+        {
+            "scope": "entity.name.type.primitive.metaxu",
+            "settings": {
+                "foreground": "#267F99",
+                "fontStyle": "italic"
+            }
+        },
+        {
+            "scope": "entity.name.type.effect.metaxu",
+            "settings": {
+                "foreground": "#098658",
+                "fontStyle": "bold"
+            }
+        },
+        {
+            "scope": "entity.name.function.effect.metaxu",
+            "settings": {
+                "foreground": "#795E26",
+                "fontStyle": "italic"
+            }
+        },
+        {
+            "scope": "entity.name.function.metaxu",
+            "settings": {
+                "foreground": "#795E26"
+            }
+        },
+        {
+            "scope": "entity.name.function.declaration.metaxu",
+            "settings": {
+                "foreground": "#795E26",
+                "fontStyle": "bold"
+            }
+        },
+        {
+            "scope": "string.quoted.double.metaxu",
+            "settings": {
+                "foreground": "#A31515"
+            }
+        },
+        {
+            "scope": "constant.numeric.integer.metaxu",
+            "settings": {
+                "foreground": "#098658"
+            }
+        },
+        {
+            "scope": "constant.numeric.float.metaxu",
+            "settings": {
+                "foreground": "#098658"
+            }
+        },
+        {
+            "scope": "comment.line.number-sign.metaxu",
+            "settings": {
+                "foreground": "#008000",
+                "fontStyle": "italic"
+            }
+        },
+        {
+            "scope": "comment.block.metaxu",
+            "settings": {
+                "foreground": "#008000",
+                "fontStyle": "italic"
+            }
+        },
+        {
+            "scope": "keyword.operator.metaxu",
+            "settings": {
+                "foreground": "#000000"
+            }
+        }
+    ]
+}

@@ -335,5 +335,88 @@ class TestModuleSystem(unittest.TestCase):
         self.assertIsInstance(func_call, ast.QualifiedFunctionCall)
         self.assertEqual(func_call.parts, ["inner", "nested_func"])
 
+    def test_closure_capture(self):
+        """Test closure capture semantics in module context"""
+        code = """
+        module counter {
+            export {
+                make_counter,
+                make_accumulator
+            }
+
+            # Test basic closure capture
+            fn make_counter(start: int) -> fn\() -> int {
+                let mut count = start;  # Variable to be captured
+                
+                fn() -> int {
+                    count = count + 1;  # Mutates captured variable
+                    count
+                }
+            }
+
+            # Test multiple captures with different modes
+            fn make_accumulator(initial: int) -> fn\(int) -> int {
+                let mut sum = initial;     # Mutable capture
+                let factor = 2;            # Immutable capture
+                
+                fn(x: int) -> int {
+                    sum = sum + (x * factor);  # Uses both captures
+                    sum
+                }
+            }
+        }
+
+        module usage {
+            import counter;
+
+            fn test_counters() -> bool {
+                let c1 = counter.make_counter(0);
+                let c2 = counter.make_counter(10);
+                
+                assert(c1() == 1);  # First counter: 0 -> 1
+                assert(c1() == 2);  # First counter: 1 -> 2
+                assert(c2() == 11); # Second counter: 10 -> 11
+                
+                let acc = counter.make_accumulator(0);
+                assert(acc(3) == 6);   # (0 + (3 * 2)) = 6
+                assert(acc(4) == 14);  # (6 + (4 * 2)) = 14
+                
+                true
+            }
+        }
+        """
+        ast_tree = self.parser.parse(code)
+        self.assertIsInstance(ast_tree, ast.Program)
+        
+        # Get the counter module
+        counter_module = ast_tree.statements[0]
+        self.assertEqual(counter_module.name, "counter")
+        
+        # Check make_counter function
+        make_counter = [f for f in counter_module.body.statements 
+                       if isinstance(f, ast.FunctionDeclaration) and f.name == "make_counter"][0]
+        
+        # Verify closure in make_counter
+        closure = make_counter.body.statements[-1]
+        self.assertIsInstance(closure, ast.LambdaExpression)
+        self.assertIn("count", closure.captured_vars)
+        self.assertEqual(closure.capture_modes["count"], "borrow_mut")
+        
+        # Check make_accumulator function
+        make_acc = [f for f in counter_module.body.statements 
+                   if isinstance(f, ast.FunctionDeclaration) and f.name == "make_accumulator"][0]
+        
+        # Verify closure in make_accumulator
+        closure = make_acc.body.statements[-1]
+        self.assertIsInstance(closure, ast.LambdaExpression)
+        self.assertIn("sum", closure.captured_vars)
+        self.assertIn("factor", closure.captured_vars)
+        self.assertEqual(closure.capture_modes["sum"], "borrow_mut")
+        self.assertEqual(closure.capture_modes["factor"], "borrow")
+        
+        # Verify type checking passes
+        self.type_checker.check(ast_tree)
+        self.assertEqual(len(self.type_checker.errors), 0)
+
 if __name__ == '__main__':
     unittest.main()
