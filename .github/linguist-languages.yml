@@ -1,0 +1,7 @@
+Metaxu:
+  type: programming
+  color: "#427819"
+  extensions:
+    - ".mx"
+  tm_scope: source.metaxu
+  ace_mode: text
