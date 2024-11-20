@@ -1,0 +1,76 @@
+# Example 3: Modules and Imports
+# This example demonstrates Metaxu's module system
+
+# Define a module for vector operations
+module math.vector {
+    # Export specific items
+    export {
+        Vector2,
+        dot,
+        scale
+    }
+    
+    # 2D vector type
+    struct Vector2 {
+        x: float,
+        y: float
+    }
+    
+    # Vector operations
+    fn dot(@const v1: Vector2, @const v2: Vector2) -> float {
+        v1.x * v2.x + v1.y * v2.y
+    }
+    
+    fn scale(@const v: Vector2, @const factor: float) -> Vector2 {
+        Vector2 {
+            x: v.x * factor,
+            y: v.y * factor
+        }
+    }
+    
+    # Private helper function (not exported)
+    fn magnitude(@const v: Vector2) -> float {
+        (v.x * v.x + v.y * v.y).sqrt()
+    }
+}
+
+# Module using relative imports
+module math.transform {
+    # Import from parent module
+    from ..vector import Vector2, scale;
+    
+    # Import and rename
+    import std.matrix as mat;
+    
+    # Public import (re-export)
+    public import std.geometry;
+    
+    # Transformation function
+    fn rotate(@const v: Vector2, @const angle: float) -> Vector2 {
+        let cos_a = angle.cos();
+        let sin_a = angle.sin();
+        
+        Vector2 {
+            x: v.x * cos_a - v.y * sin_a,
+            y: v.x * sin_a + v.y * cos_a
+        }
+    }
+}
+
+# Main module using both modules
+module main {
+    from math.vector import Vector2, dot;
+    from math.transform import rotate;
+    
+    fn main() {
+        let v1 = Vector2 { x: 3.0, y: 4.0 };
+        let v2 = Vector2 { x: 1.0, y: 2.0 };
+        
+        # Use imported functions
+        let d = dot(v1, v2);
+        let v3 = rotate(v1, 3.14159 / 2.0);
+        
+        print("Dot product: " + d.to_string());
+        print("Rotated vector: (" + v3.x.to_string() + ", " + v3.y.to_string() + ")")
+    }
+}

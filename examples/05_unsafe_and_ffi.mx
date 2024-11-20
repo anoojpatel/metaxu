@@ -1,0 +1,95 @@
+# Example 5: Unsafe and FFI
+# This example demonstrates Metaxu's unsafe blocks and foreign function interface
+
+# External C functions
+extern "C" {
+    # Function declarations
+    fn malloc(size: uint) -> *void;
+    fn free(ptr: *void);
+    fn memcpy(dest: *void, src: *void, n: uint) -> *void;
+    
+    # Type declarations
+    type FILE;
+    fn fopen(filename: *char, mode: *char) -> *FILE;
+    fn fclose(file: *FILE) -> int;
+}
+
+# Safe wrapper around unsafe memory operations
+struct Buffer {
+    ptr: *void,
+    size: uint
+}
+
+implement Buffer {
+    fn new(size: uint) -> Buffer {
+        unsafe {
+            let ptr = malloc(size);
+            Buffer { ptr: ptr, size: size }
+        }
+    }
+    
+    fn copy_from(@mut self, @const source: &[u8]) {
+        if source.len() <= self.size {
+            unsafe {
+                memcpy(self.ptr, source.as_ptr(), source.len())
+            }
+        }
+    }
+    
+    fn free(@mut self) {
+        unsafe {
+            free(self.ptr);
+            self.ptr = null;
+            self.size = 0
+        }
+    }
+}
+
+# Safe file operations using FFI
+struct File {
+    handle: *FILE
+}
+
+implement File {
+    fn open(path: string) -> Result<File, string> {
+        unsafe {
+            let handle = fopen(path.as_ptr(), "r".as_ptr());
+            if handle == null {
+                Err("Failed to open file")
+            } else {
+                Ok(File { handle: handle })
+            }
+        }
+    }
+    
+    fn close(@mut self) {
+        unsafe {
+            if self.handle != null {
+                fclose(self.handle);
+                self.handle = null
+            }
+        }
+    }
+}
+
+# Example usage
+fn main() {
+    # Create a buffer
+    let @mut buffer = Buffer.new(1024);
+    
+    # Copy some data
+    let data = vector[int,5](1, 2, 3, 4, 5);
+    buffer.copy_from(data);
+    
+    # Clean up
+    buffer.free();
+    
+    # Open a file
+    match File.open("test.txt") {
+        Ok(@mut file) -> {
+            # Use file...
+            file.close()
+        },
+        Err(e) -> print("Error: " + e)
+    }
+}

@@ -1,0 +1,59 @@
+# Example 2: Effects and Handlers
+# This example demonstrates Metaxu's algebraic effects system
+
+# Define a State effect for managing mutable state
+effect State<T> {
+    get() -> T
+    set(value: T) -> Unit
+}
+
+# Define a Logger effect for output
+effect Logger {
+    log(message: string) -> Unit
+}
+
+# Function that uses multiple effects
+fn increment_and_log() performs State<int>, Logger {
+    # Get current state
+    let value = perform State.get();
+    
+    # Log the value
+    perform Logger.log("Current value: " + value.to_string());
+    
+    # Update state
+    perform State.set(value + 1);
+    
+    # Log the new value
+    perform Logger.log("New value: " + (value + 1).to_string())
+}
+
+# Example of nested effect handlers
+fn main() {
+    # Handle State effect
+    handle State<int> with {
+        get() -> resume(0)  # Initial state is 0
+        set(value) -> resume(())
+    } in {
+        # Handle Logger effect
+        handle Logger with {
+            log(message) -> {
+                print(message);
+                resume(())
+            }
+        } in {
+            # Use both effects
+            increment_and_log()
+        }
+    }
+}
+
+# Example of effect polymorphism
+fn map<T, U, E>(list: List<T>, f: fn(T) -> U performs E) performs E -> List<U> {
+    match list {
+        [] -> [],
+        [x, ...xs] -> {
+            let y = f(x);
+            [y, ...map(xs, f)]
+        }
+    }
+}

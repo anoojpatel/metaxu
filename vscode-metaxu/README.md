@@ -37,8 +37,11 @@ fn main() {
     };
     
     try {
-        perform State::set(42) with |k| {
-            k(())
+        handle State<int> with {
+            get() -> resume(0)
+            set(value) -> resume(())
+        } in {
+            perform State.set(42)
         }
     }
 }
