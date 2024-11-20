@@ -1,13 +1,19 @@
 import ply.yacc as yacc
 from lexer import Lexer
 import metaxu_ast as ast
+from decorator_ast import Decorator, CFunctionDecorator, DecoratorList
+from extern_ast import ExternBlock, ExternFunctionDeclaration, ExternTypeDeclaration
+from unsafe_ast import (UnsafeBlock, PointerType, TypeCast, AsyncFunction,
+                       PointerDereference, AddressOf)
 
 class Parser:
     def __init__(self):
         self.lexer = Lexer()
         self.tokens = self.lexer.tokens
         self.module_names = set()
+        self.parse_stack = []  # Stack for tracking parse context
         self.parser = yacc.yacc(module=self)
+        self.current_scope = None
 
     def parse(self, data):
         self.module_names.clear()  # Reset module names for each parse
@@ -45,6 +51,8 @@ class Parser:
                     | assignment SEMICOLON
                     | assignment
                     | function_declaration
+                    | async_function
+                    | unsafe_block
                     | struct_definition
                     | enum_definition
                     | type_definition SEMICOLON
@@ -56,7 +64,10 @@ class Parser:
                     | module_declaration
                     | visibility_block
                     | expression SEMICOLON
-                    | expression'''
+                    | expression
+                    | comptime_block
+                    | comptime_function
+                    | extern_block'''
         if len(p) == 3 and isinstance(p[1], ast.LetStatement):
             p[0] = p[1]  # Let statement with semicolon
         elif len(p) == 3 and isinstance(p[1], ast.Assignment):
@@ -73,22 +84,48 @@ class Parser:
         '''for_statement : FOR IDENTIFIER IN expression LBRACE statement_list RBRACE'''
         p[0] = ast.ForStatement(p[2], p[4], p[6])
 
+    def p_let_binding(self, p):
+        '''let_binding : LET mode_annotation_list IDENT EQUALS expression
+                      | LET mode_annotation_list IDENT type_annotation EQUALS expression
+                      | LET IDENT EQUALS expression
+                      | LET IDENT type_annotation EQUALS expression'''
+        if len(p) == 7:  # let @mode x: T = e
+            p[0] = ast.LetBinding(p[3], p[6], mode=p[2], type_annotation=p[4])
+        elif len(p) == 6:  # let @mode x = e or let x: T = e
+            if isinstance(p[2], ast.Mode):
+                p[0] = ast.LetBinding(p[3], p[5], mode=p[2])
+            else:
+                p[0] = ast.LetBinding(p[2], p[5], type_annotation=p[3])
+        else:  # let x = e
+            p[0] = ast.LetBinding(p[2], p[4])
+
     def p_let_statement(self, p):
-        '''let_statement : LET reference_mode IDENTIFIER EQUALS expression SEMICOLON
-                        | LET MUT IDENTIFIER EQUALS expression SEMICOLON
-                        | LET IDENTIFIER EQUALS expression SEMICOLON
-                        | LET reference_mode IDENTIFIER EQUALS expression
-                        | LET MUT IDENTIFIER EQUALS expression
-                        | LET IDENTIFIER EQUALS expression'''
-        
-        # Strip off semicolon if present
-        has_semicolon = p[-1] == ';'
-        effective_length = len(p) - (1 if has_semicolon else 0)
-        
-        if effective_length == 7:  # With reference mode
-            p[0] = ast.LetStatement(identifier=p[3], initializer=p[5], mode=p[2])
-        else:  # Simple let statement
-            p[0] = ast.LetStatement(identifier=p[2], initializer=p[4])
+        '''let_statement : let_binding
+                        | let_binding COMMA let_bindings'''
+        if len(p) == 2:
+            p[0] = ast.LetStatement(bindings=[p[1]])
+        else:
+            p[0] = ast.LetStatement(bindings=[p[1]] + p[3])
+
+    def p_let_bindings(self, p):
+        '''let_bindings : let_binding
+                       | let_bindings COMMA let_binding'''
+        if len(p) == 2:
+            p[0] = [p[1]]
+        else:
+            p[0] = p[1] + [p[3]]
+
+    def p_mode_annotation_list(self, p):
+        '''mode_annotation_list : mode_annotation
+                               | mode_annotation_list mode_annotation'''
+        if len(p) == 2:
+            p[0] = p[1]
+        else:
+            p[0] = p[1].combine(p[2])
+
+    def p_mode_annotation(self, p):
+        '''mode_annotation : AT IDENT'''
+        p[0] = ast.Mode(p[2])
 
     def p_return_statement(self, p):
         '''return_statement : RETURN expression_or_empty SEMICOLON
@@ -376,11 +413,26 @@ class Parser:
 
     def p_function_declaration(self, p):
         '''function_declaration : FN IDENTIFIER LPAREN parameter_list RPAREN type_annotation LBRACE statement_list RBRACE
-                              | FN IDENTIFIER LPAREN parameter_list RPAREN LBRACE statement_list RBRACE'''
-        if len(p) == 10:  # With return type
+                              | FN IDENTIFIER LPAREN parameter_list RPAREN LBRACE statement_list RBRACE
+                              | FN IDENTIFIER LPAREN RPAREN type_annotation LBRACE statement_list RBRACE
+                              | FN IDENTIFIER LPAREN RPAREN LBRACE statement_list RBRACE'''
+        
+        if len(p) == 10 and p[4] != ')':  # With params and type
             p[0] = ast.FunctionDeclaration(p[2], p[4] if p[4] is not None else [], p[8], return_type=p[6])
-        else:  # Without return type
-            p[0] = ast.FunctionDeclaration(p[2], p[4] if p[4] is not None else [], p[7])
+        elif len(p) == 9 and p[4] != ')':  # With params, no type
+            p[0] = ast.FunctionDeclaration(p[2], p[4] if p[4] is not None else [], p[7], return_type=ast.NoneType())
+        elif len(p) == 9:  # No params, with type
+            p[0] = ast.FunctionDeclaration(p[2], [], p[7], return_type=p[5])
+        else:  # No params, no type
+            p[0] = ast.FunctionDeclaration(p[2], [], p[6], return_type=ast.NoneType())
+
+    def p_parameter(self, p):
+        '''parameter : IDENT COLON type_expression
+                    | IDENT mode_annotation_list COLON type_expression'''
+        if len(p) == 4:  # x: T
+            p[0] = ast.Parameter(p[1], p[3])
+        else:  # x @mode: T
+            p[0] = ast.Parameter(p[1], p[4], mode=p[2])
 
     def p_parameter_list(self, p):
         '''parameter_list : parameter_list COMMA parameter
@@ -392,17 +444,6 @@ class Parser:
             p[0] = []
         else:
             p[0] = [p[1]]
-
-    def p_parameter(self, p):
-        '''parameter : IDENTIFIER COLON mode_type_expression
-                    | reference_mode IDENTIFIER COLON type_expression
-                    | IDENTIFIER'''
-        if len(p) == 4:
-            p[0] = ast.Parameter(p[1], p[3].base_type, p[3].uniqueness)
-        elif len(p) == 5:
-            p[0] = ast.Parameter(p[2], p[4], p[1])
-        else:  # Just identifier
-            p[0] = ast.Parameter(p[1])
 
     def p_mode_type_expression(self, p):
         '''mode_type_expression : reference_mode type_expression
@@ -433,11 +474,14 @@ class Parser:
                          | enum_type
                          | array_type
                          | reference_mode type_expression
-                         | LPAREN type_expression RPAREN'''
-        if len(p) == 4:  # Parenthesized or reference mode
+                         | LPAREN type_expression RPAREN
+                         | type_expression AT mode'''
+        if len(p) == 4:  # Parenthesized, reference mode, or mode annotation
             if p[1] == '(':
                 p[0] = p[2]
-            else:
+            elif p[2] == '@':  # type @ mode
+                p[0] = ast.TypeWithMode(p[1], p[3])
+            else:  # reference_mode type
                 p[0] = ast.TypeApplication("Reference", [p[2]], mode=p[1])
         else:
             p[0] = p[1]
@@ -522,7 +566,7 @@ class Parser:
             if p[3] == ':':
                 p[0] = ast.StructField(name=p[2], type_expr=p[4], visibility=p[1])
             else:  # p[3] == '='
-                p[0] = ast.StructField(name=p[2], value=p[4], visibility=p[1])
+                    p[0] = ast.StructField(name=p[2], value=p[4], visibility=p[1])
         else:  # len(p) == 4
             if p[2] == ':':
                 p[0] = ast.StructField(name=p[1], type_expr=p[3])
@@ -626,18 +670,41 @@ class Parser:
             p[0] = p[1]
 
     def p_lambda_expression(self, p):
-        '''lambda_expression : FN LPAREN parameter_list RPAREN ARROW type_expression lambda_body
-                           | FN LPAREN parameter_list RPAREN ARROW lambda_body
-                           | FN LPAREN RPAREN ARROW type_expression lambda_body
-                           | FN LPAREN RPAREN ARROW lambda_body'''
-        if len(p) == 7 and p[3] != ')':  # With params, no return type
-            p[0] = ast.LambdaExpression(p[3] if p[3] is not None else [], p[6])
-        elif len(p) == 8:  # With params and return type
-            p[0] = ast.LambdaExpression(p[3] if p[3] is not None else [], p[7], return_type=p[6])
-        elif len(p) == 7:  # No params, with return type
-            p[0] = ast.LambdaExpression([], p[6], return_type=p[5])
-        else:  # No params, no return type
-            p[0] = ast.LambdaExpression([], p[5])
+        '''lambda_expression : FN LPAREN parameter_list RPAREN type_annotation lambda_body
+                           | FN LPAREN parameter_list RPAREN lambda_body
+                           | FN LPAREN RPAREN type_annotation lambda_body
+                           | FN LPAREN RPAREN lambda_body'''
+        
+        # Create lambda node
+        if len(p) == 7 and p[3] != ')':  # With params and type
+            lambda_node = ast.LambdaExpression(p[3] if p[3] is not None else [], p[6], return_type=p[5])
+        elif len(p) == 6 and p[3] != ')':  # With params, no type
+            lambda_node = ast.LambdaExpression(p[3] if p[3] is not None else [], p[5], return_type=ast.NoneType())
+        elif len(p) == 7:  # No params, with type
+            lambda_node = ast.LambdaExpression([], p[6], return_type=p[5])
+        else:  # No params, no type
+            lambda_node = ast.LambdaExpression([], p[5], return_type=ast.NoneType())
+        
+        # Store reference to current scope and analyze captures
+        lambda_node.scope = self.current_scope
+        
+        # Find captured variables
+        param_names = {param.name for param in lambda_node.params}
+        body_vars = self._find_variables_in_body(lambda_node.body)
+        captured = body_vars - param_names
+        
+        # Analyze capture modes
+        for var in captured:
+            # Check if variable is mutable in the outer scope
+            is_mutable = self._is_mutable_in_scope(var, self.current_scope)
+            # Check if variable is mutated in the lambda body
+            is_mutated = self._is_variable_mutated(var, lambda_node.body)
+            
+            # Determine capture mode
+            mode = "borrow_mut" if is_mutable and is_mutated else "borrow"
+            lambda_node.add_capture(var, mode)
+        
+        p[0] = lambda_node
 
     def p_perform_expression(self, p):
         '''perform_expression : PERFORM effect_operation
@@ -792,17 +859,17 @@ class Parser:
             p[0] = p[1] + [p[3]]
 
     def p_function_type(self, p):
-        '''function_type : FN BACKSLASH LPAREN type_list RPAREN ARROW type_expression
-                        | FN LPAREN type_list RPAREN ARROW type_expression
-                        | FN BACKSLASH LPAREN RPAREN ARROW type_expression
-                        | FN LPAREN RPAREN ARROW type_expression'''
-        if len(p) == 8:  # With params and backslash
-            p[0] = ast.FunctionType(p[4], p[7])
-        elif len(p) == 7:  # With params, no backslash
-            p[0] = ast.FunctionType(p[3], p[6])
-        elif len(p) == 7:  # No params, with backslash
-            p[0] = ast.FunctionType([], p[6])
-        else:  # No params, no backslash
+        '''function_type : FN BACKSLASH LPAREN type_list RPAREN type_annotation linearity_annotation
+                        | FN BACKSLASH LPAREN type_list RPAREN type_annotation
+                        | FN BACKSLASH LPAREN RPAREN type_annotation linearity_annotation
+                        | FN BACKSLASH LPAREN RPAREN type_annotation'''
+        if len(p) == 8:  # fn\(params) -> T @ linearity
+            p[0] = ast.FunctionType(p[4] if p[4] is not None else [], p[6], linearity=p[7])
+        elif len(p) == 7 and p[4] != ')':  # fn\(params) -> T
+            p[0] = ast.FunctionType(p[4] if p[4] is not None else [], p[6])
+        elif len(p) == 7:  # fn\() -> T @ linearity
+            p[0] = ast.FunctionType([], p[5], linearity=p[6])
+        else:  # fn\() -> T
             p[0] = ast.FunctionType([], p[5])
 
     def p_struct_type(self, p):
@@ -950,6 +1017,195 @@ class Parser:
         '''expression : FROM_DEVICE LPAREN IDENTIFIER RPAREN'''
         p[0] = ast.FromDevice(p[3])
 
+    def p_comptime_block(self, p):
+        '''comptime_block : COMPTIME LBRACE statement_list RBRACE'''
+        p[0] = ast.ComptimeBlock(statements=p[3])
+
+    def p_comptime_function(self, p):
+        '''comptime_function : COMPTIME FN IDENTIFIER type_params_opt LPAREN param_list_opt RPAREN type_annotation block'''
+        p[0] = ast.ComptimeFunction(
+            name=p[3],
+            type_params=p[4],
+            params=p[6],
+            return_type=p[8],
+            body=p[9],
+            is_comptime=True
+        )
+
+    def p_extern_block(self, p):
+        '''extern_block : EXTERN STRING LBRACE extern_declarations RBRACE
+                       | EXTERN STRING LBRACE RBRACE'''
+        header_path = p[2].strip('"')  # Remove quotes from string
+        if len(p) == 6:
+            declarations = p[4]
+        else:
+            declarations = []
+        p[0] = ExternBlock(header_path=header_path, declarations=declarations)
+
+    def p_extern_declarations(self, p):
+        '''extern_declarations : extern_declaration
+                             | extern_declarations extern_declaration'''
+        if len(p) == 2:
+            p[0] = [p[1]]
+        else:
+            p[0] = p[1] + [p[2]]
+
+    def p_extern_declaration(self, p):
+        '''extern_declaration : extern_function_declaration
+                            | extern_type_declaration'''
+        p[0] = p[1]
+
+    def p_extern_type_declaration(self, p):
+        '''extern_type_declaration : TYPE IDENTIFIER SEMICOLON
+                                 | TYPE IDENTIFIER EQUALS STRUCT LBRACE RBRACE SEMICOLON
+                                 | TYPE IDENTIFIER EQUALS STRUCT IDENTIFIER SEMICOLON'''
+        if len(p) == 4:
+            # Opaque type declaration: e.g. type FILE;
+            p[0] = ExternTypeDeclaration(name=p[2], is_opaque=True)
+        elif len(p) == 7:
+            # Named struct type: e.g. type stat = struct mystat;
+            p[0] = ExternTypeDeclaration(name=p[2], is_opaque=False, struct_name=p[5])
+        else:
+            # Anonymous struct type: e.g. type stat = struct {};
+            p[0] = ExternTypeDeclaration(name=p[2], is_opaque=False)
+
+    def p_unsafe_block(self, p):
+        '''unsafe_block : UNSAFE LBRACE statements RBRACE
+                       | UNSAFE LBRACE RBRACE'''
+        if len(p) == 5:
+            p[0] = UnsafeBlock(body=p[3])
+        else:
+            p[0] = UnsafeBlock(body=[])
+
+    def p_pointer_type(self, p):
+        '''pointer_type : STAR MUT type
+                       | STAR CONST type
+                       | STAR type'''
+        # Only allow pointer types in unsafe contexts or extern blocks
+        if not self._in_unsafe_or_extern_context():
+            raise SyntaxError("Pointer types are only allowed in unsafe blocks or extern declarations")
+            
+        if len(p) == 4:
+            is_mut = p[2] == 'mut'
+            base_type = p[3]
+        else:
+            is_mut = False
+            base_type = p[2]
+        p[0] = PointerType(base_type=base_type, is_mut=is_mut)
+
+    def p_type_cast(self, p):
+        '''type_cast : expression AS type'''
+        # If casting to/from a pointer type, require unsafe context
+        if (isinstance(p[3], PointerType) or 
+            (hasattr(p[1], 'type') and isinstance(p[1].type, PointerType))):
+            if not self._in_unsafe_context():
+                raise SyntaxError("Pointer type casts are only allowed in unsafe blocks")
+        p[0] = TypeCast(expr=p[1], target_type=p[3])
+
+    def p_pointer_dereference(self, p):
+        '''pointer_dereference : STAR expression'''
+        if not self._in_unsafe_context():
+            raise SyntaxError("Pointer dereference is only allowed in unsafe blocks")
+        p[0] = PointerDereference(ptr=p[2])
+
+    def p_address_of(self, p):
+        '''address_of : AMPERSAND expression
+                     | AMPERSAND MUT expression'''
+        if not self._in_unsafe_context():
+            raise SyntaxError("Taking address of value is only allowed in unsafe blocks")
+        if len(p) == 3:
+            p[0] = AddressOf(expr=p[2], is_mut=False)
+        else:
+            p[0] = AddressOf(expr=p[3], is_mut=True)
+
+    def _in_unsafe_context(self):
+        """Check if we're currently parsing inside an unsafe block"""
+        # Walk up the parse stack to find if we're in an unsafe block
+        for item in reversed(self.parse_stack):
+            if isinstance(item, UnsafeBlock):
+                return True
+        return False
+    
+    def _in_unsafe_or_extern_context(self):
+        """Check if we're in an unsafe block or extern declaration"""
+        for item in reversed(self.parse_stack):
+            if isinstance(item, (UnsafeBlock, ExternBlock)):
+                return True
+        return False
+
+    def p_decorator(self, p):
+        '''decorator : AT IDENTIFIER
+                    | AT IDENTIFIER LPAREN decorator_args RPAREN'''
+        if len(p) == 3:
+            p[0] = Decorator(name=p[2])
+        else:
+            p[0] = Decorator(name=p[2], args=p[4])
+
+    def p_decorator_args(self, p):
+        '''decorator_args : decorator_arg
+                        | decorator_args COMMA decorator_arg'''
+        if len(p) == 2:
+            p[0] = p[1]
+        else:
+            p[0] = {**p[1], **p[3]}
+
+    def p_decorator_arg(self, p):
+        '''decorator_arg : IDENTIFIER EQUALS expression'''
+        p[0] = {p[1]: p[3]}
+
+    def p_decorator_list(self, p):
+        '''decorator_list : decorator
+                        | decorator_list decorator'''
+        if len(p) == 2:
+            p[0] = DecoratorList([p[1]])
+        else:
+            p[0].decorators.append(p[2])
+
+    def p_extern_function_declaration(self, p):
+        '''extern_function_declaration : decorator_list FN IDENTIFIER LPAREN param_list_opt RPAREN ARROW type_expression
+                                     | decorator_list FN IDENTIFIER LPAREN param_list_opt RPAREN
+                                     | FN IDENTIFIER LPAREN param_list_opt RPAREN ARROW type_expression
+                                     | FN IDENTIFIER LPAREN param_list_opt RPAREN'''
+        if len(p) == 9:  # With return type and decorators
+            decorators = p[1]
+            name = p[3]
+            params = p[5]
+            return_type = p[8]
+        elif len(p) == 7:  # With decorators, no return type
+            decorators = p[1]
+            name = p[3]
+            params = p[5]
+            return_type = None
+        elif len(p) == 8:  # No decorators, with return type
+            decorators = DecoratorList([])
+            name = p[2]
+            params = p[4]
+            return_type = p[7]
+        else:  # No decorators, no return type
+            decorators = DecoratorList([])
+            name = p[2]
+            params = p[4]
+            return_type = None
+
+        # Process C function decorators
+        c_func = None
+        for decorator in decorators.decorators:
+            if decorator.name == "c_function":
+                c_func = CFunctionDecorator(
+                    borrows_refs=decorator.args.get("borrows_refs", False),
+                    consumes_refs=decorator.args.get("consumes_refs", False),
+                    produces_refs=decorator.args.get("produces_refs", False),
+                    call_mode=decorator.args.get("call_mode", "blocking"),
+                    inline=decorator.args.get("inline", True)
+                )
+                break
+
+        p[0] = ast.ExternFunctionDeclaration(
+            name=name,
+            params=params,
+            return_type=return_type,
+            c_function=c_func
+        )
 
     def p_empty(self, p):
         'empty :'
@@ -969,3 +1225,37 @@ class Parser:
             print("Syntax error at EOF")
         # Don't return None here, instead raise an exception to be caught by parse()
         raise SyntaxError("Failed to parse input")
+
+    def _find_variables_in_body(self, node):
+        """Recursively find all variable references in a node"""
+        vars = set()
+        if isinstance(node, ast.Variable):
+            vars.add(node.name)
+        elif isinstance(node, ast.Block):
+            for stmt in node.statements:
+                vars.update(self._find_variables_in_body(stmt))
+        elif isinstance(node, ast.BinaryOp):
+            vars.update(self._find_variables_in_body(node.left))
+            vars.update(self._find_variables_in_body(node.right))
+        elif isinstance(node, ast.Assignment):
+            vars.update(self._find_variables_in_body(node.target))
+            vars.update(self._find_variables_in_body(node.value))
+        return vars
+
+    def _is_mutable_in_scope(self, var_name, scope):
+        """Check if a variable is declared as mutable in the given scope"""
+        if not scope:
+            return False
+        for decl in scope.declarations:
+            if isinstance(decl, ast.VariableDeclaration) and decl.name == var_name:
+                return decl.is_mutable
+        return self._is_mutable_in_scope(var_name, scope.parent)
+
+    def _is_variable_mutated(self, var_name, node):
+        """Check if a variable is mutated in the given AST node"""
+        if isinstance(node, ast.Assignment):
+            if isinstance(node.target, ast.Variable) and node.target.name == var_name:
+                return True
+        elif isinstance(node, ast.Block):
+            return any(self._is_variable_mutated(var_name, stmt) for stmt in node.statements)
+        return False

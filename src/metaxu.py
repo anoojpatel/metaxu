@@ -9,6 +9,8 @@ from type_checker import TypeChecker
 from codegen import CodeGenerator
 from tape_vm import TapeVM
 from symbol_table import SymbolTable
+from linker import Linker, DynamicLinker
+from c_linker import CLinker, LinkageMode, create_library_config
 import metaxu_ast as ast  # Rename to avoid conflict with Python's ast module
 
 @dataclass
@@ -35,6 +37,32 @@ class MetaxuCompiler:
         # Add standard library path
         self.symbol_table = SymbolTable()
         self.symbol_table.add_module_search_path(Path("examples/std"))
+        
+        # Initialize linkers
+        self.static_linker = Linker(self.symbol_table)
+        self.dynamic_linker = DynamicLinker(self.symbol_table)
+        
+        # Initialize C linker
+        self.c_linker = CLinker(Path("build"))
+        self._register_standard_c_libraries()
+        
+    def _register_standard_c_libraries(self):
+        """Register standard C libraries"""
+        # System libc
+        self.c_linker.register_library(create_library_config(
+            name="c",
+            version="system",
+            headers=["/usr/include/stdlib.h", "/usr/include/stdio.h"],
+            link_mode=LinkageMode.DYNAMIC
+        ))
+        
+        # Math library
+        self.c_linker.register_library(create_library_config(
+            name="m",
+            version="system",
+            headers=["/usr/include/math.h"],
+            link_mode=LinkageMode.DYNAMIC
+        ))
         
     def compile_str(self, source: str, filename: str = "<string>") -> Any:
         """Compile a string of Metaxu code"""

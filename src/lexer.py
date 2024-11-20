@@ -63,7 +63,12 @@ class Lexer:
         'none': 'NONE',
         'box': 'BOX',
         'option': 'OPTION',
-        'vector': 'VECTOR'
+        'vector': 'VECTOR',
+        'extern': 'EXTERN',
+        'unsafe': 'UNSAFE',  # Add unsafe keyword
+        'async': 'ASYNC',    # Add async keyword
+        'void': 'VOID',      # Add void type
+        'size_t': 'SIZE_T',  # Add size_t type
     }
 
     # List of token names
@@ -73,7 +78,8 @@ class Lexer:
         'LPAREN', 'RPAREN', 'LBRACE', 'RBRACE', 'LBRACKET', 'RBRACKET',
         'EQUALS', 'SEMICOLON', 'COLON', 'COMMA', 'DOT', 'TRIPLE_DOT',
         'DOUBLECOLON', 'ARROW', 'BACKSLASH', 'AT', 'AMPERSAND',
-        'LESS', 'GREATER'
+        'LESS', 'GREATER', 'STAR',  # Add STAR for pointer types
+        'AS'  # Add AS for type casts
     ] + list(reserved.values())
 
     # Regular expression rules for simple tokens
@@ -95,11 +101,13 @@ class Lexer:
     t_TRIPLE_DOT = r'\.\.\.'
     t_DOUBLECOLON = r'::'
     t_ARROW = r'->'
-    t_BACKSLASH = r'\\'
+    t_BACKSLASH = r'\\' # Added for function type annotations
     t_AT = r'@'
     t_AMPERSAND = r'&'
     t_LESS = r'<'
     t_GREATER = r'>'
+    t_STAR = r'\*'  # Add rule for STAR token
+    t_AS = r'as'    # Add rule for AS token
 
     # Regular expression rules with actions
     def t_IDENTIFIER(self, t):
