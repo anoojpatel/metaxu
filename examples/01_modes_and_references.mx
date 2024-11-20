@@ -1,0 +1,43 @@
+# Example 1: Modes and References
+# This example demonstrates Metaxu's mode system and reference types
+
+# Struct with different mode annotations
+struct Counter {
+    @mut value: int,          # Mutable field
+    @const name: string,      # Immutable field
+    @local temp: int         # Stack-local field
+}
+
+# Function demonstrating different parameter modes
+fn update_counter(@mut counter: Counter, @const delta: int) -> int {
+    counter.value = counter.value + delta;
+    counter.temp = counter.value;  # OK: temp is local
+    counter.value                  # Return the new value
+}
+
+# Function showing borrowing patterns
+fn print_stats(@const counter: Counter) {
+    print("Counter " + counter.name + " has value " + counter.value.to_string())
+}
+
+fn main() {
+    # Local mutable binding
+    let @mut @local count = 0;
+    
+    # Create counter with mixed modes
+    let counter = Counter {
+        value: 0,
+        name: "main",
+        temp: 0
+    };
+    
+    # Demonstrate mode safety
+    let new_value = update_counter(counter, 5);
+    print_stats(counter);  # Can share counter since print_stats takes @const
+    
+    # Error: Cannot modify @const field
+    # counter.name = "new name";  
+    
+    # Error: Cannot access @local field outside its scope
+    # let t = counter.temp;
+}
