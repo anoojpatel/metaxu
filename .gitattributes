@@ -1,4 +1,4 @@
-*.mx linguist-language=Metaxu
+*.mx linguist-language=Python
 *.mx linguist-detectable=true
 *.py linguist-language=Python
 *.json linguist-language=JSON
