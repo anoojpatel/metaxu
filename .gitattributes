@@ -1,0 +1,30 @@
+*.mx linguist-language=Python
+*.py linguist-language=Python
+*.json linguist-language=JSON
+
+# Handle line endings automatically for files detected as text
+* text=auto
+
+# Documents
+*.md text diff=markdown
+*.txt text
+*.rst text
+
+# Scripts
+*.bash text eol=lf
+*.sh text eol=lf
+*.py text diff=python
+
+# Data
+*.json text
+*.toml text
+*.xml text
+*.yaml text
+*.yml text
+
+# Make sure these files are treated as binary
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
+*.zip binary
