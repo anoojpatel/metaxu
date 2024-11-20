@@ -1,0 +1,285 @@
+# Example 8: Advanced Matrix and Tensor Operations
+# This example shows higher-dimensional operations and optimizations
+# Note that these features have not been implemented yet!!!
+
+# Import tensor operations
+from std.tensor import Tensor, TensorOps;
+from std.linalg import Decompose, Solve;
+from std.random import Normal;
+from std.iter import Range, Iterator;
+
+# Tensor type alias for clarity
+type Matrix[T, const M: int, const N: int] = vector[vector[T,N],M];
+type Tensor3D[T, const D1: int, const D2: int, const D3: int] = vector[Matrix[T,D2,D3],D1];
+
+# Advanced matrix operations
+implement<T: Number, const M: int, const N: int> Matrix[T,M,N] {
+    # Matrix creation
+    static fn identity() -> Self where M == N {
+        Self::generate((i, j) -> if i == j { T::one() } else { T::zero() })
+    }
+    
+    static fn generate(f: fn(int, int) -> T) -> Self {
+        vector[vector[T,N],M](
+            vector[T,N](f(i, j) for j in 0..N)
+            for i in 0..M
+        )
+    }
+    
+    # Basic operations
+    fn transpose(self) -> Matrix[T,N,M] {
+        Matrix[T,N,M]::generate((i, j) -> self[j][i])
+    }
+    
+    fn trace(self) -> T where M == N {
+        (0..M).fold(T::zero(), |acc, i| acc + self[i][i])
+    }
+    
+    # Matrix multiplication with blocking for cache efficiency
+    fn matmul<const P: int>(self, other: Matrix[T,N,P]) -> Matrix[T,M,P] {
+        const BLOCK_SIZE: int = 32;  # Tune for cache size
+        
+        # Zero initialize result
+        let mut result = Matrix[T,M,P]::generate((_, _) -> T::zero());
+        
+        # Block multiplication
+        for i0 in (0..M).step(BLOCK_SIZE) {
+            for j0 in (0..P).step(BLOCK_SIZE) {
+                for k0 in (0..N).step(BLOCK_SIZE) {
+                    # Process block
+                    for i in i0..min(i0 + BLOCK_SIZE, M) {
+                        for j in j0..min(j0 + BLOCK_SIZE, P) {
+                            let mut sum = T::zero();
+                            for k in k0..min(k0 + BLOCK_SIZE, N) {
+                                sum = sum + self[i][k] * other[k][j];
+                            }
+                            result[i][j] = result[i][j] + sum;
+                        }
+                    }
+                }
+            }
+        }
+        result
+    }
+    
+    # Decompositions
+    fn lu(self) -> (Matrix[T,M,M], Matrix[T,M,N]) where M == N
+    performs Decompose {
+        # LU decomposition with partial pivoting
+        let mut l = Self::identity();
+        let mut u = self.copy();
+        
+        for i in 0..M {
+            for j in (i+1)..M {
+                let factor = u[j][i] / u[i][i];
+                l[j][i] = factor;
+                for k in i..N {
+                    u[j][k] = u[j][k] - factor * u[i][k];
+                }
+            }
+        }
+        (l, u)
+    }
+    
+    fn qr(self) -> (Matrix[T,M,M], Matrix[T,M,N])
+    performs Decompose {
+        # QR decomposition using Householder reflections
+        let mut q = Self::identity();
+        let mut r = self.clone();
+        
+        for i in 0..min(M, N) {
+            # Compute Householder vector
+            let x = vector[T,M-i](r[j][i] for j in i..M);
+            let norm = x.norm();
+            let s = if x[0] > T::zero() { -norm } else { norm };
+            
+            let u = x.copy();
+            u[0] = u[0] - s;
+            let unorm = u.norm();
+            
+            if unorm > T::epsilon() {
+                u = u / unorm;
+                
+                # Apply reflection to R and accumulate Q
+                for j in i..N {
+                    let dot = (0..M-i).fold(T::zero(),
+                        |acc, k| acc + u[k] * r[k+i][j]);
+                    for k in i..M {
+                        r[k][j] = r[k][j] - 2.0 * dot * u[k-i];
+                    }
+                }
+                
+                for j in 0..M {
+                    let dot = (0..M-i).fold(T::zero(),
+                        |acc, k| acc + u[k] * q[k+i][j]);
+                    for k in i..M {
+                        q[k][j] = q[k][j] - 2.0 * dot * u[k-i];
+                    }
+                }
+            }
+        }
+        (q, r)
+    }
+    
+    # Solve linear system Ax = b
+    fn solve(self, b: vector[T,M]) -> vector[T,N] where M == N
+    performs Solve {
+        # Use LU decomposition for solving
+        let (l, u) = self.lu();
+        
+        # Forward substitution Ly = b
+        let mut y = vector[T,M]();
+        for i in 0..M {
+            let mut sum = b[i];
+            for j in 0..i {
+                sum = sum - l[i][j] * y[j];
+            }
+            y[i] = sum;
+        }
+        
+        # Back substitution Ux = y
+        let mut x = vector[T,N]();
+        for i in (0..N).reverse() {
+            let mut sum = y[i];
+            for j in (i+1)..N {
+                sum = sum - u[i][j] * x[j];
+            }
+            x[i] = sum / u[i][i];
+        }
+        x
+    }
+}
+
+# Range extensions for tensor operations
+trait RangeOps<T> {
+    # Create cartesian product of two ranges
+    fn cartesian_product<U>(self, other: Range<U>) -> CartesianProduct<T,U>;
+}
+
+# Cartesian product iterator
+struct CartesianProduct<T,U> {
+    range1: Range<T>,
+    range2: Range<U>
+}
+
+# Implement Iterator for CartesianProduct
+implement<T,U> Iterator<(T,U)> for CartesianProduct<T,U> {
+    fn next(self) -> Option<(T,U)> {
+        for x in self.range1 {
+            for y in self.range2 {
+                return Some((x, y));
+            }
+        }
+        None
+    }
+}
+
+# Implement RangeOps for Range
+implement<T> RangeOps<T> for Range<T> {
+    fn cartesian_product<U>(self, other: Range<U>) -> CartesianProduct<T,U> {
+        CartesianProduct {
+            range1: self,
+            range2: other
+        }
+    }
+}
+
+# Tensor operations
+implement<T: Number, const D1: int, const D2: int, const D3: int>
+Tensor3D[T,D1,D2,D3] {
+    # Tensor contraction (sum over specified dimensions)
+    fn contract<const R1: int, const R2: int>(
+        self,
+        other: Tensor3D[T,R1,R2,D3]
+    ) -> Matrix[T,D1,R1] where D2 == R2 {
+        Matrix[T,D1,R1]::generate((i, j) -> {
+            (0..D2).fold(T::zero(), |acc, k| {
+                acc + (0..D3).fold(T::zero(), |acc2, l| {
+                    acc2 + self[i][k][l] * other[j][k][l]
+                })
+            })
+        })
+    }
+    
+    # Functional convolution implementation
+    fn convolve<const K1: int, const K2: int, const K3: int>(
+        self,
+        kernel: Tensor3D[T,K1,K2,K3]
+    ) -> Tensor3D[T,{D1-K1+1},{D2-K2+1},{D3-K3+1}> {
+        # Helper function to compute single convolution value
+        fn conv_at(i: int, j: int, k: int) -> T {
+            let apply_kernel = fn(acc: T, idx: (int, int, int)) -> T {
+                let (di, dj, dk) = idx;
+                acc + self[i+di][j+dj][k+dk] * kernel[di][dj][dk]
+            };
+            
+            # Create cartesian product of kernel indices
+            let kernel_indices = Range::new(0, K1)
+                .cartesian_product(Range::new(0, K2))
+                .cartesian_product(Range::new(0, K3));
+                
+            # Single fold over all kernel positions
+            kernel_indices.fold(T::zero(), apply_kernel)
+        }
+        
+        # Generate output tensor
+        Tensor3D[T,{D1-K1+1},{D2-K2+1},{D3-K3+1}>::generate(conv_at)
+    }
+    
+    # Tensor convolution
+    fn convolve(
+        self,
+        kernel: Tensor3D[T,K1,K2,K3]
+    ) -> Tensor3D[T,D1-K1+1,D2-K2+1,D3-K3+1] {
+        Tensor3D[T,D1-K1+1,D2-K2+1,D3-K3+1]::generate(
+            (i, j, k) -> {
+                (0..K1).fold(T::zero(), |acc1, di| {
+                    (0..K2).fold(acc1, |acc2, dj| {
+                        (0..K3).fold(acc2, |acc3, dk| {
+                            acc3 + self[i+di][j+dj][k+dk] * kernel[di][dj][dk]
+                        })
+                    })
+                })
+            }
+        )
+    }
+}
+
+# Example usage
+fn main() {
+    # Create random matrices
+    let a = Matrix[float,3,3]::generate(
+        (_, _) -> Normal.sample(0.0, 1.0)
+    );
+    let b = Matrix[float,3,3]::generate(
+        (_, _) -> Normal.sample(0.0, 1.0)
+    );
+    
+    # Matrix operations
+    let c = a.matmul(b);
+    let (l, u) = a.lu();
+    let (q, r) = a.qr();
+    
+    # Solve linear system
+    let x = vector[float,3](1.0, 2.0, 3.0);
+    let b = a.matmul(x);  # b = Ax
+    let x_solved = a.solve(b);  # Should recover x
+    
+    # Create 3D tensor
+    let t1 = Tensor3D[float,4,4,4]::generate(
+        (i, j, k) -> (i + j + k) as float
+    );
+    let kernel = Tensor3D[float,2,2,2]::generate(
+        (i, j, k) -> if i + j + k == 3 { 1.0 } else { 0.0 }
+    );
+    
+    # Tensor operations
+    let convolved = t1.convolve(kernel);
+    
+    # Print results
+    print("Matrix A:\n" + a.to_string());
+    print("Matrix B:\n" + b.to_string());
+    print("A * B:\n" + c.to_string());
+    print("Original x: " + x.to_string());
+    print("Solved x: " + x_solved.to_string());
+}
