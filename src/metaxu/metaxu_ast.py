@@ -1,4 +1,7 @@
-{{...}}
+from enum import Enum
+from typing import List, Optional, Dict, Set, Union
+
+
 class ComptimeError(Exception):
     """Error during compile-time evaluation"""
     def __init__(self, message, node=None, note=None):
@@ -117,7 +120,7 @@ class Node:
         if hasattr(child, 'parent'):
             child.parent = self
         return child
-    
+        
     def replace_with(self, new_node):
         """Replace this node with another in the AST"""
         if not self.parent:
@@ -184,11 +187,17 @@ class Program(Node):
         for i, stmt in enumerate(new_stmts):
             self.statements.insert(position + i, self.add_child(stmt))
 
+class Type(Node):
+    def __init__(self):
+        super().__init__()
+
 class Statement(Node):
-    pass
+    def __init__(self):
+        super().__init__()
 
 class Expression(Node):
-    pass
+    def __init__(self):
+        super().__init__()
 
 class LetStatement(Node):
     def __init__(self, identifier, initializer, mode=None):
@@ -381,6 +390,23 @@ class LambdaExpression(Expression):
         return f"lambda[captures: {captures_str}]({params_str}) -> {self.return_type or 'auto'}{lin}"
 
 # Algebraic Effects
+class EffectDeclaration(Expression):
+    """effect Read<T> {...}"""
+    def __init__(self, name, type_params, operations):
+        self.name = name
+        self.type_params = type_params or []  # List of TypeParameter
+        self.operations = operations  # List of EffectOperation
+
+class EffectOperation(Expression):
+    """effect Read<T> {
+        read() -> T; # This an operation
+        write(value: T) -> void; # This an operation
+    }"""
+    def __init__(self, name, params, return_type):
+        self.name = name
+        self.params = params or []  # List of Parameter
+        self.return_type = return_type  # Optional return type
+
 class PerformEffect(Expression):
     def __init__(self, effect_name, arguments):
         self.effect_name = effect_name
@@ -573,7 +599,7 @@ class StructFieldDefinition(Node):
         self.is_exclusively_mutable = is_exclusively_mutable
 
 # Type System
-class TypeExpression(Node):
+class TypeExpression(Type):
     """Base class for type expressions in the AST"""
     pass
 
@@ -581,6 +607,11 @@ class BasicType(TypeExpression):
     """Built-in types like int, float, etc."""
     def __init__(self, name):
         self.name = name
+
+class GenericType:
+    def __init__(self, base_type: str, type_args: List['TypeInfo']):
+        self.base_type = base_type  # e.g., "List"
+        self.type_args = type_args  # e.g., [IntType, StringType] for List<int, string>
 
 class TypeParameter(TypeExpression):
     """A type parameter used in generic types (e.g., T in List<T>)"""
@@ -831,12 +862,13 @@ class ComptimeFunction(FunctionDeclaration):
         return self.body.eval(new_context)
 
 class TypeInfo(Node):
-    def __init__(self, name, fields=None, interfaces=None, variants=None):
+    def __init__(self, name, fields=None, interfaces=None, variants=None,is_copy=False):
         super().__init__()
         self.name = name
         self.fields = fields or []
         self.interfaces = interfaces or []
         self.variants = variants or []  # For enums
+        self.is_copy = is_copy # can we blindly copy
     
     def get_field(self, name):
         return next((f for f in self.fields if f.name == name), None)
@@ -1108,4 +1140,3 @@ def eval_type_match(self, context):
             return body.eval(context)
     
     context.emit_error("No pattern matched the type")
-{{...}}
