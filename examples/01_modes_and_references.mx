@@ -20,6 +20,7 @@ fn print_stats(@const counter: Counter) {
     print("Counter " + counter.name + " has value " + counter.value.to_string())
 }
 
+
 fn main() {
     # Local mutable binding
     let @mut @local count = 0;

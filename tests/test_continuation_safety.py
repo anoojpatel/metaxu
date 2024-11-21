@@ -1,9 +1,13 @@
 import unittest
-from lexer import Lexer
-from parser import Parser
-from type_checker import TypeChecker
-from continuation_safety import ContinuationSafetyChecker
-import metaxu_ast as ast
+from pathlib import Path
+import sys
+sys.path.append(str(Path(__file__).parent.parent / 'src'))
+
+from metaxu.lexer import Lexer
+from metaxu.parser import Parser
+from metaxu.type_checker import TypeChecker
+from metaxu.continuation_safety import ContinuationSafetyChecker
+import metaxu.metaxu_ast as ast
 
 class TestContinuationSafety(unittest.TestCase):
     def setUp(self):
@@ -17,14 +21,14 @@ class TestContinuationSafety(unittest.TestCase):
         code = """
         module test {
             effect Read<T> {
-                fn read() -> T
+                read() -> T
             }
             
             fn unsafe_local_capture() {
                 let @local x = 42;
                 
                 try {
-                    perform Read::read[int]() with |k| {
+                    perform Read.read[int](fn() -> int {
                         k(x)  # Should fail - capturing local value
                     }
                 }
@@ -42,14 +46,14 @@ class TestContinuationSafety(unittest.TestCase):
         code = """
         module test {
             effect State<T> {
-                fn get() -> T
+                get() -> T
             }
             
             fn unsafe_mut_capture() {
                 let @mut x = 42;
                 
                 try {
-                    perform State::get[int]() with |k| {
+                    perform State.get[int]( with fn() -> int {
                         k(x)  # Should fail - capturing mutable reference
                     }
                 }
@@ -67,14 +71,14 @@ class TestContinuationSafety(unittest.TestCase):
         code = """
         module test {
             effect Read<T> {
-                fn read() -> T
+                read() -> T
             }
             
             fn safe_global_capture() {
                 let x = 42;  # Global by default
                 
                 try {
-                    perform Read::read[int]() with |k| {
+                    perform Read.read[int]() with |k| {
                         k(x)  # Should succeed - global value
                     }
                 }
@@ -99,7 +103,7 @@ class TestContinuationSafety(unittest.TestCase):
                 let resource = create_resource();
                 
                 try {
-                    perform Resource::take[Resource]() with |k| {
+                    perform Resource.take[Resource]() with |k| {
                         k(resource)  # Should succeed - unique value is moved
                     }
                 }
@@ -119,14 +123,14 @@ class TestContinuationSafety(unittest.TestCase):
         code = """
         module test {
             effect Read<T> {
-                fn read() -> T
+                read() -> T
             }
             
             fn safe_const_capture() {
                 let @const x = 42;
                 
                 try {
-                    perform Read::read[int]() with |k| {
+                    perform Read.read[int]() with |k| {
                         k(x)  # Should succeed - const reference
                     }
                 }

@@ -5,10 +5,10 @@ import metaxu_ast as ast
 @dataclass
 class Scope:
     """Represents a stack frame scope with its variables and their modes"""
-    variables: Dict[str, 'ast.Mode']
+    variables: Dict[str, 'ast.ModeTypeAnnotation']
     parent: Optional['Scope'] = None
     
-    def find_variable(self, name: str) -> Optional['ast.Mode']:
+    def find_variable(self, name: str) -> Optional['ast.ModeTypeAnnotation']:
         """Find a variable's mode in this scope or parent scopes"""
         if name in self.variables:
             return self.variables[name]
@@ -32,7 +32,7 @@ class ContinuationSafetyChecker:
         if self.current_scope and self.current_scope.parent:
             self.current_scope = self.current_scope.parent
             
-    def add_variable(self, name: str, mode: Optional['ast.Mode']):
+    def add_variable(self, name: str, mode: Optional['ast.ModeTypeAnnotation']):
         """Add a variable to current scope"""
         if self.current_scope:
             self.current_scope.variables[name] = mode
@@ -52,11 +52,11 @@ class ContinuationSafetyChecker:
         if isinstance(expr, ast.VariableExpression):
             mode = self.current_scope.find_variable(expr.name)
             if mode:
-                if mode.is_local:
+                if mode.locality and mode.locality.mode == ast.LocalityMode.LOCAL:
                     errors.append(f"Cannot capture local variable '{expr.name}' in continuation")
-                if mode.is_mut:
+                if mode.uniqueness and mode.uniqueness.mode == ast.UniquenessMode.EXCLUSIVE:
                     errors.append(f"Cannot capture mutable reference '{expr.name}' in continuation")
-                if not mode.is_const and not self.is_moved(expr.name):
+                if mode.uniqueness and mode.uniqueness.mode == ast.UniquenessMode.UNIQUE and not self.is_moved(expr.name):
                     errors.append(f"Must move unique value '{expr.name}' into continuation")
                     
         elif isinstance(expr, ast.ExclaveExpression):
@@ -72,7 +72,7 @@ class ContinuationSafetyChecker:
                 
         return errors
 
-    def check_effect_handler(self, handler: ast.EffectHandler) -> List[str]:
+    def check_effect_handler(self, handler: ast.HandleEffect) -> List[str]:
         """Check if an effect handler is safe"""
         errors = []
         
@@ -80,18 +80,18 @@ class ContinuationSafetyChecker:
         self.enter_scope()
         
         try:
-            # Check continuation parameter
-            k_name = handler.continuation_param
-            self.add_variable(k_name, None)  # Continuation has no mode
-            
             # Check handler body
-            if isinstance(handler.body, ast.Block):
-                for stmt in handler.body.statements:
+            if isinstance(handler.handler, ast.Block):
+                for stmt in handler.handler.statements:
                     stmt_errors = self.check_handler_statement(stmt)
                     errors.extend(stmt_errors)
             else:
-                stmt_errors = self.check_handler_statement(handler.body)
+                stmt_errors = self.check_handler_statement(handler.handler)
                 errors.extend(stmt_errors)
+                
+            # Check handled expression
+            expr_errors = self.check_continuation_capture(handler.expression)
+            errors.extend(expr_errors)
                 
         finally:
             # Exit handler scope
@@ -105,25 +105,26 @@ class ContinuationSafetyChecker:
         
         if isinstance(stmt, ast.LetStatement):
             # Check let bindings
-            for binding in stmt.bindings:
-                self.add_variable(binding.name, binding.mode)
-                value_errors = self.check_continuation_capture(binding.value)
-                errors.extend(value_errors)
+            if stmt.mode:
+                self.add_variable(stmt.identifier, stmt.mode)
+            value_errors = self.check_continuation_capture(stmt.initializer)
+            errors.extend(value_errors)
                 
         elif isinstance(stmt, ast.ExpressionStatement):
             # Check expressions
-            if isinstance(stmt.expression, ast.CallExpression):
-                # Special handling for continuation calls
-                if isinstance(stmt.expression.function, ast.VariableExpression):
-                    if stmt.expression.function.name == self.current_scope.variables.get('k'):
-                        # This is a continuation call - check arguments
-                        for arg in stmt.expression.arguments:
-                            arg_errors = self.check_continuation_capture(arg)
-                            errors.extend(arg_errors)
-                            
+            if isinstance(stmt.expression, ast.Resume):
+                # Check resume value
+                if stmt.expression.value:
+                    value_errors = self.check_continuation_capture(stmt.expression.value)
+                    errors.extend(value_errors)
+            else:
+                # Check other expressions
+                expr_errors = self.check_continuation_capture(stmt.expression)
+                errors.extend(expr_errors)
+            
         return errors
 
-    def check_perform_expression(self, perform: ast.PerformExpression) -> List[str]:
+    def check_perform_expression(self, perform: ast.PerformEffect) -> List[str]:
         """Check if a perform expression is safe"""
         errors = []
         

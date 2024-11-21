@@ -99,10 +99,10 @@ class TypeChecker:
         bool_type = ast.TypeInfo("bool", [], is_copy=True)
         string_type = ast.TypeInfo("String", [], is_copy=False)  # String needs explicit clone
         
-        self.comptime_context.add_type(int_type)
-        self.comptime_context.add_type(float_type)
-        self.comptime_context.add_type(bool_type)
-        self.comptime_context.add_type(string_type)
+        self.comptime_context.get_or_create_type_info(int_type)
+        self.comptime_context.get_or_create_type_info(float_type)
+        self.comptime_context.get_or_create_type_info(bool_type)
+        self.comptime_context.get_or_create_type_info(string_type)
 
     def check(self, node):
         # First pass: evaluate all compile-time constructs

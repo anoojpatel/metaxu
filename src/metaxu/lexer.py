@@ -43,7 +43,7 @@ class Lexer:
         # Mode-related keywords
         'unique': 'UNIQUE',
         'exclusive': 'EXCLUSIVE',
-        'shared': 'SHARED',
+        'const': 'CONST',
         'global': 'GLOBAL',
         'separate': 'SEPARATE',
         'many': 'MANY',
@@ -51,7 +51,6 @@ class Lexer:
         # Module-related keywords
         'import': 'IMPORT',
         'from': 'FROM',
-        'as': 'AS',
         'module': 'MODULE',
         'export': 'EXPORT',
         'use': 'USE',
@@ -59,6 +58,7 @@ class Lexer:
         'private': 'PRIVATE',
         'protected': 'PROTECTED',
         'visibility': 'VISIBILITY',
+        'comptime': 'COMPTIME',
         'some': 'SOME',
         'none': 'NONE',
         'box': 'BOX',

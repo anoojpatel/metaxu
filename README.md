@@ -13,6 +13,7 @@ The planned language features will include:
 - [ ] Algebraic Effects
 - [ ] Structs and Methods
 - [ ] Algebraic Subtyping
+    - [ ] SimpleSub with Row Polymorphism  
 - [ ] SIMD and Multithreading
 - [ ] Portability
 - [ ] Pattern Matching
@@ -28,5 +29,5 @@ between the objects in the world around us. Classically, the wall between two pr
 via tapping is the separator and the very essence of what connects them. Weil's philosophy  
 (theopicy really) is that through these links we experience the world and bring ourselves  
 to capital T "Truth." Given this is a compiler that I want to bootstrap,  I found "metaxu" to be  
-fitting. I hope what what we create can live up to the mantle. 
+fitting. I hope what we create can live up to the mantle. 
 

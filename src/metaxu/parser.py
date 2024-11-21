@@ -3,7 +3,7 @@ from lexer import Lexer
 import metaxu_ast as ast
 from decorator_ast import Decorator, CFunctionDecorator, DecoratorList
 from extern_ast import ExternBlock, ExternFunctionDeclaration, ExternTypeDeclaration
-from unsafe_ast import (UnsafeBlock, PointerType, TypeCast, AsyncFunction,
+from unsafe_ast import (UnsafeBlock, PointerType, TypeCast, 
                        PointerDereference, AddressOf)
 
 class Parser:
@@ -51,8 +51,8 @@ class Parser:
                     | assignment SEMICOLON
                     | assignment
                     | function_declaration
-                    | async_function
                     | unsafe_block
+                    | effect_declaration
                     | struct_definition
                     | enum_definition
                     | type_definition SEMICOLON
@@ -85,10 +85,10 @@ class Parser:
         p[0] = ast.ForStatement(p[2], p[4], p[6])
 
     def p_let_binding(self, p):
-        '''let_binding : LET mode_annotation_list IDENT EQUALS expression
-                      | LET mode_annotation_list IDENT type_annotation EQUALS expression
-                      | LET IDENT EQUALS expression
-                      | LET IDENT type_annotation EQUALS expression'''
+        '''let_binding : LET mode_annotation_list IDENTIFIER EQUALS expression
+                      | LET mode_annotation_list IDENTIFIER type_annotation EQUALS expression
+                      | LET IDENTIFIER EQUALS expression
+                      | LET IDENTIFIER type_annotation EQUALS expression'''
         if len(p) == 7:  # let @mode x: T = e
             p[0] = ast.LetBinding(p[3], p[6], mode=p[2], type_annotation=p[4])
         elif len(p) == 6:  # let @mode x = e or let x: T = e
@@ -122,10 +122,7 @@ class Parser:
             p[0] = p[1]
         else:
             p[0] = p[1].combine(p[2])
-
-    def p_mode_annotation(self, p):
-        '''mode_annotation : AT IDENT'''
-        p[0] = ast.Mode(p[2])
+ 
 
     def p_return_statement(self, p):
         '''return_statement : RETURN expression_or_empty SEMICOLON
@@ -199,10 +196,6 @@ class Parser:
             p[0] = (p[1], p[3])
         else:
             p[0] = (p[1], None)
-
-    def p_visibility_block(self, p):
-        '''visibility_block : VISIBILITY LBRACE visibility_rule_list RBRACE'''
-        p[0] = ast.VisibilityRules(rules=p[3])
 
     def p_visibility_rule_list(self, p):
         '''visibility_rule_list : visibility_rule_list COMMA visibility_rule
@@ -427,8 +420,8 @@ class Parser:
             p[0] = ast.FunctionDeclaration(p[2], [], p[6], return_type=ast.NoneType())
 
     def p_parameter(self, p):
-        '''parameter : IDENT COLON type_expression
-                    | IDENT mode_annotation_list COLON type_expression'''
+        '''parameter : IDENTIFIER COLON type_expression
+                    | IDENTIFIER mode_annotation_list COLON type_expression'''
         if len(p) == 4:  # x: T
             p[0] = ast.Parameter(p[1], p[3])
         else:  # x @mode: T
@@ -455,9 +448,9 @@ class Parser:
 
     def p_reference_mode(self, p):
         '''reference_mode : UNIQUE
-                        | SHARED
+                        | CONST
                         | EXCLUSIVE
-                        | BORROW SHARED
+                        | BORROW CONST
                         | BORROW EXCLUSIVE'''
         if len(p) == 2:
             p[0] = ast.UniquenessMode(p[1].lower())
@@ -475,7 +468,7 @@ class Parser:
                          | array_type
                          | reference_mode type_expression
                          | LPAREN type_expression RPAREN
-                         | type_expression AT mode'''
+                         | type_expression mode_annotation_list'''
         if len(p) == 4:  # Parenthesized, reference mode, or mode annotation
             if p[1] == '(':
                 p[0] = p[2]
@@ -859,15 +852,13 @@ class Parser:
             p[0] = p[1] + [p[3]]
 
     def p_function_type(self, p):
-        '''function_type : FN BACKSLASH LPAREN type_list RPAREN type_annotation linearity_annotation
-                        | FN BACKSLASH LPAREN type_list RPAREN type_annotation
-                        | FN BACKSLASH LPAREN RPAREN type_annotation linearity_annotation
+        '''function_type : FN BACKSLASH LPAREN type_list RPAREN type_annotation
                         | FN BACKSLASH LPAREN RPAREN type_annotation'''
-        if len(p) == 8:  # fn\(params) -> T @ linearity
+        if len(p) == 6:  # fn\(params) -> T @ linearity
             p[0] = ast.FunctionType(p[4] if p[4] is not None else [], p[6], linearity=p[7])
-        elif len(p) == 7 and p[4] != ')':  # fn\(params) -> T
+        elif len(p) == 5 and p[4] != ')':  # fn\(params) -> T
             p[0] = ast.FunctionType(p[4] if p[4] is not None else [], p[6])
-        elif len(p) == 7:  # fn\() -> T @ linearity
+        elif len(p) == 5:  # fn\() -> T @ linearity
             p[0] = ast.FunctionType([], p[5], linearity=p[6])
         else:  # fn\() -> T
             p[0] = ast.FunctionType([], p[5])
@@ -919,6 +910,43 @@ class Parser:
     def p_type_annotation(self, p):
         '''type_annotation : ARROW type_expression'''
         p[0] = p[2]
+ 
+    def p_effect_declaration(self, p):
+        '''effect_declaration : EFFECT IDENTIFIER type_params_opt LBRACE effect_operations_def RBRACE'''
+        p[0] = ast.EffectDeclaration(p[2], p[3], p[5])
+    
+    # Used for effect operation definition
+    def p_effect_operations_def(self, p):
+        '''effect_operations_def : effect_operation_def
+                        | effect_operations_def effect_operation_def'''
+        if len(p) == 2:
+            p[0] = [p[1]]
+        else:
+            p[0] = p[1] + [p[2]]
+    
+    def p_effect_operation_def(self, p):
+        '''effect_operation_def : IDENTIFIER LPAREN type_list RPAREN ARROW type_expression
+                              | IDENTIFIER LPAREN RPAREN ARROW type_expression
+                              | IDENTIFIER LPAREN type_list RPAREN
+                              | IDENTIFIER LPAREN RPAREN'''
+        if len(p) == 7: #
+            p[0] = ast.EffectOperation(p[1], p[3], p[6])
+        elif len(p) == 5:
+            p[0] = ast.EffectOperation(p[1], p[3], None)
+        elif len(p) == 4:
+            p[0] = ast.EffectOperation(p[1], p[3], None)
+        else:   
+            p[0] = ast.EffectOperation(p[1], [], None)
+
+
+    def p_effect_operations(self, p):
+        '''effect_operations : effect_operation
+                        | effect_operations effect_operation'''
+        if len(p) == 2:
+            p[0] = [p[1]]
+        else:
+            p[0] = p[1] + [p[2]]
+
 
     def p_handle_expression(self, p):
         '''handle_expression : HANDLE expression WITH LBRACE handle_cases RBRACE'''
@@ -1070,7 +1098,7 @@ class Parser:
             p[0] = ExternTypeDeclaration(name=p[2], is_opaque=False)
 
     def p_unsafe_block(self, p):
-        '''unsafe_block : UNSAFE LBRACE statements RBRACE
+        '''unsafe_block : UNSAFE LBRACE statement_list RBRACE
                        | UNSAFE LBRACE RBRACE'''
         if len(p) == 5:
             p[0] = UnsafeBlock(body=p[3])
@@ -1078,9 +1106,9 @@ class Parser:
             p[0] = UnsafeBlock(body=[])
 
     def p_pointer_type(self, p):
-        '''pointer_type : STAR MUT type
-                       | STAR CONST type
-                       | STAR type'''
+        '''pointer_type : STAR MUT TYPE
+                       | STAR CONST TYPE
+                       | STAR TYPE'''
         # Only allow pointer types in unsafe contexts or extern blocks
         if not self._in_unsafe_or_extern_context():
             raise SyntaxError("Pointer types are only allowed in unsafe blocks or extern declarations")
@@ -1094,7 +1122,7 @@ class Parser:
         p[0] = PointerType(base_type=base_type, is_mut=is_mut)
 
     def p_type_cast(self, p):
-        '''type_cast : expression AS type'''
+        '''type_cast : expression AS TYPE'''
         # If casting to/from a pointer type, require unsafe context
         if (isinstance(p[3], PointerType) or 
             (hasattr(p[1], 'type') and isinstance(p[1].type, PointerType))):
