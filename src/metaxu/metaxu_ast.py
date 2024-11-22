@@ -101,7 +101,7 @@ class ComptimeContext:
     
     def substitute_type_params(self, type_info, type_param_map):
         """Substitute type parameters in a type"""
-        if isinstance(type_info, TypeParam):
+        if isinstance(type_info, TypeParameter):
             return type_param_map.get(type_info.name, type_info)
         elif isinstance(type_info, GenericType):
             args = [self.substitute_type_params(arg, type_param_map) 
@@ -199,11 +199,16 @@ class Expression(Node):
     def __init__(self):
         super().__init__()
 
-class LetStatement(Node):
-    def __init__(self, identifier, initializer, mode=None):
+class LetBinding(Node):
+    def __init__(self, identifier, type_annotation=None, initializer=None, mode=None):
         self.identifier = identifier
+        self.type_annotation = type_annotation
         self.initializer = initializer
         self.mode = mode
+
+class LetStatement(Node):
+    def __init__(self, bindings):
+        self.bindings = bindings
 
 class ReturnStatement(Node):
     def __init__(self, expression):
@@ -312,12 +317,13 @@ class BinaryOperation(Expression):
         return ComptimeValue(value, left.type_info)
 
 class FunctionDeclaration(Statement):
-    def __init__(self, name, params, body, return_type=None, is_kernel=False):
+    def __init__(self, name, params, body, return_type=None, performs=None, type_params=None):
         self.name = name
         self.params = params
         self.body = body
         self.return_type = return_type
-        self.is_kernel = is_kernel
+        self.performs = performs or []  # List of effects this function performs
+        self.type_params = type_params or []  # List of TypeParameter objects
 
 class FunctionCall(Expression):
     def __init__(self, name, arguments):
@@ -390,22 +396,32 @@ class LambdaExpression(Expression):
         return f"lambda[captures: {captures_str}]({params_str}) -> {self.return_type or 'auto'}{lin}"
 
 # Algebraic Effects
-class EffectDeclaration(Expression):
-    """effect Read<T> {...}"""
+class EffectDefinition(Node):
+    """Definition of an effect type (e.g., effect Reader<T>)"""
     def __init__(self, name, type_params, operations):
-        self.name = name
-        self.type_params = type_params or []  # List of TypeParameter
-        self.operations = operations  # List of EffectOperation
+        self.name = name                # The effect name (e.g., "Reader")
+        self.type_params = type_params  # List of TypeParameter (e.g., [T])
+        self.operations = operations    # List of effect operations
 
-class EffectOperation(Expression):
-    """effect Read<T> {
-        read() -> T; # This an operation
-        write(value: T) -> void; # This an operation
-    }"""
+class EffectOperation(Node):
+    """An operation in an effect (e.g., read() -> T)"""
     def __init__(self, name, params, return_type):
         self.name = name
-        self.params = params or []  # List of Parameter
-        self.return_type = return_type  # Optional return type
+        self.params = params
+        self.return_type = return_type
+
+class EffectApplication(EffectExpression):
+    """Application of concrete types to an effect (e.g., Reader<int> or Reader<G>)"""
+    def __init__(self, effect_name, type_args):
+        self.effect_name = effect_name  # Name of the effect (e.g., "Reader")
+        self.type_args = type_args      # List of concrete types or type parameters
+        
+    def substitute(self, type_params, concrete_types):
+        """Substitute type parameters with concrete types"""
+        # e.g., Reader<G> becomes Reader<int> when G is substituted with int
+        new_args = [arg.substitute(type_params, concrete_types) 
+                   for arg in self.type_args]
+        return EffectApplication(self.effect_name, new_args)
 
 class PerformEffect(Expression):
     def __init__(self, effect_name, arguments):
@@ -437,9 +453,10 @@ class BorrowUnique(Expression):
 
 # Structs and Enums
 class StructDefinition(Node):
-    def __init__(self, name, fields, implements=None, methods=None):
+    def __init__(self, name, fields, type_params=None, implements=None, methods=None):
         self.name = name
         self.fields = fields
+        self.type_params = type_params
         self.implements = implements
         self.methods = methods if methods is not None else []
 
@@ -615,9 +632,10 @@ class GenericType:
 
 class TypeParameter(TypeExpression):
     """A type parameter used in generic types (e.g., T in List<T>)"""
-    def __init__(self, name, bounds=None):
+    def __init__(self, name, bound=None, effect=False):
         self.name = name
-        self.bounds = bounds or []  # List of types that bound this parameter
+        self.bound = bound  # Optional bound (e.g., 'T: Display')
+        self.effect = effect  # Whether this is an effect parameter
 
 class RecursiveType(TypeExpression):
     """A recursive type definition (e.g., type Tree<T> = Node<T, List<Tree<T>>>)"""
@@ -626,11 +644,6 @@ class RecursiveType(TypeExpression):
         self.type_params = type_params or []  # List of TypeParameters
         self.body = body  # The actual type expression
 
-class TypeApplication(TypeExpression):
-    """Application of type arguments to a generic type (e.g., List<int>)"""
-    def __init__(self, base_type, type_args):
-        self.base_type = base_type  # The generic type being instantiated
-        self.type_args = type_args  # List of type arguments
 
 class InterfaceType(TypeExpression):
     """Represents a reference to an interface type"""
@@ -1140,3 +1153,32 @@ def eval_type_match(self, context):
             return body.eval(context)
     
     context.emit_error("No pattern matched the type")
+
+class EffectExpression(Node):
+    """Base class for effect expressions in performs clauses"""
+    pass
+
+class EffectApplication(EffectExpression):
+    """Application of type arguments to an effect type (e.g., Reader<T>)"""
+    def __init__(self, effect_name, type_args):
+        self.effect_name = effect_name  # Name of the effect (e.g., "Reader")
+        self.type_args = type_args      # List of type arguments (e.g., [T])
+
+class EffectReference(EffectExpression):
+    """Reference to an effect parameter (e.g., E in performs E)"""
+    def __init__(self, name):
+        self.name = name  # Name of the effect parameter
+
+
+class TypeApplication(Node):
+    """Application of type parameters to a type constructor (e.g., Stack<Int>)"""
+    def __init__(self, type_constructor, type_args):
+        self.type_constructor = type_constructor  # Name of type (e.g., "Stack")
+        self.type_args = type_args               # List of types/type params
+        
+    def substitute(self, type_params, concrete_types):
+        """Substitute type parameters with concrete types"""
+        # e.g., Stack<E> becomes Stack<Int> when E is substituted with Int
+        new_args = [arg.substitute(type_params, concrete_types) 
+                   for arg in self.type_args]
+        return TypeApplication(self.type_constructor, new_args)

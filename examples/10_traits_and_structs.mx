@@ -1,0 +1,61 @@
+// First, let's define a trait with a type parameter
+trait Container<T> {
+    // Methods that operate on type T
+    fn push(value: T) -> Unit;
+    fn pop() -> Option<T>;
+    fn peek() -> Option<T>;
+    fn is_empty() -> Bool;
+}
+
+// Now a struct that will implement this trait
+struct Stack<E> {
+    // Internal storage for elements of type E
+    elements: Vec<E>,
+    size: Int,
+}
+
+// Implementing the Container trait for Stack
+implements Stack<E>: Container<E> {
+    fn push(value: E) -> Unit {
+        self.elements.push(value);
+        self.size = self.size + 1;
+    }
+
+    fn pop() -> Option<E> {
+        if self.is_empty() {
+            return None;
+        }
+        self.size = self.size - 1;
+        return Some(self.elements.pop());
+    }
+
+    fn peek() -> Option<E> {
+        if self.is_empty() {
+            return None;
+        }
+        return Some(self.elements[self.size - 1]);
+    }
+
+    fn is_empty() -> Bool {
+        return self.size == 0;
+    }
+}
+
+// Using the Stack with a concrete type
+fn example() {
+    // Here Int is substituted for E in Stack<E>
+    let stack = Stack<Int>{
+        elements: Vec<Int>::new(),
+        size: 0,
+    };
+
+    // The type system knows this is Stack<Int>
+    // which implements Container<Int>
+    stack.push(42);
+    stack.push(17);
+    
+    match stack.pop() {
+        Some(value) => print(value), // Prints 17
+        None => print("Empty stack"),
+    }
+}

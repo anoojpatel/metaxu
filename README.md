@@ -22,12 +22,12 @@ The planned language features will include:
 
 
 ### Inspiration
-Metaxu is deeply inspired by languages such as Ante, Hylo, Sage, Oxidized Ocaml, Rust and Python.
+Metaxu is deeply inspired by languages such as Ante, Hylo, Sage, Oxidized Ocaml, Rust, Zig and Python.
 
 The term "Metaux" comes from Simone Weil and neoplatonists, describing the links and seperations  
 between the objects in the world around us. Classically, the wall between two prisoners who talk  
 via tapping is the separator and the very essence of what connects them. Weil's philosophy  
-(theopicy really) is that through these links we experience the world and bring ourselves  
+(theopicy really) is that, through these links we experience the world and bring ourselves  
 to capital T "Truth." Given this is a compiler that I want to bootstrap,  I found "metaxu" to be  
 fitting. I hope what we create can live up to the mantle. 
 
