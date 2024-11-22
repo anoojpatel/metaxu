@@ -2,6 +2,10 @@ from typing import Dict, List, Optional, Union, Any
 from dataclasses import dataclass
 import metaxu_ast as ast
 from symbol_table import SymbolTable, Symbol
+from .simplesub import TypeInferencer, Polarity
+from .type_defs import (
+    CompactType, TypeBounds, unfold_once, unify, Type, TypeDefinition
+)
 
 class TypeChecker:
     def __init__(self):
@@ -9,38 +13,227 @@ class TypeChecker:
         self.comptime_context = ast.ComptimeContext()
         self.errors = []
         self.borrow_checker = BorrowChecker(self.symbol_table)
+        self.type_inferencer = TypeInferencer()
         self.setup_builtin_types()
         self.current_scope = {}
         self.reference_graph = {}  # Track references between values
         
-    def add_reference(self, from_var: str, to_var: str, mode: 'ast.Mode'):
-        """Track reference relationship between variables"""
-        if from_var not in self.reference_graph:
-            self.reference_graph[from_var] = []
-        self.reference_graph[from_var].append((to_var, mode))
-        
-    def check_reference_conflict(self, var: str) -> bool:
-        """Check if a variable has conflicting references (mut and const)"""
-        if var not in self.reference_graph:
-            return False
+    def setup_builtin_types(self):
+        """Initialize builtin types as CompactTypes"""
+        self.builtin_types = {
+            'int': CompactType(id=0, kind='primitive', name='int'),
+            'float': CompactType(id=1, kind='primitive', name='float'),
+            'bool': CompactType(id=2, kind='primitive', name='bool'),
+            'str': CompactType(id=3, kind='primitive', name='str'),
+            'unit': CompactType(id=4, kind='primitive', name='unit')
+        }
+        for name, ty in self.builtin_types.items():
+            self.current_scope[name] = ty
             
-        has_mut = False
-        has_const = False
+    def check_program(self, program: 'ast.Program'):
+        """Type check an entire program"""
+        # First pass: collect all declarations
+        all_declarations = self.collect_declarations(program)
         
-        # Check direct references
-        for _, mode in self.reference_graph[var]:
-            if mode.is_mut:
-                has_mut = True
-            if mode.is_const:
-                has_const = True
-                
-        # Check indirect references through the graph
-        for ref_var, mode in self.reference_graph.get(var, []):
-            if self.check_reference_conflict(ref_var):
-                return True
-                
-        return has_mut and has_const
+        # Sort declarations by dependency order
+        sorted_declarations = self.sort_declarations(all_declarations)
         
+        # Process declarations in dependency order
+        for decl in sorted_declarations:
+            self.check_declaration(decl)
+                
+        # Second pass: check expressions and statements
+        for decl in program.declarations:
+                self.check(decl)
+                
+    def sort_declarations(self, declarations: List['ast.Node']) -> List['ast.Node']:
+        """Sort declarations by dependency order"""
+        # Build dependency graph
+        graph = {}
+        for decl in declarations:
+            deps = set()
+            
+            if isinstance(decl, ast.TypeParameter):
+                # Type parameters depend on their bounds
+                if decl.bounds:
+                    deps.update(self.get_type_deps(bound) for bound in decl.bounds)
+                    
+            elif isinstance(decl, ast.Parameter):
+                # Parameters depend on their type annotations
+                if decl.type_annotation:
+                    deps.update(self.get_type_deps(decl.type_annotation))
+                    
+            elif isinstance(decl, ast.LetBinding):
+                # Let bindings depend on their type annotations and initializers
+                if decl.type_annotation:
+                    deps.update(self.get_type_deps(decl.type_annotation))
+                if decl.initializer:
+                    deps.update(self.get_expr_deps(decl.initializer))
+                    
+            graph[decl] = deps
+            
+        # Topologically sort declarations
+        sorted_decls = []
+        visited = set()
+        temp_mark = set()
+        
+        def visit(node):
+            if node in temp_mark:
+                self.errors.append("Cyclic dependency in declarations")
+                return
+            if node not in visited:
+                temp_mark.add(node)
+                for dep in graph[node]:
+                    visit(dep)
+                temp_mark.remove(node)
+                visited.add(node)
+                sorted_decls.append(node)
+                
+        for decl in declarations:
+            if decl not in visited:
+                visit(decl)
+                
+        return sorted_decls
+        
+    def get_type_deps(self, type_node) -> Set['ast.Node']:
+        """Get declarations that a type depends on"""
+        deps = set()
+        
+        if isinstance(type_node, ast.TypeParameter):
+            deps.add(type_node)
+        elif isinstance(type_node, ast.TypeApplication):
+            deps.update(self.get_type_deps(type_node.base_type))
+            for arg in type_node.type_args:
+                deps.update(self.get_type_deps(arg))
+                
+        return deps
+        
+    def get_expr_deps(self, expr) -> Set['ast.Node']:
+        """Get declarations that an expression depends on"""
+        deps = set()
+        
+        if isinstance(expr, ast.VariableExpression):
+            # Find the declaration this variable refers to
+            for decl in self.current_scope.values():
+                if isinstance(decl, (ast.Parameter, ast.LetBinding)) and decl.name == expr.name:
+                    deps.add(decl)
+                    
+        elif isinstance(expr, ast.FunctionCall):
+            deps.update(self.get_expr_deps(expr.function))
+            for arg in expr.arguments:
+                deps.update(self.get_expr_deps(arg))
+                
+        return deps
+        
+    def check_declaration(self, decl: 'ast.Declaration'):
+        """Type check a declaration"""
+        if isinstance(decl, ast.FunctionDeclaration):
+            self.check_function_declaration(decl)
+        elif isinstance(decl, ast.TypeDeclaration):
+            self.check_type_declaration(decl)
+        elif isinstance(decl, ast.LetStatement):
+            self.check_let_statement(decl)
+            
+    def check_type_declaration(self, decl: 'ast.TypeDeclaration'):
+        """Check a type declaration and infer variance"""
+        # Convert to CompactType
+        compact_type = self.type_inferencer.to_compact_type(decl.type_expr)
+        
+        # Analyze for variance
+        self.type_inferencer.analyze_type_definition(
+            compact_type, 
+            Polarity.NEUTRAL
+        )
+        
+        # Finalize variance inference
+        self.type_inferencer.finalize_type_definition(compact_type)
+        
+        # Add to scope
+        self.current_scope[decl.name] = compact_type
+            
+    def check_function_declaration(self, func: 'ast.FunctionDeclaration'):
+        """Check a function declaration"""
+        # Create type environment for this function
+        type_env = {}
+        
+        # Process type parameters
+        if func.type_params:
+            for param in func.type_params:
+                # Create fresh type variable for parameter
+                type_var = self.type_inferencer.fresh_var()
+                type_env[param.name] = type_var
+                
+                # Add bounds from type parameter
+                if param.bounds:
+                    for bound in param.bounds:
+                        bound_type = self.check_type(bound)
+                        if bound_type:
+                            self.type_inferencer.add_constraint(
+                                type_var, bound_type, "subtype"
+                            )
+                            
+        # Process where clause if present
+        if func.where_clause:
+            self.check_where_clause(func.where_clause, type_env)
+            
+        # Check parameter types
+        for param in func.parameters:
+            if param.type_annotation:
+                param_type = self.check_type(param.type_annotation)
+                if param_type:
+                    # Substitute type parameters
+                    param_type = self.substitute_type_params(param_type, type_env)
+                    self.current_scope[param.name] = param_type
+                    
+        # Check return type if present
+        if func.return_type:
+            return_type = self.check_type(func.return_type)
+            if return_type:
+                # Substitute type parameters
+                return_type = self.substitute_type_params(return_type, type_env)
+                self.current_scope[func.name + "_return"] = return_type
+                
+        # Add function to scope
+        self.current_scope[func.name] = func
+        
+        # Create function type as CompactType
+        param_types = [
+            self.type_inferencer.to_compact_type(param.type_annotation)
+            for param in func.parameters
+        ]
+        
+        return_type = self.type_inferencer.to_compact_type(
+            func.return_type if func.return_type else 
+            CompactType(id=next_id(), kind='var', bounds=TypeBounds())
+        )
+        
+        func_type = CompactType(
+            id=next_id(),
+            kind='function',
+            param_types=param_types,
+            return_type=return_type
+        )
+        
+        # Add parameters to scope
+        for param, param_type in zip(func.parameters, param_types):
+            self.current_scope[param.name] = param_type
+            
+        # Check body with polarity tracking
+        if func.body:
+            body_type = self.type_inferencer.infer_expression(
+                func.body,
+                Polarity.POSITIVE
+            )
+            # Ensure body type matches return type
+            if not unify(body_type, return_type, 'covariant'):
+                self.errors.append(
+                    f"Function {func.name} body type {body_type} "
+                    f"does not match return type {return_type}"
+                )
+                
+        # Add function to scope
+        self.current_scope[func.name] = func_type
+         
     def check_call_expression(self, call: 'ast.CallExpression'):
         """Check function call for aliasing violations"""
         if isinstance(call.function, ast.VariableExpression):
@@ -85,12 +278,12 @@ class TypeChecker:
                             f"Cannot alias const reference '{source_var}' as mutable"
                         )
                         
-                # Track the reference
-                self.add_reference(binding.name, source_var, binding.mode)
-                
-        # Store the mode for future reference
-        if binding.mode:
-            self.current_scope[binding.name + "_mode"] = binding.mode
+                    # Track the reference
+                    self.borrow_checker.add_reference(binding.name, source_var, binding.mode)
+            
+            # Store the mode for future reference
+            if binding.mode:
+                self.current_scope[binding.name + "_mode"] = binding.mode
         
     def setup_builtin_types(self):
         # Add built-in types
@@ -127,12 +320,97 @@ class TypeChecker:
         else:
             pass
 
+    def resolve_qualified_name(self, name: str) -> Optional[Symbol]:
+        """Resolve a fully qualified name to a symbol.
+        
+        Args:
+            name: Qualified name (e.g. 'std.collections.List' or 'List')
+        Returns:
+            Symbol if found, None otherwise
+        """
+        # Try direct lookup first (unqualified name)
+        symbol = self.symbol_table.lookup(name)
+        if symbol:
+            return symbol
+            
+        # Split into module path and symbol name
+        parts = name.split('.')
+        if len(parts) == 1:
+            return None
+            
+        # Get module and lookup symbol
+        module_path = '.'.join(parts[:-1])
+        symbol_name = parts[-1]
+        
+        module = self.symbol_table.lookup_module(module_path)
+        if not module:
+            return None
+            
+        return module.symbols.get(symbol_name)
+
     def visit_Variable(self, node):
-        """Type check variable references"""
-        symbol = self.symbol_table.lookup(node.name)
+        """Type check variable references with qualified name support"""
+        # Try to resolve as qualified name
+        symbol = self.resolve_qualified_name(node.name)
         if not symbol:
             self.errors.append(f"Name '{node.name}' not found")
             return None
+            
+        # Check visibility
+        if symbol.visibility == 'private':
+            current_module = self.symbol_table.current_module
+            symbol_module = symbol.qualified_name.rsplit('.', 1)[0] if symbol.qualified_name else None
+            
+            if current_module != symbol_module:
+                self.errors.append(f"Cannot access private symbol '{node.name}' from module '{current_module}'")
+                return None
+                
+        elif symbol.visibility == 'protected':
+            current_module = self.symbol_table.current_module
+            symbol_module = symbol.qualified_name.rsplit('.', 1)[0] if symbol.qualified_name else None
+            
+            if not (current_module == symbol_module or 
+                   (symbol_module and current_module.startswith(f"{symbol_module}."))):
+                self.errors.append(
+                    f"Cannot access protected symbol '{node.name}' from non-child module '{current_module}'"
+                )
+                return None
+        
+        return symbol.type
+
+    def visit_TypeRef(self, node):
+        """Type check type references with qualified name support"""
+        # Try to resolve as qualified name
+        symbol = self.resolve_qualified_name(node.name)
+        if not symbol:
+            self.errors.append(f"Type '{node.name}' not found")
+            return None
+            
+        if not isinstance(symbol.type, (ast.TypeDefinition, ast.StructDefinition, 
+                                      ast.EnumDefinition, ast.InterfaceDefinition)):
+            self.errors.append(f"'{node.name}' is not a type")
+            return None
+            
+        # Check visibility like regular symbols
+        if symbol.visibility == 'private':
+            current_module = self.symbol_table.current_module
+            symbol_module = symbol.qualified_name.rsplit('.', 1)[0] if symbol.qualified_name else None
+            
+            if current_module != symbol_module:
+                self.errors.append(f"Cannot access private type '{node.name}' from module '{current_module}'")
+                return None
+                
+        elif symbol.visibility == 'protected':
+            current_module = self.symbol_table.current_module
+            symbol_module = symbol.qualified_name.rsplit('.', 1)[0] if symbol.qualified_name else None
+            
+            if not (current_module == symbol_module or 
+                   (symbol_module and current_module.startswith(f"{symbol_module}."))):
+                self.errors.append(
+                    f"Cannot access protected type '{node.name}' from non-child module '{current_module}'"
+                )
+                return None
+        
         return symbol.type
 
     def visit_Import(self, node):
@@ -715,7 +993,7 @@ class TypeChecker:
                         f"Empty struct '{node.name}' generated",
                         node
                     )
-        
+                
         CodeValidator(self).visit(nodes)
     
     def handle_comptime_error(self, error):
@@ -811,217 +1089,288 @@ class TypeChecker:
             
             return True
             
-        except Exception as e:
-            self.errors.append(f"Error inserting generated nodes: {str(e)}")
-            return False
+        finally:
+            # Clean up
+            self.current_comptime_block = None
+
+    def check_let_statement(self, stmt: 'ast.LetStatement'):
+        """Process let statement during declaration pass"""
+        for binding in stmt.bindings:
+            # Convert type annotation to CompactType if present
+            var_type = None
+            if binding.type_annotation:
+                var_type = self.type_inferencer.to_compact_type(binding.type_annotation)
+            
+            # If no explicit type, create a fresh type variable
+            if not var_type:
+                var_type = CompactType(id=next_id(), kind='var', bounds=TypeBounds())
+            
+            # Add variable to scope with its type
+            self.current_scope[binding.identifier] = var_type
+            
+            # Handle mode annotations
+            if binding.mode:
+                self.current_scope[binding.identifier + "_mode"] = binding.mode
+                
+                # Check mode compatibility if binding from another variable
+                if isinstance(binding.initializer, ast.VariableExpression):
+                    source_var = binding.initializer.name
+                    source_mode = self.current_scope.get(source_var + "_mode")
+                    
+                    if source_mode:
+                        # Cannot alias mut as const or vice versa
+                        if source_mode.is_mut and binding.mode.is_const:
+                            self.errors.append(
+                                f"Cannot alias mutable reference '{source_var}' as const"
+                            )
+                        if source_mode.is_const and binding.mode.is_mut:
+                            self.errors.append(
+                                f"Cannot alias const reference '{source_var}' as mutable"
+                            )
+                    
+                        # Track the reference relationship
+                        self.borrow_checker.add_reference(binding.identifier, source_var, binding.mode)
+            
+            # Add to borrow checker's scope
+            self.borrow_checker.add_variable(binding.identifier, binding.mode)
 
     def check_type_definition(self, node, env):
-        """Type check a type definition"""
-        # Create new environment for type parameters
-        type_env = env.copy()
-        
-        # Add type parameters to environment
-        if node.type_params:
-            for param in node.type_params:
-                if param.bounds:
-                    # Check bounds are valid types
-                    for bound in param.bounds:
-                        self.check_type(bound, type_env)
-                # Add parameter to environment
-                type_env[param.name] = param
-
-        # Check the type body is well-formed
-        self.check_type(node.body, type_env)
-        
-        # For recursive types, check positivity condition
+        """Type check and infer variance for a type definition"""
+        # First: Check for recursive references and ensure positivity
         if self.is_recursive(node):
             if not self.check_positivity(node, node.body):
-                raise TypeError(f"Recursive type {node.name} violates positivity condition")
+                self.errors.append(
+                    f"Recursive type {node.name} violates strict positivity - "
+                    "recursive references must only appear in strictly positive positions"
+                )
+                return None
+
+        # Create type constructor
+        constructor = TypeConstructor(
+            name=node.name,
+            arity=len(node.type_params),
+            module_path=self.current_module_path
+        )
+        
+        # Analyze type parameter usage
+        for field in node.fields:
+            field_type = self.check_type(field.type_expr, env)
+            # Record how type parameters are used in field types
+            self.type_inferencer.analyze_type_definition(
+                field_type,
+                Polarity.POSITIVE  # Start in covariant position
+            )
+            
+        # Third pass: Infer variance for type parameters
+        self.type_inferencer.finalize_type_definition(constructor)
+        return constructor
 
     def is_recursive(self, type_def):
-        """Check if a type definition is recursive"""
+        """Check if a type definition contains recursive references"""
         def contains_self_reference(type_expr):
-            if isinstance(type_expr, ast.BasicType):
+            if isinstance(type_expr, ast.TypeReference):
                 return type_expr.name == type_def.name
             elif isinstance(type_expr, ast.TypeApplication):
-                return (isinstance(type_expr.base_type, ast.BasicType) and 
-                       type_expr.base_type.name == type_def.name)
-            elif isinstance(type_expr, ast.TypeParameter):
-                return False
+                return (isinstance(type_expr.constructor, ast.TypeReference) and 
+                       type_expr.constructor.name == type_def.name)
             else:
-                return any(contains_self_reference(t) for t in type_expr.get_contained_types())
+                return any(contains_self_reference(child) 
+                         for child in type_expr.get_children())
         return contains_self_reference(type_def.body)
 
-    def check_positivity(self, type_def, type_expr, positive=True):
-        """Check that recursive references only occur in positive positions"""
-        if isinstance(type_expr, ast.BasicType):
-            # Self-reference in negative position is not allowed
-            if type_expr.name == type_def.name and not positive:
-                return False
+    def check_positivity(self, type_def, type_expr, polarity=Polarity.POSITIVE, visited=None):
+        """
+        Check that recursive references only occur in strictly positive positions.
+        
+        Rules for strict positivity:
+        1. Self-reference cannot occur in negative position (contravariant)
+        2. Self-reference cannot occur in argument position of another type
+        3. Self-reference must be guarded by a strictly positive type constructor
+        """
+        if visited is None:
+            visited = set()
+            
+        # Prevent infinite recursion
+        type_key = f"{type_def.name}_{id(type_expr)}"
+        if type_key in visited:
             return True
+        visited.add(type_key)
+
+        if isinstance(type_expr, ast.TypeReference):
+            # Self-reference check
+            if type_expr.name == type_def.name:
+                return polarity == Polarity.POSITIVE
+            # Check other type references for potential indirect recursion
+            referenced_type = self.lookup_type(type_expr.name)
+            if referenced_type and isinstance(referenced_type, ast.TypeDefinition):
+                return self.check_positivity(type_def, referenced_type.body, polarity, visited)
+                
         elif isinstance(type_expr, ast.TypeApplication):
-            if isinstance(type_expr.base_type, ast.BasicType):
-                if type_expr.base_type.name == type_def.name and not positive:
-                    return False
-            # Check type arguments in same position
-            return all(self.check_positivity(type_def, arg, positive) 
-                      for arg in type_expr.type_args)
-        elif isinstance(type_expr, ast.TypeParameter):
-            return True
+            # Check constructor
+            if isinstance(type_expr.constructor, ast.TypeReference):
+                if type_expr.constructor.name == type_def.name:
+                    return False  # Self-reference in constructor position not allowed
+                    
+            # Check arguments with appropriate variance
+            constructor_type = self.lookup_type(type_expr.constructor.name)
+            if constructor_type:
+                for i, arg in enumerate(type_expr.arguments):
+                    # Get parameter variance from constructor
+                    param_variance = (getattr(constructor_type.type_params[i], 
+                                           'inferred_variance', 'invariant')
+                                    if hasattr(constructor_type, 'type_params')
+                                    else 'invariant')
+                    
+                    # Compose polarities
+                    arg_polarity = polarity
+                    if param_variance == 'contravariant':
+                        arg_polarity = polarity.flip()
+                    elif param_variance == 'invariant':
+                        arg_polarity = Polarity.NEUTRAL
+                        
+                    if not self.check_positivity(type_def, arg, arg_polarity, visited):
+                        return False
+                        
         elif isinstance(type_expr, ast.FunctionType):
-            # Parameter types are in negative position
-            return (all(self.check_positivity(type_def, param_type, not positive) 
-                       for param_type in type_expr.param_types) and
-                    self.check_positivity(type_def, type_expr.return_type, positive))
-        else:
-            return all(self.check_positivity(type_def, t, positive) 
-                      for t in type_expr.get_contained_types())
+            # Parameters are in negative position
+            for param in type_expr.param_types:
+                if not self.check_positivity(type_def, param, polarity.flip(), visited):
+                    return False
+            # Return type is in positive position
+            return self.check_positivity(type_def, type_expr.return_type, polarity, visited)
+            
+        # For all other type expressions, check children
+        return all(self.check_positivity(type_def, child, polarity, visited)
+                  for child in type_expr.get_children())
 
-    def check_type_application(self, node, env):
-        """Type check a type application (e.g., List<int>)"""
-        # Get the type being applied
-        base_type = self.resolve_type(node.base_type, env)
-        if not hasattr(base_type, 'type_params'):
-            raise TypeError(f"Type {base_type} is not generic")
+    def lookup_type(self, name):
+        """Look up a type definition by name"""
+        return self.symbol_table.lookup_type(name)
+
+    def check_type_visibility(self, type_def: Type) -> bool:
+        """Check if a type is visible in current module context"""
+        if not hasattr(type_def, 'visibility'):
+            return True
+            
+        current_module = self.symbol_table.current_module
+        type_module = type_def.module_path
         
-        # Check number of type arguments matches
-        if len(node.type_args) != len(base_type.type_params):
-            raise TypeError(f"Wrong number of type arguments for {base_type}")
-        
-        # Check each type argument
-        for arg, param in zip(node.type_args, base_type.type_params):
-            arg_type = self.check_type(arg, env)
-            # Check bounds
-            if param.bounds:
-                for bound in param.bounds:
-                    if not self.is_subtype(arg_type, bound):
-                        raise TypeError(f"Type argument {arg_type} does not satisfy bound {bound}")
+        if type_def.visibility == 'private':
+            return current_module == type_module
+            
+        if type_def.visibility == 'protected':
+            return (current_module == type_module or
+                   self.is_submodule(current_module, type_module))
+                   
+        return True  # public
 
-    def resolve_type(self, type_expr, env):
-        """Resolve a type expression to its definition"""
-        if isinstance(type_expr, ast.BasicType):
-            if type_expr.name in env:
-                return env[type_expr.name]
-            raise TypeError(f"Undefined type {type_expr.name}")
-        elif isinstance(type_expr, ast.TypeParameter):
-            if type_expr.name in env:
-                return env[type_expr.name]
-            raise TypeError(f"Undefined type parameter {type_expr.name}")
-        elif isinstance(type_expr, ast.TypeApplication):
-            base = self.resolve_type(type_expr.base_type, env)
-            return self.substitute_type_params(base, type_expr.type_args, env)
-        return type_expr
+    def is_submodule(self, sub_path: Tuple[str, ...], sup_path: Tuple[str, ...]) -> bool:
+        """Check if sub_path is a submodule of sup_path"""
+        return (len(sub_path) > len(sup_path) and
+                sub_path[:len(sup_path)] == sup_path)
 
-    def substitute_type_params(self, type_def, type_args, env):
-        """Substitute type parameters with concrete types"""
-        subst = dict(zip([p.name for p in type_def.type_params], type_args))
-        return self.apply_substitution(type_def.body, subst, env)
+    def check_type_definition_subtype(self, sub_def: Type, sup_def: Type) -> bool:
+        """Check subtyping between type definitions"""
+        # Handle different kinds of type definitions
+        if isinstance(sub_def, StructType) and isinstance(sup_def, StructType):
+            # Structural subtyping for structs
+            return all(
+                fname in sub_def.fields and
+                self.check_subtype(sub_def.fields[fname].field_type,
+                                 ftype.field_type)
+                for fname, ftype in sup_def.fields.items()
+            )
 
-    def apply_substitution(self, type_expr, subst, env):
-        """Apply a type parameter substitution to a type expression"""
-        if isinstance(type_expr, ast.BasicType):
-            return type_expr
-        elif isinstance(type_expr, ast.TypeParameter):
-            if type_expr.name in subst:
-                return subst[type_expr.name]
-            return type_expr
-        elif isinstance(type_expr, ast.TypeApplication):
-            base = self.apply_substitution(type_expr.base_type, subst, env)
-            args = [self.apply_substitution(arg, subst, env) 
-                   for arg in type_expr.type_args]
-            return ast.TypeApplication(base, args)
-        else:
-            return type_expr.map_types(lambda t: self.apply_substitution(t, subst, env))
-
-    def is_subtype(self, subtype, supertype):
-        # Implement subtype checking logic here
-        pass
-
-    def check_reference_compatibility(self, source_type, target_type, context):
-        """Check if one reference type can be assigned to another"""
-        if not isinstance(source_type, ast.ReferenceType) or not isinstance(target_type, ast.ReferenceType):
+        if isinstance(sub_def, EnumType) and isinstance(sup_def, EnumType):
+            # Already handled in check_subtype
             return False
-        
-        # Check reference modes
-        if source_type.mode == target_type.mode:
-            # Same mode is always compatible
-            pass
-        elif source_type.mode == ast.ReferenceMode.UNIQUE:
-            # Unique can be converted to shared or exclusive
-            pass
-        elif source_type.mode == ast.ReferenceMode.EXCLUSIVE:
-            # Exclusive can be temporarily converted to shared
-            if target_type.mode != ast.ReferenceMode.SHARED:
-                context.emit_error(
-                    f"Cannot convert {source_type.mode.value} reference to {target_type.mode.value}",
-                    notes=["Only UNIQUE references can be converted to any mode",
-                          "EXCLUSIVE references can only be converted to SHARED temporarily"]
-                )
-                return False
-        else:  # SHARED
-            # Shared references cannot be converted to other modes
-            if target_type.mode != ast.ReferenceMode.SHARED:
-                context.emit_error(
-                    f"Cannot convert shared reference to {target_type.mode.value}",
-                    notes=["SHARED references cannot be converted to other modes"]
-                )
-                return False
-        
-        # Check lifetimes
-        if source_type.lifetime and target_type.lifetime:
-            if not self.check_lifetime_outlives(source_type.lifetime, target_type.lifetime, context):
-                context.emit_error(
-                    f"Lifetime '{source_type.lifetime.name}' does not outlive '{target_type.lifetime.name}'",
-                    notes=["The borrowed value must be valid for the entire lifetime of the reference"]
-                )
-                return False
-        
-        # Check target type compatibility
-        return self.check_type_compatibility(source_type.target_type, target_type.target_type, context)
-
-    def check_lifetime_outlives(self, source_lifetime, target_lifetime, context):
-        """Check if one lifetime outlives another"""
-        if source_lifetime == target_lifetime:
-            return True
-        
-        # Check explicit constraints
-        if target_lifetime in source_lifetime.constraints:
-            return True
-        
-        # Check lexical scope
-        if isinstance(source_lifetime, ast.Lifetime) and isinstance(target_lifetime, ast.Lifetime):
-            return source_lifetime.scope.contains(target_lifetime.scope)
-        
+            
+        if isinstance(sub_def, TypeScheme) and isinstance(sup_def, TypeScheme):
+            # Check body types under appropriate substitution
+            fresh_vars = [TypeVar(f"fresh_{i}") 
+                         for i in range(len(sub_def.type_vars))]
+            sub_subst = {tv: fv for tv, fv in zip(sub_def.type_vars, fresh_vars)}
+            sup_subst = {tv: fv for tv, fv in zip(sup_def.type_vars, fresh_vars)}
+            
+            sub_body = substitute(sub_def.body_type, sub_subst)
+            sup_body = substitute(sup_def.body_type, sup_subst)
+            
+            return self.check_subtype(sub_body, sup_body)
+            
         return False
 
-    def check_reference_access(self, ref_type, is_mutation, context):
-        """Check if a reference access is valid"""
-        if not isinstance(ref_type, ast.ReferenceType):
-            return True
+    def check_type_application(self, app: TypeApplication) -> Type:
+        """Type check a type application using inferred variance.
         
-        if is_mutation:
-            if not ref_type.can_mutate():
-                context.emit_error(
-                    f"Cannot mutate through {ref_type.mode.value} reference",
-                    notes=["Only UNIQUE and EXCLUSIVE references allow mutation"]
-                )
-                return False
+        This method:
+        1. Resolves the type constructor through imports
+        2. Validates arity of type arguments
+        3. Checks variance constraints
+        4. Constructs the final type
         
-        return True
-
-    def check_move_from_reference(self, ref_type, context):
-        """Check if we can move a value out of a reference"""
-        if not isinstance(ref_type, ast.ReferenceType):
-            return True
-        
-        if not ref_type.can_move_from():
-            context.emit_error(
-                f"Cannot move value out of {ref_type.mode.value} reference",
-                notes=["Only UNIQUE references allow moving out values"]
+        Args:
+            app: The type application to check
+            
+        Returns:
+            The constructed type if valid, None if invalid
+        """
+        # Resolve the constructor through imports
+        constructor = self.resolve_type_alias(app.constructor)
+        if not isinstance(constructor, TypeConstructor):
+            self.errors.append(
+                f"Expected type constructor, got {constructor} "
+                f"(resolved from {app.constructor})"
             )
-            return False
-        
-        return True
+            return None
+            
+        # Check arity matches
+        if len(app.args) != constructor.arity:
+            self.errors.append(
+                f"Wrong number of type arguments for {constructor}, "
+                f"expected {constructor.arity}, got {len(app.args)}"
+            )
+            return None
+            
+        # Check each type argument using inferred variance
+        type_args = []
+        for i, arg in enumerate(app.args):
+            # Resolve and check the argument type
+            arg_type = self.check_type(arg)
+            if arg_type is None:
+                return None
+                
+            # Resolve through imports
+            arg_type = self.resolve_type_alias(arg_type)
+            type_args.append(arg_type)
+            
+            # Get variance from type parameter
+            param = constructor.type_params[i]
+            variance = getattr(param, 'inferred_variance', 'invariant')
+            
+            # Check variance constraints
+            if variance == 'covariant':
+                self.type_inferencer.analyze_type_definition(
+                    arg_type, 
+                    Polarity.POSITIVE
+                )
+            elif variance == 'contravariant':
+                self.type_inferencer.analyze_type_definition(
+                    arg_type,
+                    Polarity.NEGATIVE
+                )
+            elif variance == 'invariant':
+                # For invariant parameters, check both positions
+                self.type_inferencer.analyze_type_definition(
+                    arg_type,
+                    Polarity.POSITIVE
+                )
+                self.type_inferencer.analyze_type_definition(
+                    arg_type,
+                    Polarity.NEGATIVE
+                )
+
+        # Construct the final type
+        return ConstructedType(constructor, type_args)
 
     def visit_LambdaExpression(self, node):
         """Type check a lambda expression and verify its closure captures"""
@@ -1091,6 +1440,84 @@ class TypeChecker:
         param_types = [self.check(p.type_annotation, scope) for p in node.params]
         return ast.FunctionType(param_types, node.return_type, linearity=node.linearity)
 
+    def collect_declarations(self, node) -> List['ast.Node']:
+        """Recursively collect all declarations from an AST node"""
+        declarations = []
+        
+        # Handle different node types
+        if isinstance(node, ast.Program):
+            # Process top-level declarations
+            declarations.extend(node.declarations)
+            # Recursively process each declaration
+            for decl in node.declarations:
+                declarations.extend(self.collect_declarations(decl))
+                
+        elif isinstance(node, ast.FunctionDeclaration):
+            # Add type parameters as declarations
+            if node.type_params:
+                declarations.extend(node.type_params)
+            # Add parameters as declarations
+            declarations.extend(node.parameters)
+            # Process function body
+            if node.body:
+                declarations.extend(self.collect_declarations(node.body))
+                
+        elif isinstance(node, ast.Block):
+            # Process each statement in the block
+            for stmt in node.statements:
+                declarations.extend(self.collect_declarations(stmt))
+                
+        elif isinstance(node, ast.TypeDefinition):
+            # Add type parameters
+            if node.type_params:
+                declarations.extend(node.type_params)
+            # Process the type body recursively
+            declarations.extend(self.collect_declarations(node.body))
+            
+        elif isinstance(node, ast.InterfaceDefinition):
+            # Add type parameters
+            if node.type_params:
+                declarations.extend(node.type_params)
+            # Process each method
+            for method in node.methods:
+                declarations.extend(self.collect_declarations(method))
+                
+        elif isinstance(node, ast.Implementation):
+            # Add type parameters
+            if node.type_params:
+                declarations.extend(node.type_params)
+            # Process where clause if present
+            if node.where_clause:
+                declarations.extend(self.collect_declarations(node.where_clause))
+            # Process methods
+            for method in node.methods:
+                declarations.extend(self.collect_declarations(method))
+                
+        elif isinstance(node, ast.LetStatement):
+            # Add let bindings
+            declarations.extend(node.bindings)
+            # Process initializers recursively
+            for binding in node.bindings:
+                if binding.type_annotation:
+                    declarations.extend(self.collect_declarations(binding.type_annotation))
+                    
+        elif isinstance(node, ast.StructDefinition):
+            # Add fields as declarations
+            declarations.extend(node.fields)
+            # Process field types
+            for field in node.fields:
+                if field.type_expr:
+                    declarations.extend(self.collect_declarations(field.type_expr))
+                    
+        elif isinstance(node, ast.EnumDefinition):
+            # Add variants as declarations
+            declarations.extend(node.variants)
+            # Process variant fields
+            for variant in node.variants:
+                declarations.extend(self.collect_declarations(variant))
+                
+        return declarations
+
     def check_function_call(self, node, scope):
         """Type check a function call with linearity constraints"""
         # Get function type
@@ -1124,6 +1551,439 @@ class TypeChecker:
             node.function.is_active = False
             
         return func_type.return_type
+    def is_type_visible(self, ty: NamedType, from_module: Tuple[str, ...]) -> bool:
+        """Check if a type is visible from the given module path.
+        
+        Rules:
+        1. Public types are visible everywhere
+        2. Protected types are visible in submodules
+        3. Private types are only visible in same module
+        """
+        if ty.is_public:
+            return True
+            
+        # Check if from_module is a submodule of type's module
+        if ty.is_protected:
+            return self.is_submodule(from_module, ty.module_path)
+            
+        # Private types only visible in same module
+        return from_module == ty.module_path
+
+    def get_constructor_variances(self, tc: TypeConstructor) -> List[str]:
+        """Get variance annotations for constructor parameters.
+        
+        Returns a list of variance annotations ('covariant', 'contravariant', 'invariant')
+        for each type parameter of the constructor.
+        """
+        # Look up type definition
+        type_def = self.lookup_type(tc.qualified_name())
+        if not type_def or not hasattr(type_def, 'type_params'):
+            # Default to invariant if no variance info
+            return ['invariant'] * tc.arity
+            
+        # Get inferred variance for each parameter
+        return [getattr(param, 'inferred_variance', 'invariant') 
+                for param in type_def.type_params]
+
+    def check_subtype(self, sub: Type, sup: Type) -> bool:
+        """Check if sub is a subtype of sup using SimpleSub constraint generation.
+        
+        This method handles:
+        1. Nominal types with module paths
+        2. Type variables with variance
+        3. Type constructors (generics)
+        4. Structural types (records, variants)
+        """
+        # Convert to CompactType for efficient unification
+        sub_compact = self.to_compact_type(sub)
+        sup_compact = self.to_compact_type(sup)
+        
+        try:
+            # Handle nominal types
+            if isinstance(sub, NamedType) and isinstance(sup, NamedType):
+                # Check module visibility
+                if not self.is_type_visible(sub, sup.module_path):
+                    return False
+                    
+                # Get type definitions
+                sub_def = self.lookup_type(sub.qualified_name())
+                sup_def = self.lookup_type(sup.qualified_name())
+                
+                if not sub_def or not sup_def:
+                    return False
+                    
+                # Check nominal subtyping relationship
+                return self.check_type_definition_subtype(sub_def, sup_def)
+                
+            # Handle type variables
+            elif isinstance(sub, TypeVar) or isinstance(sup, TypeVar):
+                # Check bounds and constraints
+                if isinstance(sub, TypeVar):
+                    for bound in sub.constraints:
+                        if not self.check_subtype(bound, sup):
+                            return False
+                if isinstance(sup, TypeVar):
+                    for bound in sup.constraints:
+                        if not self.check_subtype(sub, bound):
+                            return False
+                return True
+                
+            # Handle type constructors (generics)
+            elif isinstance(sub, ConstructedType) and isinstance(sup, ConstructedType):
+                if sub.constructor.qualified_name() != sup.constructor.qualified_name():
+                    return False
+                    
+                # Get constructor variance annotations
+                variances = get_constructor_variances(sub.constructor)
+                
+                # Check type arguments according to variance
+                for (sub_arg, sup_arg, variance) in zip(sub.type_args, sup.type_args, variances):
+                    if variance == 'covariant':
+                        if not self.check_subtype(sub_arg, sup_arg):
+                            return False
+                    elif variance == 'contravariant':
+                        if not self.check_subtype(sup_arg, sub_arg):
+                            return False
+                    else:  # invariant
+                        if not (self.check_subtype(sub_arg, sup_arg) and 
+                            self.check_subtype(sup_arg, sub_arg)):
+                            return False
+                return True
+                
+            # Handle structural types
+            elif isinstance(sub, StructType) and isinstance(sup, StructType):
+                # Width subtyping: sub must have at least sup's fields
+                for name, field in sup.fields.items():
+                    if name not in sub.fields:
+                        return False
+                    # Check field types covariantly
+                    if not self.check_subtype(sub.fields[name].field_type, field.field_type):
+                        return False
+                return True
+                
+            elif isinstance(sub, EnumType) and isinstance(sup, EnumType):
+                # For variants, check tag subtyping
+                if not sup.is_open:  # Closed variants must match exactly
+                    if set(sub.variants.keys()) != set(sup.variants.keys()):
+                        return False
+                else:  # Open variants allow width subtyping
+                    if not set(sup.variants.keys()).issubset(set(sub.variants.keys())):
+                        return False
+                        
+                # Check variant field types
+                for tag, sup_variant in sup.variants.items():
+                    sub_variant = sub.variants[tag]
+                    for name, sup_field in sup_variant.fields.items():
+                        if name not in sub_variant.fields:
+                            return False
+                        if not self.check_subtype(sub_variant.fields[name], sup_field):
+                            return False
+                return True
+                
+            # Use SimpleSub unification for other cases
+            return unify(sub_compact, sup_compact, variance='covariant')
+            
+        except Exception as e:
+            self.errors.append(f"Error checking subtype {sub} <: {sup}: {str(e)}")
+            return False
+
+    def to_compact_type(self, ty: Type) -> CompactType:
+        """Convert a Type to CompactType for unification."""
+        if isinstance(ty, TypeVar):
+            ct = CompactType.fresh_var()
+            ct.bounds = TypeBounds()
+            for bound in ty.constraints:
+                bound_ct = self.to_compact_type(bound)
+                ct.bounds.upper_bound = bound_ct
+            return ct
+            
+        elif isinstance(ty, ConstructedType):
+            ct = CompactType()
+            ct.constructor = ty.constructor
+            ct.type_args = [self.to_compact_type(arg) for arg in ty.type_args]
+            return ct
+            
+        elif isinstance(ty, (StructType, EnumType)):
+            # Create fresh type variable for nominal types
+            ct = CompactType.fresh_var()
+            return ct
+            
+        else:
+            # Basic types map directly
+            ct = CompactType()
+            ct.kind = ty.__class__.__name__
+            return ct
+
+        def check_variant_subtype(self, sub: VariantType, sup: VariantType) -> bool:
+            """Check subtyping between variant constructors"""
+            if sub.name != sup.name:
+                return False
+                
+            # Check fields are subtypes with appropriate variance
+            return all(
+                fname in sub.fields and
+                self.check_subtype(sub.fields[fname], ftype, 'covariant')
+                for fname, ftype in sup.fields.items()
+            )
+
+    def check_type_application(self, app: TypeApplication) -> Type:
+        """Type check a type application using inferred variance.
+        
+        This method:
+        1. Resolves the type constructor through imports
+        2. Validates arity of type arguments
+        3. Checks variance constraints
+        4. Constructs the final type
+        
+        Args:
+            app: The type application to check
+            
+        Returns:
+            The constructed type if valid, None if invalid
+        """
+        # Resolve the constructor through imports
+        constructor = self.resolve_type_alias(app.constructor)
+        if not isinstance(constructor, TypeConstructor):
+            self.errors.append(
+                f"Expected type constructor, got {constructor} "
+                f"(resolved from {app.constructor})"
+            )
+            return None
+            
+        # Check arity matches
+        if len(app.args) != constructor.arity:
+            self.errors.append(
+                f"Wrong number of type arguments for {constructor}, "
+                f"expected {constructor.arity}, got {len(app.args)}"
+            )
+            return None
+            
+        # Check each type argument using inferred variance
+        type_args = []
+        for i, arg in enumerate(app.args):
+            # Resolve and check the argument type
+            arg_type = self.check_type(arg)
+            if arg_type is None:
+                return None
+                
+            # Resolve through imports
+            arg_type = self.resolve_type_alias(arg_type)
+            type_args.append(arg_type)
+            
+            # Get variance from type parameter
+            param = constructor.type_params[i]
+            variance = getattr(param, 'inferred_variance', 'invariant')
+            
+            # Check variance constraints
+            if variance == 'covariant':
+                self.type_inferencer.analyze_type_definition(
+                    arg_type, 
+                    Polarity.POSITIVE
+                )
+            elif variance == 'contravariant':
+                self.type_inferencer.analyze_type_definition(
+                    arg_type,
+                    Polarity.NEGATIVE
+                )
+            elif variance == 'invariant':
+                # For invariant parameters, check both positions
+                self.type_inferencer.analyze_type_definition(
+                    arg_type,
+                    Polarity.POSITIVE
+                )
+                self.type_inferencer.analyze_type_definition(
+                    arg_type,
+                    Polarity.NEGATIVE
+                )
+
+        # Construct the final type
+        return ConstructedType(constructor, type_args)
+
+    def check_where_clause(self, where_clause: 'ast.WhereClause', type_env: Dict[str, 'ast.Type']):
+        """Check a where clause and update type environment with constraints.
+        
+        Args:
+            where_clause: The where clause to check
+            type_env: Type environment mapping type parameter names to their types
+        """
+        if where_clause is None:
+            return
+            
+        for constraint in where_clause.constraints:
+            self.check_type_constraint(constraint, type_env)
+            
+    def check_type_constraint(self, constraint: 'ast.TypeConstraint', type_env: Dict[str, 'ast.Type']):
+        """Check a type constraint and update type environment.
+        
+        Args:
+            constraint: The constraint to check
+            type_env: Type environment mapping type parameter names to their types
+        """
+        # Get the type parameter being constrained
+        type_param = type_env.get(constraint.type_param.name)
+        if type_param is None:
+            self.errors.append(f"Unknown type parameter {constraint.type_param.name}")
+            return
+            
+        # Check the bound type exists
+        bound_type = self.check_type(constraint.bound_type)
+        if bound_type is None:
+            return
+            
+        # Handle different constraint kinds
+        if constraint.kind == 'extends':
+            # Type parameter must be a subtype of bound
+            if not self.check_subtype(type_param, bound_type):
+                self.errors.append(
+                    f"Type parameter {constraint.type_param.name} does not satisfy "
+                    f"bound {bound_type}"
+                )
+                
+        elif constraint.kind == 'implements':
+            # Type parameter must implement the interface
+            if not self.check_implements(type_param, bound_type):
+                self.errors.append(
+                    f"Type parameter {constraint.type_param.name} does not implement "
+                    f"interface {bound_type}"
+                )
+                
+    def check_implements(self, type_param: 'ast.Type', interface: 'ast.Type') -> bool:
+        """Check if a type implements an interface.
+        
+        Args:
+            type_param: The type to check
+            interface: The interface that should be implemented
+            
+        Returns:
+            True if type_param implements interface, False otherwise
+        """
+        # Get the interface definition
+        interface_def = self.lookup_type(interface.name)
+        if interface_def is None or not isinstance(interface_def, ast.InterfaceDefinition):
+            self.errors.append(f"Unknown interface {interface.name}")
+            return False
+            
+        # Check each method in the interface
+        for method in interface_def.methods:
+            if not self.has_compatible_method(type_param, method):
+                return False
+                
+        return True
+        
+    def has_compatible_method(self, type_param: 'ast.Type', method: 'ast.MethodDefinition') -> bool:
+        """Check if a type has a method compatible with the interface method.
+        
+        Args:
+            type_param: The type to check
+            method: The interface method definition
+            
+        Returns:
+            True if type_param has a compatible method, False otherwise
+        """
+        # For type parameters, we assume they satisfy the interface
+        # The actual check will happen when the type parameter is instantiated
+        if isinstance(type_param, ast.TypeParameter):
+            return True
+            
+        # For concrete types, check method exists with compatible signature
+        type_def = self.lookup_type(type_param.name)
+        if type_def is None:
+            return False
+            
+        # Find matching method
+        for type_method in type_def.methods:
+            if type_method.name == method.name:
+                # Check parameter types are compatible
+                if len(type_method.params) != len(method.params):
+                    return False
+                    
+                for param1, param2 in zip(type_method.params, method.params):
+                    if not self.check_subtype(param1.type, param2.type):
+                        return False
+                        
+                # Check return type is compatible
+                if not self.check_subtype(type_method.return_type, method.return_type):
+                    return False
+                    
+                return True
+                
+        return False
+
+    def check_variance_constraints(self, ty: Type, required_variance: str):
+        """Check that type satisfies variance requirements"""
+        def get_variance(ty: Type) -> str:
+            if isinstance(ty, TypeVar):
+                return ty.variance
+            if isinstance(ty, ConstructedType):
+                # Composed variance based on constructor's field variance
+                variances = [
+                    compose_variance(field_var, get_variance(arg))
+                    for field_var, arg in zip(ty.constructor.field_variance, ty.type_args)
+                ]
+                return reduce_variance(variances)
+            return 'invariant'
+            
+        actual = get_variance(ty)
+        if not self.is_compatible_variance(actual, required_variance):
+            self.errors.append(
+                f"Type {ty} has variance {actual} but {required_variance} was required"
+            )
+
+    def is_compatible_variance(self, actual: str, required: str) -> bool:
+        """Check if actual variance satisfies required variance"""
+        if required == 'invariant':
+            return actual == 'invariant'
+        if required == 'covariant':
+            return actual in ('covariant', 'invariant')
+        if required == 'contravariant':
+            return actual in ('contravariant', 'invariant')
+        return False
+
+    def compose_variance(self, outer: str, inner: str) -> str:
+        """Compose two variance annotations"""
+        if outer == 'invariant' or inner == 'invariant':
+            return 'invariant'
+        if outer == inner:
+            return outer
+        return 'invariant'  # Different non-invariant variances compose to invariant
+
+    def reduce_variance(self, variances: List[str]) -> str:
+        """Combine multiple variance annotations"""
+        if not variances:
+            return 'invariant'
+        result = variances[0]
+        for v in variances[1:]:
+            result = self.compose_variance(result, v)
+        return result
+    
+    def convert_to_type_definition(self, node: 'ast.TypeDefinition') -> 'TypeDefinition':
+        """Convert AST TypeDefinition to type_defs.TypeDefinition"""
+        # Convert type parameters to TypeVars
+        type_vars = []
+        if node.type_params:
+            for param in node.type_params:
+                type_vars.append(TypeVar(param.name))
+                
+        # Convert body type
+        body_type = self.check_type(node.body) if node.body else None
+        
+        return TypeDefinition(
+            name=node.name,
+            type_params=type_vars,
+            body=body_type
+        )
+
+    def register_type_definition(self, node: 'ast.TypeDefinition'):
+        """Register a type definition in the symbol table"""
+        # Convert AST node to TypeDefinition
+        type_def = self.convert_to_type_definition(node)
+        
+        # Register in symbol table
+        self.symbol_table.type_registry.define_type(node.name, type_def)
+        
+        # Return the TypeDefinition for use in type checking
+        return type_def
+
 
 class BorrowChecker:
     def __init__(self, symbol_table):
@@ -1134,6 +1994,7 @@ class BorrowChecker:
         self.unique_vars = set()  # variables with unique mode
         self.scope_stack = []  # Stack of scopes
         self.region_stack = []  # Stack of regions
+        self.reference_graph = {}  # variable_name -> [(referenced_var, mode)]
         self.enter_scope()     # Initialize the global scope
         self.enter_region()    # Initialize the global region
 
@@ -1307,3 +2168,87 @@ class BorrowChecker:
         # Called when the variable's scope ends or when borrows are no longer valid.
         self.shared_borrows.pop(var_name, None)
         self.mutable_borrows.discard(var_name)
+
+    def add_reference(self, from_var: str, to_var: str, mode: 'ast.Mode'):
+        """Track reference relationship between variables"""
+        if from_var not in self.reference_graph:
+            self.reference_graph[from_var] = []
+        self.reference_graph[from_var].append((to_var, mode))
+        
+    def check_reference_conflict(self, var: str) -> bool:
+        """Check if a variable has conflicting references (mut and const)"""
+        if var not in self.reference_graph:
+            return False
+            
+        has_mut = False
+        has_const = False
+        
+        # Check direct references
+        for _, mode in self.reference_graph[var]:
+            if mode.is_mut:
+                has_mut = True
+            if mode.is_const:
+                has_const = True
+                
+        # Check indirect references through the graph
+        for ref_var, mode in self.reference_graph.get(var, []):
+            if self.check_reference_conflict(ref_var):
+                return True
+                
+        return has_mut and has_const
+        
+    def check_mode_compatibility(self, expected_mode, actual_mode):
+        """Check if actual_mode is compatible with expected_mode"""
+        # Check uniqueness compatibility
+        if expected_mode.uniqueness.mode == ast.UniquenessMode.UNIQUE:
+            if actual_mode.uniqueness.mode != ast.UniquenessMode.UNIQUE:
+                return False
+        elif expected_mode.uniqueness.mode == ast.UniquenessMode.EXCLUSIVE:
+            if actual_mode.uniqueness.mode not in [ast.UniquenessMode.UNIQUE, ast.UniquenessMode.EXCLUSIVE]:
+                return False
+
+        # Check locality compatibility
+        if expected_mode.locality.mode == ast.LocalityMode.LOCAL:
+            if actual_mode.locality.mode != ast.LocalityMode.LOCAL:
+                return False
+
+        # Check linearity compatibility
+        if expected_mode.linearity.mode == ast.LinearityMode.ONCE:
+            if actual_mode.linearity.mode != ast.LinearityMode.ONCE:
+                return False
+        elif expected_mode.linearity.mode == ast.LinearityMode.SEPARATE:
+            if actual_mode.linearity.mode not in [ast.LinearityMode.ONCE, ast.LinearityMode.SEPARATE]:
+                return False
+
+        return True
+
+    def check_assignment(self, target_var: str, source_var: str):
+        """Check if assignment is allowed based on modes"""
+        target_mode = self.get_variable_mode(target_var)
+        source_mode = self.get_variable_mode(source_var)
+        
+        if not target_mode or not source_mode:
+            return  # No mode restrictions
+            
+        # Check mode compatibility
+        if not self.check_mode_compatibility(target_mode, source_mode):
+            raise ValueError(f"Cannot assign {source_var} with mode {source_mode} to {target_var} with mode {target_mode}")
+            
+        # Check for reference conflicts
+        if self.check_reference_conflict(source_var):
+            raise ValueError(f"Cannot assign {source_var} due to conflicting references")
+            
+    def get_variable_mode(self, var_name: str) -> Optional['ast.Mode']:
+        """Get the mode of a variable"""
+        symbol = self.symbol_table.lookup(var_name)
+        return getattr(symbol, 'mode', None) if symbol else None
+        
+    def add_variable(self, var_name: str, mode: Optional['ast.Mode']):
+        """Add a variable to borrow checking"""
+        if mode:
+            if mode.is_unique:
+                self.unique_vars.add(var_name)
+            if mode.is_mut:
+                self.add_mutable_borrow(var_name)
+            else:
+                self.add_shared_borrow(var_name)

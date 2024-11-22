@@ -109,7 +109,7 @@ class Parser:
 
     def p_let_bindings(self, p):
         '''let_bindings : let_binding
-                       | let_bindings COMMA let_binding'''
+                       | let_binding COMMA let_bindings'''
         if len(p) == 2:
             p[0] = [p[1]]
         else:
@@ -405,19 +405,54 @@ class Parser:
             p[0] = p[1] + [p[3]]
 
     def p_function_declaration(self, p):
-        '''function_declaration : FN IDENTIFIER LPAREN parameter_list RPAREN type_annotation LBRACE statement_list RBRACE
+        '''function_declaration : FN IDENTIFIER type_param_list LPAREN parameter_list RPAREN type_annotation LBRACE statement_list RBRACE
+                              | FN IDENTIFIER type_param_list LPAREN parameter_list RPAREN LBRACE statement_list RBRACE
+                              | FN IDENTIFIER type_param_list LPAREN RPAREN type_annotation LBRACE statement_list RBRACE
+                              | FN IDENTIFIER type_param_list LPAREN RPAREN LBRACE statement_list RBRACE
+                              | FN IDENTIFIER LPAREN parameter_list RPAREN type_annotation LBRACE statement_list RBRACE
                               | FN IDENTIFIER LPAREN parameter_list RPAREN LBRACE statement_list RBRACE
                               | FN IDENTIFIER LPAREN RPAREN type_annotation LBRACE statement_list RBRACE
                               | FN IDENTIFIER LPAREN RPAREN LBRACE statement_list RBRACE'''
         
-        if len(p) == 10 and p[4] != ')':  # With params and type
+        if len(p) == 11:  # With type params, params and return type
+            p[0] = ast.FunctionDeclaration(p[2], p[5] if p[5] is not None else [], p[9], return_type=p[7], type_params=p[3])
+        elif len(p) == 10 and p[4] == '(':  # With type params, params, no return type
+            p[0] = ast.FunctionDeclaration(p[2], p[5] if p[5] is not None else [], p[8], type_params=p[3])
+        elif len(p) == 10:  # With type params, no params, with return type
+            p[0] = ast.FunctionDeclaration(p[2], [], p[8], return_type=p[6], type_params=p[3])
+        elif len(p) == 9 and p[3] != '(':  # With type params, no params, no return type
+            p[0] = ast.FunctionDeclaration(p[2], [], p[7], type_params=p[3])
+        elif len(p) == 10:  # No type params, with params and return type
             p[0] = ast.FunctionDeclaration(p[2], p[4] if p[4] is not None else [], p[8], return_type=p[6])
-        elif len(p) == 9 and p[4] != ')':  # With params, no type
-            p[0] = ast.FunctionDeclaration(p[2], p[4] if p[4] is not None else [], p[7], return_type=ast.NoneType())
-        elif len(p) == 9:  # No params, with type
+        elif len(p) == 9 and p[4] != ')':  # No type params, with params, no return type
+            p[0] = ast.FunctionDeclaration(p[2], p[4] if p[4] is not None else [], p[7])
+        elif len(p) == 9:  # No type params, no params, with return type
             p[0] = ast.FunctionDeclaration(p[2], [], p[7], return_type=p[5])
-        else:  # No params, no type
-            p[0] = ast.FunctionDeclaration(p[2], [], p[6], return_type=ast.NoneType())
+        else:  # No type params, no params, no return type
+            p[0] = ast.FunctionDeclaration(p[2], [], p[6])
+
+    def p_type_param_list(self, p):
+        '''type_param_list : LT type_params GT'''
+        p[0] = p[2]
+
+    def p_type_params(self, p):
+        '''type_params : type_param
+                      | type_params COMMA type_param'''
+        if len(p) == 2:
+            p[0] = [p[1]]
+        else:
+            p[0] = p[1] + [p[3]]
+
+    def p_type_param(self, p):
+        '''type_param : IDENTIFIER
+                     | IDENTIFIER COLON type_expression
+                     | IDENTIFIER COLON EFFECT'''
+        if len(p) == 2:
+            p[0] = ast.TypeParameter(p[1])
+        elif len(p) == 4 and p[3] == 'effect':
+            p[0] = ast.TypeParameter(p[1], effect=True)
+        else:
+            p[0] = ast.TypeParameter(p[1], bound=p[3])
 
     def p_parameter(self, p):
         '''parameter : IDENTIFIER COLON type_expression
@@ -934,7 +969,7 @@ class Parser:
         elif len(p) == 5:
             p[0] = ast.EffectOperation(p[1], p[3], None)
         elif len(p) == 4:
-            p[0] = ast.EffectOperation(p[1], p[3], None)
+            p[0] = ast.EffectOperation(p[1], [], None)
         else:   
             p[0] = ast.EffectOperation(p[1], [], None)
 

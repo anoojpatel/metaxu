@@ -323,6 +323,7 @@ class TestModuleSystem(unittest.TestCase):
         func = [stmt for stmt in module.body.statements if isinstance(stmt, ast.FunctionDeclaration)][0]
         
         # Check variant instantiation
+        breakpoint()
         let_stmt = func.body[0]
         variant_inst = let_stmt.initializer
         self.assertIsInstance(variant_inst, ast.VariantInstance)
