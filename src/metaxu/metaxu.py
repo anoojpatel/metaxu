@@ -1,8 +1,9 @@
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any, Optional, Union, List, Dict
 import argparse
 import sys
+import os
 
 from parser import Parser
 from type_checker import TypeChecker
@@ -103,172 +104,69 @@ class MetaxuCompiler:
         with open(path) as f:
             return self.compile_str(f.read(), str(path))
             
+    def compile_files(self, filepaths: List[Union[str, Path]]) -> Dict[str, Any]:
+        """Compile multiple Metaxu source files"""
+        results = {}
+        
+        # First pass - parse all files to collect dependencies
+        for filepath in filepaths:
+            path = Path(filepath)
+            module_name = path.stem
+            self.symbol_table.enter_module(module_name, path)
+            
+            with open(path) as f:
+                source = f.read()
+                ast_tree = self.parser.parse(source)
+                module = ast.Module(
+                    name=module_name,
+                    statements=ast_tree.statements if hasattr(ast_tree, 'statements') else [ast_tree],
+                    path=path
+                )
+                self.type_checker.collect_imports(module)
+            
+            self.symbol_table.exit_module()
+            
+        # Second pass - compile in dependency order
+        for module_name in self.symbol_table.get_load_order():
+            if module_name in results:
+                continue
+                
+            module_info = self.symbol_table.modules[module_name]
+            with open(module_info.path) as f:
+                code = self.compile_str(f.read(), str(module_info.path))
+                results[module_name] = code
+                
+        return results
+
     def run_vm(self, code: Any) -> Any:
         """Run compiled code in the TapeVM"""
         return self.vm.execute(code)
 
-def create_example_files():
-    """Create example Metaxu source files"""
-    examples = {
-        "hello.mx": """
-# Basic hello world
-print("Hello from Metaxu!")
-""",
-
-        "effects.mx": """
-# Example of algebraic effects
-effect Logger {
-    log(message: String) -> Unit
-}
-
-effect State<T> {
-    get() -> T
-    put(value: T) -> Unit
-}
-
-# Counter example using State effect
-fn counter() -> Int {
-    perform State.get() + 1
-}
-
-# Main program using effects
-fn main() {
-    handle State with {
-        get() -> resume(0)
-        put(x) -> resume(())
-    } in {
-        # Use Logger effect
-        handle Logger with {
-            log(msg) -> {
-                print(msg)
-                resume(())
-            }
-        } in {
-            perform Logger.log("Starting counter...")
-            let result = counter()
-            perform Logger.log(f"Counter result: {result}")
-        }
-    }
-}
-""",
-
-        "ownership.mx": """
-# Example of ownership and borrowing
-struct Buffer {
-    data: unique [Int]
-}
-
-fn process(buf: &mut Buffer) {
-    # Mutable borrow of buffer
-    buf.data[0] = 42
-}
-
-fn main() {
-    let buf = Buffer { data: [1, 2, 3] }
-    process(&mut buf)  # Borrow buffer mutably
-    print(buf.data[0]) # Should print 42
-}
-""",
-
-        "modules/std/io.mx": """
-# Standard IO module
-effect IO {
-    print(msg: String) -> Unit
-    read_line() -> String
-}
-
-fn println(msg: String) {
-    perform IO.print(msg + "\n")
-}
-""",
-
-        "modules/std/collections.mx": """
-# Collections module
-struct List<T> {
-    data: [T]
-    len: Int
-}
-
-fn empty<T>() -> List<T> {
-    List { data: [], len: 0 }
-}
-
-fn push<T>(list: &mut List<T>, item: T) {
-    list.data[list.len] = item
-    list.len = list.len + 1
-}
-""",
-
-        "modules/example.mx": """
-# Example using modules
-import std.io
-import std.collections as col
-from std.io import println
-from ..other.utils import format_string
-
-fn main() {
-    # Create a new list
-    let mut numbers = col.empty<Int>()
-    
-    # Add some numbers
-    col.push(&mut numbers, 1)
-    col.push(&mut numbers, 2)
-    
-    # Print using imported println
-    println("Numbers: " + numbers.len)
-    
-    # Use relative import
-    let msg = format_string("Total: {}", numbers.len)
-    io.println(msg)
-}
-"""
-    }
-    
-    example_dir = Path("examples")
-    example_dir.mkdir(exist_ok=True)
-    
-    # Create std library directory
-    std_dir = example_dir / "std"
-    std_dir.mkdir(exist_ok=True)
-    
-    for filename, content in examples.items():
-        file_path = example_dir / filename
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(file_path, 'w') as f:
-            f.write(content)
-    
-    print(f"Created example files in {example_dir}/")
-
 def main():
     """CLI entry point"""
     parser = argparse.ArgumentParser(description="Metaxu compiler")
-    parser.add_argument("file", nargs="?", help="Source file to compile")
-    parser.add_argument("--target", choices=["vm", "c"], default="vm",
-                       help="Compilation target")
-    parser.add_argument("--optimize", "-O", action="store_true",
-                       help="Enable optimizations")
-    parser.add_argument("--debug", "-g", action="store_true",
-                       help="Include debug information")
-    parser.add_argument("--output", "-o", help="Output file")
-    parser.add_argument("--dump-ir", action="store_true",
-                       help="Dump intermediate representation")
-    parser.add_argument("--dump-ast", action="store_true",
-                       help="Dump abstract syntax tree")
-    parser.add_argument("--create-examples", action="store_true",
-                       help="Create example source files")
-    parser.add_argument("--run", "-r", action="store_true",
-                       help="Run the compiled code in VM")
+    parser.add_argument('files', nargs='+', help='Source files to compile')
+    parser.add_argument('--target', choices=['vm', 'c'], default='vm',
+                       help='Compilation target (default: vm)')
+    parser.add_argument('--output', '-o', help='Output file')
+    parser.add_argument('--optimize', '-O', action='store_true',
+                       help='Enable optimizations')
+    parser.add_argument('--debug', '-g', action='store_true',
+                       help='Include debug information')
+    parser.add_argument('--dump-ir', action='store_true',
+                       help='Dump VM IR')
+    parser.add_argument('--dump-ast', action='store_true',
+                       help='Dump AST')
+    parser.add_argument('--run', action='store_true',
+                       help='Run in VM after compilation')
     
     args = parser.parse_args()
     
-    if args.create_examples:
-        create_example_files()
-        return
-        
+   
     if not args.file:
         parser.print_help()
         return
-        
+    
     options = CompileOptions(
         target=args.target,
         optimize=args.optimize,
@@ -282,16 +180,41 @@ def main():
     compiler = MetaxuCompiler(options)
     
     try:
-        code = compiler.compile_file(args.file)
-        if code is None:
+        # Compile all input files
+        results = compiler.compile_files(args.files)
+        
+        if not results:
+            print("Compilation failed", file=sys.stderr)
             sys.exit(1)
             
-        if args.run:
-            result = compiler.run_vm(code)
-            print("Result:", result)
+        # Handle output based on target
+        if args.target == 'vm':
+            if args.run:
+                # Run the main module
+                main_module = Path(args.files[0]).stem
+                if main_module in results:
+                    compiler.run_vm(results[main_module])
+            else:
+                # Save VM bytecode
+                output = args.output or 'out.mxb'
+                with open(output, 'wb') as f:
+                    # TODO: Implement bytecode serialization
+                    pass
+                    
+        else:  # target == 'c'
+            # Generate C output
+            output_dir = args.output or 'build'
+            os.makedirs(output_dir, exist_ok=True)
+            
+            for module_name, code in results.items():
+                output_file = Path(output_dir) / f"{module_name}.c"
+                with open(output_file, 'w') as f:
+                    f.write(code)
+                    
+            print(f"Generated C code in {output_dir}")
             
     except Exception as e:
-        print("Error:", e, file=sys.stderr)
+        print(f"Error: {str(e)}", file=sys.stderr)
         sys.exit(1)
 
 if __name__ == "__main__":

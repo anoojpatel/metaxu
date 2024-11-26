@@ -260,5 +260,68 @@ class TestEffectSafety(unittest.TestCase):
         self.type_checker.check(result)
         self.assertEqual(len(self.type_checker.errors), 0)
 
+    def test_thread_effects(self):
+        code = '''
+        effect Thread {
+            spawn(f: () -> a) -> Thread
+            join(t: Thread) -> Unit
+            current() -> Thread
+            yield_() -> Unit
+            detach(t: Thread) -> Unit
+        }
+
+        effect ThreadPool {
+            submit(f: () -> a) -> Future<a>
+            await_(f: Future<a>) -> a
+            set_pool_size(n: i32) -> Unit
+        }
+
+        // Example: Parallel map using thread pool
+        fn parallel_map<T, U>(items: Vec<T>, f: (T) -> U) -> Vec<U> {
+            // Set up thread pool
+            perform ThreadPool.set_pool_size(4);
+            
+            // Submit tasks for each item
+            let futures = items.map(|item| {
+                perform ThreadPool.submit(|| f(item))
+            });
+            
+            // Await all results
+            futures.map(|future| perform ThreadPool.await_(future))
+        }
+
+        // Example: Producer-consumer with threads
+        fn producer_consumer(items: Vec<i32>) -> Vec<i32> {
+            let queue = new Queue<i32>();
+            let results = new Vec<i32>();
+            
+            // Spawn producer thread
+            let producer = perform Thread.spawn(|| {
+                for item in items {
+                    queue.push(item);
+                    perform Thread.yield_();
+                }
+            });
+            
+            // Spawn consumer thread
+            let consumer = perform Thread.spawn(|| {
+                while !queue.is_empty() {
+                    let item = queue.pop();
+                    results.push(item * 2);
+                    perform Thread.yield_();
+                }
+            });
+            
+            // Wait for both threads
+            perform Thread.join(producer);
+            perform Thread.join(consumer);
+            
+            results
+        }
+        '''
+        result = self.parser.parse(code)
+        self.type_checker.check(result)
+        self.assertEqual(len(self.type_checker.errors), 0)
+
 if __name__ == '__main__':
     unittest.main()

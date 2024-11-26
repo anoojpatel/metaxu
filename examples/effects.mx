@@ -1,0 +1,36 @@
+# Example of algebraic effects
+effect Logger {
+    log(message: String) -> Unit
+}
+
+effect State<T> {
+    get() -> T
+    put(value: T) -> Unit
+}
+
+# Counter example using State effect
+fn counter() -> Int {
+    perform State.get() + 1
+}
+
+# Main program using effects
+fn main() {
+    handle State with {
+        get() -> resume(0)
+        put(x) -> resume(())
+    } in {
+        # Use Logger effect
+        handle Logger with {
+            log(msg) -> {
+                print(msg)
+                resume(())
+            }
+        } in {
+            perform Logger.log("Starting counter")
+            let x = counter()
+            perform Logger.log(f"Counter value: {x}")
+            perform State.put(x)
+            perform Logger.log("Done")
+        }
+    }
+}
