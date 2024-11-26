@@ -1,8 +1,35 @@
 from dataclasses import dataclass
 from typing import List, Dict, Optional, Any, Tuple
+from enum import Enum
 
 class Type:
-    pass
+    """Base class for all types"""
+    def __init__(self):
+        self.destructor = None  # Optional[Destructor]
+        
+    def needs_drop(self) -> bool:
+        """Check if this type needs to be dropped"""
+        return self.destructor is not None and self.destructor.needs_cleanup()
+        
+    def add_cleanup_field(self, field_name: str, field_type: 'Type'):
+        """Add a field that needs cleanup when this type is dropped"""
+        if self.destructor is None:
+            self.destructor = Destructor()
+        self.destructor.add_field(field_name, field_type)
+
+class Destructor:
+    """Information about how to clean up a type"""
+    def __init__(self, cleanup_fields=None):
+        # Map of field name to cleanup action needed
+        self.cleanup_fields = cleanup_fields or {}
+        
+    def add_field(self, field_name: str, field_type: 'Type'):
+        """Add a field that needs cleanup"""
+        self.cleanup_fields[field_name] = field_type
+        
+    def needs_cleanup(self) -> bool:
+        """Check if this type needs any cleanup"""
+        return bool(self.cleanup_fields)
 
 class NamedType(Type):
     module_path: tuple[str, ...]  # E.g., ('my_module', 'sub_module')
@@ -11,6 +38,7 @@ class NamedType(Type):
     is_protected: bool
 
     def __init__(self, module_path, name, is_public=False, is_protected=False):
+        super().__init__()
         self.module_path = module_path
         self.name = name
         self.is_public = is_public
@@ -42,6 +70,7 @@ class NoneType(Type):
 # Ownership Types
 class UniqueType(Type):
     def __init__(self, base_type):
+        super().__init__()
         self.base_type = base_type
 
     def __str__(self):
@@ -49,6 +78,7 @@ class UniqueType(Type):
 
 class SharedType(Type):
     def __init__(self, base_type):
+        super().__init__()
         self.base_type = base_type
 
     def __str__(self):
@@ -57,6 +87,7 @@ class SharedType(Type):
 # Function Types
 class FunctionType(Type):
     def __init__(self, param_types, return_type):
+        super().__init__()
         self.param_types = param_types
         self.return_type = return_type
 
@@ -67,6 +98,7 @@ class FunctionType(Type):
 # Vector Types for SIMD
 class VectorType(Type):
     def __init__(self, base_type, size):
+        super().__init__()
         self.base_type = base_type
         self.size = size
 
@@ -76,6 +108,7 @@ class VectorType(Type):
 # Box Types for Heap Allocation
 class BoxType(Type):
     def __init__(self, inner_type):
+        super().__init__()
         self.inner_type = inner_type
 
     def __str__(self):
@@ -83,6 +116,7 @@ class BoxType(Type):
 
 class ReferenceType(Type):
     def __init__(self, base_type, is_mutable=False):
+        super().__init__()
         self.base_type = base_type
         self.is_mutable = is_mutable
 
@@ -93,6 +127,7 @@ class ReferenceType(Type):
 # Recursive Types
 class RecursiveType(Type):
     def __init__(self, type_name, type_parameters=None):
+        super().__init__()
         self.type_name = type_name
         self.type_parameters = type_parameters or []
         self._resolved_type = None
@@ -113,6 +148,7 @@ class RecursiveType(Type):
 class TypeVar(Type):
     """Type variable for polymorphic types"""
     def __init__(self, name: str, module_path: Optional[Tuple[str, ...]] = None):
+        super().__init__()
         self.name = name
         self.module_path = module_path or tuple()
         self.constraints = []  # Upper/lower bounds for constrained type variables
@@ -128,6 +164,7 @@ class TypeConstructor(Type):
     """Type constructor for generic types"""
     def __init__(self, name: str, arity: int,
                  module_path: Optional[Tuple[str, ...]] = None):
+        super().__init__()
         self.name = name
         self.arity = arity
         self.module_path = module_path or tuple()
@@ -141,6 +178,7 @@ class TypeConstructor(Type):
 # Enum and Variant Types
 class RowVar(Type):
     def __init__(self, name):
+        super().__init__()
         self.name = name
 
     def __str__(self):
@@ -154,6 +192,7 @@ class EnumType(Type):
                  type_params: List[TypeVar] = None,
                  module_path: Optional[Tuple[str, ...]] = None,
                  is_open: bool = False):
+        super().__init__()
         self.name = name
         self.variants = variants
         self.type_params = type_params or []
@@ -173,6 +212,7 @@ class EnumType(Type):
 
 class VariantType(Type):
     def __init__(self, enum_name, name, fields=None):
+        super().__init__()
         self.enum_name = enum_name
         self.name = name
         self.fields = fields or {}  # Dict of field_name: field_type
@@ -227,6 +267,7 @@ class LinearityMode(Mode):
 
 class ModeType(Type):
     def __init__(self, base_type, uniqueness=None, locality=None, linearity=None):
+        super().__init__()
         self.base_type = base_type
         self.uniqueness = uniqueness or UniquenessMode(UniquenessMode.SHARED)
         self.locality = locality or LocalityMode(LocalityMode.GLOBAL)
@@ -252,6 +293,7 @@ class StructField:
 
 class StructType(Type):
     def __init__(self, name, fields):
+        super().__init__()
         self.name = name
         self.fields = {name: StructField(name, ftype) for name, ftype in fields.items()}
 
@@ -295,26 +337,113 @@ class HandlerType(Type):
     handled_type: Type
     resume_type: Type
 
+class DomainKey(Type):
+    """Type representing an access key for a domain"""
+    def __init__(self, domain_type: 'DomainType'):
+        super().__init__()
+        self.domain_type = domain_type
+    
+    def __str__(self):
+        return f"Key<{self.domain_type}>"
+
 class DomainEffect(EffectType):
-    """Effect for domain-based parallelism operations"""
+    """Effect for domain-based parallelism operations with key-based access control"""
     def __init__(self, value_type):
         super().__init__("Domain")
         self.value_type = value_type
         self.operations = {
-            "create": FunctionType([value_type], DomainType(value_type)),
-            "acquire": FunctionType([DomainType(value_type)], value_type),
-            "release": FunctionType([DomainType(value_type)], UnitType()),
-            "transfer": FunctionType([DomainType(value_type), ThreadType()], UnitType())
+            # Create a new domain with a value, returns domain and its key
+            "create": FunctionType([value_type], TupleType([DomainType(value_type), DomainKey(DomainType(value_type))])),
+            
+            # Acquire mutable access using a key, returns the value
+            "acquire": FunctionType([DomainType(value_type), DomainKey(DomainType(value_type))], value_type),
+            
+            # Release mutable access using a key
+            "release": FunctionType([DomainType(value_type), DomainKey(DomainType(value_type)), value_type], UnitType()),
+            
+            # Transfer domain ownership to another thread, transfers the key too
+            "transfer": FunctionType(
+                [DomainType(value_type), DomainKey(DomainType(value_type)), ThreadType()], 
+                UnitType()
+            ),
+            
+            # Try to acquire without blocking, returns None if domain is locked
+            "try_acquire": FunctionType(
+                [DomainType(value_type), DomainKey(DomainType(value_type))], 
+                OptionType(value_type)
+            )
         }
 
 class DomainType(Type):
-    """Type representing a domain containing a value"""
+    """Type representing a domain containing a value with key-based access control"""
     def __init__(self, value_type):
         super().__init__()
         self.value_type = value_type
+        # Domains need cleanup since they allocate heap memory
+        self.add_cleanup_field("value", value_type)
+        # The contained value must be mutable (UNIQUE or EXCLUSIVE)
+        if isinstance(value_type, ModeType):
+            if value_type.uniqueness.mode not in [UniquenessMode.UNIQUE, UniquenessMode.EXCLUSIVE]:
+                raise TypeError("Domain values must have UNIQUE or EXCLUSIVE uniqueness")
     
     def __str__(self):
         return f"Domain<{self.value_type}>"
+
+    def check_thread_safe(self, value_type: Type) -> bool:
+        """Domains are thread-safe because access is controlled by keys"""
+        return True
+
+class ThreadEffect(EffectType):
+    """Effect for thread operations with ownership tracking"""
+    def __init__(self):
+        super().__init__("Thread")
+        self.operations = {
+            # Can only move values with appropriate modes across threads
+            "spawn": FunctionType(
+                [ClosureType([], AnyType(), requires_thread_safe=True)], 
+                ThreadType()
+            ),
+            "join": FunctionType([ThreadType()], UnitType()),
+            "current": FunctionType([], ThreadType()),
+            "yield_": FunctionType([], UnitType()),
+            "detach": FunctionType([ThreadType()], UnitType())
+        }
+
+    def check_thread_safe(self, value_type: Type) -> bool:
+        """Check if a type is thread-safe based on its modes"""
+        if isinstance(value_type, ModeType):
+            # Thread-safe if:
+            # 1. Unique or Exclusive uniqueness (no shared mutable state)
+            # 2. Once or Separate linearity (no concurrent access)
+            is_safe_uniqueness = value_type.uniqueness.mode in [UniquenessMode.UNIQUE, UniquenessMode.EXCLUSIVE]
+            is_safe_linearity = value_type.linearity.mode in [LinearityMode.ONCE, LinearityMode.SEPARATE]
+            
+            # Local values are not thread-safe as they are tied to a specific thread
+            if value_type.locality.mode == LocalityMode.LOCAL:
+                return False
+                
+            return is_safe_uniqueness or is_safe_linearity
+        return False
+
+class ClosureType(Type):
+    """Type for closures with mode tracking"""
+    def __init__(self, param_types: List[Type], return_type: Type, 
+                 requires_thread_safe: bool = False,
+                 captured_vars: Dict[str, ModeType] = None):
+        super().__init__()
+        self.param_types = param_types
+        self.return_type = return_type
+        self.requires_thread_safe = requires_thread_safe
+        self.captured_vars = captured_vars or {}
+
+    def check_captures(self) -> bool:
+        """Check if captures are thread-safe based on their modes"""
+        if not self.requires_thread_safe:
+            return True
+            
+        thread_effect = ThreadEffect()
+        return all(thread_effect.check_thread_safe(var_type) 
+                  for var_type in self.captured_vars.values())
 
 # SimpleSub Type System Components
 class TypeScheme:
@@ -353,6 +482,7 @@ class ConstructedType(Type):
 class IntersectionType(Type):
     """Intersection of types (greatest lower bound)"""
     def __init__(self, types: List[Type]):
+        super().__init__()
         self.types = types
         
     def __str__(self):
@@ -361,6 +491,7 @@ class IntersectionType(Type):
 class UnionType(Type):
     """Union of types (least upper bound)"""
     def __init__(self, types: List[Type]):
+        super().__init__()
         self.types = types
         
     def __str__(self):
@@ -450,6 +581,45 @@ def substitute(ty: Type, subst: Dict[TypeVar, Type], visited: Optional[Set[str]]
         )
         
     return ty
+
+@dataclass
+class TypeBounds:
+    """Bounds for type variables during unification"""
+    upper_bound: Optional[Type] = None
+    lower_bound: Optional[Type] = None
+    needs_drop: bool = False
+
+    def merge(self, other: 'TypeBounds') -> 'TypeBounds':
+        return TypeBounds(
+            upper_bound=self.upper_bound if self.upper_bound else other.upper_bound,
+            lower_bound=other.lower_bound if other.lower_bound else self.lower_bound,
+            needs_drop=self.needs_drop or other.needs_drop
+        )
+
+@dataclass
+class TypeInfo:
+    name: str
+    size: int
+    alignment: int
+    needs_drop: bool = False
+    drop_fn: Optional[Callable] = None
+
+    def get_drop_fn(self) -> Optional[str]:
+        if not self.needs_drop:
+            return None
+        return f"drop_{self.name}"
+
+@dataclass
+class StructField:
+    name: str
+    type: 'Type'
+    offset: int
+    needs_drop: bool = False
+
+    def get_drop_code(self, struct_ptr: str) -> Optional[str]:
+        if not self.needs_drop:
+            return None
+        return f"drop_{self.type.name}(&{struct_ptr}->{self.name});"
 
 @dataclass
 class CompactType:
@@ -618,9 +788,3 @@ def next_id() -> int:
 reserved = {
     # ... existing tokens ...
 }
-
-@dataclass
-class TypeBounds:
-    """Bounds for type variables during unification"""
-    upper_bound: Optional[CompactType] = None
-    lower_bound: Optional[CompactType] = None

@@ -107,26 +107,7 @@ class CInteropManager:
     def _create_nonblocking_wrapper(self, func_info: CFunctionInfo, args: List[ast.Expression]) -> ast.Expression:
         """Create a non-blocking wrapper that manages reference lifetimes"""
         # Similar to blocking wrapper but runs in background
-        stmts = []
-        
-        # Lock references
-        if func_info.borrows_refs or func_info.consumes_refs:
-            stmts.append(ast.ReferenceLock(args))
-            
-        # Create async call
-        call = ast.AsyncCFunctionCall(
-            name=func_info.name,
-            args=args,
-            return_type=self._convert_c_type(func_info.return_type)
-        )
-        
-        # Add completion handler for reference management
-        completion_handler = ast.CompletionHandler([
-            ast.ReferenceUnlock(args),
-            ast.ReferenceCleanup(args) if func_info.consumes_refs else ast.NoOp()
-        ])
-        
-        return ast.AsyncBlock([*stmts, call, completion_handler])
+        return NotImplementedError()
 
     def _create_unsafe_wrapper(self, func_info: CFunctionInfo, args: List[ast.Expression]) -> ast.Expression:
         """Create an unsafe wrapper with minimal checks"""

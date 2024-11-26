@@ -1,0 +1,14 @@
+# Collections module
+struct List<T> {
+    data: vector[T,N]
+    len: Int
+}
+
+fn empty<T>() -> List[T] {
+    List { data: vector[T,N], len: 0 }
+}
+
+fn push<T>(list: @mut List[T], item: T) {
+    list.data[list.len] = item
+    list.len = list.len + 1
+}

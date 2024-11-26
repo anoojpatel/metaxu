@@ -1,0 +1,15 @@
+# Example of ownership and borrowing
+struct Buffer {
+    data: unique vector[Int,N]
+}
+
+fn process(buf: @mut Buffer) {
+    # Mutable borrow of buffer
+    buf.data[0] = 42
+}
+
+fn main() {
+    let buf = Buffer { data: vector[int,3](1, 2, 3) }
+    process(buf)  # Borrow buffer
+    print(buf.data[0])  # Still own buffer here
+}

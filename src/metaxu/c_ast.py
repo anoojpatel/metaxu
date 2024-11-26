@@ -10,13 +10,6 @@ class CFunctionCall(Expression):
     return_type: Type
 
 @dataclass
-class AsyncCFunctionCall(Expression):
-    """An asynchronous call to a C function"""
-    name: str
-    args: List[Expression]
-    return_type: Type
-
-@dataclass
 class UnsafeBlock(Expression):
     """A block of unsafe code"""
     body: List[Expression]

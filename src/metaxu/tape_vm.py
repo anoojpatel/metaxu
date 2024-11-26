@@ -24,6 +24,15 @@ class Opcode(Enum):
     TRANSFER_DOMAIN = auto()
     # Ownership
     MOVE_VAR = auto()
+    # Memory operations
+    LOAD_INDIRECT = auto()  # Load value from address on stack
+    STORE_INDIRECT = auto()  # Store value to address on stack
+    MALLOC = auto()  # Allocate memory
+    FREE = auto()  # Free memory
+    TRACK_DROP = auto()  # Track value for dropping
+    MOVE = auto()  # Move value (invalidate source)
+   
+    EXCLAVE = auto()  # Move local value to caller's region
     # SIMD Operations
     VEC_ADD = auto()
     VEC_SUB = auto()
@@ -51,7 +60,7 @@ class Opcode(Enum):
     FROM_DEVICE = auto()
     # Control flow
     JUMP_IF_FALSE = auto()
-    JUMP = auto()
+    JUMP = auto() 
     LABEL = auto()
     DUP = auto()
     POP = auto()
@@ -70,6 +79,7 @@ class Frame:
         self.scope_name = scope_name
         self.local_vars = {}
         self.resources = []  # List of resources to deallocate
+        self.owned_values = []  # Values owned by this frame
         if environment:
             self.local_vars.update(environment)
 
@@ -106,6 +116,8 @@ class TapeVM:
         self.continuations = {}
         self.thread_id = thread_id or generate_thread_id()
         self.message_queue = message_queue or Queue()
+        self.memory = {}  # Memory for heap allocations
+        self.drop_tracker = {}  # Track which values need dropping
         register_vm(self)
 
     def run(self):
@@ -133,12 +145,54 @@ class TapeVM:
                     self.stack.append(frame.local_vars[name])
                     break
             else:
-                raise Exception(f"Variable '{name}' not found")            
+                raise Exception(f"Variable '{name}' not found")
         elif opcode == Opcode.STORE_VAR:
             name = instr.operands[0]
-            self.frames[-1].local_vars[name] = self.stack.pop()
-            self.pc += 1
-            self.vars[instr.operands[0]] = value
+            value = self.stack.pop()
+            self.frames[-1].local_vars[name] = value
+        elif opcode == Opcode.LOAD_INDIRECT:
+            # Load value from address
+            addr = self.stack.pop()
+            if not isinstance(addr, int):
+                raise Exception("Invalid memory address")
+            if addr not in self.memory:
+                raise Exception("Memory access violation")
+            self.stack.append(self.memory[addr])
+            
+        elif opcode == Opcode.STORE_INDIRECT:
+            # Store value to address
+            value = self.stack.pop()
+            addr = self.stack.pop()
+            if not isinstance(addr, int):
+                raise Exception("Invalid memory address")
+            self.memory[addr] = value
+            
+        elif opcode == Opcode.MALLOC:
+            # Allocate memory and return address
+            size = self.stack.pop()
+            addr = len(self.memory)  # Simple allocation strategy
+            self.memory[addr] = None  # Reserve space
+            self.stack.append(addr)
+            
+        elif opcode == Opcode.FREE:
+            # Free memory at address
+            addr = self.stack.pop()
+            if addr in self.memory:
+                del self.memory[addr]
+                
+        elif opcode == Opcode.TRACK_DROP:
+            # Track value for dropping
+            var_name = instr.operands[0]
+            needs_drop = instr.operands[1]
+            self.drop_tracker[var_name] = needs_drop
+            
+        elif opcode == Opcode.MOVE:
+            # Move value (invalidate source)
+            src = instr.operands[0]
+            dst = instr.operands[1]
+            if src in self.drop_tracker:
+                self.drop_tracker[dst] = self.drop_tracker[src]
+                del self.drop_tracker[src]
         elif opcode == Opcode.ADD:
             right = self.stack.pop()
             left = self.stack.pop()
@@ -325,7 +379,7 @@ class TapeVM:
             if not self.frames:
                 raise Exception("Frame stack underflow!")
             frame = self.frames.pop()
-            self.pc = self.frame.return_address
+            self.pc = frame.return_address
         elif opcode == Opcode.PUSH:
             value = self.stack.pop()
             self.stack.append(value)
@@ -333,6 +387,24 @@ class TapeVM:
         elif opcode == Opcode.POP:
             self.stack.pop()
             self.pc += 1        
+        
+        elif opcode == Opcode.EXCLAVE:
+            # Move value from current frame to caller's frame
+            value = self.stack.pop()
+            if len(self.call_stack) < 2:
+                raise Exception("Cannot exclave from top-level frame")
+            
+            # Get caller's frame
+            caller_frame = self.call_stack[-2]
+            
+            # Move value to caller's region
+            caller_frame.owned_values.append(value)
+            self.frames[-1].owned_values.remove(value)
+            
+            # Return control to caller
+            self.pc = caller_frame.return_address
+            self.call_stack.pop()
+            self.frames.pop()
         # TODO: Implement other opcodes...
         else:
             raise Exception(f"Unknown opcode {opcode}")

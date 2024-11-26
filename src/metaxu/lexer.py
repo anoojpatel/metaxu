@@ -73,12 +73,13 @@ class Lexer:
 
     # List of token names
     tokens = [
-        'IDENTIFIER', 'INTEGER', 'FLOAT', 'STRING',
+        'IDENTIFIER', 'NUMBER', 'FLOAT', 'STRING', 'BOOL',
         'PLUS', 'MINUS', 'TIMES', 'DIVIDE',
         'LPAREN', 'RPAREN', 'LBRACE', 'RBRACE', 'LBRACKET', 'RBRACKET',
-        'SEMICOLON', 'COLON', 'COMMA', 'DOT',
-        'EQUALS', 'ARROW', 'PIPE',
-        'LT', 'GT', 'LE', 'GE', 'EQ', 'NE',
+        'EQUALS', 'SEMICOLON', 'COLON', 'COMMA', 'DOT', 'TRIPLE_DOT',
+        'DOUBLECOLON', 'ARROW', 'BACKSLASH', 'AT', 'AMPERSAND',
+        'LESS', 'GREATER', 'STAR',  # Add STAR for pointer types
+        'AS'  # Add AS for type casts
     ] + list(reserved.values())
 
     # Regular expression rules for simple tokens
@@ -92,19 +93,21 @@ class Lexer:
     t_RBRACE = r'\}'
     t_LBRACKET = r'\['
     t_RBRACKET = r'\]'
+    t_EQUALS = r'='
     t_SEMICOLON = r';'
     t_COLON = r':'
     t_COMMA = r','
     t_DOT = r'\.'
-    t_EQUALS = r'='
+    t_TRIPLE_DOT = r'\.\.\.'
+    t_DOUBLECOLON = r'::'
     t_ARROW = r'->'
-    t_PIPE = r'\|'
-    t_LT = r'<'
-    t_GT = r'>'
-    t_LE = r'<='
-    t_GE = r'>='
-    t_EQ = r'=='
-    t_NE = r'!='
+    t_BACKSLASH = r'\\' # Added for function type annotations
+    t_AT = r'@'
+    t_AMPERSAND = r'&'
+    t_LESS = r'<'
+    t_GREATER = r'>'
+    t_STAR = r'\*'  # Add rule for STAR token
+    t_AS = r'as'    # Add rule for AS token
 
     # Regular expression rules with actions
     def t_IDENTIFIER(self, t):
@@ -113,7 +116,7 @@ class Lexer:
         t.type = self.reserved.get(t.value, 'IDENTIFIER') 
         return t
 
-    def t_INTEGER(self, t):
+    def t_NUMBER(self, t):
         r'\d+'
         t.value = int(t.value)
         return t
@@ -122,11 +125,16 @@ class Lexer:
         r'\d*\.\d+'
         t.value = float(t.value)
         return t
+    def t_BOOL(self, t):
+        r'(true|false)'
+        t.value = True if t.value == 'true' else False
+        return t
 
     def t_STRING(self, t):
         r'"[^"]*"'
         t.value = t.value[1:-1]  # Remove quotes
         return t
+
 
     # Comments
     def t_COMMENT(self, t):

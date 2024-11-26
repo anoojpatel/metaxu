@@ -70,6 +70,14 @@ class TypeInfo:
     layout: Optional[MemoryLayout] = None
     is_generic: bool = False
     generic_info: Optional[GenericTypeInfo] = None
+    needs_drop: bool = False
+
+class DropFlag:
+    """Tracks whether a value needs to be dropped"""
+    def __init__(self, var_name: str, var_type: Type):
+        self.var_name = var_name
+        self.var_type = var_type
+        self.needs_drop = True  # Set to False when moved
 
 class CodeGenerator:
     def __init__(self):
@@ -94,6 +102,52 @@ class CodeGenerator:
         self.current_stack_offset = 0
         self.effect_handlers = {}
         self.continuations = {}
+        self.drop_flags = {}  # Dict[str, DropFlag]
+
+    def track_drop(self, var_name: str, var_type: Type):
+        """Start tracking a value that needs to be dropped"""
+        if var_type.needs_drop():
+            self.drop_flags[var_name] = DropFlag(var_name, var_type)
+
+    def move_value(self, var_name: str):
+        """Mark a value as moved, so it won't be dropped"""
+        if var_name in self.drop_flags:
+            self.drop_flags[var_name].needs_drop = False
+
+    def generate_drops(self, scope_vars: set):
+        """Generate drop code for variables going out of scope"""
+        drop_code = []
+        for var_name in scope_vars:
+            if var_name in self.drop_flags and self.drop_flags[var_name].needs_drop:
+                flag = self.drop_flags[var_name]
+                drop_code.extend(self.generate_destructor(flag.var_name, flag.var_type))
+                del self.drop_flags[var_name]
+        return drop_code
+
+    def generate_destructor(self, var_name: str, var_type: Type) -> List[Instruction]:
+        """Generate code to clean up a value"""
+        instructions = []
+
+        if isinstance(var_type, DomainType):
+            # Free domain and its contents
+            instructions.extend([
+                Instruction(Opcode.LOAD_VAR, var_name),
+                Instruction(Opcode.CALL_FUNC, "free_domain", 1)
+            ])
+        elif isinstance(var_type, ModeType) and var_type.locality.mode == LocalityMode.GLOBAL:
+            # Free heap-allocated global value
+            instructions.extend([
+                Instruction(Opcode.LOAD_VAR, var_name),
+                Instruction(Opcode.CALL_FUNC, "free", 1)
+            ])
+
+            # Recursively free fields that need cleanup
+            if var_type.destructor:
+                for field_name, field_type in var_type.destructor.cleanup_fields.items():
+                    field_var = f"{var_name}->{field_name}"
+                    instructions.extend(self.generate_destructor(field_var, field_type))
+
+        return instructions
 
     def new_label(self, prefix="label"):
         label = f"{prefix}_{self.label_counter}"
@@ -132,7 +186,7 @@ class CodeGenerator:
         output = [f"# Module: {node.name}"]
         if node.docstring:
             output.append(f'"""{node.docstring}"""')
-        
+
         for stmt in node.statements:
             output.extend(self.generate(stmt))
 
@@ -171,21 +225,59 @@ class CodeGenerator:
             self.generate(stmt)
 
     def gen_Assignment(self, node):
+        # If target is being moved, mark it as moved
+        if isinstance(node.expression, MoveNode):
+            self.move_value(node.name)
+        
+        # Generate the expression code
         self.generate(node.expression)
         self.emit(Opcode.STORE_VAR, node.name)
-        symbol = Symbol(node.name, self.type_checker.check(node.expression))
+        
+        # Track for destruction if needed
+        var_type = self.type_checker.check(node.expression)
+        symbol = Symbol(node.name, var_type)
         self.symbol_table.define(node.name, symbol)
+        if var_type.needs_drop():
+            self.track_drop(node.name, var_type)
 
     def gen_LetStatement(self, node):
+        # Similar to Assignment
+        if isinstance(node.expression, MoveNode):
+            self.move_value(node.name)
+            
         self.generate(node.expression)
         self.emit(Opcode.STORE_VAR, node.name)
+        
+        var_type = self.type_checker.check(node.expression)
+        if var_type.needs_drop():
+            self.track_drop(node.name, var_type)
 
     def gen_VariableDeclaration(self, node):
+        if isinstance(node.initializer, MoveNode):
+            self.move_value(node.name)
+            
         self.generate(node.initializer)
         self.emit(Opcode.STORE_VAR, node.name)
+        
+        # Track for destruction
+        if node.type.needs_drop():
+            self.track_drop(node.name, node.type)
 
     def gen_Return(self, node):
+        """Generate code for return statement with proper cleanup"""
+        # Get current scope's variables that need dropping
+        scope_vars = set()
+        for scope in reversed(self.scope_stack):
+            scope_vars.update(scope.variables)
+            
+        # Generate drops for all variables in scope
+        drop_instrs = self.generate_drops(scope_vars)
+        
+        # Generate the return value
         self.generate(node.expression)
+        
+        # Add the drop instructions before the return
+        self.instructions.extend(drop_instrs)
         self.emit(Opcode.RETURN)
 
     def gen_Literal(self, node):
@@ -199,7 +291,7 @@ class CodeGenerator:
         right_type = self.type_checker.check(node.right)
         self.generate(node.left)
         self.generate(node.right)
-        
+
         if isinstance(left_type, VectorType) and isinstance(right_type, VectorType):
             op_map = {
                 '+': Opcode.VEC_ADD,
@@ -218,14 +310,20 @@ class CodeGenerator:
 
     def gen_Block(self, node):
         self.enter_scope('block')
+        scope_vars = set()
         for stmt in node.statements:
+            if isinstance(stmt, VarDeclNode):
+                scope_vars.add(stmt.name)
+                self.track_drop(stmt.name, stmt.type)
             self.generate(stmt)
+        drop_instrs = self.generate_drops(scope_vars)
+        self.instructions.extend(drop_instrs)
         self.exit_scope()
 
     def gen_EffectDeclaration(self, node):
         """Generate code for effect declaration"""
         effect_name = node.name
-        
+
         # Create effect type info
         effect_layout = MemoryLayout()
         self.type_info[effect_name] = TypeInfo(
@@ -234,7 +332,7 @@ class CodeGenerator:
             layout=effect_layout,
             is_generic=bool(node.type_params)
         )
-        
+
         # Generate labels for each operation
         for op in node.operations:
             op_label = self.new_label(f"{effect_name}_{op.name}")
@@ -244,40 +342,40 @@ class CodeGenerator:
     def gen_HandleExpression(self, node):
         """Generate code for handle expression"""
         effect_name = node.effect.name
-        
+
         # Create labels for handlers
         handler_labels = {}
         for handler in node.handlers:
             handler_label = self.new_label(f"handler_{handler.name}")
             handler_labels[handler.name] = handler_label
-            
+
         # Set up handlers
         for handler in node.handlers:
             self.emit(Opcode.SET_HANDLER, handler.name, handler_labels[handler.name])
-        
+
         # Generate handler implementations
         for handler in node.handlers:
             self.emit(Opcode.LABEL, handler_labels[handler.name])
             self.enter_scope(f"handler_{handler.name}")
-            
+
             # Set up parameters including continuation
             for param in handler.params[:-1]:  # Skip continuation param
                 self.emit(Opcode.STORE_VAR, param.name)
-            
+
             # Store continuation
             cont_param = handler.params[-1]
             self.emit(Opcode.CREATE_CONTINUATION, cont_param.name)
-            
+
             # Generate handler body
             self.generate(handler.body)
-            
+
             self.exit_scope()
-        
+
         # Generate body with handlers in scope
         body_end_label = self.new_label("handle_end")
         self.generate(node.body)
         self.emit(Opcode.LABEL, body_end_label)
-        
+
         # Clean up handlers
         for handler in node.handlers:
             self.emit(Opcode.UNSET_HANDLER, handler.name)
@@ -287,17 +385,17 @@ class CodeGenerator:
         # Generate arguments
         for arg in node.arguments:
             self.generate(arg)
-        
+
         # Create continuation for resume
         cont_label = self.new_label("perform_cont")
         self.emit(Opcode.CREATE_CONTINUATION, cont_label)
-        
+
         # Call effect handler
-        self.emit(Opcode.CALL_EFFECT_HANDLER, 
+        self.emit(Opcode.CALL_EFFECT_HANDLER,
                  node.effect.name,
                  len(node.arguments),
                  cont_label)
-        
+
         # Add label for continuation
         self.emit(Opcode.LABEL, cont_label)
 
@@ -305,13 +403,13 @@ class CodeGenerator:
         """Generate code for struct definition"""
         struct_name = node.name
         layout = MemoryLayout()
-        
+
         # Add fields to layout
         for field in node.fields:
             field_type = self.type_checker.check(field.type)
             type_info = self.type_info[field_type.name]
             layout.add_field(field.name, type_info.size, type_info.align, field_type)
-        
+
         # Store struct info
         self.type_info[struct_name] = TypeInfo(
             size=layout.total_size,
@@ -325,11 +423,11 @@ class CodeGenerator:
         """Generate code for struct instantiation"""
         struct_type = self.type_checker.check(node)
         layout = self.struct_layouts[struct_type.name]
-        
+
         # Generate field values
         for field in node.fields:
             self.generate(field.value)
-        
+
         self.emit(Opcode.CREATE_STRUCT, struct_type.name, len(node.fields))
 
     def gen_FieldAccess(self, node):
@@ -338,7 +436,7 @@ class CodeGenerator:
         struct_type = self.type_checker.check(node.struct)
         layout = self.struct_layouts[struct_type.name]
         offset = layout.get_offset(node.field)
-        
+
         self.emit(Opcode.ACCESS_FIELD, offset)
 
     def gen_TypeDefinition(self, node):
@@ -346,7 +444,7 @@ class CodeGenerator:
         if node.type_params:
             # This is a generic type definition
             self.ir_generator.register_generic_type(node)
-            
+
             # Add to symbol table
             type_info = self.type_checker.check_type_definition(node)
             self.symbol_table.define_type(node.name, type_info)
@@ -360,20 +458,20 @@ class CodeGenerator:
         base_type = self.symbol_table.lookup_type(node.base_type)
         if not base_type:
             raise Exception(f"Undefined type: {node.base_type}")
-            
+
         # Check and resolve type arguments
         type_args = []
         for arg in node.type_args:
             arg_type = self.type_checker.check_type(arg)
             type_args.append(arg_type)
-            
+
         # Generate IR for instantiated type
         type_info = self.ir_generator.instantiate_generic_type(node.base_type, type_args)
-        
+
         # Add instantiated type to instructions
         self.instructions.extend(self.ir_generator.instructions)
         self.ir_generator.instructions.clear()
-        
+
         return type_info
 
     def gen_TypeParameter(self, node):
@@ -383,13 +481,13 @@ class CodeGenerator:
         for bound in node.bounds:
             bound_type = self.type_checker.check_type(bound)
             bound_types.append(bound_type)
-            
+
         # Create type parameter info
         type_param = self.type_checker.create_type_parameter(node.name, bound_types)
-        
+
         # Add to symbol table
         self.symbol_table.define_type_parameter(node.name, type_param)
-        
+
         return type_param
 
     def gen_RecursiveType(self, node):
@@ -397,20 +495,20 @@ class CodeGenerator:
         # First pass: register type parameters
         for param in node.type_params:
             self.gen_TypeParameter(param)
-            
+
         # Second pass: process the type body with parameters in scope
         body_type = self.type_checker.check_type(node.body)
-        
+
         # Create recursive type
         type_info = self.type_checker.create_recursive_type(
             node.name,
             node.type_params,
             body_type
         )
-        
+
         # Add to symbol table
         self.symbol_table.define_type(node.name, type_info)
-        
+
         return type_info
 
     def gen_VectorLiteral(self, node):
@@ -491,57 +589,19 @@ class CodeGenerator:
     def gen_ExclaveExpression(self, node):
         # Generate code for the inner expression
         self.generate(node.expression)
-        
+
         # Store the result in a temporary variable that will be accessible
         # in both the inner and outer scopes
         temp_var = f"_exclave_result_{self.label_counter}"
         self.emit(Opcode.STORE_VAR, temp_var)
-        
+
         # Load the variable back to make it available for the next operation
         self.emit(Opcode.LOAD_VAR, temp_var)
 
     def gen_FunctionDeclaration(self, node):
-        """Generate code for function declaration with proper scope handling"""
-        func_label = f"func_{node.name}"
-        # Save current instructions and symbol table
-        current_instructions = self.instructions
-        current_symbol_table = self.symbol_table
-        
-        # Create new scope for function
-        self.instructions = []
-        self.symbol_table = SymbolTable(parent=current_symbol_table)
-        
-        # Define function parameters in symbol table
-        for param_name, param_type in node.params:
-            self.symbol_table.define(param_name, Symbol(param_name, param_type))
-        
-        # Generate function body
-        self.enter_scope(func_label)
-        for stmt in node.body:
-            self.generate(stmt)
-        self.exit_scope()
-        
-        # Add return if not present
-        if not self.instructions or not isinstance(self.instructions[-1].opcode, Opcode.RETURN):
-            self.emit(Opcode.RETURN)
-        
-        # Save function instructions
-        function_instructions = self.instructions
-        self.functions[node.name] = function_instructions
-        
-        # Restore instructions and symbol table
-        self.instructions = current_instructions
-        self.symbol_table = current_symbol_table
-        
-        # If kernel, generate GPU code
-        if node.is_kernel:
-            gpu_code = self.generate_gpu_code(node)
-            self.gpu_kernels[node.name] = gpu_code
-
-    def gen_FunctionDefinition(self, node):
         """Generate code for function definition with proper environment setup"""
         function_label = node.name
-        
+
         # Generate function object creation
         self.emit(Opcode.CREATE_FUNC, function_label)
         self.emit(Opcode.STORE_VAR, node.name)
@@ -549,30 +609,41 @@ class CodeGenerator:
         # Generate the function code
         self.enter_scope(function_label)
         self.emit(Opcode.LABEL, function_label)
-        
+
         # Function parameters and body
         self.gen_FunctionBody(node)
-        
+
         self.exit_scope()
         self.emit(Opcode.END)
 
     def gen_FunctionBody(self, node):
         """Generate VM instructions for function body with parameter handling"""
         # Handle function parameters
+        param_vars = set()
         for param in node.parameters:
             self.emit(Opcode.POP)
             self.emit(Opcode.STORE_VAR, param.name)
+            param_vars.add(param.name)
+            # Track parameters that need dropping
+            if param.type.needs_drop():
+                self.track_drop(param.name, param.type)
 
         # Generate instructions for the function's statements
         self.gen_Block(node.body)
+        
+        # Generate drops for parameters before return
+        drop_instrs = self.generate_drops(param_vars)
+        self.instructions.extend(drop_instrs)
 
     def gen_FunctionCall(self, node):
         """Generate code for function calls with proper argument handling"""
         # Generate code for the function expression
         self.generate(node.function_expr)
-        
+
         # Push arguments onto the stack
         for arg in node.arguments:
+            if isinstance(arg, MoveNode):
+                self.move_value(arg.variable)
             self.generate(arg)
             self.emit(Opcode.PUSH)
 
@@ -583,26 +654,26 @@ class CodeGenerator:
         """Generate code for closures with proper variable capture"""
         # Identify captured variables
         captured_vars = self.get_captured_variables(node)
-        
+
         # Generate code to capture variables
         for var in captured_vars:
             self.emit(Opcode.LOAD_VAR, var)
             self.emit(Opcode.PUSH)
-        
+
         # Create the function object with captured environment
         function_label = self.new_label('lambda')
         self.emit(Opcode.CREATE_CLOSURE, function_label, len(captured_vars))
-        
+
         # Store the closure
         self.emit(Opcode.STORE_VAR, node.name)
 
         # Generate the function code
         self.enter_scope(function_label)
         self.emit(Opcode.LABEL, function_label)
-        
+
         # Function parameters and body
         self.gen_FunctionBody(node)
-        
+
         self.exit_scope()
         self.emit(Opcode.END)
 
@@ -669,7 +740,7 @@ class CodeGenerator:
     def instantiate_generic_type(self, base_type: str, type_args: List[Any]) -> TypeInfo:
         """Instantiate a generic type with concrete type arguments"""
         generic_info = self.generic_types[base_type]
-        
+
         if len(type_args) != len(generic_info.type_params):
             raise TypeError(f"Wrong number of type arguments for {base_type}")
 
@@ -716,20 +787,41 @@ class CodeGenerator:
             return
 
         layout = MemoryLayout()
-        
-        # Calculate offsets for each field
+
+        # Calculate offsets for each field and track which fields need dropping
+        needs_drop = False
         for field in struct_def.fields:
             field_type = self.type_info[field.type_annotation.name]
-            layout.add_field(field.name, field_type.size, field_type.align)
-        
+            layout.add_field(field.name, field_type.size, field_type.align, field_type)
+            if field_type.needs_drop:
+                needs_drop = True
+
         # Store layout for later use
         self.struct_layouts[struct_def.name] = layout
         self.type_info[struct_def.name] = TypeInfo(
             size=layout.total_size,
             align=layout.alignment,
-            layout=layout
+            layout=layout,
+            needs_drop=needs_drop
         )
-        
+
+        # Generate destructor for struct if needed
+        if needs_drop:
+            destructor_label = f"drop_{struct_def.name}"
+            self.emit(Opcode.LABEL, destructor_label)
+            
+            # Drop each field that needs dropping
+            for field in struct_def.fields:
+                field_type = self.type_info[field.type_annotation.name]
+                if field_type.needs_drop:
+                    offset = layout.get_offset(field.name)
+                    self.emit(Opcode.LOAD_ARG, 0)  # Load struct pointer
+                    self.emit(Opcode.LOAD_CONST, offset)
+                    self.emit(Opcode.ADD)
+                    self.emit(Opcode.CALL_FUNC, f"drop_{field_type.name}")
+            
+            self.emit(Opcode.RETURN)
+
         # Emit struct creation instruction
         self.emit(Opcode.CREATE_STRUCT, struct_def.name, [f.name for f in struct_def.fields])
 
@@ -738,29 +830,68 @@ class CodeGenerator:
         layout = self.struct_layouts[struct_inst.struct_name]
         type_info = self.type_info[struct_inst.struct_name]
         
+        # Track struct for dropping if needed
+        if type_info.needs_drop:
+            self.track_drop(struct_inst.target, type_info)
+
         # Allocate memory for struct
         self.emit(Opcode.LOAD_CONST, type_info.size)
         self.emit(Opcode.CALL_FUNC, "malloc", 1)
-        
+        self.emit(Opcode.STORE_VAR, struct_inst.target)
+
         # Initialize fields
         for field_name, field_value in struct_inst.field_values.items():
+            if isinstance(field_value, MoveNode):
+                self.move_value(field_value.variable)
+                
             self.generate_expression(field_value)
             offset = layout.get_offset(field_name)
+            self.emit(Opcode.LOAD_VAR, struct_inst.target)
             self.emit(Opcode.LOAD_CONST, offset)
             self.emit(Opcode.ADD)
-            self.emit(Opcode.STORE_VAR, f"_{field_name}")
+            self.emit(Opcode.STORE_INDIRECT)
 
     def gen_field_access(self, field_access) -> None:
-        """Generate code for field access"""
+        """Generate code for field access with ownership tracking"""
+        struct_type = self.get_expression_type(field_access.struct_expression)
+        
+        # Get struct layout info
+        layout = self.struct_layouts[struct_type.name]
+        field_offset = layout.get_offset(field_access.field_name)
+        field_type = struct_type.fields[field_access.field_name].field_type
+        
+        # Generate struct pointer
         self.generate_expression(field_access.struct_expression)
         
-        struct_type = self.get_expression_type(field_access.struct_expression)
-        layout = self.struct_layouts[struct_type]
-        offset = layout.get_offset(field_access.field_name)
-        
-        self.emit(Opcode.LOAD_CONST, offset)
-        self.emit(Opcode.ADD)
-        self.emit(Opcode.ACCESS_FIELD, field_access.field_name)
+        if field_access.is_move:
+            # Moving the field - mark as moved in parent struct
+            struct_name = struct_type.name
+            field_path = f"{struct_name}.{field_access.field_name}"
+            self.move_value(field_path)
+            
+            # Track field for dropping if needed
+            if field_type.needs_drop:
+                self.emit(Opcode.TRACK_DROP, field_access.field_name, True)
+            
+            # Load field value
+            self.emit(Opcode.LOAD_CONST, field_offset)
+            self.emit(Opcode.ADD)
+            self.emit(Opcode.LOAD_INDIRECT)
+            
+            # Move ownership
+            self.emit(Opcode.MOVE, field_path, field_access.field_name)
+            
+        else:
+            # Borrowing the field - just load address
+            self.emit(Opcode.LOAD_CONST, field_offset)
+            self.emit(Opcode.ADD)
+            # For borrowed fields, we return the address
+            if field_access.is_mutable:
+                # Mutable borrow - can write through pointer
+                self.emit(Opcode.LOAD_INDIRECT)
+            else:
+                # Immutable borrow - can only read
+                self.emit(Opcode.LOAD_INDIRECT)
 
     def get_expression_type(self, expr) -> str:
         """Get the type name of an expression"""
@@ -777,62 +908,62 @@ class CodeGenerator:
         if isinstance(stmt, LetStatement):
             self.generate_expression(stmt.expression)
             self.emit(Opcode.STORE_VAR, stmt.name)
-        
+
         elif isinstance(stmt, Assignment):
             self.generate_expression(stmt.expression)
             self.emit(Opcode.STORE_VAR, stmt.name)
-        
+
         elif isinstance(stmt, IfStatement):
             else_label = self.new_label("else")
             end_label = self.new_label("endif")
-            
+
             # Generate condition
             self.generate_expression(stmt.condition)
             self.emit(Opcode.JUMP_IF_FALSE, else_label)
-            
+
             # Generate then branch
             self.generate_statement(stmt.then_body)
             self.emit(Opcode.JUMP, end_label)
-            
+
             # Generate else branch
             self.emit(Opcode.LABEL, else_label)
             if stmt.else_body:
                 self.generate_statement(stmt.else_body)
-            
+
             self.emit(Opcode.LABEL, end_label)
-        
+
         elif isinstance(stmt, WhileStatement):
             start_label = self.new_label("while")
             end_label = self.new_label("endwhile")
-            
+
             self.emit(Opcode.LABEL, start_label)
-            
+
             # Generate condition
             self.generate_expression(stmt.condition)
             self.emit(Opcode.JUMP_IF_FALSE, end_label)
-            
+
             # Generate body
             self.generate_statement(stmt.body)
             self.emit(Opcode.JUMP, start_label)
-            
+
             self.emit(Opcode.LABEL, end_label)
-        
+
         elif isinstance(stmt, ReturnStatement):
             self.generate_expression(stmt.expression)
             self.emit(Opcode.RETURN)
-        
+
         elif isinstance(stmt, StructDefinition):
             self.gen_struct_def(stmt)
-        
+
         elif isinstance(stmt, EffectDeclaration):
             self.gen_EffectDeclaration(stmt)
-        
+
         elif isinstance(stmt, HandleExpression):
             self.gen_HandleExpression(stmt)
-        
+
         elif isinstance(stmt, PerformExpression):
             self.gen_PerformExpression(stmt)
-        
+
         else:
             raise TypeError(f"Unsupported statement type: {type(stmt)}")
 
@@ -840,14 +971,14 @@ class CodeGenerator:
         """Generate code for expressions"""
         if isinstance(expr, Literal):
             self.emit(Opcode.LOAD_CONST, expr.value)
-        
+
         elif isinstance(expr, Variable):
             self.emit(Opcode.LOAD_VAR, expr.name)
-        
+
         elif isinstance(expr, BinaryOperation):
             self.generate_expression(expr.left)
             self.generate_expression(expr.right)
-            
+
             # Map operators to opcodes
             op_map = {
                 '+': Opcode.ADD,
@@ -856,19 +987,19 @@ class CodeGenerator:
                 '/': Opcode.DIV,
             }
             self.emit(op_map[expr.operator])
-        
+
         elif isinstance(expr, StructInstantiation):
             self.gen_struct_instantiation(expr)
-        
+
         elif isinstance(expr, FieldAccess):
             self.gen_field_access(expr)
-        
+
         elif isinstance(expr, HandleExpression):
             self.gen_HandleExpression(expr)
-        
+
         elif isinstance(expr, PerformExpression):
             self.gen_PerformExpression(expr)
-        
+
         else:
             raise TypeError(f"Unsupported expression type: {type(expr)}")
 
@@ -882,38 +1013,129 @@ class CodeGenerator:
         return self.instructions
 
     def gen_DomainEffect(self, node):
-        """Generate code for domain effect operations"""
+        """Generate code for domain effect operations build into the langauge"""
         effect_name = node.effect.name
         operation = node.operation
-        
+
         # Generate arguments
         for arg in node.arguments:
             self.generate(arg)
-            
+
         if operation == "create":
             # Create domain from value on stack
             self.emit(Opcode.CREATE_DOMAIN)
-            
+
         elif operation == "acquire":
             # Acquire domain and get value
             self.emit(Opcode.ACQUIRE_DOMAIN)
-            
+
         elif operation == "release":
             # Release domain
             self.emit(Opcode.RELEASE_DOMAIN)
-            
+
         elif operation == "transfer":
             # Transfer domain to another thread
             self.emit(Opcode.TRANSFER_DOMAIN)
-            
+
         # Create continuation for effect
         cont_label = self.new_label(f"domain_{operation}_cont")
         self.emit(Opcode.CREATE_CONTINUATION, cont_label)
-        
+
         # Call effect handler
-        self.emit(Opcode.CALL_EFFECT_HANDLER, 
+        self.emit(Opcode.CALL_EFFECT_HANDLER,
                  effect_name,
                  len(node.arguments),
                  cont_label)
-                 
+
         self.emit(Opcode.LABEL, cont_label)
+
+    def gen_ThreadEffect(self, node):
+        """Generate code for thread effect operations builtin to the language"""
+        effect_name = node.effect.name
+        operation = node.operation
+
+        # Generate arguments
+        for arg in node.arguments:
+            self.generate(arg)
+
+        if operation == "spawn":
+            # Create closure for thread function
+            closure = node.arguments[0]
+            self.gen_Closure(closure)
+
+            # Create thread
+            self.emit(Opcode.CREATE_THREAD)
+
+        elif operation == "join":
+            # Join thread
+            self.emit(Opcode.JOIN_THREAD)
+
+        elif operation == "current":
+            # Get current thread
+            self.emit(Opcode.CURRENT_THREAD)
+
+        elif operation == "yield":
+            # Yield current thread
+            self.emit(Opcode.YIELD)
+
+        elif operation == "detach":
+            # Detach thread
+            self.emit(Opcode.DETACH_THREAD)
+
+        # Create continuation for effect
+        cont_label = self.new_label(f"thread_{operation}_cont")
+        self.emit(Opcode.CREATE_CONTINUATION, cont_label)
+
+        # Call effect handler
+        self.emit(Opcode.CALL_EFFECT_HANDLER,
+                 effect_name,
+                 len(node.arguments),
+                 cont_label)
+
+        self.emit(Opcode.LABEL, cont_label)
+
+    def gen_ThreadPoolEffect(self, node):
+        """Generate code for thread pool effect operations build into the language"""
+        effect_name = node.effect.name
+        operation = node.operation
+
+        # Generate arguments
+        for arg in node.arguments:
+            self.generate(arg)
+
+        if operation == "submit":
+            # Create closure for task
+            closure = node.arguments[0]
+            self.gen_Closure(closure)
+
+            # Submit to thread pool
+            self.emit(Opcode.SUBMIT_TASK)
+
+        elif operation == "await":
+            # Await future
+            self.emit(Opcode.AWAIT_FUTURE)
+
+        elif operation == "set_pool_size":
+            # Set thread pool size
+            self.emit(Opcode.SET_POOL_SIZE)
+
+        # Create continuation for effect
+        cont_label = self.new_label(f"pool_{operation}_cont")
+        self.emit(Opcode.CREATE_CONTINUATION, cont_label)
+
+        # Call effect handler
+        self.emit(Opcode.CALL_EFFECT_HANDLER,
+                 effect_name,
+                 len(node.arguments),
+                 cont_label)
+
+        self.emit(Opcode.LABEL, cont_label)
+
+
+    def gen_ExclaveExpression(self, value_expr) -> None:
+        """Generate code to move a value to the caller's region and return"""
+        # Generate value expression
+        self.generate_expression(value_expr)
+        
+        # Move value to caller's region and return
+        self.emit(Opcode.EXCLAVE)

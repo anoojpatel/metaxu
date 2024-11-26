@@ -397,7 +397,7 @@ class LambdaExpression(Expression):
 
 # Algebraic Effects
 class EffectDefinition(Node):
-    """Definition of an effect type (e.g., effect Reader[T])"""
+    """Definition of an effect type (e.g., effect Reader<T>)"""
     def __init__(self, name, type_params, operations):
         self.name = name                # The effect name (e.g., "Reader")
         self.type_params = type_params  # List of TypeParameter (e.g., [T])
@@ -628,10 +628,10 @@ class BasicType(TypeExpression):
 class GenericType:
     def __init__(self, base_type: str, type_args: List['TypeInfo']):
         self.base_type = base_type  # e.g., "List"
-        self.type_args = type_args  # e.g., [IntType, StringType] for List[int, string]
+        self.type_args = type_args  # e.g., [IntType, StringType] for List<int, string>
 
 class TypeParameter(TypeExpression):
-    """A type parameter used in generic types (e.g., T in List[T])"""
+    """A type parameter used in generic types (e.g., T in List<T>)"""
     def __init__(self, name, bound=None, effect=False):
         self.name = name
         self.bound = bound  # Optional bound (e.g., 'T: Display')
