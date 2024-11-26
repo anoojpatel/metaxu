@@ -49,17 +49,17 @@ class TestEffectfulCode(unittest.TestCase):
         }
 
         # Polymorphic over effect E
-        fn transform<T, U, E>(f: fn\(&T) -> U performs E) performs Reader<T>, Writer<U>, E {
+        fn transform<T, U, E>(f: fn\(&T) -> U performs E) performs Reader[T], Writer[U], E {
             let x = perform Reader.read();
             let y = f(&x);  # Borrow x when passing to f
             perform Writer.write(y)
         }
 
         fn main() {
-            handle Reader<int> with {
+            handle Reader[int] with {
                 read() -> resume(42)
             } in {
-                handle Writer<String> with {
+                handle Writer[String] with {
                     write(value) -> resume(())
                 } in {
                     # Lambda that borrows its input
@@ -85,7 +85,7 @@ class TestEffectfulCode(unittest.TestCase):
         }
 
         # Function using multiple effects
-        fn increment_and_log() performs State<int>, Logger {
+        fn increment_and_log() performs State[int], Logger {
             let value = perform State.get();
             perform Logger.log("Current value: " + value.to_string());
             perform State.put(value + 1);
@@ -93,7 +93,7 @@ class TestEffectfulCode(unittest.TestCase):
         }
 
         fn main() {
-            handle State<int> with {
+            handle State[int] with {
                 get() -> resume(0)
                 put(x) -> resume(())
             } in {
@@ -117,15 +117,15 @@ class TestEffectfulCode(unittest.TestCase):
             try<T>(block: fn() -> T) -> Result<T, E>
         }
 
-        fn might_fail() performs Error<String> {
+        fn might_fail() performs Error[String] {
             if some_condition {
                 perform Error.raise("Something went wrong")
             }
             42
         }
 
-        fn safe_computation() -> Result<int, String> {
-            handle Error<String> with {
+        fn safe_computation() -> Result[int, String] {
+            handle Error[String] with {
                 raise(error) -> resume(Err(error))
                 try(block) -> {
                     let result = block();
@@ -152,14 +152,14 @@ class TestEffectfulCode(unittest.TestCase):
             write_file(path: String, content: String)
         }
 
-        fn async process_file(path: String) performs Async<Unit>, IO {
+        fn async process_file(path: String) performs Async[Unit], IO {
             let content = perform IO.read_file(path);
             let processed = perform Async.await(process_content(content));
             perform IO.write_file(path + ".processed", processed)
         }
 
         fn main() {
-            handle Async<Unit> with {
+            handle Async[Unit] with {
                 await(future) -> {
                     runtime.spawn(future);
                     resume(runtime.join())
@@ -182,7 +182,7 @@ class TestEffectfulCode(unittest.TestCase):
         """Test error cases in effect inference"""
         code = '''
         effect Database {
-            query(sql: String) -> Vec<Row>
+            query(sql: String) -> Vec[Row]
         }
 
         # Error: Unhandled effect
@@ -191,7 +191,7 @@ class TestEffectfulCode(unittest.TestCase):
         }
 
         # Error: Missing effect annotation
-        fn missing_annotation() -> Vec<Row> {
+        fn missing_annotation() -> Vec[Row] {
             perform Database.query("SELECT * FROM users")
         }
 
@@ -213,13 +213,13 @@ class TestEffectfulCode(unittest.TestCase):
         }
 
         fn nested_resources() {
-            handle Resource<File> with {
+            handle Resource[File] with {
                 acquire() -> resume(File.open("outer.txt"))
                 release(f) -> resume(f.close())
             } in {
                 let outer = perform Resource.acquire();
                 
-                handle Resource<File> with {
+                handle Resource[File] with {
                     acquire() -> resume(File.open("inner.txt"))
                     release(f) -> resume(f.close())
                 } in {

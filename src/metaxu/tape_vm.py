@@ -17,6 +17,11 @@ class Opcode(Enum):
     CREATE_CLOSURE = auto()
     CALL_FUNC = auto()
     RETURN = auto()
+    # Domain operations
+    CREATE_DOMAIN = auto()
+    ACQUIRE_DOMAIN = auto()
+    RELEASE_DOMAIN = auto()
+    TRANSFER_DOMAIN = auto()
     # Ownership
     MOVE_VAR = auto()
     # SIMD Operations
