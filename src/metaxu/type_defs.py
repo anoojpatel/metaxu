@@ -295,6 +295,27 @@ class HandlerType(Type):
     handled_type: Type
     resume_type: Type
 
+class DomainEffect(EffectType):
+    """Effect for domain-based parallelism operations"""
+    def __init__(self, value_type):
+        super().__init__("Domain")
+        self.value_type = value_type
+        self.operations = {
+            "create": FunctionType([value_type], DomainType(value_type)),
+            "acquire": FunctionType([DomainType(value_type)], value_type),
+            "release": FunctionType([DomainType(value_type)], UnitType()),
+            "transfer": FunctionType([DomainType(value_type), ThreadType()], UnitType())
+        }
+
+class DomainType(Type):
+    """Type representing a domain containing a value"""
+    def __init__(self, value_type):
+        super().__init__()
+        self.value_type = value_type
+    
+    def __str__(self):
+        return f"Domain<{self.value_type}>"
+
 # SimpleSub Type System Components
 class TypeScheme:
     """Universal type scheme with quantified variables"""
@@ -434,13 +455,15 @@ def substitute(ty: Type, subst: Dict[TypeVar, Type], visited: Optional[Set[str]]
 class CompactType:
     """Compact representation of types for efficient unification and variance tracking"""
     id: int  # Unique identifier
-    kind: str  # 'var', 'constructor', 'recursive'
+    kind: str  # 'var', 'constructor', 'recursive', or 'effect'
     bounds: Optional['TypeBounds'] = None
     constructor: Optional[TypeConstructor] = None
     type_args: Optional[List['CompactType']] = None
     recursive_ref: Optional[str] = None  # Name for recursive types
     variance: Optional[str] = None  # 'covariant', 'contravariant', 'invariant'
-    
+    name: Optional[str] = None
+    operations: Optional[Dict[str, 'EffectOperation']] = None
+
     @staticmethod
     def fresh_var() -> 'CompactType':
         """Create fresh type variable"""
@@ -452,54 +475,83 @@ class CompactType:
     
     def find(self) -> 'CompactType':
         """Find representative with path compression"""
-        if self.bounds and self.bounds.upper_bound:
+        if self.kind == 'var' and self.bounds and self.bounds.upper_bound:
             self.bounds.upper_bound = self.bounds.upper_bound.find()
             return self.bounds.upper_bound
         return self
 
-@dataclass
-class TypeBounds:
-    """Bounds for type variables during unification"""
-    upper_bound: Optional[CompactType] = None
-    lower_bound: Optional[CompactType] = None
-    
 def unify(t1: CompactType, t2: CompactType, variance: str = 'invariant') -> bool:
     """Unify two types with variance"""
-    t1, t2 = t1.find(), t2.find()
-    if t1 == t2:
+    t1 = t1.find()
+    t2 = t2.find()
+
+    if t1.id == t2.id:
         return True
-        
-    # Handle variables
+
     if t1.kind == 'var':
         if occurs_check(t1, t2):
             return False
         t1.bounds.upper_bound = t2
         return True
+
     if t2.kind == 'var':
         if occurs_check(t2, t1):
             return False
         t2.bounds.upper_bound = t1
         return True
-        
-    # Handle recursive types
-    if t1.kind == 'recursive' and t2.kind == 'recursive':
-        if t1.recursive_ref == t2.recursive_ref:
-            # Same recursive type - unify parameters
-            return all(unify(a1, a2, variance) 
-                      for a1, a2 in zip(t1.type_args or [], t2.type_args or []))
-        # Different recursive types - unfold once and try again
-        return unify(unfold_once(t1), unfold_once(t2), variance)
-        
-    # Handle constructors
-    if t1.kind == 'constructor' and t2.kind == 'constructor':
-        if t1.constructor != t2.constructor:
+
+    if t1.kind != t2.kind:
+        return False
+
+    if t1.kind == 'effect':
+        # Effect types unify if they have the same name and operations
+        if t1.name != t2.name:
             return False
-        # Unify arguments with composed variance
-        return all(unify(a1, a2, compose_variance(variance, v))
-                  for a1, a2, v in zip(t1.type_args or [], 
-                                     t2.type_args or [],
-                                     get_constructor_variances(t1.constructor)))
-                                     
+        
+        # Check operations match
+        if set(t1.operations.keys()) != set(t2.operations.keys()):
+            return False
+            
+        # Unify operation types according to variance
+        for op_name, op1 in t1.operations.items():
+            op2 = t2.operations[op_name]
+            
+            # Parameters are contravariant
+            for p1, p2 in zip(op1.param_types, op2.param_types):
+                if not unify(p1, p2, 'contravariant'):
+                    return False
+                    
+            # Return type is covariant
+            if op1.return_type and op2.return_type:
+                if not unify(op1.return_type, op2.return_type, 'covariant'):
+                    return False
+        return True
+
+    if t1.kind == 'constructor':
+        if t1.constructor.qualified_name() != t2.constructor.qualified_name():
+            return False
+        if len(t1.type_args or []) != len(t2.type_args or []):
+            return False
+        # Get constructor variance annotations
+        variances = get_constructor_variances(t1.constructor)
+        # Unify type arguments according to variance
+        for a1, a2, v in zip(t1.type_args, t2.type_args, variances):
+            composed = compose_variance(variance, v)
+            if not unify(a1, a2, composed):
+                return False
+        return True
+
+    if t1.kind == 'recursive':
+        if t1.recursive_ref != t2.recursive_ref:
+            return False
+        # Unify type arguments
+        if len(t1.type_args or []) != len(t2.type_args or []):
+            return False
+        for a1, a2 in zip(t1.type_args or [], t2.type_args or []):
+            if not unify(a1, a2, variance):
+                return False
+        return True
+
     return False
 
 def occurs_check(var: CompactType, ty: CompactType) -> bool:
@@ -566,3 +618,9 @@ def next_id() -> int:
 reserved = {
     # ... existing tokens ...
 }
+
+@dataclass
+class TypeBounds:
+    """Bounds for type variables during unification"""
+    upper_bound: Optional[CompactType] = None
+    lower_bound: Optional[CompactType] = None

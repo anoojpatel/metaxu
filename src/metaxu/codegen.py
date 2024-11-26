@@ -880,3 +880,40 @@ class CodeGenerator:
         else:
             self.generate_statement(node)
         return self.instructions
+
+    def gen_DomainEffect(self, node):
+        """Generate code for domain effect operations"""
+        effect_name = node.effect.name
+        operation = node.operation
+        
+        # Generate arguments
+        for arg in node.arguments:
+            self.generate(arg)
+            
+        if operation == "create":
+            # Create domain from value on stack
+            self.emit(Opcode.CREATE_DOMAIN)
+            
+        elif operation == "acquire":
+            # Acquire domain and get value
+            self.emit(Opcode.ACQUIRE_DOMAIN)
+            
+        elif operation == "release":
+            # Release domain
+            self.emit(Opcode.RELEASE_DOMAIN)
+            
+        elif operation == "transfer":
+            # Transfer domain to another thread
+            self.emit(Opcode.TRANSFER_DOMAIN)
+            
+        # Create continuation for effect
+        cont_label = self.new_label(f"domain_{operation}_cont")
+        self.emit(Opcode.CREATE_CONTINUATION, cont_label)
+        
+        # Call effect handler
+        self.emit(Opcode.CALL_EFFECT_HANDLER, 
+                 effect_name,
+                 len(node.arguments),
+                 cont_label)
+                 
+        self.emit(Opcode.LABEL, cont_label)

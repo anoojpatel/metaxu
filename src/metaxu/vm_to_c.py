@@ -28,6 +28,52 @@ class VMToCCompiler:
         self.c_code += "    void* result;\n"
         self.c_code += "} continuation_t;\n\n"
 
+        # Add domain structure for ownership tracking
+        self.c_code += "typedef struct {\n"
+        self.c_code += "    pthread_mutex_t mutex;\n"
+        self.c_code += "    int domain_id;\n"
+        self.c_code += "    void* data;\n"
+        self.c_code += "} domain_t;\n\n"
+
+        # Add domain registry for tracking active domains
+        self.c_code += "typedef struct {\n"
+        self.c_code += "    pthread_mutex_t mutex;\n"
+        self.c_code += "    domain_t* domains[256];\n"
+        self.c_code += "    int num_domains;\n"
+        self.c_code += "} domain_registry_t;\n\n"
+
+        self.c_code += "domain_registry_t domain_registry = {\n"
+        self.c_code += "    .mutex = PTHREAD_MUTEX_INITIALIZER,\n"
+        self.c_code += "    .num_domains = 0\n"
+        self.c_code += "};\n\n"
+
+        # Add domain operations
+        self.c_code += "domain_t* create_domain(void* data) {\n"
+        self.c_code += "    domain_t* domain = malloc(sizeof(domain_t));\n"
+        self.c_code += "    domain->mutex = (pthread_mutex_t)PTHREAD_MUTEX_INITIALIZER;\n"
+        self.c_code += "    pthread_mutex_lock(&domain_registry.mutex);\n"
+        self.c_code += "    domain->domain_id = domain_registry.num_domains++;\n"
+        self.c_code += "    domain->data = data;\n"
+        self.c_code += "    domain_registry.domains[domain->domain_id] = domain;\n"
+        self.c_code += "    pthread_mutex_unlock(&domain_registry.mutex);\n"
+        self.c_code += "    return domain;\n"
+        self.c_code += "}\n\n"
+
+        self.c_code += "void* domain_acquire(domain_t* domain) {\n"
+        self.c_code += "    pthread_mutex_lock(&domain->mutex);\n"
+        self.c_code += "    return domain->data;\n"
+        self.c_code += "}\n\n"
+
+        self.c_code += "void domain_release(domain_t* domain) {\n"
+        self.c_code += "    pthread_mutex_unlock(&domain->mutex);\n"
+        self.c_code += "}\n\n"
+
+        self.c_code += "void transfer_domain(domain_t* domain, pthread_t thread) {\n"
+        self.c_code += "    pthread_mutex_lock(&domain_registry.mutex);\n"
+        self.c_code += "    // Transfer ownership logic here\n"
+        self.c_code += "    pthread_mutex_unlock(&domain_registry.mutex);\n"
+        self.c_code += "}\n\n"
+
         # Add thread-local storage and message queue types
         self.c_code += "typedef struct {\n"
         self.c_code += "    pthread_mutex_t mutex;\n"
@@ -269,6 +315,42 @@ class VMToCCompiler:
             self.c_code += f"{indent}int {temp_var} = {struct_var}.{field_name};\n"
             
             self.stack_push(temp_var)
+
+        elif opcode == Opcode.END:
+            # Clean up any CUDA variables in this scope
+            for var in self.cuda_vars:
+                self.c_code += f"{indent}cudaFree({var}_d);\n"
+            
+            # Close the current scope block
+            if self.current_scope:
+                self.indent_level -= 1
+                self.c_code += f"{indent}}}\n"
+                self.current_scope = None
+                
+        elif opcode == Opcode.CREATE_DOMAIN:
+            # Get the data to wrap in a domain
+            data = self.stack_pop()
+            temp_var = self.get_temp_var()
+            self.c_code += f"{indent}domain_t* {temp_var} = create_domain((void*){data});\n"
+            self.stack_push(temp_var)
+
+        elif opcode == Opcode.ACQUIRE_DOMAIN:
+            # Get domain and acquire exclusive access
+            domain = self.stack_pop()
+            temp_var = self.get_temp_var()
+            self.c_code += f"{indent}void* {temp_var} = domain_acquire({domain});\n"
+            self.stack_push(temp_var)
+
+        elif opcode == Opcode.RELEASE_DOMAIN:
+            # Release domain after use
+            domain = self.stack_pop()
+            self.c_code += f"{indent}domain_release({domain});\n"
+
+        elif opcode == Opcode.TRANSFER_DOMAIN:
+            # Transfer domain ownership to another thread
+            thread = self.stack_pop()
+            domain = self.stack_pop()
+            self.c_code += f"{indent}transfer_domain({domain}, {thread});\n"
 
         elif opcode == Opcode.DUP:
             value = self.stack[-1]

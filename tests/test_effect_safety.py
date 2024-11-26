@@ -19,7 +19,7 @@ class TestEffectSafety(unittest.TestCase):
         }
 
         fn use_state() {
-            handle State<i32> with {
+            handle State[i32] with {
                 get() -> {
                     let value = &state;
                     resume(value)
@@ -47,7 +47,7 @@ class TestEffectSafety(unittest.TestCase):
         }
 
         fn channel_usage() {
-            handle Channel<String> with {
+            handle Channel[String] with {
                 send(msg) -> {
                     buffer = move msg;  # Linear use
                     resume(())
@@ -78,13 +78,13 @@ class TestEffectSafety(unittest.TestCase):
         }
 
         fn nested_effects() {
-            handle Reader<String> with {
+            handle Reader[String] with {
                 read() -> {
                     let value = &data;
                     resume(value)
                 }
             } in {
-                handle Writer<String> with {
+                handle Writer[String] with {
                     write(value) -> {
                         let borrowed = &*value;  # Nested borrow
                         resume(())
@@ -134,7 +134,7 @@ class TestEffectSafety(unittest.TestCase):
         }
 
         fn invalid_borrow() {
-            handle InvalidBorrow<i32> with {
+            handle InvalidBorrow[i32] with {
                 escape(value) -> {
                     resume(value)  # Error: returning borrowed value
                 }
@@ -156,7 +156,7 @@ class TestEffectSafety(unittest.TestCase):
 
         fn invalid_move() {
             let x = "moved";
-            handle InvalidMove<String> with {
+            handle InvalidMove[String] with {
                 consume(value) -> {
                     resume(value)  # Error: value used after move
                     print(value);  # Error: use after move
@@ -170,3 +170,95 @@ class TestEffectSafety(unittest.TestCase):
         result = self.parser.parse(code)
         with self.assertRaises(TypeError):
             self.type_checker.check(result)
+
+    def test_nested_effect_handlers(self):
+        code = '''
+        effect State<T> {
+            get() -> T
+            put(value: T) -> Unit
+        }
+
+        effect Logger {
+            log(message: String) -> Unit
+        }
+
+        fn increment_and_log() {
+            handle State[int] with {
+                get() -> resume(0)
+                put(value) -> resume(())
+            } in 
+            handle Logger with {
+                log(message) -> resume(())
+            } in {
+                let x = perform State.get();
+                perform Logger.log("Got value: " + x);
+                perform State.put(x + 1);
+                perform Logger.log("Incremented value");
+            }
+        }
+        '''
+        result = self.parser.parse(code)
+        self.type_checker.check(result)
+        self.assertEqual(len(self.type_checker.errors), 0)
+
+    def test_effect_type_application(self):
+        code = '''
+        effect State<T> {
+            get() -> T
+            put(value: T) -> Unit
+        }
+
+        fn increment_counter() {
+            handle State[int] with {
+                get() -> resume(0)
+                put(value) -> resume(())
+            } in {
+                let x = perform State.get();
+                perform State.put(x + 1);
+                x + 1
+            }
+        }
+        '''
+        result = self.parser.parse(code)
+        self.type_checker.check(result)
+        self.assertEqual(len(self.type_checker.errors), 0)
+
+    def test_domain_effect(self):
+        code = '''
+        effect Domain<T> {
+            create(value: T) -> Domain<T>
+            acquire(domain: Domain<T>) -> T
+            release(domain: Domain<T>) -> Unit
+            transfer(domain: Domain<T>, thread: Thread) -> Unit
+        }
+
+        fn parallel_increment(x: i32) -> i32 {
+            // Create domain for shared value
+            let domain = perform Domain.create(x);
+            
+            // Spawn worker thread
+            let worker = spawn {
+                // Acquire domain in worker
+                let value = perform Domain.acquire(domain);
+                let new_value = value + 1;
+                perform Domain.release(domain);
+                
+                // Transfer domain back to main thread
+                perform Domain.transfer(domain, current_thread());
+            };
+            
+            // Wait for worker
+            join(worker);
+            
+            // Get final value
+            let result = perform Domain.acquire(domain);
+            perform Domain.release(domain);
+            result
+        }
+        '''
+        result = self.parser.parse(code)
+        self.type_checker.check(result)
+        self.assertEqual(len(self.type_checker.errors), 0)
+
+if __name__ == '__main__':
+    unittest.main()

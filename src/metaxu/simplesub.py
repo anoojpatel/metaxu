@@ -121,6 +121,20 @@ class TypeInferencer:
         compact = self.to_compact_type(type_def)
         self._analyze_type(compact, polarity)
 
+    def check_function_type(self, func_type: CompactType, polarity: Polarity) -> CompactType:
+        """Check a function type, handling contravariance in argument positions"""
+        if not isinstance(func_type, FunctionType):
+            return func_type
+            
+        # Arguments are contravariant
+        param_types = [self._analyze_type(param, polarity.flip()) 
+                      for param in func_type.param_types]
+                      
+        # Return type is covariant
+        return_type = self._analyze_type(func_type.return_type, polarity)
+        
+        return FunctionType(param_types, return_type, func_type.linearity)
+
     def _analyze_type(self, ty: CompactType, polarity: Polarity):
         """Analyze a type to record variable usage positions"""
         ty = ty.find()
@@ -134,6 +148,13 @@ class TypeInferencer:
                 composed = compose_variance(polarity, param_variance)
                 self._analyze_type(arg, composed)
                 
+        elif ty.kind == 'function':
+            # Check function body with proper variance
+            body_type = self._analyze_type(ty.body, polarity) if hasattr(ty, 'body') else None
+            
+            # Check function type itself
+            return self.check_function_type(ty, polarity)
+
         elif ty.kind == 'recursive':
             # Analyze parameters
             for param in (ty.type_args or []):

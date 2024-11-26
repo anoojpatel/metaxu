@@ -29,7 +29,18 @@ class TypeChecker:
         }
         for name, ty in self.builtin_types.items():
             self.current_scope[name] = ty
+
+    def get_current_module_path(self) -> List[str]:
+        """Get the current module path as a list of components"""
+        if not hasattr(self, '_module_path'):
+            self._module_path = []
             
+        if self.current_module:
+            # Split current module into components
+            return self.current_module.split('.')
+            
+        return self._module_path
+
     def check_program(self, program: 'ast.Program'):
         """Type check an entire program"""
         # First pass: collect all declarations
@@ -136,6 +147,37 @@ class TypeChecker:
             
     def check_type_declaration(self, decl: 'ast.TypeDeclaration'):
         """Check a type declaration and infer variance"""
+        # First check if type expression contains qualified names
+        def check_type_refs(type_expr):
+            if isinstance(type_expr, ast.TypeReference):
+                # Try to resolve as qualified name
+                symbol = self.resolve_qualified_name(type_expr.name)
+                if not symbol:
+                    self.errors.append(f"Type '{type_expr.name}' not found")
+                    return False
+                    
+                # Check visibility
+                if not self.check_type_visibility(symbol.type):
+                    self.errors.append(
+                        f"Type '{type_expr.name}' is not visible in current module"
+                    )
+                    return False
+                    
+            elif isinstance(type_expr, ast.TypeApplication):
+                # Check constructor
+                if not check_type_refs(type_expr.constructor):
+                    return False
+                # Check arguments    
+                for arg in type_expr.arguments:
+                    if not check_type_refs(arg):
+                        return False
+                        
+            return True
+            
+        # Check all type references are valid and visible
+        if not check_type_refs(decl.type_expr):
+            return None
+            
         # Convert to CompactType
         compact_type = self.type_inferencer.to_compact_type(decl.type_expr)
         
@@ -148,9 +190,17 @@ class TypeChecker:
         # Finalize variance inference
         self.type_inferencer.finalize_type_definition(compact_type)
         
-        # Add to scope
-        self.current_scope[decl.name] = compact_type
+        # Get fully qualified name by resolving module path
+        qualified_name = self.resolve_qualified_name(decl.name)
+        if not qualified_name:
+            # If name isn't already qualified, qualify it with current module path
+            module_path = self.get_current_module_path()
+            qualified_name = f"{'.'.join(module_path)}.{decl.name}" if module_path else decl.name
             
+        self.current_scope[qualified_name] = compact_type
+        
+        return compact_type
+
     def check_function_declaration(self, func: 'ast.FunctionDeclaration'):
         """Check a function declaration"""
         # Create type environment for this function
@@ -235,31 +285,30 @@ class TypeChecker:
         self.current_scope[func.name] = func_type
          
     def check_call_expression(self, call: 'ast.CallExpression'):
-        """Check function call for aliasing violations"""
-        if isinstance(call.function, ast.VariableExpression):
-            func_name = call.function.name
-            func_type = self.current_scope.get(func_name)
+        func_type = self.check(node.function)
+        if not isinstance(func_type, ast.FunctionType):
+            self.errors.append(f"Cannot call non-function type {func_type}")
+            return None
+
+        # Track which values are used as mut/const refs
+        mut_refs = set()
+        const_refs = set()
+        
+        for arg, param_type in zip(call.arguments, func_type.param_types):
+            if isinstance(arg, ast.VariableExpression):
+                arg_name = arg.name
+                if param_type.mode:
+                    if param_type.mode.is_mut:
+                        mut_refs.add(arg_name)
+                    if param_type.mode.is_const:
+                        const_refs.add(arg_name)
+                        
+        # Check for same value used as both mut and const
+        for var in mut_refs & const_refs:
+            self.errors.append(
+                f"Cannot pass '{var}' as both mutable and const reference"
+            )
             
-            if func_type and isinstance(func_type, ast.FunctionType):
-                # Track which values are used as mut/const refs
-                mut_refs = set()
-                const_refs = set()
-                
-                for arg, param_type in zip(call.arguments, func_type.param_types):
-                    if isinstance(arg, ast.VariableExpression):
-                        arg_name = arg.name
-                        if param_type.mode:
-                            if param_type.mode.is_mut:
-                                mut_refs.add(arg_name)
-                            if param_type.mode.is_const:
-                                const_refs.add(arg_name)
-                                
-                # Check for same value used as both mut and const
-                for var in mut_refs & const_refs:
-                    self.errors.append(
-                        f"Cannot pass '{var}' as both mutable and const reference"
-                    )
-                    
     def check_let_binding(self, binding: 'ast.LetBinding'):
         """Check let binding for aliasing violations"""
         if binding.mode:
@@ -378,7 +427,7 @@ class TypeChecker:
         
         return symbol.type
 
-    def visit_TypeRef(self, node):
+    def visit_TypeRefrerence(self, node):
         """Type check type references with qualified name support"""
         # Try to resolve as qualified name
         symbol = self.resolve_qualified_name(node.name)
@@ -617,108 +666,165 @@ class TypeChecker:
 
     def visit_EffectDeclaration(self, node):
         """Handle effect declaration with type checking"""
-        # Check for duplicate effect declaration
-        if self.symbol_table.lookup(node.name):
-            self.errors.append(f"Effect {node.name} already declared")
-            return None
+        # Create effect type with type parameters
+        type_params = {}
+        if node.type_params:
+            for param in node.type_params:
+                # Create fresh type variable for parameter
+                param_var = self.type_inferencer.fresh_type_var(param.name)
+                type_params[param.name] = param_var
+                
+                # Add bounds from type parameter
+                if param.bounds:
+                    for bound in param.bounds:
+                        bound_type = self.check_type(bound)
+                        if bound_type:
+                            self.type_inferencer.add_constraint(
+                                param_var,
+                                self.type_inferencer.to_compact_type(bound_type),
+                                Polarity.POSITIVE
+                            )
 
-        # Create effect type with operations
-        operations = []
+        # Register effect operations with their types
+        operations = {}
         for op in node.operations:
-            # Check operation parameters
-            params = []
-            for param in op.params:
+            # Convert parameter types to CompactType
+            param_types = []
+            for param in (op.params or []):
                 param_type = self.check(param.type_annotation)
-                params.append(ast.Parameter(param.name, param_type))
+                if param_type:
+                    param_types.append(
+                        self.type_inferencer.to_compact_type(param_type)
+                    )
             
-            # Check return type
-            return_type = self.check(op.return_type) if op.return_type else None
+            # Convert return type to CompactType
+            return_type = None
+            if op.return_type:
+                ret_type = self.check(op.return_type)
+                if ret_type:
+                    return_type = self.type_inferencer.to_compact_type(ret_type)
             
-            operations.append(ast.EffectOperation(
-                op.name, params, return_type, op.type_params
-            ))
+            operations[op.name] = ast.EffectOperation(
+                name=op.name,
+                param_types=param_types,
+                return_type=return_type
+            )
 
-        effect_type = ast.EffectType(node.name, operations, node.type_params)
+        # Create effect type as CompactType
+        effect_type = CompactType(
+            id=next_id(),
+            kind='effect',
+            name=node.name,
+            type_params=type_params,
+            operations=operations
+        )
+
+        # Register in symbol table
         self.symbol_table.define(node.name, Symbol(node.name, effect_type))
+        
+        # Infer variance for type parameters
+        self.type_inferencer.finalize_type_definition(effect_type)
+        
         return effect_type
 
     def visit_HandleExpression(self, node):
         """Type check handle expressions with proper resource tracking"""
-        # Check effect type
+        # Get the effect type being handled
         effect_type = self.check(node.effect)
         if not isinstance(effect_type, ast.EffectType):
-            self.errors.append(f"Cannot handle non-effect type: {effect_type}")
+            self.errors.append(f"Cannot handle non-effect type {effect_type}")
             return None
 
-        # Enter handler scope for borrow checking
-        self.borrow_checker.enter_handler_scope()
+        # Check that handler provides implementations for all effect operations
+        provided_ops = {case.operation for case in node.cases}
+        required_ops = set(effect_type.operations.keys())
+        if provided_ops != required_ops:
+            missing = required_ops - provided_ops
+            extra = provided_ops - required_ops
+            if missing:
+                self.errors.append(f"Handler missing implementations for operations: {missing}")
+            if extra:
+                self.errors.append(f"Handler provides implementations for unknown operations: {extra}")
+            return None
 
-        # Check handler implementations
-        for handler in node.handlers:
-            op = next((op for op in effect_type.operations if op.name == handler.name), None)
-            if not op:
-                self.errors.append(f"No such operation {handler.name} in effect {effect_type.name}")
-                continue
+        # Type check each handler case
+        for case in node.cases:
+            op_type = effect_type.operations.get(case.operation)
+            if not op_type:
+                continue  # Already reported error above
 
-            # Check handler parameters match operation
-            if len(handler.params) != len(op.params) + 1:  # +1 for continuation
+            # Check parameter types
+            if len(case.params) != len(op_type.param_types):
                 self.errors.append(
-                    f"Handler {handler.name} has wrong number of parameters. "
-                    f"Expected {len(op.params) + 1}, got {len(handler.params)}"
+                    f"Handler for {case.operation} takes {len(case.params)} parameters "
+                    f"but effect declares {len(op_type.param_types)}"
                 )
                 continue
 
-            # Check continuation parameter type
-            cont_param = handler.params[-1]
-            cont_type = ast.ContinuationType(op.return_type, effect_type)
-            self.symbol_table.define(cont_param.name, Symbol(cont_param.name, cont_type))
+            # Create new scope for handler case
+            self.symbol_table.enter_scope()
+            for param, param_type in zip(case.params, op_type.param_types):
+                self.symbol_table.define(param, Symbol(param, param_type))
 
-            # Check handler body
-            handler_type = self.check(handler.body)
-            if handler_type != op.return_type:
+            # Type check handler body
+            body_type = self.check(case.body)
+            if body_type != op_type.return_type:
                 self.errors.append(
-                    f"Handler {handler.name} returns {handler_type}, "
-                    f"but should return {op.return_type}"
+                    f"Handler for {case.operation} returns {body_type} "
+                    f"but effect declares {op_type.return_type}"
                 )
 
-        # Check body with handlers in scope
-        body_type = self.check(node.body)
+            self.symbol_table.exit_scope()
 
-        # Exit handler scope
-        self.borrow_checker.exit_handler_scope()
+        # Type check the IN block and propagate effects
+        self.symbol_table.enter_scope()
+        block_type = self.check(node.body)
+        self.symbol_table.exit_scope()
 
-        return body_type
+        return block_type
 
     def visit_PerformExpression(self, node):
         """Type check perform expressions"""
-        # Check effect operation exists
-        effect_type = self.check(node.effect)
-        if not isinstance(effect_type, ast.EffectType):
-            self.errors.append(f"Cannot perform non-effect type: {effect_type}")
+        # Get the effect being performed
+        if not isinstance(node.effect, ast.QualifiedName):
+            self.errors.append("Effect must be a qualified name")
             return None
 
-        op = next((op for op in effect_type.operations if op.name == node.operation), None)
-        if not op:
-            self.errors.append(f"No such operation {node.operation} in effect {effect_type.name}")
+        effect_name = node.effect.base
+        effect_symbol = self.symbol_table.lookup(effect_name)
+        if not effect_symbol or not isinstance(effect_symbol.type, ast.EffectType):
+            self.errors.append(f"Unknown effect {effect_name}")
             return None
+
+        effect_type = effect_symbol.type
+        operation = node.effect.member
+
+        # Check if operation exists
+        if operation not in effect_type.operations:
+            self.errors.append(f"Unknown operation {operation} for effect {effect_name}")
+            return None
+
+        op_type = effect_type.operations[operation]
 
         # Check arguments
-        if len(node.arguments) != len(op.params):
+        if len(node.args) != len(op_type.param_types):
             self.errors.append(
-                f"Wrong number of arguments for {node.operation}. "
-                f"Expected {len(op.params)}, got {len(node.arguments)}"
+                f"Operation {operation} takes {len(op_type.param_types)} arguments "
+                f"but got {len(node.args)}"
             )
             return None
 
-        for arg, param in zip(node.arguments, op.params):
+        # Type check each argument
+        for arg, param_type in zip(node.args, op_type.param_types):
             arg_type = self.check(arg)
-            if arg_type != param.type:
+            if arg_type != param_type:
                 self.errors.append(
-                    f"Wrong argument type for {node.operation}. "
-                    f"Expected {param.type}, got {arg_type}"
+                    f"Operation {operation} argument type mismatch: "
+                    f"expected {param_type}, got {arg_type}"
                 )
+                return None
 
-        return op.return_type
+        return op_type.return_type
 
     def visit_Module(self, node):
         """Type check a module"""
@@ -783,34 +889,7 @@ class TypeChecker:
         return True
 
     def visit_FunctionCall(self, node):
-        func_type = self.check(node.function)
-        if not isinstance(func_type, ast.FunctionType):
-            self.errors.append(f"Cannot call non-function type {func_type}")
-            return None
-
-        # Check linearity constraints
-        if func_type.linearity == ast.LinearityMode.ONCE:
-            if node.function.is_consumed:
-                self.errors.append("Cannot call a once function multiple times")
-            node.function.is_consumed = True
-        elif func_type.linearity == ast.LinearityMode.SEPARATE:
-            if node.function.is_active:
-                self.errors.append("Cannot make reentrant call to separate function")
-            node.function.is_active = True
-            
-        # Check arguments
-        if len(node.arguments) != len(func_type.param_types):
-            self.errors.append(f"Wrong number of arguments")
-            return None
-
-        for arg, param_type in zip(node.arguments, func_type.param_types):
-            arg_type = self.check(arg)
-            if isinstance(param_type, ast.ModeType):
-                if not self.check_mode_compatibility(param_type, arg_type):
-                    self.errors.append(f"Mode mismatch: expected {param_type}, got {arg_type}")
-                    return None
-
-        return func_type.return_type
+        return self.check_function_call(node, self.current_scope)
 
     def visit_FieldAccess(self, node):
         base_type = self.check(node.base)
@@ -896,7 +975,7 @@ class TypeChecker:
             def __init__(self, checker):
                 self.checker = checker
             
-            def visit_TypeRef(self, node):
+            def visit_TypeReference(self, node):
                 type_info = self.checker.comptime_context.get_type(node.name)
                 if not type_info:
                     self.checker.comptime_context.emit_error(
@@ -1284,7 +1363,7 @@ class TypeChecker:
         if isinstance(sub_def, EnumType) and isinstance(sup_def, EnumType):
             # Already handled in check_subtype
             return False
-            
+        
         if isinstance(sub_def, TypeScheme) and isinstance(sup_def, TypeScheme):
             # Check body types under appropriate substitution
             fresh_vars = [TypeVar(f"fresh_{i}") 
@@ -1298,7 +1377,7 @@ class TypeChecker:
             return self.check_subtype(sub_body, sup_body)
             
         return False
-
+                    
     def check_type_application(self, app: TypeApplication) -> Type:
         """Type check a type application using inferred variance.
         
@@ -1378,14 +1457,9 @@ class TypeChecker:
         return self.check_lambda_expression(node, scope)
 
     def check_lambda_expression(self, node, scope):
-        """Type check a lambda expression and verify its closure captures"""
+        """Type check a lambda expression using SimpleSub constraint generation and scope checking"""
         # Create new scope for lambda parameters
-        lambda_scope = ast.Scope(parent=scope)
-        
-        # Add parameters to scope
-        for param in node.params:
-            param_type = self.check(param.type_annotation, scope)
-            lambda_scope.add_variable(param.name, param_type, is_mutable=param.is_mutable)
+        lambda_scope = dict(scope)
         
         # Verify captured variables and determine linearity
         has_mut_captures = False
@@ -1416,6 +1490,23 @@ class TypeChecker:
             if var.linearity == ast.LinearityMode.ONCE:
                 has_once_captures = True
         
+        # Create fresh type variables for parameters
+        param_types = []
+        for param in node.parameters:
+            if param.type_annotation:
+                param_type = self.check(param.type_annotation, scope)
+            else:
+                param_type = self.type_inferencer.fresh_type_var(param.name)
+            lambda_scope[param.name] = param_type
+            param_types.append(param_type)
+
+            # Add parameter to scope with mutability info
+            self.symbol_table.add_variable(param.name, param_type, is_mutable=param.is_mutable)
+
+        # Check body with SimpleSub and scope rules
+        with self.symbol_table.scope():
+            body_type = self.check(node.body, lambda_scope)
+        
         # Determine lambda's linearity mode
         if has_once_captures:
             node.linearity = ast.LinearityMode.ONCE
@@ -1424,21 +1515,69 @@ class TypeChecker:
         else:
             node.linearity = ast.LinearityMode.MANY
         
-        # Check lambda body
-        return_type = self.check(node.body, lambda_scope)
+        # Create function type with linearity
+        func_type = ast.FunctionType(param_types, body_type, linearity=node.linearity)
         
-        # Record inferred return type if not explicitly specified
-        if not node.return_type:
-            node.return_type = return_type
-        else:
-            # Verify return type matches if explicitly specified
-            explicit_type = self.check(node.return_type, scope)
-            if not self.types_match(return_type, explicit_type):
-                self.errors.append(f"Lambda return type mismatch: expected {explicit_type}, got {return_type}")
+        # Add to type inferencer for constraint solving
+        compact_type = self.type_inferencer.to_compact_type(func_type)
+        self.type_inferencer.add_constraint(
+            compact_type,
+            self.type_inferencer.fresh_type_var("lambda"),
+            Polarity.NEUTRAL
+        )
         
-        # Create function type for lambda with appropriate linearity
-        param_types = [self.check(p.type_annotation, scope) for p in node.params]
-        return ast.FunctionType(param_types, node.return_type, linearity=node.linearity)
+        return func_type
+
+    def check_function_call(self, node, scope):
+        """Type check a function call with linearity constraints and scope checking"""
+        # Get function type
+        func_type = self.check(node.function, scope)
+        
+        # Handle lambda expressions
+        if isinstance(node.function, ast.LambdaExpression):
+            func_type = self.check_lambda_expression(node.function, scope)
+            
+        if not isinstance(func_type, ast.FunctionType):
+            self.errors.append(f"Cannot call non-function type {func_type}")
+            return ast.ErrorType()
+            
+        # Check linearity constraints
+        if func_type.linearity == ast.LinearityMode.ONCE:
+            if node.function.is_consumed:
+                self.errors.append("Cannot call a once function multiple times")
+            node.function.is_consumed = True
+        elif func_type.linearity == ast.LinearityMode.SEPARATE:
+            if node.function.is_active:
+                self.errors.append("Cannot make reentrant call to separate function")
+            node.function.is_active = True
+            
+        # Check arguments with SimpleSub and scope rules
+        if len(node.arguments) != len(func_type.param_types):
+            self.errors.append(f"Wrong number of arguments: expected {len(func_type.param_types)}, got {len(node.arguments)}")
+            return ast.ErrorType()
+            
+        for arg, param_type in zip(node.arguments, func_type.param_types):
+            # Check argument in current scope
+            arg_type = self.check(arg, scope)
+            
+            # Check borrow rules if argument is a variable
+            if isinstance(arg, ast.Variable):
+                var = self.symbol_table.lookup(arg.name)
+                if var and var.is_borrowed_mut:
+                    self.errors.append(f"Cannot pass mutably borrowed variable '{arg.name}' as argument")
+            
+            # Add subtyping constraint
+            self.type_inferencer.add_constraint(
+                self.type_inferencer.to_compact_type(arg_type),
+                self.type_inferencer.to_compact_type(param_type),
+                Polarity.NEGATIVE  # Arguments are contravariant
+            )
+            
+        # Reset active state after call completes
+        if func_type.linearity == ast.LinearityMode.SEPARATE:
+            node.function.is_active = False
+            
+        return func_type.return_type
 
     def collect_declarations(self, node) -> List['ast.Node']:
         """Recursively collect all declarations from an AST node"""
@@ -1518,39 +1657,8 @@ class TypeChecker:
                 
         return declarations
 
-    def check_function_call(self, node, scope):
-        """Type check a function call with linearity constraints"""
-        # Get function type
-        func_type = self.check(node.function, scope)
-        if not isinstance(func_type, ast.FunctionType):
-            self.errors.append(f"Cannot call non-function type {func_type}")
-            return ast.ErrorType()
-            
-        # Check linearity constraints
-        if func_type.linearity == ast.LinearityMode.ONCE:
-            if node.function.is_consumed:
-                self.errors.append("Cannot call a once function multiple times")
-            node.function.is_consumed = True
-        elif func_type.linearity == ast.LinearityMode.SEPARATE:
-            if node.function.is_active:
-                self.errors.append("Cannot make reentrant call to separate function")
-            node.function.is_active = True
-            
-        # Check arguments
-        if len(node.arguments) != len(func_type.param_types):
-            self.errors.append(f"Wrong number of arguments: expected {len(func_type.param_types)}, got {len(node.arguments)}")
-            return ast.ErrorType()
-            
-        for arg, param_type in zip(node.arguments, func_type.param_types):
-            arg_type = self.check(arg, scope)
-            if not self.types_match(arg_type, param_type):
-                self.errors.append(f"Argument type mismatch: expected {param_type}, got {arg_type}")
-                
-        # Reset active state after call completes
-        if func_type.linearity == ast.LinearityMode.SEPARATE:
-            node.function.is_active = False
-            
-        return func_type.return_type
+    
+
     def is_type_visible(self, ty: NamedType, from_module: Tuple[str, ...]) -> bool:
         """Check if a type is visible from the given module path.
         

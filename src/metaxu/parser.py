@@ -432,7 +432,7 @@ class Parser:
             p[0] = ast.FunctionDeclaration(p[2], [], p[6])
 
     def p_type_param_list(self, p):
-        '''type_param_list : LT type_params GT'''
+        '''type_param_list : LESS type_params GREATER'''
         p[0] = p[2]
 
     def p_type_params(self, p):
@@ -445,14 +445,11 @@ class Parser:
 
     def p_type_param(self, p):
         '''type_param : IDENTIFIER
-                     | IDENTIFIER COLON type_expression
-                     | IDENTIFIER COLON EFFECT'''
+                     | IDENTIFIER COLON type_constraint'''
         if len(p) == 2:
-            p[0] = ast.TypeParameter(p[1])
-        elif len(p) == 4 and p[3] == 'effect':
-            p[0] = ast.TypeParameter(p[1], effect=True)
+            p[0] = ast.TypeParameter(p[1], None)
         else:
-            p[0] = ast.TypeParameter(p[1], bound=p[3])
+            p[0] = ast.TypeParameter(p[1], p[3])
 
     def p_parameter(self, p):
         '''parameter : IDENTIFIER COLON type_expression
@@ -511,6 +508,8 @@ class Parser:
                 p[0] = ast.TypeWithMode(p[1], p[3])
             else:  # reference_mode type
                 p[0] = ast.TypeApplication("Reference", [p[2]], mode=p[1])
+        elif len(p) == 2 and isinstance(p[1], str):  # Simple type name (IDENTIFIER)
+            p[0] = ast.TypeReference(p[1])
         else:
             p[0] = p[1]
 
@@ -519,12 +518,16 @@ class Parser:
         p[0] = ast.TypeApplication("Array", [p[3]])
 
     def p_type_application(self, p):
-        '''type_application : IDENTIFIER LESS type_argument_list GREATER'''
+        '''type_application : IDENTIFIER LBRACKET type_argument_list RBRACKET'''
         p[0] = ast.TypeApplication(p[1], p[3])
 
     def p_type_argument_list(self, p):
-        '''type_argument_list : type_expression
-                            | type_argument_list COMMA type_expression'''
+        '''type_argument_list : type_list'''
+        p[0] = p[1]
+
+    def p_type_list(self, p):
+        '''type_list : type_expression
+                    | type_list COMMA type_expression'''
         if len(p) == 2:
             p[0] = [p[1]]
         else:
@@ -825,7 +828,7 @@ class Parser:
         '''interface_type : IDENTIFIER
                         | IDENTIFIER LESS type_list GREATER'''
         if len(p) == 2:
-            p[0] = ast.InterfaceType(p[1], None)
+            p[0] = ast.InterfaceType(p[1], [])
         else:
             p[0] = ast.InterfaceType(p[1], p[3])
 
@@ -847,12 +850,22 @@ class Parser:
             p[0] = p[1] + [p[3]]
 
     def p_type_constraint(self, p):
-        '''type_constraint : type_expression COLON type_bound
+        '''type_constraint : type_expression COLON EFFECT
+                         | type_expression COLON type_bound
                          | type_expression EXTENDS type_bound
                          | type_expression IMPLEMENTS type_bound
                          | type_expression EQUALS type_expression'''
         if p[2] == '=':
             p[0] = ast.TypeConstraint(p[1], 'equals', p[3])
+        elif p[2] == ':' and p[3] == 'effect':
+            p[0] = ast.EffectApplication(p[1])
+        elif p[2] == ':':
+            p[0] = ast.TypeConstraint(p[1], 'subtype', p[3])
+        elif p[2] == 'extends':
+            p[0] = ast.TypeConstraint(p[1], 'extends', p[3])
+        elif p[2] == 'implements':
+            p[0] = ast.TypeConstraint(p[1], 'implements', p[3])
+
         else:
             p[0] = ast.TypeConstraint(p[1], p[2].lower(), p[3])
 
@@ -947,8 +960,8 @@ class Parser:
         p[0] = p[2]
  
     def p_effect_declaration(self, p):
-        '''effect_declaration : EFFECT IDENTIFIER type_params_opt LBRACE effect_operations_def RBRACE'''
-        p[0] = ast.EffectDeclaration(p[2], p[3], p[5])
+        '''effect_declaration : EFFECT IDENTIFIER LESS type_params GREATER LBRACE effect_operations_def RBRACE'''
+        p[0] = ast.EffectDeclaration(p[2], p[4], p[7])
     
     # Used for effect operation definition
     def p_effect_operations_def(self, p):
@@ -967,9 +980,9 @@ class Parser:
         if len(p) == 7: #
             p[0] = ast.EffectOperation(p[1], p[3], p[6])
         elif len(p) == 5:
-            p[0] = ast.EffectOperation(p[1], p[3], None)
+            p[0] = ast.EffectOperation(p[1], [], p[5])
         elif len(p) == 4:
-            p[0] = ast.EffectOperation(p[1], [], None)
+            p[0] = ast.EffectOperation(p[1], p[3], None)
         else:   
             p[0] = ast.EffectOperation(p[1], [], None)
 
@@ -984,8 +997,8 @@ class Parser:
 
 
     def p_handle_expression(self, p):
-        '''handle_expression : HANDLE expression WITH LBRACE handle_cases RBRACE'''
-        p[0] = ast.HandleExpression(p[2], p[5])
+        '''handle_expression : HANDLE type_expression WITH LBRACE handle_cases RBRACE IN expression'''
+        p[0] = ast.HandleEffect(p[2], p[5], p[8])
 
     def p_handle_cases(self, p):
         '''handle_cases : handle_case
@@ -1322,3 +1335,32 @@ class Parser:
         elif isinstance(node, ast.Block):
             return any(self._is_variable_mutated(var_name, stmt) for stmt in node.statements)
         return False
+
+    def parse_effect_type(self):
+        """Parse an effect type (e.g., State[T])"""
+        name = self.expect_identifier()
+        type_args = []
+        
+        if self.match('['):
+            type_args = self.parse_type_args()
+            self.expect(']')
+            
+        return ast.EffectApplication(name, type_args)
+
+    def parse_type_args(self):
+        """Parse type arguments between [ and ]"""
+        args = []
+        while not self.check(']'):
+            args.append(self.parse_type())
+            if not self.check(']'):
+                self.expect(',')
+        return args
+
+    def parse_type_application(self):
+        """Parse a type application (e.g., List[T])"""
+        base = self.parse_type_name()
+        if self.match('['):
+            args = self.parse_type_args()
+            self.expect(']')
+            return ast.TypeApplication(base, args)
+        return base
