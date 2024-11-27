@@ -13,7 +13,7 @@ Welcome to the Metaxu documentation! Metaxu is a self-hosted, low-level function
 - [Ownership and Borrowing](ownership_and_borrowing.md)
 
 ### Effects and Runtime
-- [Algebraic Effects](effects/index.md)
+- [Builtin Algebraic Effects](effects/index.md)
   - Thread Effects
   - Domain Effects
   - Atomic Effects
