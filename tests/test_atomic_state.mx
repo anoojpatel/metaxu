@@ -1,0 +1,67 @@
+# Test atomic state operations
+
+import effects.state (AtomicInt, Atomic, new_atomic)
+import effects.thread (Thread, spawn, join)
+
+# Concurrent increment test
+fn test_concurrent_increment() -> Bool {
+    let counter = new_atomic(0)
+    let num_threads = 4
+    let iterations = 1000000
+    
+    # Spawn threads that increment counter
+    let threads = Array::new()
+    for _ in 0..num_threads {
+        let thread = spawn(|| {
+            for _ in 0..iterations {
+                perform Atomic::add(counter, 1)
+            }
+        })
+        threads.push(thread)
+    }
+    
+    # Wait for all threads
+    for thread in threads {
+        join(thread)
+    }
+    
+    # Verify final count
+    let final_count = perform Atomic::load(counter)
+    assert(final_count == num_threads * iterations)
+    true
+}
+
+# Test bank account transfers
+fn test_concurrent_transfers() -> Bool {
+    let account1 = new_account(1000)
+    let account2 = new_account(0)
+    let num_threads = 4
+    let amount = 100
+    
+    # Spawn threads that transfer money
+    let threads = Array::new()
+    for _ in 0..num_threads {
+        let thread = spawn(|| {
+            transfer(account1, account2, amount)
+        })
+        threads.push(thread)
+    }
+    
+    # Wait for all threads
+    for thread in threads {
+        join(thread)
+    }
+    
+    # Verify balances
+    let balance1 = perform Atomic::load(account1.balance)
+    let balance2 = perform Atomic::load(account2.balance)
+    assert(balance1 + balance2 == 1000)  # Total preserved
+    true
+}
+
+fn main() -> Bool {
+    assert(test_concurrent_increment())
+    assert(test_concurrent_transfers())
+    assert(test_atomic_ops())
+    true
+}

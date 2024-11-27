@@ -414,10 +414,11 @@ class EffectDeclaration(Node):
 
 class EffectOperation(Node):
     """An operation in an effect (e.g., read() -> T)"""
-    def __init__(self, name, params, return_type):
+    def __init__(self, name, params, return_type, c_effect=None):
         self.name = name
         self.params = params
         self.return_type = return_type
+        self.c_effect = c_effect  # C effect type for this operation
 
 class EffectExpression(Node):
     """Base class for effect expressions in performs clauses"""
@@ -1166,7 +1167,17 @@ def eval_type_match(self, context):
     
     context.emit_error("No pattern matched the type")
 
-
+# Effect System
+class EffectMapping:
+    """Maps a Metaxu effect to a C runtime effect"""
+    def __init__(self, metaxu_effect, c_effect):
+        self.metaxu_effect = metaxu_effect  # Name of Metaxu effect
+        self.c_effect = c_effect            # Name of C effect
+        
+class WithClause:
+    """Effect mapping clause (e.g., 'with EFFECT_SPAWN')"""
+    def __init__(self, c_effect):
+        self.c_effect = c_effect  # Name of C effect to map to
 
 class EffectApplication(EffectExpression):
     """Application of type arguments to an effect type (e.g., Reader[T])"""

@@ -1,0 +1,99 @@
+# Domain effects for Metaxu
+# These effects are implemented by the C runtime
+
+# Map C runtime functions
+extern fn runtime_effect_alloc(size: Int) -> domain_t
+extern fn runtime_effect_free(domain: domain_t)
+extern fn runtime_effect_move(from: domain_t, to: domain_t)
+extern fn runtime_effect_borrow(domain: domain_t) -> Any
+extern fn runtime_effect_store(domain: domain_t, value: Any)
+
+# Map C runtime types
+extern type domain_t
+
+# Domain type represents an ownership domain
+type Domain[T] = domain_t
+
+# Domain effects for memory management
+effect Domain = {
+    # Allocate memory in a new domain
+    fn alloc[T](size: Int) -> @unique Domain[T]
+
+    # Free memory and call drop handlers
+    fn free[T](domain: @unique Domain[T])
+
+    # Move ownership between domains
+    fn move[T](from: @unique Domain[T], to: @unique Domain[T])
+
+    # Temporarily borrow data from a domain
+    fn borrow[T](domain: @unique Domain[T]) -> @global T
+}
+
+# Create a new domain with given value
+fn new_domain[T](value: @global T) -> @unique Domain[T] {
+    with handle Domain {
+        alloc[U](size) -> runtime_effect_alloc(size)
+        free[U](domain) -> runtime_effect_free(domain)
+        move[U](from, to) -> runtime_effect_move(from, to)
+        borrow[U](domain) -> runtime_effect_borrow(domain) as U
+    } in {
+        let domain = perform Domain::alloc[T](sizeof[T])
+        # Initialize domain with value using runtime
+        runtime_effect_store(domain, value)
+        domain
+    }
+}
+
+# Drop a domain and its contents
+fn drop[T](domain: @unique Domain[T]) {
+    with handle Domain {
+        alloc[U](size) -> runtime_effect_alloc(size)
+        free[U](domain) -> runtime_effect_free(domain)
+        move[U](from, to) -> runtime_effect_move(from, to)
+        borrow[U](domain) -> runtime_effect_borrow(domain) as U
+    } in {
+        perform Domain::free[T](domain)
+    }
+}
+
+# Move value between domains
+fn move_value[T](from: @unique Domain[T], to: @unique Domain[T]) {
+    with handle Domain {
+        alloc[U](size) -> runtime_effect_alloc(size)
+        free[U](domain) -> runtime_effect_free(domain)
+        move[U](from, to) -> runtime_effect_move(from, to)
+        borrow[U](domain) -> runtime_effect_borrow(domain) as U
+    } in {
+        perform Domain::move[T](from, to)
+    }
+}
+
+# Borrow value from domain
+fn borrow[T](domain: @unique Domain[T]) -> @global T {
+    with handle Domain {
+        alloc[U](size) -> runtime_effect_alloc(size)
+        free[U](domain) -> runtime_effect_free(domain)
+        move[U](from, to) -> runtime_effect_move(from, to)
+        borrow[U](domain) -> runtime_effect_borrow(domain) as U
+    } in {
+        perform Domain::borrow[T](domain)
+    }
+}
+
+# Example: Safe resource management
+fn example() {
+    # Create two domains
+    let d1 = new_domain(42)
+    let d2 = new_domain(0)
+    
+    # Move value from d1 to d2
+    move_value(d1, d2)
+    
+    # Borrow value from d2
+    let val = borrow(d2)
+    assert(val == 42)
+    
+    # Clean up
+    drop(d1)
+    drop(d2)
+}

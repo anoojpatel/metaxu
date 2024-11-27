@@ -1,0 +1,100 @@
+# Synchronization primitives for domains and data structures
+
+from effects.state import AtomicInt, Atomic
+from effects.thread import Thread, yield
+
+# RwLock using atomics
+struct RwLock = {
+    readers: AtomicInt,     # Number of active readers
+    writer: AtomicInt,      # 1 if writer active, 0 otherwise
+    write_waiting: AtomicInt # Number of writers waiting
+}
+
+# RwLock operations effect
+effect RwLock = {
+    # Create new RwLock
+    fn create() -> RwLock
+    
+    # Acquire read lock
+    fn read_lock(lock: RwLock) -> Bool
+    
+    # Release read lock
+    fn read_unlock(lock: RwLock)
+    
+    # Acquire write lock
+    fn write_lock(lock: RwLock) -> Bool
+    
+    # Release write lock
+    fn write_unlock(lock: RwLock)
+}
+
+# High-level operations
+fn new_rwlock() -> RwLock {
+    perform RwLock::create()
+}
+
+fn with_read[T](lock: RwLock, f: fn() -> T) -> Option[T] {
+    if perform RwLock::read_lock(lock) {
+        let result = f()
+        perform RwLock::read_unlock(lock)
+        Some(result)
+    } else {
+        None
+    }
+}
+
+fn with_write[T](lock: RwLock, f: fn() -> T) -> Option[T] {
+    if perform RwLock::write_lock(lock) {
+        let result = f()
+        perform RwLock::write_unlock(lock)
+        Some(result)
+    } else {
+        None
+    }
+}
+
+# Example: Thread-safe counter
+type Counter = {
+    value: Int,
+    lock: RwLock
+}
+
+fn new_counter() -> Counter {
+    Counter {
+        value: 0,
+        lock: new_rwlock()
+    }
+}
+
+fn increment(counter: Counter) -> Bool {
+    with_write(counter.lock, || {
+        counter.value += 1
+    }).is_some()
+}
+
+fn get_value(counter: Counter) -> Option[Int] {
+    with_read(counter.lock, || counter.value)
+}
+
+# Example usage
+fn test_sync_counter() -> Bool {
+    # Create thread-safe counter
+    let counter = new_counter()
+    
+    # Spawn threads to increment
+    let threads = for i in 0..10 {
+        spawn(|| {
+            for j in 0..100 {
+                increment(counter)
+            }
+        })
+    }
+    
+    # Wait for all threads
+    for thread in threads {
+        join(thread)
+    }
+    
+    # Verify final count
+    get_value(counter) == Some(1000)
+}

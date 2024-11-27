@@ -1,0 +1,128 @@
+# Advanced effects for Metaxu
+
+# Resource effect for safe resource management
+effect Resource[T] {
+    # Acquire a resource
+    fn acquire() -> T
+    
+    # Release a resource
+    fn release(resource: T) -> ()
+    
+    # Use resource with cleanup
+    fn with_resource[U](f: fn(T) -> U) -> U
+}
+
+# State effect with transactions
+effect State[T] {
+    # Get current state
+    fn get() -> T
+    
+    # Set new state
+    fn put(value: T) -> ()
+    
+    # Run in transaction
+    fn atomic[U](f: fn() -> U) -> U
+    
+    # Rollback transaction
+    fn rollback() -> !
+}
+
+# Async effect for non-blocking operations
+effect Async[T] {
+    # Create a future
+    fn future[U](f: fn() -> U) -> Future[U]
+    
+    # Await a future
+    fn await[U](future: Future[U]) -> U
+    
+    # Run multiple futures concurrently
+    fn parallel[U](futures: Array[Future[U]]) -> Array[U]
+}
+
+# Error handling effect
+effect Error[E] {
+    # Throw an error
+    fn throw(error: E) -> !
+    
+    # Try operation with recovery
+    fn try[T](f: fn() -> T, recover: fn(E) -> T) -> T
+    
+    # Chain error handlers
+    fn chain[T, F](f: fn() -> Result[T, E], g: fn(E) -> Result[T, F]) -> Result[T, F]
+}
+
+# Example usage of resource effect
+fn with_file(path: String) -> Result[String, Error] {
+    handle Resource[File] with {
+        acquire() -> File.open(path)
+        release(file) -> file.close()
+        with_resource(f) -> {
+            let resource = acquire()
+            let result = f(resource)
+            release(resource)
+            result
+        }
+    } in {
+        let file = perform Resource.acquire()
+        let contents = file.read_to_string()
+        perform Resource.release(file)
+        Ok(contents)
+    }
+}
+
+# Example usage of state effect
+fn increment_counter() -> Int {
+    handle State[Int] with {
+        get() -> {
+            let current = state
+            resume(current)
+        }
+        put(value) -> {
+            state = value
+            resume(())
+        }
+        atomic(f) -> {
+            let snapshot = state
+            try {
+                let result = f()
+                resume(result)
+            } catch {
+                state = snapshot
+                resume(throw())
+            }
+        }
+        rollback() -> throw()
+    } in {
+        perform State.atomic(|| {
+            let current = perform State.get()
+            perform State.put(current + 1)
+            if current >= 100 {
+                perform State.rollback()
+            }
+            current + 1
+        })
+    }
+}
+
+# Example usage of async effect
+fn fetch_urls(urls: Array[String]) -> Array[String] {
+    handle Async[String] with {
+        future(f) -> {
+            let thread = Thread.spawn(f)
+            Future { thread: thread }
+        }
+        await(f) -> Thread.join(f.thread)
+        parallel(fs) -> {
+            let results = Array.new()
+            for f in fs {
+                results.push(await(f))
+            }
+            results
+        }
+    } in {
+        let futures = urls.map(|url| {
+            perform Async.future(|| http_get(url))
+        })
+        perform Async.parallel(futures)
+    }
+}

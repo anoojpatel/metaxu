@@ -1,0 +1,93 @@
+# Thread-safe concurrent data structures
+from effects.state import AtomicInt, Atomic, new_atomic
+from effects.domain import Domain
+from effects.sync import RwLock, RwLockOp, SyncDomain
+from effects.thread import Thread, spawn, join
+
+# Thread-safe concurrent queue
+type ConcurrentQueue[T] = {
+    data: SyncDomain[List[T]],     # Protected list of items
+    size: AtomicInt,               # Atomic counter for size
+}
+
+# Create new concurrent queue
+fn new_queue[T]() -> @global ConcurrentQueue[T] {
+    ConcurrentQueue {
+        data: SyncDomain::new([]),  # Empty list
+        size: new_atomic(0)         # Initial size 0
+    }
+}
+
+# Add item to queue
+fn enqueue[T](queue: @global ConcurrentQueue[T], item: T) -> () {
+    # Add item to list under write lock
+    perform SyncDomain::write(queue.data, |items| {
+        let new_items = items.append(item)
+        (new_items, ())
+    })
+    
+    # Increment size atomically
+    perform Atomic::add(queue.size, 1)
+}
+
+# Try to remove and return item from queue
+fn try_dequeue[T](queue: @global ConcurrentQueue[T]) -> Option[T] {
+    # First check size atomically
+    if perform Atomic::load(queue.size) == 0 {
+        return None
+    }
+    
+    # Try to remove under write lock
+    let result = perform SyncDomain::write(queue.data, |items| {
+        if items.is_empty() {
+            (items, None)
+        } else {
+            let (item, remaining) = items.remove_first()
+            (remaining, Some(item))
+        }
+    })
+    
+    # Decrement size if we got an item
+    if result.is_some() {
+        perform Atomic::sub(queue.size, 1)
+    }
+    
+    return result
+}
+
+# Get current queue size
+fn queue_size[T](queue: @global ConcurrentQueue[T]) -> Int {
+    perform Atomic::load(queue.size)
+}
+
+# Example usage:
+fn example() {
+    # Create shared queue
+    let queue = new_queue[Int]()
+    
+    # Spawn producer thread
+    let producer = spawn(|| {
+        for i in range(0, 10) {
+            enqueue(queue, i)
+            yield()  # Be nice to other threads
+        }
+    })
+    
+    # Spawn consumer thread
+    let consumer = spawn(|| {
+        let mut count = 0
+        while count < 10 {
+            match try_dequeue(queue) {
+                Some(item) => {
+                    count += 1
+                    print("Consumed: {}", item)
+                }
+                None => yield()  # Queue empty, let others run
+            }
+        }
+    })
+    
+    # Wait for both threads
+    join(producer)
+    join(consumer)
+}

@@ -1,0 +1,188 @@
+# State effect using hardware atomics
+# Implemented using C11 atomic operations
+
+# Map C runtime functions
+extern fn runtime_effect_alloc_atomic(initial: Int) -> atomic_state_t
+extern fn runtime_effect_atomic_load(state: atomic_state_t) -> Int
+extern fn runtime_effect_atomic_store(state: atomic_state_t, value: Int)
+extern fn runtime_effect_atomic_cas(state: atomic_state_t, expected: Int, desired: Int) -> Int
+extern fn runtime_effect_atomic_add(state: atomic_state_t, value: Int) -> Int
+extern fn runtime_effect_atomic_sub(state: atomic_state_t, value: Int) -> Int
+
+# Map C runtime types
+extern type atomic_state_t
+
+# Atomic state type
+type AtomicInt = atomic_state_t
+
+# Atomic state operations effect
+effect Atomic = {
+    # Create new atomic state
+    fn alloc(initial: Int) -> AtomicInt
+    
+    # Load current value
+    fn load(state: AtomicInt) -> Int
+    
+    # Store new value
+    fn store(state: AtomicInt, value: Int)
+    
+    # Compare and swap
+    fn cas(state: AtomicInt, expected: Int, desired: Int) -> Int
+    
+    # Add value and return previous
+    fn add(state: AtomicInt, value: Int) -> Int
+    
+    # Subtract value and return previous
+    fn sub(state: AtomicInt, value: Int) -> Int
+}
+
+# Create new atomic integer with default handler
+fn new_atomic(initial: Int) -> AtomicInt {
+    with handle Atomic {
+        alloc(i) -> runtime_effect_alloc_atomic(i)
+        load(s) -> runtime_effect_atomic_load(s)
+        store(s, v) -> runtime_effect_atomic_store(s, v)
+        cas(s, e, d) -> runtime_effect_atomic_cas(s, e, d)
+        add(s, v) -> runtime_effect_atomic_add(s, v)
+        sub(s, v) -> runtime_effect_atomic_sub(s, v)
+    } in {
+        perform Atomic::alloc(initial)
+    }
+}
+
+# High-level atomic operations using handlers
+fn atomic_increment(state: AtomicInt) -> Int {
+    with handle Atomic {
+        alloc(i) -> runtime_effect_alloc_atomic(i)
+        load(s) -> runtime_effect_atomic_load(s)
+        store(s, v) -> runtime_effect_atomic_store(s, v)
+        cas(s, e, d) -> runtime_effect_atomic_cas(s, e, d)
+        add(s, v) -> runtime_effect_atomic_add(s, v)
+        sub(s, v) -> runtime_effect_atomic_sub(s, v)
+    } in {
+        perform Atomic::add(state, 1)
+    }
+}
+
+fn atomic_decrement(state: AtomicInt) -> Int {
+    with handle Atomic {
+        alloc(i) -> runtime_effect_alloc_atomic(i)
+        load(s) -> runtime_effect_atomic_load(s)
+        store(s, v) -> runtime_effect_atomic_store(s, v)
+        cas(s, e, d) -> runtime_effect_atomic_cas(s, e, d)
+        add(s, v) -> runtime_effect_atomic_add(s, v)
+        sub(s, v) -> runtime_effect_atomic_sub(s, v)
+    } in {
+        perform Atomic::sub(state, 1)
+    }
+}
+
+fn atomic_get(state: AtomicInt) -> Int {
+    with handle Atomic {
+        alloc(i) -> runtime_effect_alloc_atomic(i)
+        load(s) -> runtime_effect_atomic_load(s)
+        store(s, v) -> runtime_effect_atomic_store(s, v)
+        cas(s, e, d) -> runtime_effect_atomic_cas(s, e, d)
+        add(s, v) -> runtime_effect_atomic_add(s, v)
+        sub(s, v) -> runtime_effect_atomic_sub(s, v)
+    } in {
+        perform Atomic::load(state)
+    }
+}
+
+fn atomic_set(state: AtomicInt, value: Int) {
+    with handle Atomic {
+        alloc(i) -> runtime_effect_alloc_atomic(i)
+        load(s) -> runtime_effect_atomic_load(s)
+        store(s, v) -> runtime_effect_atomic_store(s, v)
+        cas(s, e, d) -> runtime_effect_atomic_cas(s, e, d)
+        add(s, v) -> runtime_effect_atomic_add(s, v)
+        sub(s, v) -> runtime_effect_atomic_sub(s, v)
+    } in {
+        perform Atomic::store(state, value)
+    }
+}
+
+fn atomic_compare_and_swap(state: AtomicInt, expected: Int, desired: Int) -> Int {
+    with handle Atomic {
+        alloc(i) -> runtime_effect_alloc_atomic(i)
+        load(s) -> runtime_effect_atomic_load(s)
+        store(s, v) -> runtime_effect_atomic_store(s, v)
+        cas(s, e, d) -> runtime_effect_atomic_cas(s, e, d)
+        add(s, v) -> runtime_effect_atomic_add(s, v)
+        sub(s, v) -> runtime_effect_atomic_sub(s, v)
+    } in {
+        perform Atomic::cas(state, expected, desired)
+    }
+}
+
+# Example usage
+fn example() {
+    # Create atomic counter
+    let counter = new_atomic(0)
+    
+    # Increment and get value
+    let prev = atomic_increment(counter)
+    let curr = atomic_get(counter)
+    
+    # Compare and swap
+    let swapped = atomic_compare_and_swap(counter, curr, curr + 1)
+}
+
+# Example: Thread-safe bank account
+struct Account = {
+    balance: AtomicInt
+}
+
+fn new_account(initial: Int) -> Account {
+    Account {
+        balance: new_atomic(initial)
+    }
+}
+
+fn deposit(account: Account, amount: Int) -> Int {
+    atomic_add(account.balance, amount)
+}
+
+fn withdraw(account: Account, amount: Int) -> Int {
+    atomic_sub(account.balance, amount)
+}
+
+fn get_balance(account: Account) -> Int {
+    atomic_get(account.balance)
+}
+
+fn transfer(from: Account, to: Account, amount: Int) -> Bool {
+    let current = get_balance(from)
+    if current >= amount {
+        let previous = atomic_compare_and_swap(from.balance, current, current - amount)
+        if previous == current {
+            deposit(to, amount)
+            return true
+        }
+    }
+    return false
+}
+
+# Test atomic operations
+fn test_atomic_ops() -> Bool {
+    let x = new_atomic(0)
+    
+    # Test increment
+    let v1 = atomic_increment(x)
+    assert(v1 == 0)  # Returns old value
+    assert(atomic_get(x) == 1)
+    
+    # Test CAS
+    assert(atomic_compare_and_swap(x, 1, 2))  # Should succeed
+    assert(!atomic_compare_and_swap(x, 1, 3))  # Should fail
+    assert(atomic_get(x) == 2)
+    
+    # Test arithmetic
+    assert(atomic_add(x, 3) == 2)  # Returns old value
+    assert(atomic_get(x) == 5)
+    assert(atomic_sub(x, 2) == 5)
+    assert(atomic_get(x) == 3)
+    
+    true
+}

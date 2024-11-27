@@ -1,4 +1,24 @@
 from metaxu.tape_vm import Opcode, Instruction
+from metaxu.effect_map import EffectParser
+from typing import List, Optional, Dict
+
+class EffectMapper:
+    def __init__(self):
+        self.effect_map = {}
+        self.c_effect_types = set()
+
+    def register_effect_mapping(self, metaxu_effect: str, c_effect: str, return_type: str, arg_types: List[str]):
+        """Register a mapping from Metaxu effect to C runtime effect"""
+        key = (metaxu_effect, c_effect)
+        self.effect_map[key] = {
+            'return_type': return_type,
+            'arg_types': arg_types
+        }
+        self.c_effect_types.add(c_effect)
+
+    def get_effect_mapping(self, metaxu_effect: str, c_effect: str) -> Optional[Dict]:
+        """Get the mapping info for a Metaxu-to-C effect pair"""
+        return self.effect_map.get((metaxu_effect, c_effect))
 
 class VMToCCompiler:
     def __init__(self, instructions, linker, options=None):
@@ -18,6 +38,21 @@ class VMToCCompiler:
         self.cuda_enabled = False  # Default to no CUDA support
         self.message_queues = set()
         self.drop_tracker = DropTracker()
+        self.effect_parser = EffectParser()
+        self.effect_mapper = EffectMapper()
+
+    def register_effect_mapping(self, metaxu_effect: str, c_effect: str, return_type: str, arg_types: List[str]):
+        """Register a mapping from Metaxu effect to C runtime effect"""
+        self.effect_mapper.register_effect_mapping(metaxu_effect, c_effect, return_type, arg_types)
+
+    def compile_effect_operation(self, effect_op: str, args: List[str]) -> str:
+        """Compile an effect operation with C runtime mapping"""
+        mapping = self.effect_mapper.get_effect_mapping(effect_op, self.effect_parser.get_c_effect(effect_op))
+        if not mapping:
+            raise Exception(f"No mapping found for effect {effect_op}")
+                
+        # Generate C function call
+        return f"runtime_{self.effect_parser.get_c_effect(effect_op).lower()}({', '.join(args)})"
 
     def compile(self):
         """Generate C code from VM instructions"""
@@ -59,6 +94,9 @@ class VMToCCompiler:
         self.c_code += "#include <pthread.h>\n"  # For multithreading
         self.c_code += "#include <setjmp.h>\n"   # For continuation handling
         
+        # Include effect system
+        self.c_code += "#include \"effects.h\"\n"
+        
         # Only include CUDA if explicitly enabled
         if self.cuda_enabled:
             self.c_code += "#include <cuda_runtime.h>\n"
@@ -71,7 +109,8 @@ class VMToCCompiler:
         self.c_code += "struct thread_pool;\n"
         self.c_code += "struct future;\n"
         self.c_code += "struct queue;\n"
-        self.c_code += "struct task;\n\n"
+        self.c_code += "struct task;\n"
+        self.c_code += "struct domain;\n\n"
         
         # Type aliases
         self.c_code += "// Type definitions\n"
@@ -79,7 +118,8 @@ class VMToCCompiler:
         self.c_code += "typedef struct thread_pool thread_pool_t;\n"
         self.c_code += "typedef struct future future_t;\n"
         self.c_code += "typedef struct queue queue_t;\n"
-        self.c_code += "typedef struct task task_t;\n\n"
+        self.c_code += "typedef struct task task_t;\n"
+        self.c_code += "typedef struct domain domain_t;\n\n"
 
     def _generate_exports(self):
         """Generate exported symbols for library mode"""
@@ -98,6 +138,16 @@ class VMToCCompiler:
 
     def _generate_runtime(self):
         """Generate runtime support code"""
+        self._generate_effect_table()
+        self.c_code += "\n// Runtime initialization\n"
+        self.c_code += "static mx_runtime_t* runtime = NULL;\n\n"
+        self.c_code += "static void init_runtime() {\n"
+        self.c_code += "    if (runtime) return;\n"
+        self.c_code += "    runtime = malloc(sizeof(mx_runtime_t));\n"
+        self.c_code += "    runtime->effect_system = mx_effect_system_create();\n"
+        self.c_code += "    mx_init_static_effects(runtime->effect_system);\n"
+        self.c_code += "}\n\n"
+
         # Basic structures
         self.c_code += "// Runtime structures\n"
         
@@ -217,9 +267,43 @@ class VMToCCompiler:
         self.c_code += "    }\n"
         self.c_code += "}\n\n"
 
+    def _generate_effect_table(self):
+        """Generate static effect handler table"""
+        self.c_code += "\n// Static effect handler table\n"
+        self.c_code += "static const struct {\n"
+        self.c_code += "    const char* name;\n"
+        self.c_code += "    mx_effect_handler_t handler;\n"
+        self.c_code += "} mx_static_effects[] = {\n"
+        
+        # Add all registered effects
+        for metaxu_effect, c_effect in self.effect_mapper.effect_map.items():
+            handler_name = f"handle_{c_effect[1].lower()}"
+            self.c_code += f'    {{"{metaxu_effect[0]}::{metaxu_effect[1]}", {handler_name}}},\n'
+        
+        self.c_code += "    {NULL, NULL}\n"
+        self.c_code += "};\n\n"
+        
+        # Generate static initialization function
+        self.c_code += "static void mx_init_static_effects(mx_effect_system_t* system) {\n"
+        self.c_code += "    for (int i = 0; mx_static_effects[i].name != NULL; i++) {\n"
+        self.c_code += "        mx_register_effect(system, mx_static_effects[i].name, mx_static_effects[i].handler);\n"
+        self.c_code += "    }\n"
+        self.c_code += "}\n\n"
+
     def _generate_init(self):
         """Generate initialization code"""
-        self.c_code += "    // TODO: Add initialization code\n"
+        self.c_code += "    // Initialize effect system\n"
+        self.c_code += "    init_effect_system();\n\n"
+        
+        # Initialize thread pool if needed
+        if self._uses_threads():
+            self.c_code += "    // Initialize thread pool\n"
+            self.c_code += "    thread_pool_t* global_pool = create_thread_pool(4);\n"
+        
+        # Initialize global domain if needed
+        if self._uses_domains():
+            self.c_code += "    // Initialize global domain\n"
+            self.c_code += "    domain_t* global_domain = create_domain();\n"
 
     def _compile_instruction(self, instr):
         """Compile a single instruction"""
@@ -240,14 +324,9 @@ class VMToCCompiler:
             context = self.get_temp_var()
             thread = self.get_temp_var()
             
-            # Create thread context
-            self.c_code += f"{indent}thread_context_t* {context} = malloc(sizeof(thread_context_t));\n"
-            self.c_code += f"{indent}{context}->queues = create_message_queue(10);\n"
-            self.c_code += f"{indent}{context}->locals = NULL;\n"
-            
-            # Create and start thread
-            self.c_code += f"{indent}pthread_t {thread};\n"
-            self.c_code += f"{indent}pthread_create(&{thread}, NULL, (void* (*)(void*)){func_name}, {context});\n"
+            # Create spawn request
+            self.c_code += f"{indent}spawn_request_t req = {{.function = {func_name}}};\n"
+            self.c_code += f"{indent}thread_t* {thread} = invoke_effect(EFFECT_SPAWN, &req);\n"
             self.stack_push(thread)
 
         elif opcode == Opcode.TO_DEVICE:
@@ -274,12 +353,17 @@ class VMToCCompiler:
         elif opcode == Opcode.SEND_MESSAGE:
             queue = self.stack_pop()
             msg = self.stack_pop()
-            self.c_code += f"{indent}send_message({queue}, (void*){msg});\n"
+            
+            # Create send request
+            self.c_code += f"{indent}message_t req = {{.queue = {queue}, .data = {msg}}};\n"
+            self.c_code += f"{indent}invoke_effect(EFFECT_SEND, &req);\n"
 
         elif opcode == Opcode.RECEIVE_MESSAGE:
             queue = self.stack_pop()
             result = self.get_temp_var()
-            self.c_code += f"{indent}int {result} = (int)receive_message({queue});\n"
+            
+            # Create receive request
+            self.c_code += f"{indent}void* {result} = invoke_effect(EFFECT_RECEIVE, {queue});\n"
             self.stack_push(result)
 
         elif opcode == Opcode.CREATE_CONTINUATION:
@@ -473,7 +557,7 @@ class VMToCCompiler:
             self.stack_push(value)
         elif opcode == Opcode.POP:
             self.stack_pop()
-        elif opcode == Opcode.PRINT:
+        elif opcode == Opcode.PRINT: # Technically effectful but useful to debug
             value = self.stack_pop()
             # Check if value is a string constant
             if any(f'const char* {value} =' in line or f'char* {value} =' in line for line in self.c_code.split('\n')):
@@ -536,6 +620,43 @@ class VMToCCompiler:
             self.c_code += f"{indent}{value} = move_to_caller_region({value});\n"
             self.c_code += f"{indent}return {value};\n"
         
+        elif opcode == Opcode.JOIN_THREAD:
+            thread = self.stack_pop()
+            result = self.get_temp_var()
+            
+            # Create join request
+            self.c_code += f"{indent}join_request_t req = {{.thread = {thread}}};\n"
+            self.c_code += f"{indent}void* {result} = invoke_effect(EFFECT_JOIN, &req);\n"
+            self.stack_push(result)
+
+        elif opcode == Opcode.ALLOC_DOMAIN:
+            size = self.stack_pop()
+            domain = self.get_temp_var()
+            
+            # Create alloc request
+            self.c_code += f"{indent}alloc_request_t req = {{.size = {size}}};\n"
+            self.c_code += f"{indent}domain_t* {domain} = invoke_effect(EFFECT_ALLOC, &req);\n"
+            self.stack_push(domain)
+
+        elif opcode == Opcode.FREE_DOMAIN:
+            domain = self.stack_pop()
+            self.c_code += f"{indent}invoke_effect(EFFECT_FREE, {domain});\n"
+
+        elif opcode == Opcode.MOVE_DOMAIN:
+            from_domain = self.stack_pop()
+            to_domain = self.stack_pop()
+            
+            # Create move request
+            self.c_code += f"{indent}move_request_t req = {{.from = {from_domain}, .to = {to_domain}}};\n"
+            self.c_code += f"{indent}invoke_effect(EFFECT_MOVE, &req);\n"
+
+        elif opcode == Opcode.BORROW_DOMAIN:
+            domain = self.stack_pop()
+            result = self.get_temp_var()
+            
+            # Create borrow request
+            self.c_code += f"{indent}void* {result} = invoke_effect(EFFECT_BORROW, {domain});\n"
+            self.stack_push(result)
 
     def get_temp_var(self):
         temp_var = f"t{self.temp_var_count}"

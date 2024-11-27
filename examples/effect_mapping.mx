@@ -1,0 +1,33 @@
+# Example of effect mapping in Metaxu
+
+extern type Thread[T];
+extern type Mutex;
+
+# Thread effect with C runtime mappings
+effect Thread = {
+    fn spawn[T](f: fn() -> @global T) -> @global Thread[T] with EFFECT_SPAWN
+    fn join[T](thread: @global Thread[T]) -> @global T with EFFECT_JOIN
+}
+
+# Mutex effect with C runtime mappings
+effect Mutex = {
+    fn create() -> @global Mutex with EFFECT_MUTEX_CREATE
+    fn lock(mutex: @global Mutex) -> () with EFFECT_MUTEX_LOCK
+    fn unlock(mutex: @global Mutex) -> () with EFFECT_MUTEX_UNLOCK
+}
+
+# Example usage
+fn main() -> () {
+    # Create a mutex
+    let mutex = perform Mutex.create();
+    
+    # Create a thread that uses the mutex
+    let thread = perform Thread.spawn(|| {
+        perform Mutex.lock(mutex);
+        # Critical section
+        perform Mutex.unlock(mutex);
+    });
+    
+    # Wait for thread to complete
+    perform Thread.join(thread);
+}
