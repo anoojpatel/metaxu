@@ -1,6 +1,6 @@
 # Metaxu
-A self-hosted Low level functional-style programming language 🌀 
-
+A self-hosted Low level functional-style programming language 🌀  
+[Documentation](docs/index.md)
 ## Installation
 
 ### Prerequisites
@@ -35,7 +35,31 @@ uv sync
 
 4. Use Metaxu Compiler:
 ```bash
-metaxu --help
+$ metaxu --help
+
+ usage: metaxu [-h] [--target {vm,c}] [--output OUTPUT] [--optimize] [--debug] [--dump-ir] [--dump-ast] [--run] [--link-mode {static,dynamic,library}]
+              [--library-name LIBRARY_NAME] [--cuda]
+              files [files ...]
+
+Metaxu compiler
+
+positional arguments:
+  files                 Source files to compile
+
+options:
+  -h, --help            show this help message and exit
+  --target {vm,c}       Compilation target (default: vm)
+  --output, -o OUTPUT   Output file
+  --optimize, -O        Enable optimizations
+  --debug, -g           Include debug information
+  --dump-ir             Dump VM IR
+  --dump-ast            Dump AST
+  --run                 Run in VM after compilation
+  --link-mode {static,dynamic,library}
+                        Linking mode (default: static)
+  --library-name LIBRARY_NAME
+                        Library name (for library builds)
+  --cuda                Enable CUDA support
 ```
 
 ## Development
