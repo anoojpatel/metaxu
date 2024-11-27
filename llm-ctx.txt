@@ -1,0 +1,349 @@
+# Metaxu Language Context
+
+## Overview
+Metaxu is a modern systems programming language that prioritizes:
+- Speed and performance through zero-cost abstractions
+- Memory safety via modal borrow checking
+- Developer ergonomics with functional-style features
+- Type safety through advanced type system features
+
+Current Implementation:
+- Written in Python, compiling through TapeVM to C
+- Goal: Self-hosting compiler in Metaxu
+- Target: Systems programming with minimal runtime overhead
+
+## Core Language Features
+
+### Type System
+```yaml
+Overview:
+  Foundation:
+    - Based on SimpleSub algorithm
+    - Bidirectional type inference
+    - Algebraic data types (ADTs)
+    - First-class polymorphism
+    - Modal type qualifiers
+
+Type Inference:
+  Algorithm:
+    - Bidirectional type checking
+    - Bottom-up inference with top-down checking
+    - Polar type variables for subtyping
+    - Local type inference within functions
+    - Global inference across module boundaries
+  
+  Features:
+    - Principal types guarantee
+    - Complete type inference (no annotations needed)
+    - Smart mode inference
+    - Effect inference
+    - Subtyping with bounded quantification
+  
+  Inference Rules:
+    Local:
+      - Type variables scoped to function
+      - Mode inference based on usage
+      - Effect tracking within function
+    Global:
+      - Module-level type inference
+      - Cross-function type relationships
+      - Interface consistency checking
+    
+  Constraints:
+    - Subtyping constraints (≤)
+    - Mode compatibility
+    - Effect presence
+    - Resource usage tracking
+
+Type Features:
+  Algebraic Types:
+    - Sum types (variants)
+    - Product types (records)
+    - Recursive types
+    - Existential types
+    
+  Polymorphism:
+    - Rank-N types
+    - Higher-kinded types
+    - Type classes (planned)
+    - Associated types
+    
+  Mode System:
+    - Modal qualifiers (@local, @global, etc.)
+    - Mode inference
+    - Mode constraints
+    - Mode polymorphism
+    
+  Effects:
+    - Effect types
+    - Effect inference
+    - Handler effects
+    - Effect polymorphism
+
+Examples:
+  Basic Inference:
+    ```metaxu
+    # Type inferred as: fn(x: Int) -> Int
+    fn double(x) = x * 2
+    
+    # Type inferred as: fn<T>(x: T, y: T) -> T where T: Add
+    fn add(x, y) = x + y
+    ```
+  
+  Mode Inference:
+    ```metaxu
+    # Inferred as @local due to stack usage
+    fn stack_array() = [1, 2, 3]
+    
+    # Inferred as @global due to thread sharing
+    fn shared_data() = spawn { ... }
+    ```
+  
+  Effect Inference:
+    ```metaxu
+    # Inferred effect: io
+    fn read_file(path) = File.read(path)
+    
+    # No effects inferred (pure function)
+    fn pure_calc(x) = x * x
+    ```
+
+Type Safety:
+  Guarantees:
+    - Sound type system
+    - No runtime type errors
+    - Effect safety
+    - Mode safety
+    - Resource safety
+  
+  Compile-time Checks:
+    - Exhaustive pattern matching
+    - Effect handling coverage
+    - Mode compatibility
+    - Resource usage
+    - Termination analysis (partial)
+
+Implementation:
+  Architecture:
+    - Constraint generation
+    - Constraint solving
+    - Mode analysis
+    - Effect analysis
+    - Subtyping resolution
+  
+  Optimizations:
+    - Incremental type checking
+    - Constraint simplification
+    - Mode specialization
+    - Effect elimination
+    - Monomorphization
+```
+
+### Effect System
+```yaml
+Categories:
+  Thread:
+    - spawn: Create new threads
+    - join: Wait for completion
+    - yield: Cooperative scheduling
+  
+  Domain:
+    - alloc: Create ownership domains
+    - move: Transfer ownership
+    - borrow: Temporary access
+    - free: Resource cleanup
+  
+  Atomic:
+    - load/store: Memory operations
+    - cas: Compare-and-swap
+    - add/sub: Atomic arithmetic
+  
+  RwLock:
+    - create: Initialize locks
+    - read_lock/unlock: Shared access
+    - write_lock/unlock: Exclusive access
+
+Implementation:
+  - O(1) effect handler lookups
+  - Fixed-size hash tables
+  - Linear probing for collisions
+  - Type-safe value handling
+  - Zero-cost abstractions where possible
+```
+
+### Memory Management
+```yaml
+Ownership Model:
+  - Unboxed modal references
+  - Move semantics
+  - Borrow checking
+  - Domain-based isolation
+
+Reference Modes:
+  Basic:
+    - @owned: Full ownership, move semantics
+    - @const: Immutable borrow
+    - @mut: Mutable borrow
+    - @global: Thread-safe reference
+  
+  Locality:
+    @local:
+      - Stack-bound references
+      - Can reference @global data
+      - Cannot escape local scope
+      - Faster access, no synchronization
+    @global:
+      - Heap-allocated data
+      - Thread-safe access
+      - Cannot reference @local data
+      - Requires synchronization
+  
+  Multiplicity:
+    @once:
+      - Single-use references
+      - Must be consumed exactly once
+      - Used for resources (files, sockets)
+      - Compiler enforces single use
+    @many:
+      - Multi-use references
+      - Can be used multiple times
+      - Default for most types
+      - No usage restrictions
+    @separate:
+      - Disjoint references
+      - No aliasing allowed
+      - Used for parallel computation
+      - Compiler ensures separation
+
+Mode Relationships:
+  Hierarchy:
+    - @local can reference @global
+    - @global cannot reference @local
+    - @once must be consumed
+    - @separate must not alias
+  
+  Combinations:
+    Valid:
+      - @local @once: Single-use local resource
+      - @global @many: Shared thread-safe data
+      - @local @separate: Parallel local computation
+    Invalid:
+      - @global @local: Cannot mix scopes
+      - @once @many: Contradictory usage
+      - @global @separate with same data
+
+Usage Examples:
+  ```metaxu
+  fn process(x: @local @once File) { ... }     # Local single-use file
+  fn share(x: @global @many Data) { ... }      # Shared multi-use data
+  fn parallel(x: @local @separate Array) { ... } # Parallel array processing
+  ```
+
+Safety Guarantees:
+  - Local references cannot outlive their scope
+  - Global references are always thread-safe
+  - Once references are used exactly once
+  - Separate references never alias
+  - Mode combinations are checked at compile time
+```
+
+### Concurrency
+```yaml
+Features:
+  - Native threading support
+  - Message passing primitives
+  - SIMD operations
+  - Lock-free data structures
+  - Domain-based isolation
+
+Synchronization:
+  - Atomic operations
+  - Reader-writer locks
+  - Mutex primitives
+  - Thread domains
+```
+
+## Runtime Implementation
+
+### C Runtime
+```yaml
+Components:
+  - Effect handler system
+  - Thread management
+  - Memory management
+  - Value representation
+  - Type erasure
+
+Optimizations:
+  - Inline effect handlers
+  - Zero-cost type erasure
+  - Efficient memory layout
+  - Thread-local storage
+```
+
+### Compilation Pipeline
+```yaml
+Stages:
+  1. Parse Metaxu source
+  2. Type checking and inference
+  3. Effect analysis
+  4. Lower to TapeVM IR
+  5. Optimize IR
+  6. Generate C code
+  7. Compile to native
+```
+
+## Development Status
+
+### Current Features
+```yaml
+Implemented:
+  - Basic type system
+  - Effect handler registration
+  - Thread primitives
+  - Domain management
+  - Atomic operations
+  - RwLock implementation
+
+In Progress:
+  - Advanced type inference
+  - Effect optimization
+  - Memory safety guarantees
+  - Cross-platform support
+```
+
+### Planned Features
+```yaml
+Near Term:
+  - Dynamic handler tables
+  - Advanced collision handling
+  - More effect categories
+  - Cross-platform effects
+
+Long Term:
+  - Self-hosted compiler
+  - Advanced optimizations
+  - IDE integration
+  - Package management
+```
+
+## Philosophy and Design Principles
+```yaml
+Core Values:
+  - Type safety without complexity
+  - Zero-cost abstractions
+  - Clear error messages
+  - Developer ergonomics
+  - Predictable performance
+
+Influences:
+  - Ante: Effect system
+  - Hylo: Type system
+  - Sage: Syntax design
+  - OCaml: Functional features
+  - Rust: Memory safety
+  - Zig: Low-level control
+  - Python: Ergonomics
+```
+
+Note: This context is current as of [DATE]. Features and implementation details may change as the language evolves.
