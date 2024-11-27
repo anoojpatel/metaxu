@@ -1,0 +1,174 @@
+# Thread effects for Metaxu
+# These effects are implemented by the C runtime
+
+# Map C runtime functions
+extern fn runtime_effect_spawn(f: fn() -> Any) -> thread_t
+extern fn runtime_effect_join(thread: thread_t) -> Any
+extern fn runtime_effect_yield()
+extern fn runtime_effect_queue_create(capacity: Int) -> queue_t
+extern fn runtime_effect_queue_send(queue: queue_t, msg: Any)
+extern fn runtime_effect_queue_receive(queue: queue_t) -> Any
+extern fn runtime_effect_queue_try_receive(queue: queue_t) -> Option[Any]
+
+# Map C runtime types
+extern type thread_t
+extern type queue_t
+
+# Thread type
+type Thread[T] = thread_t
+
+# Message queue type
+type Queue[T] = queue_t
+
+# Thread operations effect
+effect Thread = {
+    # Spawn new thread
+    fn spawn[T](f: fn() -> @global T) -> @global Thread[T]
+    
+    # Wait for thread completion
+    fn join[T](thread: @global Thread[T]) -> @global T
+    
+    # Yield control
+    fn yield()
+}
+
+# Channel effects for thread communication
+effect Channel = {
+    # Create a new queue
+    fn create[T](capacity: Int) -> @unique Queue[T]
+    
+    # Send a message to a queue
+    fn send[T](queue: @unique Queue[T], msg: @global T)
+
+    # Receive a message from a queue
+    fn receive[T](queue: @unique Queue[T]) -> @global T
+
+    # Try to receive without blocking
+    fn try_receive[T](queue: @unique Queue[T]) -> Option[@global T]
+}
+
+# Create a new message queue
+fn new_queue[T](capacity: Int) -> @unique Queue[T] {
+    with handle Channel {
+        create[U](cap) -> runtime_effect_queue_create(cap)
+        send[U](q, m) -> runtime_effect_queue_send(q, m)
+        receive[U](q) -> runtime_effect_queue_receive(q) as U
+        try_receive[U](q) -> 
+            match runtime_effect_queue_try_receive(q) {
+                Some(v) -> Some(v as U)
+                None -> None
+            }
+    } in {
+        perform Channel::create[T](capacity)
+    }
+}
+
+# High-level thread operations
+fn spawn[T](f: fn() -> T) -> Thread[T] {
+    with handle Thread {
+        spawn[U](g) -> runtime_effect_spawn(g)
+        join[U](t) -> runtime_effect_join(t) as U
+        yield() -> runtime_effect_yield()
+    } in {
+        perform Thread::spawn[T](f)
+    }
+}
+
+fn join[T](thread: Thread[T]) -> T {
+    with handle Thread {
+        spawn[U](g) -> runtime_effect_spawn(g)
+        join[U](t) -> runtime_effect_join(t) as U
+        yield() -> runtime_effect_yield()
+    } in {
+        perform Thread::join[T](thread)
+    }
+}
+
+fn yield() {
+    with handle Thread {
+        spawn[U](g) -> runtime_effect_spawn(g)
+        join[U](t) -> runtime_effect_join(t) as U
+        yield() -> runtime_effect_yield()
+    } in {
+        perform Thread::yield()
+    }
+}
+
+# Send message to queue
+fn send[T](queue: Queue[T], msg: T) {
+    with handle Channel {
+        create[U](cap) -> runtime_effect_queue_create(cap)
+        send[U](q, m) -> runtime_effect_queue_send(q, m)
+        receive[U](q) -> runtime_effect_queue_receive(q) as U
+        try_receive[U](q) -> 
+            match runtime_effect_queue_try_receive(q) {
+                Some(v) -> Some(v as U)
+                None -> None
+            }
+    } in {
+        perform Channel::send[T](queue, msg)
+    }
+}
+
+# Receive message from queue
+fn receive[T](queue: Queue[T]) -> T {
+    with handle Channel {
+        create[U](cap) -> runtime_effect_queue_create(cap)
+        send[U](q, m) -> runtime_effect_queue_send(q, m)
+        receive[U](q) -> runtime_effect_queue_receive(q) as U
+        try_receive[U](q) -> 
+            match runtime_effect_queue_try_receive(q) {
+                Some(v) -> Some(v as U)
+                None -> None
+            }
+    } in {
+        perform Channel::receive[T](queue)
+    }
+}
+
+# Try to receive message without blocking
+fn try_receive[T](queue: Queue[T]) -> Option[T] {
+    with handle Channel {
+        create[U](cap) -> runtime_effect_queue_create(cap)
+        send[U](q, m) -> runtime_effect_queue_send(q, m)
+        receive[U](q) -> runtime_effect_queue_receive(q) as U
+        try_receive[U](q) -> 
+            match runtime_effect_queue_try_receive(q) {
+                Some(v) -> Some(v as U)
+                None -> None
+            }
+    } in {
+        perform Channel::try_receive[T](queue)
+    }
+}
+
+# Example: Thread communication
+fn example() {
+    # Create message queue
+    let queue = new_queue[Int](10)
+    
+    # Spawn producer thread
+    let producer = spawn(|| {
+        for i in 0..10 {
+            send(queue, i)
+            yield()
+        }
+    })
+    
+    # Spawn consumer thread
+    let consumer = spawn(|| {
+        let mut sum = 0
+        for i in 0..10 {
+            match try_receive(queue) {
+                Some(v) -> sum += v
+                None -> yield()
+            }
+        }
+        sum
+    })
+    
+    # Wait for completion
+    join(producer)
+    let total = join(consumer)
+    assert(total == 45)  # Sum of 0..9
+}

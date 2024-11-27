@@ -323,5 +323,81 @@ class TestEffectSafety(unittest.TestCase):
         self.type_checker.check(result)
         self.assertEqual(len(self.type_checker.errors), 0)
 
+    def test_thread_effect_safety(self):
+        """Test thread effect safety rules"""
+        code = '''
+        # Thread with result type
+        fn compute_value() -> Int {
+            42
+        }
+
+        fn thread_test() {
+            # Spawn thread
+            let t = perform Thread::spawn(compute_value)
+            
+            # Can't use thread value before join
+            let x = t.result  # Should error
+            
+            # Must join to get result
+            let result = perform Thread.join(t)
+            assert(result == 42)
+        }
+        '''
+        result = self.parser.parse(code)
+        errors = self.type_checker.check(result)
+        self.assertTrue(any('Cannot access thread result before join' in str(e) for e in errors))
+
+    def test_domain_effect_safety(self):
+        """Test domain effect safety rules"""
+        code = '''
+        fn domain_test() {
+            # Create domain
+            let d1 = new_domain(42)
+            let d2 = new_domain(0)
+            
+            # Can't move after borrow
+            let x = perform Domain.borrow(d1)
+            perform Domain.move(d1, d2)  # Should error
+            
+            # Can't borrow twice
+            let y = perform Domain.borrow(d1)  # Should error
+            
+            # Can't use after move
+            perform Domain.move(d1, d2)
+            let z = perform Domain.borrow(d1)  # Should error
+        }
+        '''
+        result = self.parser.parse(code)
+        errors = self.type_checker.check(result)
+        self.assertTrue(any('Cannot move domain while borrowed' in str(e) for e in errors))
+        self.assertTrue(any('Cannot borrow domain twice' in str(e) for e in errors))
+        self.assertTrue(any('Cannot use domain after move' in str(e) for e in errors))
+
+    def test_effect_handler_safety(self):
+        """Test effect handler safety rules"""
+        code = '''
+        effect State<T> {
+            get() -> T
+            put(value: T) -> ()
+        }
+
+        fn handler_test() {
+            let state = 42
+            
+            handle State[Int] with {
+                get() -> resume(state)
+                put(value) -> {
+                    state = value  # Should error: can't modify captured variable
+                    resume(())
+                }
+            } in {
+                perform State.put(100)
+            }
+        }
+        '''
+        result = self.parser.parse(code)
+        errors = self.type_checker.check(result)
+        self.assertTrue(any('Cannot modify captured variable in handler' in str(e) for e in errors))
+
 if __name__ == '__main__':
     unittest.main()

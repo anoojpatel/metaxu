@@ -1,0 +1,72 @@
+# Metaxu Standard Prelude
+# Core types and effects implemented by the C runtime
+
+# Core primitive types
+type Int = i64
+type Bool = bool
+type Float = f64
+type Char = char
+type String = str
+
+# Option type for nullable values
+type Option[T] = {
+    is_some: Bool,
+    value: T
+}
+
+# Result type for error handling
+type Result[T, E] = {
+    is_ok: Bool,
+    value: T,
+    error: E
+}
+
+# Core effects for memory and control flow
+effect Core = {
+    # Memory allocation
+    fn malloc(size: Int) -> *()
+    fn free(ptr: *())
+    
+    # Control flow
+    fn panic(msg: String) -> !
+    fn yield() -> ()
+    
+    # Thread management
+    fn get_thread_id() -> Int
+    fn spawn_thread(id: Int) -> ()
+}
+
+# Option constructors and methods
+fn Some[T](value: T) -> Option[T] {
+    Option { is_some: true, value: value }
+}
+
+fn None[T]() -> Option[T] {
+    Option { is_some: false, value: unsafe { uninit() } }
+}
+
+# Result constructors and methods
+fn Ok[T, E](value: T) -> Result[T, E] {
+    Result { is_ok: true, value: value, error: unsafe { uninit() } }
+}
+
+fn Err[T, E](error: E) -> Result[T, E] {
+    Result { is_ok: false, value: unsafe { uninit() }, error: error }
+}
+
+# Utility functions
+fn panic(msg: String) -> ! {
+    perform Core::panic(msg)
+}
+
+fn yield() {
+    perform Core::yield()
+}
+
+fn get_thread_id() -> Int {
+    perform Core::get_thread_id()
+}
+
+fn spawn_thread(id: Int) {
+    perform Core::spawn_thread(id)
+}

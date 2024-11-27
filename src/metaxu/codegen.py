@@ -1137,3 +1137,30 @@ class CodeGenerator:
                  cont_label)
 
         self.emit(Opcode.LABEL, cont_label)
+
+    def generate_effect_operation(self, effect_op: ast.EffectOperation) -> str:
+        """Generate code for an effect operation with C runtime mapping"""
+        if effect_op.c_effect:
+            # Generate C runtime function declaration
+            return_type = self.get_c_type(effect_op.return_type)
+            params = [f"{self.get_c_type(p.type)} {p.name}" for p in effect_op.params]
+            
+            return f"""
+{return_type} runtime_{effect_op.c_effect.lower()}({', '.join(params)}) {{
+    // Call C runtime implementation
+    return {effect_op.c_effect.lower()}({', '.join(p.name for p in effect_op.params)});
+}}
+"""
+        else:
+            # Normal effect operation code generation
+            return self.generate_effect_op_default(effect_op)
+
+    def generate_effect_mapping_header(self, effect_decl: ast.EffectDeclaration) -> str:
+        """Generate header declarations for mapped C runtime effects"""
+        header = []
+        for op in effect_decl.operations:
+            if op.c_effect:
+                return_type = self.get_c_type(op.return_type)
+                params = [f"{self.get_c_type(p.type)} {p.name}" for p in op.params]
+                header.append(f"{return_type} runtime_{op.c_effect.lower()}({', '.join(params)});")
+        return '\n'.join(header)

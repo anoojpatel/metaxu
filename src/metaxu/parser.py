@@ -799,8 +799,13 @@ class Parser:
         p[0] = p[2]
 
     def p_effect_operation(self, p):
-        '''effect_operation : IDENTIFIER DOT IDENTIFIER LPAREN argument_list RPAREN'''
-        p[0] = ast.EffectOperation(p[1], p[3], p[5])
+        '''effect_operation : FN IDENTIFIER LPAREN param_list RPAREN ARROW type_expr
+                          | FN IDENTIFIER LPAREN param_list RPAREN ARROW type_expr WITH IDENTIFIER'''
+        name = p[2]
+        params = p[4]
+        return_type = p[7]
+        c_effect = p[9] if len(p) > 8 else None
+        p[0] = ast.EffectOperation(name, params, return_type, c_effect)
 
     def p_struct_instantiation(self, p):
         '''struct_instantiation : IDENTIFIER LBRACE field_assignments RBRACE
@@ -1016,41 +1021,28 @@ class Parser:
         p[0] = p[2]
  
     def p_effect_declaration(self, p):
-        '''effect_declaration : EFFECT IDENTIFIER LESS type_params GREATER LBRACE effect_operations_def RBRACE'''
-        p[0] = ast.EffectDeclaration(p[2], p[4], p[7])
-    
-    # Used for effect operation definition
-    def p_effect_operations_def(self, p):
-        '''effect_operations_def : effect_operation_def
-                        | effect_operations_def effect_operation_def'''
-        if len(p) == 2:
-            p[0] = [p[1]]
+        '''effect_declaration : EFFECT IDENTIFIER EQUALS LBRACE effect_operation_list RBRACE
+                            | EFFECT IDENTIFIER type_params EQUALS LBRACE effect_operation_list RBRACE'''
+        name = p[2]
+        if len(p) == 7:
+            type_params = []
+            operations = p[5]
         else:
-            p[0] = p[1] + [p[2]]
-    
-    def p_effect_operation_def(self, p):
-        '''effect_operation_def : IDENTIFIER LPAREN type_list RPAREN ARROW type_expression
-                              | IDENTIFIER LPAREN RPAREN ARROW type_expression
-                              | IDENTIFIER LPAREN type_list RPAREN
-                              | IDENTIFIER LPAREN RPAREN'''
-        if len(p) == 7: #
-            p[0] = ast.EffectOperation(p[1], p[3], p[6])
-        elif len(p) == 5:
-            p[0] = ast.EffectOperation(p[1], [], p[5])
-        elif len(p) == 4:
-            p[0] = ast.EffectOperation(p[1], p[3], None)
-        else:   
-            p[0] = ast.EffectOperation(p[1], [], None)
+            type_params = p[3]
+            operations = p[6]
+        p[0] = ast.EffectDeclaration(name, type_params, operations)
 
-
-    def p_effect_operations(self, p):
-        '''effect_operations : effect_operation
-                        | effect_operations effect_operation'''
+    def p_effect_operation_list(self, p):
+        '''effect_operation_list : effect_operation
+                                | effect_operation_list effect_operation'''
         if len(p) == 2:
             p[0] = [p[1]]
         else:
             p[0] = p[1] + [p[2]]
 
+    def p_with_clause(self, p):
+        '''with_clause : WITH IDENTIFIER'''
+        p[0] = ast.WithClause(p[2])
 
     def p_handle_expression(self, p):
         '''handle_expression : HANDLE type_expression WITH LBRACE handle_cases RBRACE IN expression'''

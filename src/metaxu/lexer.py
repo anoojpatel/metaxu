@@ -6,18 +6,28 @@ class Lexer:
     # A string containing ignored characters (spaces and tabs)
     t_ignore = ' \t'
 
-    # Reserved words
+    # Keywords
     reserved = {
-        'effect': 'EFFECT',
+        'if': 'IF',
+        'else': 'ELSE',
+        'while': 'WHILE',
+        'for': 'FOR',
+        'fn': 'FN',
+        'return': 'RETURN',
         'struct': 'STRUCT',
         'enum': 'ENUM',
         'match': 'MATCH',
-        'with': 'WITH',
+        'effect': 'EFFECT',
         'handle': 'HANDLE',
         'perform': 'PERFORM',
-        'resume': 'RESUME',
-        'move': 'MOVE',
+        'with': 'WITH',
+        'in': 'IN',
+        'let': 'LET',
         'mut': 'MUT',
+        'type': 'TYPE',
+        'extern': 'EXTERN',
+        'const': 'CONST',
+        'move': 'MOVE',
         'local': 'LOCAL',
         'exclave': 'EXCLAVE',
         'once': 'ONCE',
@@ -27,7 +37,6 @@ class Lexer:
         'from_device': 'FROM_DEVICE',
         'print': 'PRINT',  # Add print keyword
         # Control flow keywords
-        'return': 'RETURN',
         'if': 'IF',
         'else': 'ELSE',
         'while': 'WHILE',
