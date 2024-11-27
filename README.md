@@ -1,5 +1,5 @@
-# Metaxu
-A self-hosted Low level functional-style programming language 🌀  
+# Metaxu🌀  
+A self-hosted Low level functional-style programming language  
 [Documentation](docs/index.md)
 ## Installation
 
