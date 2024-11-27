@@ -4,6 +4,32 @@ A self-hosted Low level functional-style programming language <br>
 [<a href="docs/index.md">Documentation</a>]
 </p>
 
+## What is Metaxu?
+Metaxu is a modern systems programming language that prioritizes speed, safety, and developer joy. 
+Currently written in Python, it compiles through a TapeVM intermediate representation into optimized C code. 
+Our ultimate goal? To bootstrap Metaxu in itself, creating a language that's so elegant and intuitive 
+that writing its own compiler becomes a delightful challenge.
+
+## Core Features
+- 🚀 Zero-cost abstractions with unboxed references and move semantics
+- 🛡️ Memory safety through simple modal borrow checking
+- ⚡ Powerful algebraic effects system
+- 🧬 Advanced type system with algebraic subtyping and row polymorphism
+- 🔄 Pattern matching and compile-time metaprogramming
+- 🧵 First-class concurrency with SIMD and multithreading
+- 📦 Cross-platform portability
+
+## Philosophy
+The name "Metaxu" comes from philosopher Simone Weil's concept of divine intermediaries. Just as a wall 
+between prison cells becomes both a barrier and a medium for communication through taps, Metaxu serves 
+as a bridge between high-level abstractions and low-level performance. It connects human intention to 
+machine execution, striving to make systems programming both powerful and accessible.
+
+Deeply inspired by [Ante](https://ante-lang.org), [Hylo](https://hylo-lang.org), [Sage](https://github.com/adam-mcdaniel/sage), [Oxidized OCaml](https://blog.janestreet.com/oxidizing-ocaml-locality/), [Rust](https://rust-lang.org), [Zig](https://ziglang.org), and [Python](https://www.python.org), we're building a 
+language that embraces both pragmatism and purity. Our goal is to create a tool that helps programmers 
+express their ideas clearly and efficiently, while ensuring their code remains fast and reliable. Furthermore, we want to create a language that's accessible to everyone, regardless of their background or experience level, so that anyone can learn how to build compilers.
+
+
 ## Installation
 
 ### Prerequisites
@@ -88,32 +114,3 @@ doit clean
 
 Test binaries are output to the `outputs/` directory.
 
-## Structure
-The language currently will be compiled (very slowly) in Python into a TapeVM. This lowered Tape IR will  
-then emit to a bespoke C program. As the syntax, ergonomics and safety is matured, we will reimplement 
-the compiler in pure Metaxu. The goal is to design a language that is fast, fun and safe. The metric  
-will be how "fun" will it be to write a compiler for itself.
-
-## Features
-The planned language features will include:
-- [ ] Unboxed modal references and mutable move semantics
-- [ ] Borrow Checking
-- [ ] Algebraic Effects
-- [ ] Structs and Methods
-- [ ] Algebraic Subtyping
-    - [ ] SimpleSub with Row Polymorphism  
-- [ ] SIMD and Multithreading
-- [ ] Portability
-- [ ] Pattern Matching
-- [ ] Generics
-- [ ] Compilation time execution
-
-### Inspiration
-Metaxu is deeply inspired by languages such as Ante, Hylo, Sage, Oxidized Ocaml, Rust, Zig and Python.
-
-The term "Metaux" comes from Simone Weil and neoplatonists, describing the links and seperations  
-between the objects in the world around us. Classically, the wall between two prisoners who talk  
-via tapping is the separator and the very essence of what connects them. Weil's philosophy  
-(theopicy really) is that, through these links we experience the world and bring ourselves  
-to capital T "Truth." Given this is a compiler that I want to bootstrap,  I found "metaxu" to be  
-fitting. I hope what we create can live up to the mantle. 
