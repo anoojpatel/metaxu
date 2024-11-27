@@ -3,13 +3,13 @@ Code Generator for Metaxu.
 Handles translation of AST to VM IR, including structs, types, effects, and memory layout.
 """
 
-from typing import Dict, List, Set, Optional, Union, Tuple, Any
-from dataclasses import dataclass
-from tape_vm import Opcode, Instruction
-from symbol_table import SymbolTable, Symbol
-from types import *
-from metaxu_ast import *
-from type_checker import TypeChecker
+from typing import Dict, List, Optional, Set, Tuple, Union
+from metaxu.tape_vm import Opcode, Instruction
+from metaxu.metaxu_ast import * 
+from metaxu.errors import CompileError, SourceLocation
+from metaxu.symbol_table import SymbolTable, Symbol
+from metaxu.type_defs import *
+from metaxu.type_checker import TypeChecker
 
 @dataclass
 class TypeConstraint:
@@ -103,6 +103,7 @@ class CodeGenerator:
         self.effect_handlers = {}
         self.continuations = {}
         self.drop_flags = {}  # Dict[str, DropFlag]
+        self.debug = True
 
     def track_drop(self, var_name: str, var_type: Type):
         """Start tracking a value that needs to be dropped"""
@@ -163,62 +164,216 @@ class CodeGenerator:
     def emit(self, opcode: Opcode, *operands):
         """Emit a VM instruction"""
         self.instructions.append(Instruction(opcode, *operands))
+        self.debug = True  # Enable debug logging
 
-    def generate(self, node):
-        """Generate code for an AST node"""
-        method = f'generate_{node.__class__.__name__}'
-        if hasattr(self, method):
-            return getattr(self, method)(node)
+    def log(self, msg):
+        if self.debug:
+            print(f"[CodeGen Debug] {msg}")
+
+    def generate(self, node) -> List[Instruction]:
+        """Generate code for a node"""
+        self.log(f"generate() called with node type: {type(node)}")
+        
+        if isinstance(node, Module):
+            self.log(f"Handling Module node with name: {node.name}")
+            # Generate code for module body
+            self.generate(node.body)
+            return self.instructions
+            
+        elif isinstance(node, ModuleBody):
+            self.log(f"Handling ModuleBody node with {len(node.statements)} statements")
+            # Generate code for each statement in module
+            for stmt in node.statements:
+                self.generate_statement(stmt)
+            return self.instructions
+            
+        elif isinstance(node, Statement):
+            self.log("Handling Statement node")
+            self.generate_statement(node)
+            return self.instructions
+            
+        elif isinstance(node, Expression):
+            self.log("Handling Expression node")
+            self.generate_expression(node)
+            return self.instructions
+            
         else:
-            raise NotImplementedError(f"Code generation not implemented for {node.__class__.__name__}")
+            self.log(f"Attempting to handle unknown node type: {type(node)}")
+            # Try to handle as statement if not one of the above
+            try:
+                self.generate_statement(node)
+                return self.instructions
+            except CompileError as e:
+                self.log(f"Failed to handle node: {e}")
+                raise CompileError(
+                    message=f"Unsupported node type: {type(node)}",
+                    error_type="CodeGenError",
+                    notes=[f"The code generator doesn't know how to handle {type(node).__name__} nodes"]
+                )
 
-    def generate_Module(self, node):
-        """Generate code for a module"""
-        # Skip if already generated
-        if node.name in self.generated_modules:
-            return []
+    def generate_statement(self, stmt) -> None:
+        """Generate code for a statement"""
+        self.log(f"generate_statement() called with statement type: {type(stmt)}")
+        
+        # High-level module and type-related statements
+        if isinstance(stmt, Module):
+            self.log("Handling Module in generate_statement")
+            # Instead of recursively calling generate(), handle the module body directly
+            if hasattr(stmt, 'body') and isinstance(stmt.body, ModuleBody):
+                for s in stmt.body.statements:
+                    self.generate_statement(s)
+            
+        elif isinstance(stmt, ModuleBody):
+            self.log("Handling ModuleBody in generate_statement")
+            for s in stmt.statements:
+                self.generate_statement(s)
 
-        self.generated_modules.add(node.name)
-        old_module = self.current_module
-        self.current_module = node.name
+        elif isinstance(stmt, FunctionDeclaration):
+            self.log("Handling FunctionDeclaration")
+            self.gen_function_def(stmt)
+ 
 
-        # Generate module code
-        output = [f"# Module: {node.name}"]
-        if node.docstring:
-            output.append(f'"""{node.docstring}"""')
+        elif isinstance(stmt, StructDefinition):
+            self.log("Handling StructDefinition")
+            self.gen_struct_def(stmt)
 
-        for stmt in node.statements:
-            output.extend(self.generate(stmt))
+        elif isinstance(stmt, EffectDeclaration):
+            self.log("Handling EffectDeclaration")
+            self.gen_EffectDeclaration(stmt)
 
-        self.current_module = old_module
-        return output
+        elif isinstance(stmt, HandleEffect):
+            self.log("Handling HandleEffect")
+            self.gen_HandleEffect(stmt)
 
-    def generate_Import(self, node):
-        """Generate code for an import statement"""
-        # Imports are handled during module generation
-        return []
+        elif isinstance(stmt, PerformEffect):
+            self.log("Handling PerformEffect")
+            self.gen_PerformEffect(stmt)
 
-    def generate_FromImport(self, node):
-        """Generate code for a from-import statement"""
-        # Imports are handled during module generation
-        return []
+        # Basic language constructs
+        elif isinstance(stmt, LetStatement):
+            self.generate_expression(stmt.expression)
+            self.emit(Opcode.STORE_VAR, stmt.name)
 
-    def generate_Name(self, node):
-        """Generate code for a name, handling qualified names"""
-        if isinstance(node.id, list):
-            # Qualified name (e.g. std.io.println)
-            return '.'.join(node.id)
-        return node.id
+        elif isinstance(stmt, Assignment):
+            self.generate_expression(stmt.expression)
+            self.emit(Opcode.STORE_VAR, stmt.name)
 
-    def generate_Call(self, node):
-        """Generate code for a function call, handling qualified names"""
-        func = self.generate(node.func)
-        args = [self.generate(arg) for arg in node.args]
-        return f"{func}({', '.join(args)})"
+        elif isinstance(stmt, IfStatement):
+            else_label = self.new_label("else")
+            end_label = self.new_label("endif")
 
-    def get_output(self):
-        """Get the final generated code"""
-        return '\n'.join(self.output)
+            # Generate condition
+            self.generate_expression(stmt.condition)
+            self.emit(Opcode.JUMP_IF_FALSE, else_label)
+
+            # Generate then branch
+            self.generate_statement(stmt.then_body)
+            self.emit(Opcode.JUMP, end_label)
+
+            # Generate else branch
+            self.emit(Opcode.LABEL, else_label)
+            if stmt.else_body:
+                self.generate_statement(stmt.else_body)
+
+            self.emit(Opcode.LABEL, end_label)
+
+        elif isinstance(stmt, WhileStatement):
+            start_label = self.new_label("while")
+            end_label = self.new_label("endwhile")
+
+            # Generate loop header
+            self.emit(Opcode.LABEL, start_label)
+            self.generate_expression(stmt.condition)
+            self.emit(Opcode.JUMP_IF_FALSE, end_label)
+
+            # Generate loop body
+            self.generate_statement(stmt.body)
+            self.emit(Opcode.JUMP, start_label)
+
+            self.emit(Opcode.LABEL, end_label)
+
+        elif isinstance(stmt, PrintStatement):
+            if stmt.arguments:
+                for arg in stmt.arguments:
+                    self.generate_expression(arg)
+                    self.emit(Opcode.PRINT)
+            else:
+                # Handle empty print statement
+                self.emit(Opcode.PRINT_NEWLINE)
+
+        else:
+            self.log(f"Unknown statement type: {type(stmt)}")
+            raise CompileError(
+                message=f"Unsupported statement type: {type(stmt)}",
+                error_type="CodeGenError",
+                notes=[f"The code generator doesn't know how to handle {type(stmt).__name__} statements"]
+    )
+
+    def generate_expression(self, expr):
+        """Generate code for an expression"""
+        self.log(f"generate_expression() called with expression type: {type(expr)}")
+        
+        if isinstance(expr, Literal):
+            self.log("Handling Literal")
+            self.emit(Opcode.LOAD_CONST, expr.value)
+
+        elif isinstance(expr, Variable):
+            self.log("Handling Variable")
+            self.emit(Opcode.LOAD_VAR, expr.name)
+
+        elif isinstance(expr, BinaryOperation):
+            self.log("Handling BinaryOperation")
+            self.generate_expression(expr.left)
+            self.generate_expression(expr.right)
+
+            # Map operators to opcodes
+            op_map = {
+                '+': Opcode.ADD,
+                '-': Opcode.SUB,
+                '*': Opcode.MUL,
+                '/': Opcode.DIV,
+            }
+            self.emit(op_map[expr.operator])
+
+        elif isinstance(expr, StructInstantiation):
+            self.log("Handling StructInstantiation")
+            self.gen_struct_instantiation(expr)
+
+        elif isinstance(expr, FieldAccess):
+            self.log("Handling FieldAccess")
+            self.gen_field_access(expr)
+
+        elif isinstance(expr, HandleEffect):
+            self.log("Handling HandleEffect")
+            self.gen_HandleEffect(expr)
+
+        elif isinstance(expr, PerformEffect):
+            self.log("Handling PerformEffect")
+            self.gen_PerformEffect(expr)
+
+        elif isinstance(expr, ThreadEffect):
+            self.log("Handling ThreadEffect")
+            self.gen_ThreadEffect(expr)
+
+        elif isinstance(expr, DomainEffect):
+            self.log("Handling DomainEffect")
+            self.gen_DomainEffect(expr)
+
+        elif isinstance(expr, ThreadPoolEffect):
+            self.log("Handling ThreadPoolEffect")
+            self.gen_ThreadPoolEffect(expr)
+
+        elif isinstance(expr, ExclaveExpression):
+            self.log("Handling ExclaveExpression")
+            self.gen_ExclaveExpression(expr)
+
+        else:
+            self.log(f"Unknown expression type: {type(expr)}")
+            raise CompileError(
+                message=f"Unsupported expression type: {type(expr)}",
+                error_type="CodeGenError",
+                notes=[f"The code generator doesn't know how to handle {type(expr).__name__} expressions"]
+            )
 
     def gen_Program(self, node):
         for stmt in node.statements:
@@ -339,7 +494,7 @@ class CodeGenerator:
             self.emit(Opcode.LABEL, op_label)
             self.generate(op)
 
-    def gen_HandleExpression(self, node):
+    def gen_HandleEffect(self, node):
         """Generate code for handle expression"""
         effect_name = node.effect.name
 
@@ -380,24 +535,6 @@ class CodeGenerator:
         for handler in node.handlers:
             self.emit(Opcode.UNSET_HANDLER, handler.name)
 
-    def gen_PerformExpression(self, node):
-        """Generate code for perform expression"""
-        # Generate arguments
-        for arg in node.arguments:
-            self.generate(arg)
-
-        # Create continuation for resume
-        cont_label = self.new_label("perform_cont")
-        self.emit(Opcode.CREATE_CONTINUATION, cont_label)
-
-        # Call effect handler
-        self.emit(Opcode.CALL_EFFECT_HANDLER,
-                 node.effect.name,
-                 len(node.arguments),
-                 cont_label)
-
-        # Add label for continuation
-        self.emit(Opcode.LABEL, cont_label)
 
     def gen_StructDefinition(self, node):
         """Generate code for struct definition"""
@@ -536,42 +673,21 @@ class CodeGenerator:
         # Generate code for arguments
         for arg in node.args:
             self.generate(arg)
-            self.emit(Instruction('PUSH'))
+            self.emit(Opcode.PUSH)
 
         # Generate unique labels for continuation and effect handler
         continuation_label = self.new_label("cont")
         effect_handler_label = f"{node.effect_name}_handler"
 
         # Jump to effect handler
-        self.emit(Instruction('JUMP', effect_handler_label))
+        self.emit(Opcode.JUMP, effect_handler_label)
 
         # Place continuation label
-        self.emit(Instruction('LABEL', continuation_label))
+        self.emit(Opcode.LABEL, continuation_label)
         # Generate code for effect arguments
-        # for arg in node.arguments:
-        #    self.generate(arg)
-        # self.emit(Instruction(Opcode.PERFORM_EFFECT, node.effect_name, len(node.arguments)))
-
-    def gen_HandleEffect(self, node):
-        handler_label = f"handler_{node.effect_name}_{self.function_counter}"
-        self.function_counter += 1
-        # Save current instructions and symbol table
-        current_instructions = self.instructions
-        current_symbol_table = self.symbol_table
-        self.instructions = []
-        self.symbol_table = SymbolTable(parent=current_symbol_table)
-        # Generate handler code
-        self.generate(node.handler)
-        handler_instructions = self.instructions
-        # Restore instructions and symbol table
-        self.instructions = current_instructions
-        self.symbol_table = current_symbol_table
-        # Set up effect handler
-        self.emit(Opcode.SET_HANDLER, node.effect_name, handler_instructions)
-        # Generate code for the expression
-        self.generate(node.expression)
-        # Unset effect handler
-        self.emit(Opcode.UNSET_HANDLER, node.effect_name)
+        for arg in node.args:
+            self.generate(arg)
+        self.emit(Opcode.PERFORM_EFFECT, node.effect_name, len(node.args))
 
     def gen_Move(self, node):
         # Handle move semantics
@@ -587,16 +703,12 @@ class CodeGenerator:
         self.emit(Opcode.FROM_DEVICE, node.variable)
 
     def gen_ExclaveExpression(self, node):
-        # Generate code for the inner expression
-        self.generate(node.expression)
-
-        # Store the result in a temporary variable that will be accessible
-        # in both the inner and outer scopes
-        temp_var = f"_exclave_result_{self.label_counter}"
-        self.emit(Opcode.STORE_VAR, temp_var)
-
-        # Load the variable back to make it available for the next operation
-        self.emit(Opcode.LOAD_VAR, temp_var)
+        """Generate code to move a value to the caller's region and return"""
+        # Generate value expression
+        self.generate_expression(node.value)
+        
+        # Move value to caller's region and return
+        self.emit(Opcode.EXCLAVE)
 
     def gen_FunctionDeclaration(self, node):
         """Generate code for function definition with proper environment setup"""
@@ -903,114 +1015,9 @@ class CodeGenerator:
             return symbol.type.name if symbol else "unknown"
         return "unknown"
 
-    def generate_statement(self, stmt) -> None:
-        """Generate code for statements"""
-        if isinstance(stmt, LetStatement):
-            self.generate_expression(stmt.expression)
-            self.emit(Opcode.STORE_VAR, stmt.name)
-
-        elif isinstance(stmt, Assignment):
-            self.generate_expression(stmt.expression)
-            self.emit(Opcode.STORE_VAR, stmt.name)
-
-        elif isinstance(stmt, IfStatement):
-            else_label = self.new_label("else")
-            end_label = self.new_label("endif")
-
-            # Generate condition
-            self.generate_expression(stmt.condition)
-            self.emit(Opcode.JUMP_IF_FALSE, else_label)
-
-            # Generate then branch
-            self.generate_statement(stmt.then_body)
-            self.emit(Opcode.JUMP, end_label)
-
-            # Generate else branch
-            self.emit(Opcode.LABEL, else_label)
-            if stmt.else_body:
-                self.generate_statement(stmt.else_body)
-
-            self.emit(Opcode.LABEL, end_label)
-
-        elif isinstance(stmt, WhileStatement):
-            start_label = self.new_label("while")
-            end_label = self.new_label("endwhile")
-
-            self.emit(Opcode.LABEL, start_label)
-
-            # Generate condition
-            self.generate_expression(stmt.condition)
-            self.emit(Opcode.JUMP_IF_FALSE, end_label)
-
-            # Generate body
-            self.generate_statement(stmt.body)
-            self.emit(Opcode.JUMP, start_label)
-
-            self.emit(Opcode.LABEL, end_label)
-
-        elif isinstance(stmt, ReturnStatement):
-            self.generate_expression(stmt.expression)
-            self.emit(Opcode.RETURN)
-
-        elif isinstance(stmt, StructDefinition):
-            self.gen_struct_def(stmt)
-
-        elif isinstance(stmt, EffectDeclaration):
-            self.gen_EffectDeclaration(stmt)
-
-        elif isinstance(stmt, HandleExpression):
-            self.gen_HandleExpression(stmt)
-
-        elif isinstance(stmt, PerformExpression):
-            self.gen_PerformExpression(stmt)
-
-        else:
-            raise TypeError(f"Unsupported statement type: {type(stmt)}")
-
-    def generate_expression(self, expr) -> None:
-        """Generate code for expressions"""
-        if isinstance(expr, Literal):
-            self.emit(Opcode.LOAD_CONST, expr.value)
-
-        elif isinstance(expr, Variable):
-            self.emit(Opcode.LOAD_VAR, expr.name)
-
-        elif isinstance(expr, BinaryOperation):
-            self.generate_expression(expr.left)
-            self.generate_expression(expr.right)
-
-            # Map operators to opcodes
-            op_map = {
-                '+': Opcode.ADD,
-                '-': Opcode.SUB,
-                '*': Opcode.MUL,
-                '/': Opcode.DIV,
-            }
-            self.emit(op_map[expr.operator])
-
-        elif isinstance(expr, StructInstantiation):
-            self.gen_struct_instantiation(expr)
-
-        elif isinstance(expr, FieldAccess):
-            self.gen_field_access(expr)
-
-        elif isinstance(expr, HandleExpression):
-            self.gen_HandleExpression(expr)
-
-        elif isinstance(expr, PerformExpression):
-            self.gen_PerformExpression(expr)
-
-        else:
-            raise TypeError(f"Unsupported expression type: {type(expr)}")
-
-    def generate(self, node) -> List[Instruction]:
-        """Generate code for any AST node"""
-        if isinstance(node, Program):
-            for stmt in node.statements:
-                self.generate_statement(stmt)
-        else:
-            self.generate_statement(node)
-        return self.instructions
+    def get_output(self):
+        """Get the final generated code"""
+        return '\n'.join(self.output)
 
     def gen_DomainEffect(self, node):
         """Generate code for domain effect operations build into the langauge"""
@@ -1130,12 +1137,3 @@ class CodeGenerator:
                  cont_label)
 
         self.emit(Opcode.LABEL, cont_label)
-
-
-    def gen_ExclaveExpression(self, value_expr) -> None:
-        """Generate code to move a value to the caller's region and return"""
-        # Generate value expression
-        self.generate_expression(value_expr)
-        
-        # Move value to caller's region and return
-        self.emit(Opcode.EXCLAVE)

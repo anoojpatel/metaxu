@@ -1,8 +1,8 @@
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set
 from pathlib import Path
-import metaxu_ast as ast
-from symbol_table import SymbolTable, Symbol, ModuleInfo
+import metaxu.metaxu_ast as ast
+from metaxu.symbol_table import SymbolTable, Symbol, ModuleInfo
 
 @dataclass
 class LinkageType:

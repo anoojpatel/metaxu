@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import List, Dict, Optional, Any, Tuple
+from typing import List, Dict, Optional, Any, Tuple, Callable
 from enum import Enum
 
 class Type:
@@ -187,6 +187,20 @@ class EmptyRow(Type):
     def __str__(self):
         return "EmptyRow"
 
+class VariantType(Type):
+    def __init__(self, enum_name, name, fields=None):
+        super().__init__()
+        self.enum_name = enum_name
+        self.name = name
+        self.fields = fields or {}  # Dict of field_name: field_type
+
+    def __str__(self):
+        if self.fields:
+            fields = ", ".join(f"{name}: {type_}" for name, type_ in self.fields.items())
+            return f"{self.enum_name}::{self.name}({fields})"
+        return f"{self.enum_name}::{self.name}"
+
+
 class EnumType(Type):
     def __init__(self, name: str, variants: Dict[str, VariantType], 
                  type_params: List[TypeVar] = None,
@@ -210,18 +224,6 @@ class EnumType(Type):
         params = ", ".join(str(p) for p in self.type_params)
         return f"{self.qualified_name()}<{params}>"
 
-class VariantType(Type):
-    def __init__(self, enum_name, name, fields=None):
-        super().__init__()
-        self.enum_name = enum_name
-        self.name = name
-        self.fields = fields or {}  # Dict of field_name: field_type
-
-    def __str__(self):
-        if self.fields:
-            fields = ", ".join(f"{name}: {type_}" for name, type_ in self.fields.items())
-            return f"{self.enum_name}::{self.name}({fields})"
-        return f"{self.enum_name}::{self.name}"
 
 # Mode Types
 class Mode:
@@ -509,7 +511,7 @@ class TypeDefinition:
         return f"{self.name}{params}"
 
 # Helper functions for type manipulation
-def substitute(ty: Type, subst: Dict[TypeVar, Type], visited: Optional[Set[str]] = None) -> Type:
+def substitute(ty: Type, subst: Dict[TypeVar, Type], visited: Optional[set[str]] = None) -> Type:
     """Substitute type variables in a type with cycle detection"""
     if visited is None:
         visited = set()

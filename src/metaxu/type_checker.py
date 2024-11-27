@@ -1,11 +1,14 @@
-from typing import Dict, List, Optional, Union, Any
-from dataclasses import dataclass
-import metaxu_ast as ast
-from symbol_table import SymbolTable, Symbol
-from .simplesub import TypeInferencer, Polarity
-from .type_defs import (
-    CompactType, TypeBounds, unfold_once, unify, Type, TypeDefinition
+from typing import Dict, List, Optional, Union, Any, Set, Tuple
+from dataclasses import dataclass, field
+import metaxu.metaxu_ast as ast
+from metaxu.symbol_table import SymbolTable, Symbol, ModuleInfo
+from metaxu.simplesub import TypeInferencer, Polarity
+from metaxu.type_defs import (
+    CompactType, TypeBounds, unfold_once, unify, TypeConstructor,
+    NamedType, Type, TypeDefinition
 )
+from pathlib import Path
+from metaxu.errors import CompileError, SourceLocation, get_source_context
 
 class TypeChecker:
     def __init__(self):
@@ -333,7 +336,29 @@ class TypeChecker:
             # Store the mode for future reference
             if binding.mode:
                 self.current_scope[binding.name + "_mode"] = binding.mode
-        
+                
+                # Check mode compatibility if binding from another variable
+                if isinstance(binding.initializer, ast.VariableExpression):
+                    source_var = binding.initializer.name
+                    source_mode = self.current_scope.get(source_var + "_mode")
+                    
+                    if source_mode:
+                        # Cannot alias mut as const or vice versa
+                        if source_mode.is_mut and binding.mode.is_const:
+                            self.errors.append(
+                                f"Cannot alias mutable reference '{source_var}' as const"
+                            )
+                        if source_mode.is_const and binding.mode.is_mut:
+                            self.errors.append(
+                                f"Cannot alias const reference '{source_var}' as mutable"
+                            )
+                    
+                        # Track the reference relationship
+                        self.borrow_checker.add_reference(binding.identifier, source_var, binding.mode)
+            
+            # Add to borrow checker's scope
+            self.borrow_checker.add_variable(binding.identifier, binding.mode)
+
     def setup_builtin_types(self):
         # Add built-in types
         int_type = ast.TypeInfo("int", [], is_copy=True)
@@ -727,7 +752,7 @@ class TypeChecker:
         
         return effect_type
 
-    def visit_HandleExpression(self, node):
+    def visit_HandleEffect(self, node):
         """Type check handle expressions with proper resource tracking"""
         # Get the effect type being handled
         effect_type = self.check(node.effect)
@@ -826,17 +851,79 @@ class TypeChecker:
 
         return op_type.return_type
 
-    def visit_Module(self, node):
+    def visit_Module(self, node: 'ast.Module') -> None:
         """Type check a module"""
-        # Enter module scope
-        self.symbol_table.enter_module(node.name, node.path)
-        
-        # Type check all statements
-        for stmt in node.statements:
-            self.check(stmt)
-        
-        # Exit module scope
-        self.symbol_table.exit_module()
+        try:
+            # Skip if module is already being processed
+            if node.name in self.symbol_table.modules and self.symbol_table.modules[node.name].is_loaded:
+                return
+
+            # Create module info if not exists
+            if node.name not in self.symbol_table.modules:
+                self.symbol_table.modules[node.name] = ModuleInfo(
+                    path=Path(node.name + '.mx'),
+                    symbols={},
+                    imports=set(),
+                    is_loaded=False
+                )
+
+            # Mark as loaded before processing to prevent recursion
+            self.symbol_table.modules[node.name].is_loaded = True
+
+            # Enter module scope
+            self.symbol_table.enter_module(node.name, Path(node.name + '.mx'))
+
+            try:
+                # Collect imports first
+                self.collect_imports(node)
+
+                # Process module body
+                if node.body:
+                    self.visit(node.body)
+            finally:
+                # Exit module scope
+                self.symbol_table.exit_module()
+                
+        except Exception as e:
+            location = SourceLocation(
+                file=getattr(node, 'source_file', '<unknown>'),
+                line=getattr(node, 'line', 0),
+                column=getattr(node, 'column', 0)
+            )
+            
+            error = CompileError(
+                message=str(e),
+                error_type="TypeError",
+                location=location,
+                node=node,
+                context=get_source_context(location.file, location.line),
+                stack_trace=traceback.format_stack(),
+                notes=["Check that all imported modules exist and are accessible"]
+            )
+            self.errors.append(error)
+            raise error from e
+
+    def _get_source_context(self, node: 'ast.Node', context_lines: int = 3) -> Optional[str]:
+        """Get source code context around a node's location"""
+        if not hasattr(node, 'source_file') or not hasattr(node, 'line'):
+            return None
+            
+        try:
+            with open(node.source_file) as f:
+                lines = f.readlines()
+                
+            start = max(0, node.line - context_lines - 1)
+            end = min(len(lines), node.line + context_lines)
+            
+            context = []
+            for i in range(start, end):
+                line_num = i + 1
+                prefix = '> ' if line_num == node.line else '  '
+                context.append(f"{prefix}{line_num:4d} | {lines[i].rstrip()}")
+                
+            return '\n'.join(context)
+        except:
+            return None
 
     def visit_Name(self, node):
         """Type check a name node, handling qualified names"""
@@ -1378,7 +1465,7 @@ class TypeChecker:
             
         return False
                     
-    def check_type_application(self, app: TypeApplication) -> Type:
+    def check_type_application(self, app: ast.TypeApplication) -> Type:
         """Type check a type application using inferred variance.
         
         This method:
@@ -1657,7 +1744,37 @@ class TypeChecker:
                 
         return declarations
 
-    
+    def collect_imports(self, module: 'ast.Module') -> None:
+        """Collect all imports from a module and register them in the symbol table"""
+        # Initialize module info if not exists
+        if module.name not in self.symbol_table.modules:
+            self.symbol_table.modules[module.name] = ModuleInfo(
+                path=Path(module.name + '.mx'),
+                symbols={},
+                imports=set(),
+                is_loaded=False
+            )
+            
+        # Skip if already loaded to prevent recursion
+        if self.symbol_table.modules[module.name].is_loaded:
+            return
+            
+        # Mark as loaded before processing imports
+        self.symbol_table.modules[module.name].is_loaded = True
+        
+        for stmt in module.body.statements:
+            if isinstance(stmt, ast.Import):
+                # Add import to symbol table
+                if stmt.alias:
+                    module_name = stmt.alias
+                else:
+                    module_name = stmt.module_path[-1]
+                    
+                # Create module path
+                module_path = Path(*stmt.module_path).with_suffix('.mx')
+                
+                # Add to current module's imports
+                self.symbol_table.modules[module.name].imports.add(module_name)
 
     def is_type_visible(self, ty: NamedType, from_module: Tuple[str, ...]) -> bool:
         """Check if a type is visible from the given module path.
@@ -1834,7 +1951,7 @@ class TypeChecker:
                 for fname, ftype in sup.fields.items()
             )
 
-    def check_type_application(self, app: TypeApplication) -> Type:
+    def check_type_application(self, app: ast.TypeApplication) -> Type:
         """Type check a type application using inferred variance.
         
         This method:
@@ -2360,3 +2477,33 @@ class BorrowChecker:
                 self.add_mutable_borrow(var_name)
             else:
                 self.add_shared_borrow(var_name)
+
+@dataclass
+class CompileError:
+    """Detailed compile error with source location and context"""
+    message: str
+    node: Optional['ast.Node'] = None
+    source_file: Optional[str] = None
+    line: Optional[int] = None
+    column: Optional[int] = None
+    context: Optional[str] = None
+    stack_trace: List[str] = field(default_factory=list)
+
+    def __str__(self) -> str:
+        parts = []
+        # Location info
+        loc = f"{self.source_file}:{self.line}:{self.column}" if all([self.source_file, self.line, self.column]) else "unknown location"
+        parts.append(f"Error at {loc}: {self.message}")
+        
+        # Source context if available
+        if self.context:
+            parts.append("\nContext:")
+            parts.append(self.context)
+            parts.append(" " * (self.column - 1) + "^" if self.column else "")
+        
+        # Stack trace
+        if self.stack_trace:
+            parts.append("\nStack trace:")
+            parts.extend(f"  {frame}" for frame in self.stack_trace)
+        
+        return "\n".join(parts)

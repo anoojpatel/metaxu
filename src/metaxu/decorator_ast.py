@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any
-from metaxu_ast import Node, Expression
+from metaxu.metaxu_ast import Node, Expression
 
 @dataclass
 class Decorator(Node):

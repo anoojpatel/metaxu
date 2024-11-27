@@ -1,46 +1,86 @@
 import ply.yacc as yacc
-from lexer import Lexer
-import metaxu_ast as ast
-from decorator_ast import Decorator, CFunctionDecorator, DecoratorList
-from extern_ast import ExternBlock, ExternFunctionDeclaration, ExternTypeDeclaration
-from unsafe_ast import (UnsafeBlock, PointerType, TypeCast, 
+from metaxu.lexer import Lexer
+import metaxu.metaxu_ast as ast
+from metaxu.decorator_ast import Decorator, CFunctionDecorator, DecoratorList
+from metaxu.extern_ast import ExternBlock, ExternFunctionDeclaration, ExternTypeDeclaration
+from metaxu.unsafe_ast import (UnsafeBlock, PointerType, TypeCast, 
                        PointerDereference, AddressOf)
+from metaxu.errors import CompileError, SourceLocation, get_source_context
 
 class Parser:
     def __init__(self):
         self.lexer = Lexer()
-        self.tokens = self.lexer.tokens
-        self.module_names = set()
-        self.parse_stack = []  # Stack for tracking parse context
+        self.tokens = self.lexer.tokens  # Get token list from lexer
         self.parser = yacc.yacc(module=self)
+        self.module_names = set()
+        self.parse_stack = []
         self.current_scope = None
 
-    def parse(self, data):
-        self.module_names.clear()  # Reset module names for each parse
+    def parse(self, source: str, file_path: str = "<unknown>") -> 'ast.Module':
+        """Parse source code into an AST"""
         try:
-            result = self.parser.parse(data, lexer=self.lexer)
-            if result is None:
-                return ast.Program([])  # Return empty program instead of None
+            # Initialize lexer with source
+            self.lexer.source_file = file_path
+            # Parse using PLY
+            result = self.parser.parse(source, lexer=self.lexer)
+            if result:
+                result.source_file = file_path
             return result
+            
         except Exception as e:
-            print(f"Error during parsing: {e}")
-            raise
+            # Get current token for error location
+            token = self.lexer.current_token if hasattr(self.lexer, 'current_token') else None
+            location = SourceLocation(
+                file=file_path,
+                line=token.lineno if token else 0,
+                column=token.lexpos if token else 0
+            ) if token else None
+            
+            error = CompileError(
+                message=str(e),
+                error_type="ParseError",
+                location=location,
+                context=get_source_context(file_path, location.line) if location else None,
+                stack_trace=traceback.format_stack(),
+                notes=["Check syntax near this location"]
+            )
+            raise error from e
 
-    def p_program(self, p):
-        '''program : statement_list'''
-        p[0] = ast.Program(p[1])
+    def p_module(self, p):
+        '''module : module_body'''
+        p[0] = ast.Module(
+            name=None,  # Module name will be set later
+            body=p[1]
+        )
 
-    def p_statement_list(self,p):
-        '''statement_list : statement_list statement
-                        | statement
+    def p_module_body(self, p):
+        '''module_body : docstring_opt exports_opt statement_list'''
+        statements = []
+        visibility_rules = None
+        
+        if p[3]:
+            # Extract visibility rules from statements if present
+            for stmt in p[3]:
+                if isinstance(stmt, ast.VisibilityRules):
+                    visibility_rules = stmt.rules
+                else:
+                    statements.append(stmt)
+                
+        p[0] = ast.ModuleBody(
+            statements=statements,
+            docstring=p[1],
+            exports=p[2],
+            visibility_rules=visibility_rules
+        )
+
+    def p_statement_list(self, p):
+        '''statement_list : statement
+                        | statement_list statement
                         | empty'''
-        if len(p) == 3:
-            if p[1] is None:
-                p[0] = [p[2]] if p[2] is not None else []
-            else:
-                p[0] = p[1] + ([p[2]] if p[2] is not None else [])
+        if len(p) == 2:
+            p[0] = [p[1]] if p[1] else []
         else:
-            p[0] = [p[1]] if p[1] is not None else []
+            p[0] = p[1] + [p[2]] if p[2] else p[1]
 
     def p_statement(self, p):
         '''statement : return_statement
@@ -63,6 +103,8 @@ class Parser:
                     | from_import_statement
                     | module_declaration
                     | visibility_block
+                    | print_statement SEMICOLON
+                    | print_statement
                     | expression SEMICOLON
                     | expression
                     | comptime_block
@@ -72,6 +114,11 @@ class Parser:
             p[0] = p[1]  # Let statement with semicolon
         elif len(p) == 3 and isinstance(p[1], ast.Assignment):
             p[0] = p[1]  # Assignment with semicolon
+        elif len(p) == 3 and isinstance(p[1], ast.PrintStatement):
+            p[0] = p[1]  # Print statement with semicolon
+        elif len(p) == 3 and isinstance(p[1], ast.Expression):
+            # Handle expressions with semicolons
+            p[0] = p[1]
         else:
             p[0] = p[1]  # All other statements
 
@@ -168,7 +215,7 @@ class Parser:
                     visibility_rules = stmt.rules
                 else:
                     statements.append(stmt)
-        
+                
         p[0] = ast.ModuleBody(statements=statements, docstring=p[1], exports=p[2], visibility_rules=visibility_rules)
 
     def p_docstring_opt(self, p):
@@ -337,7 +384,9 @@ class Parser:
                 | IDENTIFIER LPAREN RPAREN
                 | LPAREN expression RPAREN'''
         if len(p) == 2:
-            if isinstance(p[1], str):
+            if isinstance(p[1], tuple) and p[1][1] == 'string':
+                p[0] = ast.Literal(p[1][0])  # Create string literal
+            elif isinstance(p[1], str):
                 if p[1].lower() == 'true':
                     p[0] = ast.Literal(True)
                 elif p[1].lower() == 'false':
@@ -366,16 +415,23 @@ class Parser:
                         | IDENTIFIER LPAREN RPAREN
                         | qualified_name LPAREN argument_list RPAREN
                         | qualified_name LPAREN RPAREN'''
-        if isinstance(p[1], ast.QualifiedName):
-            if len(p) == 4:  # Empty args
-                p[0] = ast.QualifiedFunctionCall(p[1].parts, [])
-            else:  # With args
+        if len(p) == 5:  # With arguments
+            if isinstance(p[1], str):
+                # Handle built-in functions like print specially
+                if p[1] == 'print':
+                    p[0] = ast.PrintStatement(p[3] if p[3] is not None else [])
+                else:
+                    p[0] = ast.FunctionCall(p[1], p[3] if p[3] is not None else [])
+            elif isinstance(p[1], ast.QualifiedName):
                 p[0] = ast.QualifiedFunctionCall(p[1].parts, p[3] if p[3] is not None else [])
-        else:
-            if len(p) == 4:  # Empty args
-                p[0] = ast.FunctionCall(p[1], [])
-            else:  # With args
-                p[0] = ast.FunctionCall(p[1], p[3] if p[3] is not None else [])
+        else:  # No arguments (len(p) == 4)
+            if isinstance(p[1], str):
+                if p[1] == 'print':
+                    p[0] = ast.PrintStatement([])
+                else:
+                    p[0] = ast.FunctionCall(p[1], [])
+            elif isinstance(p[1], ast.QualifiedName):
+                p[0] = ast.QualifiedFunctionCall(p[1].parts, [])
 
     def p_qualified_name(self, p):
         '''qualified_name : IDENTIFIER
@@ -1283,39 +1339,84 @@ class Parser:
             c_function=c_func
         )
 
+    def p_print_statement(self, p):
+        '''print_statement : PRINT LPAREN argument_list RPAREN
+                         | PRINT LPAREN RPAREN'''
+        if len(p) == 5:
+            p[0] = ast.PrintStatement(p[3])
+        else:
+            p[0] = ast.PrintStatement([])
+
     def p_empty(self, p):
         'empty :'
         pass
 
     def p_error(self, p):
         if p:
-            print(f"Syntax error at token {p.type}, value '{p.value}', line {p.lineno}, position {p.lexpos}")
-            # Print the next few tokens to help with debugging
-            tok = self.parser.token()
-            print("Next tokens:")
-            for _ in range(5):  # Print next 5 tokens
-                if tok:
-                    print(f"  {tok.type}: {tok.value}")
-                    tok = self.parser.token()
+            raise CompileError(
+                message=f"Syntax error at token {p.type}",
+                error_type="ParseError",
+                location=SourceLocation(
+                    file=self.lexer.source_file,
+                    line=p.lineno,
+                    column=p.lexpos
+                ),
+                context=get_source_context(self.lexer.source_file, p.lineno),
+                notes=[f"Unexpected token '{p.value}'"]
+            )
         else:
-            print("Syntax error at EOF")
-        # Don't return None here, instead raise an exception to be caught by parse()
-        raise SyntaxError("Failed to parse input")
+            raise CompileError(
+                message="Syntax error at EOF",
+                error_type="ParseError",
+                location=None,
+                notes=["Unexpected end of file"]
+            )
 
     def _find_variables_in_body(self, node):
         """Recursively find all variable references in a node"""
         vars = set()
+        print(f"Finding variables in node type: {type(node)}")
+        
+        if node is None:
+            print("Warning: None node encountered")
+            return vars
+            
+        if isinstance(node, list):
+            print(f"Warning: List encountered instead of AST node: {node}")
+            # Handle list case by processing each element
+            for item in node:
+                vars.update(self._find_variables_in_body(item))
+            return vars
+            
         if isinstance(node, ast.Variable):
             vars.add(node.name)
         elif isinstance(node, ast.Block):
+            print(f"Processing Block node with statements: {type(node.statements)}")
             for stmt in node.statements:
                 vars.update(self._find_variables_in_body(stmt))
-        elif isinstance(node, ast.BinaryOp):
+        elif isinstance(node, ast.BinaryOperation):
             vars.update(self._find_variables_in_body(node.left))
             vars.update(self._find_variables_in_body(node.right))
-        elif isinstance(node, ast.Assignment):
-            vars.update(self._find_variables_in_body(node.target))
-            vars.update(self._find_variables_in_body(node.value))
+        elif isinstance(node, ast.FunctionCall):
+            for arg in node.arguments:
+                vars.update(self._find_variables_in_body(arg))
+        elif isinstance(node, ast.LetBinding):
+            if node.initializer:
+                vars.update(self._find_variables_in_body(node.initializer))
+        elif isinstance(node, ast.LetStatement):
+            for binding in node.bindings:
+                vars.update(self._find_variables_in_body(binding))
+        elif isinstance(node, ast.ReturnStatement):
+            if node.expression:
+                vars.update(self._find_variables_in_body(node.expression))
+        elif isinstance(node, ast.PrintStatement):
+            for arg in node.arguments:
+                vars.update(self._find_variables_in_body(arg))
+        elif isinstance(node, ast.Program):
+            print(f"Processing Program node with statements: {type(node.statements)}")
+            for stmt in node.statements:
+                vars.update(self._find_variables_in_body(stmt))
+                
         return vars
 
     def _is_mutable_in_scope(self, var_name, scope):
@@ -1329,11 +1430,23 @@ class Parser:
 
     def _is_variable_mutated(self, var_name, node):
         """Check if a variable is mutated in the given AST node"""
+        print(f"Checking mutation for {var_name} in node type: {type(node)}")
+        
+        if node is None:
+            print("Warning: None node encountered in mutation check")
+            return False
+            
+        if isinstance(node, list):
+            print(f"Warning: List encountered in mutation check: {node}")
+            return any(self._is_variable_mutated(var_name, item) for item in node)
+            
         if isinstance(node, ast.Assignment):
             if isinstance(node.target, ast.Variable) and node.target.name == var_name:
                 return True
         elif isinstance(node, ast.Block):
+            print(f"Checking Block node with statements: {type(node.statements)}")
             return any(self._is_variable_mutated(var_name, stmt) for stmt in node.statements)
+            
         return False
 
     def parse_effect_type(self):

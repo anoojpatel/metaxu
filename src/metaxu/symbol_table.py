@@ -1,8 +1,8 @@
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 from pathlib import Path
-from .type_defs import TypeDefinition, Type
-import ast
+from metaxu.type_defs import TypeDefinition, Type
+import metaxu.metaxu_ast as ast
 
 @dataclass
 class ModuleInfo:
@@ -41,6 +41,37 @@ class SymbolTable:
     def add_module_search_path(self, path: Path):
         """Add a directory to search for modules"""
         self.module_search_paths.append(path)
+
+    def get_load_order(self) -> List[str]:
+        """Get a list of module names in dependency order"""
+        # Build dependency graph
+        graph = {name: list(info.imports) for name, info in self.modules.items()}
+        
+        # Track visited and in_progress for cycle detection
+        visited = set()
+        in_progress = set()
+        order = []
+        
+        def visit(node: str):
+            if node in in_progress:
+                raise Exception(f"Circular dependency detected involving module {node}")
+            if node in visited:
+                return
+                
+            in_progress.add(node)
+            for dep in graph[node]:
+                if dep in self.modules:  # Only visit known modules
+                    visit(dep)
+            in_progress.remove(node)
+            visited.add(node)
+            order.append(node)
+            
+        # Visit each unvisited node
+        for node in graph:
+            if node not in visited:
+                visit(node)
+                
+        return order
 
     def resolve_module_path(self, module_path: List[str], relative_level: int = 0) -> Optional[Path]:
         """Resolve a module path to an actual file path"""
@@ -134,8 +165,8 @@ class SymbolTable:
             return
 
         # Create parser and type checker
-        from parser import Parser
-        from type_checker import TypeChecker
+        from metaxu.parser import Parser
+        from metaxu.type_checker import TypeChecker
         
         parser = Parser()
         type_checker = TypeChecker()
