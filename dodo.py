@@ -12,6 +12,9 @@ C_COMPILER = 'gcc'
 C_FLAGS = ['-pthread']
 INCLUDE_FLAGS = ['-I.']
 
+# Directories
+OUTPUT_DIR = 'outputs'
+
 # Source files
 EFFECTS_SRC = 'src/metaxu/runtimes/c/effects.c'
 VALUES_SRC = 'src/metaxu/runtimes/c/values.c'
@@ -30,9 +33,14 @@ PYTHON_TESTS = [
     'tests/test_effectful_code.py'
 ]
 
+def ensure_output_dir():
+    """Create output directory if it doesn't exist"""
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
 def task_build_atomic_effects():
     """Build atomic effects test"""
-    target = 'test_atomic_effects'
+    ensure_output_dir()
+    target = os.path.join(OUTPUT_DIR, 'test_atomic_effects')
     sources = ['tests/test_atomic_effects.c'] + COMMON_SRCS
     
     return {
@@ -46,7 +54,8 @@ def task_build_atomic_effects():
 
 def task_build_effect_runtime():
     """Build effect runtime test"""
-    target = 'test_effect_runtime'
+    ensure_output_dir()
+    target = os.path.join(OUTPUT_DIR, 'test_effect_runtime')
     sources = ['tests/test_effect_runtime.c'] + COMMON_SRCS
     
     return {
@@ -61,7 +70,7 @@ def task_build_effect_runtime():
 def task_test_atomic_effects():
     """Run atomic effects test"""
     return {
-        'actions': ['./test_atomic_effects'],
+        'actions': [os.path.join(OUTPUT_DIR, 'test_atomic_effects')],
         'task_dep': ['build_atomic_effects'],
         'verbosity': 2,
     }
@@ -69,7 +78,7 @@ def task_test_atomic_effects():
 def task_test_effect_runtime():
     """Run effect runtime test"""
     return {
-        'actions': ['./test_effect_runtime'],
+        'actions': [os.path.join(OUTPUT_DIR, 'test_effect_runtime')],
         'task_dep': ['build_effect_runtime'],
         'verbosity': 2,
     }
