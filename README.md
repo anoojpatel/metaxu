@@ -1,6 +1,9 @@
-# Metaxu🌀  
-A self-hosted Low level functional-style programming language  
-[Documentation](docs/index.md)
+<h1 style="text-align: center;"> Metaxu🌀  </h1>
+<p style="text-align: center;">
+A self-hosted Low level functional-style programming language <br>    
+[<a href="docs/index.md">Documentation</a>]
+</p>
+
 ## Installation
 
 ### Prerequisites
