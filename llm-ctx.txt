@@ -234,9 +234,9 @@ Mode Relationships:
 
 Usage Examples:
   ```metaxu
-  fn process(x: @local @once File) { ... }     # Local single-use file
-  fn share(x: @global @many Data) { ... }      # Shared multi-use data
-  fn parallel(x: @local @separate Array) { ... } # Parallel array processing
+  fn process(@local @once x: File) { ... }     # Local single-use file
+  fn share(@global @many x: Data) { ... }      # Shared multi-use data
+  fn parallel(@local @separate x: Array) { ... } # Parallel array processing
   ```
 
 Safety Guarantees:
@@ -346,4 +346,4 @@ Influences:
   - Python: Ergonomics
 ```
 
-Note: This context is current as of [DATE]. Features and implementation details may change as the language evolves.
+Note: This context is current as of 27-11-24. Features and implementation details may change as the language evolves.
