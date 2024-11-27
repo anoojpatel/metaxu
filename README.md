@@ -95,6 +95,8 @@ options:
                         Library name (for library builds)
   --cuda                Enable CUDA support
 ```
+#### Helping LLMs
+We have a `llm-ctx.txt` file that contains some examples of how to use Metaxu with LLMs. It follows [llms.txt](https://llmstxt.org/) standards. Add it via `@docs` for IDEs or into relvant context manager protocols.
 
 ## Development
 
