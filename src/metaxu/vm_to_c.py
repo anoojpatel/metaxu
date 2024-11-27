@@ -328,9 +328,11 @@ class VMToCCompiler:
             if isinstance(value, int):
                 self.c_code += f"{indent}int {temp_var} = {value};\n"
             elif isinstance(value, float):
-                self.c_code += f"{indent}float {temp_var} = {value};\n"
+                self.c_code += f"{indent}float {temp_var} = {value}f;\n"
             elif isinstance(value, str):
-                self.c_code += f'{indent}char* {temp_var} = "{value}";\n'
+                # Escape special characters in string
+                escaped_value = value.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n')
+                self.c_code += f'{indent}const char* {temp_var} = "{escaped_value}";\n'
             else:
                 raise Exception(f"Unsupported constant type: {type(value)}")
             self.stack_push(temp_var)
@@ -473,8 +475,8 @@ class VMToCCompiler:
             self.stack_pop()
         elif opcode == Opcode.PRINT:
             value = self.stack_pop()
-            # Check if value is a string constant (starts with t and was loaded as char*)
-            if value.startswith('t') and f'char* {value} =' in self.c_code:
+            # Check if value is a string constant
+            if any(f'const char* {value} =' in line or f'char* {value} =' in line for line in self.c_code.split('\n')):
                 self.c_code += f"{indent}printf(\"%s\\n\", {value});\n"
             else:
                 self.c_code += f"{indent}printf(\"%d\\n\", {value});\n"
