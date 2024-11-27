@@ -1,4 +1,6 @@
 import ply.lex as lex
+from metaxu.errors import CompileError, SourceLocation, get_source_context
+from typing import List
 
 class Lexer:
     # A string containing ignored characters (spaces and tabs)
@@ -23,6 +25,7 @@ class Lexer:
         'kernel': 'KERNEL',
         'to_device': 'TO_DEVICE',
         'from_device': 'FROM_DEVICE',
+        'print': 'PRINT',  # Add print keyword
         # Control flow keywords
         'return': 'RETURN',
         'if': 'IF',
@@ -132,13 +135,13 @@ class Lexer:
 
     def t_STRING(self, t):
         r'"[^"]*"'
-        t.value = t.value[1:-1]  # Remove quotes
+        t.value = (t.value[1:-1], 'string')  # Tuple with (value, type)
         return t
 
 
     # Comments
     def t_COMMENT(self, t):
-        r'//.*'
+        r'\#.*'
         pass
 
     # Define a rule so we can track line numbers

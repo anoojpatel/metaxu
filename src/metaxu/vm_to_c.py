@@ -1,148 +1,228 @@
-from tape_vm import Opcode, Instruction
+from metaxu.tape_vm import Opcode, Instruction
 
 class VMToCCompiler:
-    def __init__(self, instructions):
+    def __init__(self, instructions, linker, options=None):
         self.instructions = instructions
+        self.linker = linker
+        self.options = options
         self.c_code = ""
         self.indent_level = 0
         self.vars = set()
         self.stack = []
         self.type_stack = []
+        self.temp_var_count = 0
+        self.label_count = 0
         self.current_scope = None
         self.scope_counter = 0
         self.thread_local_vars = set()
-        self.cuda_vars = set()
+        self.cuda_enabled = False  # Default to no CUDA support
         self.message_queues = set()
         self.drop_tracker = DropTracker()
 
     def compile(self):
-        # Include necessary headers
+        """Generate C code from VM instructions"""
+        # Set CUDA support based on options
+        if self.options and hasattr(self.options, 'cuda_enabled'):
+            self.cuda_enabled = self.options.cuda_enabled
+
+        self._generate_prelude()
+        self._generate_runtime()
+        
+        # For libraries, generate exported symbols
+        if self.options and self.options.link_mode == "library":
+            self._generate_exports()
+        
+        # Generate main function for executables
+        if not self.options or self.options.link_mode != "library":
+            self.c_code += "int main(int argc, char *argv[]) {\n"
+            self.indent_level += 1
+            self._generate_init()
+        
+        # Generate instruction implementations
+        for instr in self.instructions:
+            self._compile_instruction(instr)
+            
+        # Close main for executables
+        if not self.options or self.options.link_mode != "library":
+            self.c_code += "    return 0;\n"
+            self.c_code += "}\n"
+            
+        return self.c_code
+
+    def _generate_prelude(self):
+        """Generate includes and common declarations"""
+        # Standard includes
         self.c_code += "#include <stdio.h>\n"
         self.c_code += "#include <stdlib.h>\n"
+        self.c_code += "#include <string.h>\n"
+        self.c_code += "#include <stdbool.h>\n"  # For bool type
         self.c_code += "#include <pthread.h>\n"  # For multithreading
-        self.c_code += "#include <cuda_runtime.h>\n"  # For CUDA operations
-        self.c_code += "#include <setjmp.h>\n"  # For continuation handling
+        self.c_code += "#include <setjmp.h>\n"   # For continuation handling
+        
+        # Only include CUDA if explicitly enabled
+        if self.cuda_enabled:
+            self.c_code += "#include <cuda_runtime.h>\n"
+        
         self.c_code += "\n"
         
-        # Simple continuation structure
-        self.c_code += "typedef struct {\n"
+        # Forward declarations
+        self.c_code += "// Forward declarations\n"
+        self.c_code += "struct continuation_state;\n"
+        self.c_code += "struct thread_pool;\n"
+        self.c_code += "struct future;\n"
+        self.c_code += "struct queue;\n"
+        self.c_code += "struct task;\n\n"
+        
+        # Type aliases
+        self.c_code += "// Type definitions\n"
+        self.c_code += "typedef struct continuation_state continuation_state_t;\n"
+        self.c_code += "typedef struct thread_pool thread_pool_t;\n"
+        self.c_code += "typedef struct future future_t;\n"
+        self.c_code += "typedef struct queue queue_t;\n"
+        self.c_code += "typedef struct task task_t;\n\n"
+
+    def _generate_exports(self):
+        """Generate exported symbols for library mode"""
+        if not self.options.library_name:
+            raise ValueError("Library name must be specified for library builds")
+            
+        # Generate library initialization function
+        self.c_code += f"EXPORT void {self.options.library_name}_init(void) {{\n"
+        self._generate_init()
+        self.c_code += "}\n\n"
+        
+        # Generate cleanup function
+        self.c_code += f"EXPORT void {self.options.library_name}_cleanup(void) {{\n"
+        self.c_code += "    // TODO: Add cleanup code\n"
+        self.c_code += "}\n\n"
+
+    def _generate_runtime(self):
+        """Generate runtime support code"""
+        # Basic structures
+        self.c_code += "// Runtime structures\n"
+        
+        # Continuation structure
+        self.c_code += "struct continuation_state {\n"
         self.c_code += "    jmp_buf env;\n"
         self.c_code += "    void* result;\n"
-        self.c_code += "} continuation_t;\n\n"
-
-        # Add domain structure for ownership tracking
-        self.c_code += "typedef struct {\n"
+        self.c_code += "    void (*handler)(continuation_state_t*);\n"
+        self.c_code += "};\n\n"
+        
+        # Domain structure for ownership tracking
+        self.c_code += "typedef struct domain {\n"
         self.c_code += "    pthread_mutex_t mutex;\n"
         self.c_code += "    int domain_id;\n"
         self.c_code += "    void* data;\n"
         self.c_code += "    void (*drop_value)(void*);\n"
         self.c_code += "    bool value_needs_drop;\n"
         self.c_code += "} domain_t;\n\n"
-
-        # Add domain registry for tracking active domains
-        self.c_code += "typedef struct {\n"
+        
+        # Message queue structure
+        self.c_code += "struct queue {\n"
+        self.c_code += "    void** items;\n"
+        self.c_code += "    size_t capacity;\n"
+        self.c_code += "    size_t size;\n"
+        self.c_code += "    size_t head;\n"
+        self.c_code += "    size_t tail;\n"
         self.c_code += "    pthread_mutex_t mutex;\n"
-        self.c_code += "    domain_t* domains[256];\n"
-        self.c_code += "    int num_domains;\n"
-        self.c_code += "} domain_registry_t;\n\n"
-
-        self.c_code += "domain_registry_t domain_registry = {\n"
-        self.c_code += "    .mutex = PTHREAD_MUTEX_INITIALIZER,\n"
-        self.c_code += "    .num_domains = 0\n"
+        self.c_code += "    pthread_cond_t not_empty;\n"
+        self.c_code += "    pthread_cond_t not_full;\n"
         self.c_code += "};\n\n"
-
-        # Add domain operations
-        self.c_code += "domain_t* create_domain(void* data, void (*drop_value)(void*), bool value_needs_drop) {\n"
-        self.c_code += "    domain_t* domain = malloc(sizeof(domain_t));\n"
-        self.c_code += "    domain->mutex = (pthread_mutex_t)PTHREAD_MUTEX_INITIALIZER;\n"
-        self.c_code += "    pthread_mutex_lock(&domain_registry.mutex);\n"
-        self.c_code += "    domain->domain_id = domain_registry.num_domains++;\n"
-        self.c_code += "    domain->data = data;\n"
-        self.c_code += "    domain->drop_value = drop_value;\n"
-        self.c_code += "    domain->value_needs_drop = value_needs_drop;\n"
-        self.c_code += "    domain_registry.domains[domain->domain_id] = domain;\n"
-        self.c_code += "    pthread_mutex_unlock(&domain_registry.mutex);\n"
-        self.c_code += "    return domain;\n"
-        self.c_code += "}\n\n"
-
-        self.c_code += "void* domain_acquire(domain_t* domain) {\n"
-        self.c_code += "    pthread_mutex_lock(&domain->mutex);\n"
-        self.c_code += "    return domain->data;\n"
-        self.c_code += "}\n\n"
-
-        self.c_code += "void domain_release(domain_t* domain) {\n"
-        self.c_code += "    pthread_mutex_unlock(&domain->mutex);\n"
-        self.c_code += "}\n\n"
-
-        self.c_code += "void transfer_domain(domain_t* domain, pthread_t thread) {\n"
-        self.c_code += "    pthread_mutex_lock(&domain_registry.mutex);\n"
-        self.c_code += "    // Transfer ownership logic here\n"
-        self.c_code += "    pthread_mutex_unlock(&domain_registry.mutex);\n"
-        self.c_code += "}\n\n"
-
-       
-
-        # Add region management functions
-        self.c_code += "// Move value to caller's region\n"
-        self.c_code += "void* move_to_caller_region(void* value) {\n"
-        self.c_code += "    // Transfer ownership to caller\n"
-        self.c_code += "    return value;\n"
-        self.c_code += "}\n\n"
-
-        # Add thread-local storage and message queue types
-        self.c_code += "typedef struct {\n"
+        
+        # Task structure
+        self.c_code += "struct task {\n"
+        self.c_code += "    void (*function)(void*);\n"
+        self.c_code += "    void* arg;\n"
+        self.c_code += "    bool detached;\n"
+        self.c_code += "    future_t* future;\n"
+        self.c_code += "};\n\n"
+        
+        # Thread pool structure
+        self.c_code += "struct thread_pool {\n"
+        self.c_code += "    pthread_t* threads;\n"
+        self.c_code += "    size_t num_threads;\n"
+        self.c_code += "    queue_t* tasks;\n"
+        self.c_code += "    bool should_stop;\n"
         self.c_code += "    pthread_mutex_t mutex;\n"
-        self.c_code += "    pthread_cond_t cond;\n"
-        self.c_code += "    void* data;\n"
-        self.c_code += "    int size;\n"
-        self.c_code += "    int capacity;\n"
-        self.c_code += "} message_queue_t;\n\n"
+        self.c_code += "    pthread_cond_t condition;\n"
+        self.c_code += "};\n\n"
+        
+        # Future structure
+        self.c_code += "struct future {\n"
+        self.c_code += "    void* result;\n"
+        self.c_code += "    bool is_ready;\n"
+        self.c_code += "    pthread_mutex_t mutex;\n"
+        self.c_code += "    pthread_cond_t condition;\n"
+        self.c_code += "};\n\n"
+        
+        # Function prototypes
+        self.c_code += "// Function prototypes\n"
+        self.c_code += "bool queue_empty(queue_t* queue);\n"
+        self.c_code += "void* queue_pop(queue_t* queue);\n"
+        self.c_code += "void free_message_queue(queue_t* queue);\n"
+        self.c_code += "void free_thread_pool(thread_pool_t* pool);\n"
+        self.c_code += "void free_future(future_t* future);\n\n"
+        
+        # Implementation of utility functions
+        self.c_code += "// Utility function implementations\n"
+        self._generate_utility_functions()
 
-        # Add thread context structure
-        self.c_code += "typedef struct {\n"
-        self.c_code += "    message_queue_t* queues;\n"
-        self.c_code += "    void* locals;\n"
-        self.c_code += "} thread_context_t;\n\n"
-
-        # Add effect handler table
-        self.c_code += "typedef struct {\n"
-        self.c_code += "    int effect_type;\n"
-        self.c_code += "    void (*handler)(continuation_state_t*);\n"
-        self.c_code += "} effect_handler_t;\n\n"
-
-        # Add effect handler registration
-        self.c_code += "effect_handler_t effect_handlers[256];\n"
-        self.c_code += "int num_effect_handlers = 0;\n\n"
-
-        self.c_code += "void register_effect_handler(int effect_type, void (*handler)(continuation_state_t*)) {\n"
-        self.c_code += "    effect_handlers[num_effect_handlers].effect_type = effect_type;\n"
-        self.c_code += "    effect_handlers[num_effect_handlers].handler = handler;\n"
-        self.c_code += "    num_effect_handlers++;\n"
+    def _generate_utility_functions(self):
+        """Generate implementations of utility functions"""
+        # Queue operations
+        self.c_code += "bool queue_empty(queue_t* queue) {\n"
+        self.c_code += "    return queue->size == 0;\n"
+        self.c_code += "}\n\n"
+        
+        self.c_code += "void* queue_pop(queue_t* queue) {\n"
+        self.c_code += "    if (queue_empty(queue)) return NULL;\n"
+        self.c_code += "    void* item = queue->items[queue->head];\n"
+        self.c_code += "    queue->head = (queue->head + 1) % queue->capacity;\n"
+        self.c_code += "    queue->size--;\n"
+        self.c_code += "    return item;\n"
+        self.c_code += "}\n\n"
+        
+        # Memory management functions
+        self.c_code += "void free_message_queue(queue_t* queue) {\n"
+        self.c_code += "    if (queue) {\n"
+        self.c_code += "        if (queue->items) free(queue->items);\n"
+        self.c_code += "        pthread_mutex_destroy(&queue->mutex);\n"
+        self.c_code += "        pthread_cond_destroy(&queue->not_empty);\n"
+        self.c_code += "        pthread_cond_destroy(&queue->not_full);\n"
+        self.c_code += "        free(queue);\n"
+        self.c_code += "    }\n"
+        self.c_code += "}\n\n"
+        
+        self.c_code += "void free_thread_pool(thread_pool_t* pool) {\n"
+        self.c_code += "    if (pool) {\n"
+        self.c_code += "        if (pool->threads) free(pool->threads);\n"
+        self.c_code += "        if (pool->tasks) {\n"
+        self.c_code += "            while (!queue_empty(pool->tasks)) {\n"
+        self.c_code += "                task_t* task = queue_pop(pool->tasks);\n"
+        self.c_code += "                if (task) free(task);\n"
+        self.c_code += "            }\n"
+        self.c_code += "            free_message_queue(pool->tasks);\n"
+        self.c_code += "        }\n"
+        self.c_code += "        pthread_mutex_destroy(&pool->mutex);\n"
+        self.c_code += "        pthread_cond_destroy(&pool->condition);\n"
+        self.c_code += "        free(pool);\n"
+        self.c_code += "    }\n"
+        self.c_code += "}\n\n"
+        
+        self.c_code += "void free_future(future_t* future) {\n"
+        self.c_code += "    if (future) {\n"
+        self.c_code += "        pthread_mutex_destroy(&future->mutex);\n"
+        self.c_code += "        pthread_cond_destroy(&future->condition);\n"
+        self.c_code += "        free(future);\n"
+        self.c_code += "    }\n"
         self.c_code += "}\n\n"
 
-        # Generate message queue operations
-        self._generate_message_queue_operations()
-        
-        self.gen_thread_types()
-        self.gen_thread_handlers()
-        self.install_thread_handlers()
-        
-        self.c_code += "int main() {\n"
-        self.indent_level += 1
-        self.translate_instructions()
-        self.indent_level -= 1
-        self.c_code += "    return 0;\n"
-        self.c_code += "}\n"
-        return self.c_code
+    def _generate_init(self):
+        """Generate initialization code"""
+        self.c_code += "    // TODO: Add initialization code\n"
 
-    def translate_instructions(self):
-        idx = 0
-        while idx < len(self.instructions):
-            instr = self.instructions[idx]
-            self.translate_instruction(instr)
-            idx += 1
-
-    def translate_instruction(self, instr):
+    def _compile_instruction(self, instr):
+        """Compile a single instruction"""
         opcode = instr.opcode
         indent = '    ' * self.indent_level
 
@@ -384,20 +464,7 @@ class VMToCCompiler:
             # Store value through pointer
             value = self.stack_pop()
             addr = self.stack_pop()
-            self.c_code += f"{indent}*({addr}) = {value};\n"
-
-        elif opcode == Opcode.FIELD_ACCESS:
-            # Get field name from operands
-            field_name = instr.operands[0]
-            
-            # Pop struct variable from stack
-            struct_var = self.stack_pop()
-            
-            # Access field and store in temp var
-            temp_var = self.get_temp_var()
-            self.c_code += f"{indent}int {temp_var} = {struct_var}.{field_name};\n"
-            
-            self.stack_push(temp_var)
+            self.c_code += f"{indent}*({addr}) = {value};\n" 
 
         elif opcode == Opcode.DUP:
             value = self.stack[-1]
@@ -406,7 +473,11 @@ class VMToCCompiler:
             self.stack_pop()
         elif opcode == Opcode.PRINT:
             value = self.stack_pop()
-            self.c_code += f"{indent}printf(\"%d\\n\", {value});\n"
+            # Check if value is a string constant (starts with t and was loaded as char*)
+            if value.startswith('t') and f'char* {value} =' in self.c_code:
+                self.c_code += f"{indent}printf(\"%s\\n\", {value});\n"
+            else:
+                self.c_code += f"{indent}printf(\"%d\\n\", {value});\n"
         elif opcode == Opcode.MALLOC:
             size = self.stack_pop()
             ptr = self.get_temp_var()
@@ -465,7 +536,8 @@ class VMToCCompiler:
         
 
     def get_temp_var(self):
-        temp_var = f"t{len(self.vars)}"
+        temp_var = f"t{self.temp_var_count}"
+        self.temp_var_count += 1
         self.vars.add(temp_var)
         return temp_var
 
@@ -476,10 +548,6 @@ class VMToCCompiler:
         if not self.stack:
             raise Exception("Stack underflow")
         return self.stack.pop()
-
-    def translate_instructions(self):
-        for instr in self.instructions:
-            self.translate_instruction(instr)
 
     def gen_thread_types(self):
         """Generate C code for thread-related types"""

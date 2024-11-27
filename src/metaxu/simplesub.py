@@ -6,7 +6,7 @@ Based on the paper "Simple and Practical Type Inference for Higher-Rank Polymorp
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple, Union
 from enum import Enum
-from .type_defs import (
+from metaxu.type_defs import (
     Type, FunctionType, TypeVar, TypeScheme, TypeConstructor,
     CompactType, TypeBounds, unfold_once, unify, compose_variance,
     substitute_compact, next_id

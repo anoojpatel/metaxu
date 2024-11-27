@@ -177,15 +177,16 @@ class Node:
 class Program(Node):
     def __init__(self, statements):
         super().__init__()
-        self.statements = [self.add_child(stmt) for stmt in statements]
+        self.statements = [self.add_child(stmt) for stmt in (statements or [])]
         self.scope = Scope(parent=None)  # Global scope
     
     def add_statements(self, new_stmts, position=-1):
         """Add statements at specific position (-1 for end)"""
-        if position < 0:
-            position = len(self.statements)
-        for i, stmt in enumerate(new_stmts):
-            self.statements.insert(position + i, self.add_child(stmt))
+        new_stmts = [self.add_child(stmt) for stmt in new_stmts]
+        if position == -1:
+            self.statements.extend(new_stmts)
+        else:
+            self.statements[position:position] = new_stmts
 
 class Type(Node):
     def __init__(self):
@@ -200,53 +201,60 @@ class Expression(Node):
         super().__init__()
 
 class LetBinding(Node):
-    def __init__(self, identifier, type_annotation=None, initializer=None, mode=None):
+    def __init__(self, identifier, initializer, type_annotation=None, mode=None):
+        super().__init__()
         self.identifier = identifier
         self.type_annotation = type_annotation
-        self.initializer = initializer
+        self.initializer = self.add_child(initializer) if initializer else None
         self.mode = mode
 
-class LetStatement(Node):
+class LetStatement(Statement):
     def __init__(self, bindings):
-        self.bindings = bindings
+        super().__init__()
+        self.bindings = [self.add_child(binding) for binding in bindings]
 
-class ReturnStatement(Node):
+class ReturnStatement(Statement):
     def __init__(self, expression):
-        self.expression = expression
+        super().__init__()
+        self.expression = self.add_child(expression) if expression else None
 
     def __repr__(self):
-        return f"ReturnStatement({self.expression})"
+        return f"Return({self.expression})"
 
-class IfStatement(Node):
+class IfStatement(Statement):
     def __init__(self, condition, then_body, else_body):
-        self.condition = condition
-        self.then_body = then_body
-        self.else_body = else_body
+        super().__init__()
+        self.condition = self.add_child(condition)
+        self.then_body = self.add_child(then_body)
+        self.else_body = self.add_child(else_body) if else_body else None
 
-class WhileStatement(Node):
+class WhileStatement(Statement):
     """While loop control structure"""
     def __init__(self, condition, body):
-        self.condition = condition
-        self.body = body
+        super().__init__()
+        self.condition = self.add_child(condition)
+        self.body = self.add_child(body)
 
 class ForStatement(Statement):
     def __init__(self, iterator, iterable, body):
-        self.iterator = iterator
-        self.iterable = iterable
-        self.body = body
+        super().__init__()
+        self.iterator = iterator  # Just a string identifier
+        self.iterable = self.add_child(iterable)
+        self.body = self.add_child(body)
 
 class Block(Node):
     def __init__(self, statements=None):
         super().__init__()
         self.statements = [self.add_child(stmt) for stmt in (statements or [])]
         self.scope = Scope(parent=None)  # Will be set when added to AST
-    
+
+    # Add statements at specific position (-1 for end)
     def add_statements(self, new_stmts, position=-1):
-        """Add statements at specific position (-1 for end)"""
         if position < 0:
             position = len(self.statements)
-        for i, stmt in enumerate(new_stmts):
-            self.statements.insert(position + i, self.add_child(stmt))
+        for stmt in new_stmts:
+            self.statements.insert(position, self.add_child(stmt))
+            position += 1
 
 class Scope:
     """Represents a lexical scope in the program"""
@@ -296,9 +304,10 @@ class Assignment(Statement):
 
 class BinaryOperation(Expression):
     def __init__(self, left, operator, right):
-        self.left = left
+        super().__init__()
+        self.left = self.add_child(left)
         self.operator = operator
-        self.right = right
+        self.right = self.add_child(right)
 
     def eval(self, context):
         left = self.left.eval(context)
@@ -327,16 +336,16 @@ class FunctionDeclaration(Statement):
 
 class FunctionCall(Expression):
     def __init__(self, name, arguments):
-        self.name = name
-        self.arguments = arguments
+        super().__init__()
+        self.name = name  # String or QualifiedName
+        self.arguments = [self.add_child(arg) for arg in (arguments or [])]
 
     def eval(self, context):
-        fn = context.get_variable(self.name)
-        if not fn or not hasattr(fn, 'eval'):
-            raise Exception(f"Cannot evaluate function {self.name} at compile time")
-        
+        func = context.lookup(self.name)
+        if not func:
+            raise Exception(f"Function {self.name} not found")
         args = [arg.eval(context) for arg in self.arguments]
-        return fn.eval(context, args)
+        return func(*args)
 
 # --- Advanced Features ---
 
@@ -396,7 +405,7 @@ class LambdaExpression(Expression):
         return f"lambda[captures: {captures_str}]({params_str}) -> {self.return_type or 'auto'}{lin}"
 
 # Algebraic Effects
-class EffectDefinition(Node):
+class EffectDeclaration(Node):
     """Definition of an effect type (e.g., effect Reader<T>)"""
     def __init__(self, name, type_params, operations):
         self.name = name                # The effect name (e.g., "Reader")
@@ -410,6 +419,9 @@ class EffectOperation(Node):
         self.params = params
         self.return_type = return_type
 
+class EffectExpression(Node):
+    """Base class for effect expressions in performs clauses"""
+    pass
 class EffectApplication(EffectExpression):
     """Application of concrete types to an effect (e.g., Reader[int] or Reader[G])"""
     def __init__(self, effect_name, type_args):
@@ -1154,9 +1166,7 @@ def eval_type_match(self, context):
     
     context.emit_error("No pattern matched the type")
 
-class EffectExpression(Node):
-    """Base class for effect expressions in performs clauses"""
-    pass
+
 
 class EffectApplication(EffectExpression):
     """Application of type arguments to an effect type (e.g., Reader[T])"""
@@ -1186,3 +1196,9 @@ class TypeApplication(Node):
         new_args = [arg.substitute(type_params, concrete_types) 
                    for arg in self.type_args]
         return TypeApplication(self.type_constructor, new_args)
+
+class PrintStatement(Statement):
+    """AST node for print statements"""
+    def __init__(self, arguments=None):
+        super().__init__()
+        self.arguments = [self.add_child(arg) for arg in (arguments or [])]

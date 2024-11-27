@@ -1,7 +1,10 @@
 # tape_vm.py
 
 from enum import Enum, auto
+from typing import List, Dict, Optional, Union, Any
+from dataclasses import dataclass
 import threading
+from metaxu.errors import CompileError
 from queue import Queue
 
 class Opcode(Enum):
@@ -17,6 +20,7 @@ class Opcode(Enum):
     CREATE_CLOSURE = auto()
     CALL_FUNC = auto()
     RETURN = auto()
+    END = auto()
     # Domain operations
     CREATE_DOMAIN = auto()
     ACQUIRE_DOMAIN = auto()
@@ -64,6 +68,10 @@ class Opcode(Enum):
     LABEL = auto()
     DUP = auto()
     POP = auto()
+    PUSH = auto()
+    # I/O Operations 
+    PRINT = auto()  # Print value from stack
+    PRINT_NEWLINE = auto()  # Print newline
 
 class Instruction:
     def __init__(self, opcode, *operands):
@@ -103,8 +111,8 @@ class Continuation:
 
 class TapeVM:
     """ An Instruction TapeVM with a Stack"""
-    def __init__(self, instructions, thread_id=None, message_queue=None):
-        self.instructions = instructions
+    def __init__(self, thread_id=None, message_queue=None):
+        self.instructions = None
         self.pc = 0  # Program counter
         self.stack = []
         self.vars = {}
@@ -120,7 +128,8 @@ class TapeVM:
         self.drop_tracker = {}  # Track which values need dropping
         register_vm(self)
 
-    def run(self):
+    def run(self, instructions):
+        self.instructions = instructions
         self.preprocess_labels()
         while self.pc < len(self.instructions):
             instr = self.instructions[self.pc]
@@ -135,7 +144,6 @@ class TapeVM:
 
     def execute(self, instr):
         opcode = instr.opcode
-
         if opcode == Opcode.LOAD_CONST:
             self.stack.append(instr.operands[0])
         elif opcode == Opcode.LOAD_VAR:
@@ -209,7 +217,7 @@ class TapeVM:
             right = self.stack.pop()
             left = self.stack.pop()
             self.stack.append(left // right)
-        if opcode == Opcode.CREATE_FUNC:
+        elif opcode == Opcode.CREATE_FUNC:
             label = instr.operands[0]
             func_obj = FunctionObject(label, {})
             self.stack.append(func_obj)
@@ -288,7 +296,7 @@ class TapeVM:
             threading.Thread(target=new_thread_vm.run).start()
             # Push thread ID onto the stack
             self.stack.append(new_thread_vm.thread_id)
-        if opcode == Opcode.CREATE_CONTINUATION:
+        elif opcode == Opcode.CREATE_CONTINUATION:
             continuation_label = instr.operands[0]
             # Create continuation object capturing current state
             cont = Continuation(
@@ -405,6 +413,14 @@ class TapeVM:
             self.pc = caller_frame.return_address
             self.call_stack.pop()
             self.frames.pop()
+        elif opcode == Opcode.PRINT:
+            # Print value from stack
+            value = self.stack.pop()
+            print(value, end='')
+            
+        elif opcode == Opcode.PRINT_NEWLINE:
+            # Print newline
+            print()
         # TODO: Implement other opcodes...
         else:
             raise Exception(f"Unknown opcode {opcode}")

@@ -9,6 +9,9 @@ dependencies = [
     "ply>=3.11",
 ]
 
+[project.scripts]
+metaxu = "metaxu.metaxu:main"
+
 [dependency-groups]
 dev = [
     "pylsp-mypy>=0.6.9",

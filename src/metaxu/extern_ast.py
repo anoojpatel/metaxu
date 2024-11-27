@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from typing import List, Optional
-from metaxu_ast import Node, Expression, Type
-from decorator_ast import CFunctionDecorator
+from metaxu.metaxu_ast import Node, Expression, Type
+from metaxu.decorator_ast import CFunctionDecorator
 
 @dataclass
 class ExternFunctionDeclaration(Node):

@@ -1,182 +1,289 @@
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Union
+from enum import Enum, auto
 from pathlib import Path
 import subprocess
-import platform
-from enum import Enum
-import os
+from typing import List, Dict, Optional, Set, Union
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import multiprocessing
+from metaxu.errors import CompileError
 
 class LinkageMode(Enum):
-    STATIC = "static"    # .a files
-    DYNAMIC = "dynamic"  # .so/.dylib files
-    HEADER = "header"    # .h files only
+    STATIC = "static"
+    DYNAMIC = "dynamic"
+    HEADER = "header"  # For header-only libraries
+
+class OptimizationLevel(Enum):
+    NONE = auto()     # -O0
+    DEBUG = auto()    # -Og
+    SIZE = auto()     # -Os
+    SPEED = auto()    # -O2
+    AGGRESSIVE = auto() # -O3
 
 @dataclass
-class CLibraryConfig:
+class CompilerConfig:
+    """Configuration for compiler behavior"""
+    optimization: OptimizationLevel = OptimizationLevel.NONE
+    debug_symbols: bool = False
+    parallel: bool = True
+    max_jobs: Optional[int] = None  # None means use CPU count
+    arch: Optional[str] = None  # Target architecture (e.g., 'x86_64', 'arm64')
+    custom_flags: List[str] = field(default_factory=list)
+    header_only: bool = False
+    position_independent: bool = False
+
+@dataclass
+class LibraryConfig:
+    """Configuration for a C library dependency"""
     name: str
-    version: str
-    headers: List[str]
-    link_mode: LinkageMode
-    lib_paths: List[str] = field(default_factory=list)
-    include_paths: List[str] = field(default_factory=list)
-    dependencies: List[str] = field(default_factory=list)
-    target_specific: bool = False
-    compiler_flags: List[str] = field(default_factory=list)
-    linker_flags: List[str] = field(default_factory=list)
+    version: str = "system"
+    headers: List[str] = field(default_factory=list)
+    link_mode: LinkageMode = LinkageMode.DYNAMIC
+    pkg_config: Optional[str] = None
+    include_dirs: List[Path] = field(default_factory=list)
+    lib_dirs: List[Path] = field(default_factory=list)
+
+def create_library_config(name: str, **kwargs) -> LibraryConfig:
+    return LibraryConfig(name, **kwargs)
 
 class CLinker:
-    def __init__(self, build_dir: Path):
-        self.build_dir = build_dir
-        self.libraries: Dict[str, CLibraryConfig] = {}
-        self.linked_libraries: Set[str] = set()
-        self._setup_platform()
-        
-    def _setup_platform(self):
-        """Setup platform-specific configurations"""
-        self.platform = platform.system().lower()
-        if self.platform == "darwin":
-            self.lib_extension = ".dylib"
-            self.static_lib_extension = ".a"
-            self.default_compiler = "clang"
-            self.default_linker = "ld"
-        elif self.platform == "linux":
-            self.lib_extension = ".so"
-            self.static_lib_extension = ".a"
-            self.default_compiler = "gcc"
-            self.default_linker = "ld"
-        else:
-            raise RuntimeError(f"Unsupported platform: {self.platform}")
+    def __init__(self, build_dir: Path, config: Optional[CompilerConfig] = None):
+        """Initialize the C linker with a build directory"""
+        self.build_dir = Path(build_dir).resolve()  # Get absolute normalized path
+        self.config = config or CompilerConfig()
+        self.libraries: Dict[str, LibraryConfig] = {}
+        self.include_paths: List[Path] = []
+        self.library_paths: List[Path] = []
+        self.header_files: Set[Path] = set()
 
-    def register_library(self, config: CLibraryConfig):
-        """Register a C library for linking"""
+    def _resolve_path(self, path: Union[str, Path], relative_to_build: bool = True) -> Path:
+        """Resolve a path, optionally making it relative to build_dir"""
+        path = Path(path)
+        
+        # If path starts with build_dir, don't add it again
+        if str(path).startswith(str(self.build_dir)):
+            return path.resolve()
+            
+        if path.is_absolute():
+            return path.resolve()
+            
+        if relative_to_build:
+            return (self.build_dir / path).resolve()
+            
+        return path.resolve()
+
+    def add_library(self, config: LibraryConfig):
+        """Add a library dependency"""
         self.libraries[config.name] = config
-
-    def _compile_library(self, config: CLibraryConfig) -> Path:
-        """Compile a C library if needed"""
-        output_dir = self.build_dir / config.name
-        output_dir.mkdir(parents=True, exist_ok=True)
         
-        # Compile source files if any
-        objects = []
-        for src in config.headers:
-            if src.endswith('.c'):  # Only compile .c files
-                obj_file = output_dir / f"{Path(src).stem}.o"
-                if not obj_file.exists() or self._is_outdated(obj_file, Path(src)):
-                    cmd = [
-                        self.default_compiler,
-                        "-c",
-                        "-fPIC",
-                        *config.compiler_flags,
-                        *[f"-I{p}" for p in config.include_paths],
-                        src,
-                        "-o",
-                        str(obj_file)
-                    ]
-                    subprocess.run(cmd, check=True)
-                objects.append(obj_file)
+    def add_include_path(self, path: Path):
+        """Add an include search path"""
+        self.include_paths.append(Path(path))
         
-        # Create library
-        if config.link_mode == LinkageMode.STATIC:
-            lib_file = output_dir / f"lib{config.name}{self.static_lib_extension}"
-            if objects and (not lib_file.exists() or self._is_outdated(lib_file, *objects)):
-                subprocess.run(["ar", "rcs", str(lib_file), *[str(o) for o in objects]], check=True)
-        else:  # Dynamic
-            lib_file = output_dir / f"lib{config.name}{self.lib_extension}"
-            if objects and (not lib_file.exists() or self._is_outdated(lib_file, *objects)):
-                cmd = [
-                    self.default_compiler,
-                    "-shared",
-                    *config.linker_flags,
-                    "-o",
-                    str(lib_file),
-                    *[str(o) for o in objects]
-                ]
-                subprocess.run(cmd, check=True)
+    def add_library_path(self, path: Path):
+        """Add a library search path"""
+        self.library_paths.append(Path(path))
+
+    def add_header(self, path: Path):
+        """Add a header file to be generated/processed"""
+        self.header_files.add(Path(path))
+
+    def _get_optimization_flags(self) -> List[str]:
+        """Get optimization-related compiler flags"""
+        flags = []
         
-        return lib_file if objects else None
+        # Optimization level
+        opt_map = {
+            OptimizationLevel.NONE: "-O0",
+            OptimizationLevel.DEBUG: "-Og",
+            OptimizationLevel.SIZE: "-Os",
+            OptimizationLevel.SPEED: "-O2",
+            OptimizationLevel.AGGRESSIVE: "-O3"
+        }
+        flags.append(opt_map[self.config.optimization])
+        
+        # Debug symbols
+        if self.config.debug_symbols:
+            flags.append("-g")
+            
+        # Position independent code
+        if self.config.position_independent:
+            flags.append("-fPIC")
+            
+        return flags
 
-    def _is_outdated(self, target: Path, *sources: Path) -> bool:
-        """Check if target is older than any of the sources"""
-        if not target.exists():
-            return True
-        target_mtime = target.stat().st_mtime
-        return any(s.stat().st_mtime > target_mtime for s in sources if s.exists())
+    def _get_architecture_flags(self) -> List[str]:
+        """Get architecture-specific compiler flags"""
+        flags = []
+        
+        if self.config.arch:
+            flags.extend(["-march=" + self.config.arch])
+            
+            # Add additional arch-specific optimizations
+            if self.config.arch in ["x86_64", "amd64"]:
+                flags.extend(["-mtune=generic"])
+            elif self.config.arch.startswith("arm"):
+                flags.extend(["-mfpu=neon", "-mfloat-abi=hard"])
+                
+        return flags
 
-    def link_library(self, name: str, target_file: Path):
-        """Link a C library into the target file"""
-        if name in self.linked_libraries:
-            return
+    def _get_compiler_flags(self) -> List[str]:
+        """Get all compiler flags"""
+        flags = ["-Wall", "-Wextra"]  # Basic warning flags
+        
+        # Add optimization flags
+        flags.extend(self._get_optimization_flags())
+        
+        # Add architecture flags
+        flags.extend(self._get_architecture_flags())
+        
+        # Add include paths
+        for path in self.include_paths:
+            flags.extend(["-I", str(path)])
             
-        config = self.libraries.get(name)
-        if not config:
-            raise ValueError(f"Unknown library: {name}")
+        # Add library paths
+        for path in self.library_paths:
+            flags.extend(["-L", str(path)])
             
-        # Link dependencies first
-        for dep in config.dependencies:
-            self.link_library(dep, target_file)
+        # Add custom flags
+        flags.extend(self.config.custom_flags)
             
-        # Compile and link the library
-        lib_file = self._compile_library(config)
-        if lib_file:
-            if config.link_mode == LinkageMode.STATIC:
-                # For static linking, we need to include the whole archive
-                subprocess.run([
-                    self.default_linker,
-                    "-r",
-                    str(target_file),
-                    str(lib_file),
-                    *config.linker_flags,
-                    "-o",
-                    str(target_file) + ".tmp"
-                ], check=True)
-                os.rename(str(target_file) + ".tmp", str(target_file))
+        # Add pkg-config flags
+        for lib in self.libraries.values():
+            if lib.pkg_config:
+                try:
+                    pkg_flags = subprocess.check_output(
+                        ["pkg-config", "--cflags", "--libs", lib.pkg_config],
+                        text=True
+                    ).strip().split()
+                    flags.extend(pkg_flags)
+                except subprocess.CalledProcessError as e:
+                    raise CompileError(
+                        message=f"Failed to get pkg-config flags for {lib.pkg_config}",
+                        error_type="LinkError",
+                        notes=[f"Make sure {lib.pkg_config} is installed"]
+                    )
+                    
+        return flags
+
+    def _compile_source(self, source_file: str, output_file: str, compiler_flags: List[str]) -> Optional[str]:
+        """Compile a single source file"""
+        try:
+            # Resolve source and output paths
+            source_path = self._resolve_path(source_file, relative_to_build=False)  # Don't add build_dir to source
+            output_path = self._resolve_path(output_file)  # Add build_dir to output
+            
+            # Ensure output directory exists
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+
+            if not source_path.exists():
+                return f"Source file not found: {source_path}"
+
+            cmd = ["gcc"] + compiler_flags + ["-c", str(source_path), "-o", str(output_path)]
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                cwd=str(self.build_dir)  # Convert Path to str for subprocess
+            )
+            
+            if result.returncode != 0:
+                return f"Error compiling {source_path}:\n{result.stderr}"
+                
+            return None
+            
+        except subprocess.SubprocessError as e:
+            return f"Failed to compile {source_file}: {str(e)}"
+
+    def compile_and_link(self, source_files: List[str], output_file: str, is_dynamic: bool = False):
+        """Compile and link C source files into an executable or library"""
+        try:
+            # Ensure build directory exists
+            self.build_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Resolve source files without adding build_dir prefix
+            abs_source_files = [str(self._resolve_path(src, relative_to_build=False)) for src in source_files]
+            output_path = self._resolve_path(output_file)
+            
+            # Ensure output directory exists
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+
+            # Get compiler flags
+            compiler_flags = self._get_compiler_flags()
+            
+            # Generate header files if needed
+            for header in self.header_files:
+                header_path = self._resolve_path(header.name)
+                header_path.parent.mkdir(parents=True, exist_ok=True)
+                if not header_path.exists():
+                    # TODO: Implement header generation logic
+                    pass
+            
+            # Compile source files in parallel if enabled
+            object_files = []
+            errors = []
+            
+            if self.config.parallel:
+                max_workers = self.config.max_jobs or multiprocessing.cpu_count()
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    futures = []
+                    
+                    for source in abs_source_files:
+                        obj_file = str(self.build_dir / Path(source).name.replace('.c', '.o'))
+                        # Ensure object file directory exists
+                        Path(obj_file).parent.mkdir(parents=True, exist_ok=True)
+                        object_files.append(obj_file)
+                        futures.append(
+                            executor.submit(
+                                self._compile_source,
+                                source,
+                                obj_file,
+                                compiler_flags
+                            )
+                        )
+                        
+                    for future in as_completed(futures):
+                        if error := future.result():
+                            errors.append(error)
             else:
-                # For dynamic linking, we just need to add the library path and name
-                subprocess.run([
-                    self.default_linker,
-                    "-r",
-                    str(target_file),
-                    f"-L{lib_file.parent}",
-                    f"-l{config.name}",
-                    *config.linker_flags,
-                    "-o",
-                    str(target_file) + ".tmp"
-                ], check=True)
-                os.rename(str(target_file) + ".tmp", str(target_file))
+                # Sequential compilation
+                for source in abs_source_files:
+                    obj_file = str(self.build_dir / Path(source).name.replace('.c', '.o'))
+                    # Ensure object file directory exists
+                    Path(obj_file).parent.mkdir(parents=True, exist_ok=True)
+                    object_files.append(obj_file)
+                    if error := self._compile_source(source, obj_file, compiler_flags):
+                        errors.append(error)
+                        
+            if errors:
+                raise CompileError(
+                    message="Compilation failed",
+                    error_type="CompilationError",
+                    notes=errors
+                )
                 
-        self.linked_libraries.add(name)
-
-    def generate_bindings(self, config: CLibraryConfig) -> str:
-        """Generate Metaxu bindings for a C library"""
-        bindings = []
-        bindings.append(f"module {config.name} {{")
-        
-        # Add extern declarations for all functions
-        for header in config.headers:
-            if header.endswith('.h'):
-                # Parse header and generate bindings
-                # This is a simplified version - you'd want to use a proper C parser
-                bindings.append(f'    extern "{header}" {{')
-                # Add function declarations
-                bindings.append('    }')
+            # Link object files
+            linker_flags = []
+            if is_dynamic:
+                linker_flags.extend(["-shared"])
                 
-        bindings.append("}")
-        return "\n".join(bindings)
-
-def create_library_config(
-    name: str,
-    version: str,
-    headers: List[str],
-    link_mode: LinkageMode,
-    target_specific: bool = False,
-    **kwargs
-) -> CLibraryConfig:
-    """Helper function to create library configurations"""
-    return CLibraryConfig(
-        name=name,
-        version=version,
-        headers=headers,
-        link_mode=link_mode,
-        target_specific=target_specific,
-        **kwargs
-    )
+            cmd = ["gcc"] + object_files + ["-o", str(output_path)] + linker_flags
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                cwd=str(self.build_dir)  # Convert Path to str for subprocess
+            )
+            
+            if result.returncode != 0:
+                raise CompileError(
+                    message="Linking failed",
+                    error_type="LinkError",
+                    notes=[result.stderr]
+                )
+                
+        except subprocess.SubprocessError as e:
+            raise CompileError(
+                message=f"Failed to run C compiler: {str(e)}",
+                error_type="CompilationError",
+                notes=["Make sure gcc is installed and in your PATH"]
+            )

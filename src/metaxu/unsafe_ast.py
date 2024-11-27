@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from typing import List, Optional
-from metaxu_ast import Node, Expression, Type
+from metaxu.metaxu_ast import Node, Expression, Type
 
 @dataclass
 class UnsafeBlock(Node):
