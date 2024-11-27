@@ -85,6 +85,9 @@ target/
 # Jupyter Notebook
 .ipynb_checkpoints
 
+# doit Files
+.doit.*
+
 # IPython
 profile_default/
 ipython_config.py

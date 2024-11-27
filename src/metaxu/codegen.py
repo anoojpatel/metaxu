@@ -1138,7 +1138,7 @@ class CodeGenerator:
 
         self.emit(Opcode.LABEL, cont_label)
 
-    def generate_effect_operation(self, effect_op: ast.EffectOperation) -> str:
+    def generate_effect_operation(self, effect_op: EffectOperation) -> str:
         """Generate code for an effect operation with C runtime mapping"""
         if effect_op.c_effect:
             # Generate C runtime function declaration
@@ -1155,7 +1155,7 @@ class CodeGenerator:
             # Normal effect operation code generation
             return self.generate_effect_op_default(effect_op)
 
-    def generate_effect_mapping_header(self, effect_decl: ast.EffectDeclaration) -> str:
+    def generate_effect_mapping_header(self, effect_decl: EffectDeclaration) -> str:
         """Generate header declarations for mapped C runtime effects"""
         header = []
         for op in effect_decl.operations:
