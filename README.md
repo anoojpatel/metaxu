@@ -1,8 +1,13 @@
+<div align="center">
+<img src=https://github.com/user-attachments/assets/9a8ec76c-224a-4662-96fb-bdf0b420e01f width="12%" height="12%"></img>
+
+
 <h1 style="text-align: center;"> Metaxu🌀  </h1>
 <p style="text-align: center;">
 A self-hosted Low level functional-style programming language <br>    
 [<a href="docs/index.md">Documentation</a>]
 </p>
+</div>
 
 ## What is Metaxu?
 Metaxu is a modern systems programming language that prioritizes speed, safety, and developer joy. 
