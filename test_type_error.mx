@@ -1,0 +1,14 @@
+
+    struct Node<T> {
+        data: T,
+        @mut next: Option[Node[T]]
+    }
+
+    fn main() {
+        # Type error: trying to create Node with wrong type
+        let node = Node[Int] {
+            data: "string",  # Should be Int
+            next: None
+        };
+    }
+    

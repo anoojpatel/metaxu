@@ -1,0 +1,154 @@
+# Implementation of a generic linked list with safe mutation patterns.
+# All nodes are allocated on the heap (global) with proper borrow checking.
+
+# Node in the linked list, parameterized over the data type T
+struct Node<T> {
+    # The actual data stored in this node
+    data: T,
+    # Optional pointer to next node. @mut allows us to modify the next pointer
+    # Option[Node[T]] represents a nullable pointer to the next node
+    @mut next: Option[Node[T]]
+}
+
+# LinkedList container that maintains a pointer to the first node
+struct LinkedList<T> {
+    # Optional pointer to first node. @mut allows us to modify the head pointer
+    @mut head: Option[Node[T]]
+}
+
+# Creates a new empty linked list
+# Type parameter T is inferred from context where new_list is called
+fn new_list<T>() -> LinkedList[T] {
+    LinkedList[T] { head: None }
+}
+
+# Adds a new node to the front of the list
+# @mut list ensures exclusive access during modification
+fn push_front<T>(list: @mut LinkedList[T], value: T) {
+    # Create new node with current head as next
+    let new_node = Node[T] {
+        data: value,
+        next: list.head  # Move current head into new node's next
+    };
+    
+    # Update head to point to new node
+    list.head = Some(new_node);
+}
+
+# Removes and returns the first node's data from the list
+# Returns None if list is empty
+fn pop_front<T>(list: @mut LinkedList[T]) -> Option[T] {
+    # Take ownership of head node using pattern matching
+    if let Some(head) = list.head {
+        # Update list head to point to next node
+        list.head = head.next;
+        # Return the data from the removed node
+        # Node is dropped here, deallocating the memory
+        return Some(head.data)
+    } else {
+        return None
+    }
+}
+
+# Removes the node after the given node and returns its data
+# Returns None if there is no next node
+fn remove_next<T>(node: @mut Node[T]) -> Option[T] {
+    # Take ownership of next node using pattern matching
+    if let Some(next) = node.next {
+        # Update node's next pointer to skip the removed node
+        node.next = next.next;
+        # Return the data from the removed node
+        # Node is dropped here, deallocating the memory
+        return Some(next.data)
+    } else {
+        return None
+    }
+}
+
+# Gets a reference to the nth node's data in the list
+# Returns None if index is out of bounds
+# Note: This returns an immutable reference to avoid aliasing issues
+fn get<T>(list: @const LinkedList[T], index: Int) -> Option[@const T] {
+    let mut current = list.head;
+    let mut i = 0;
+    
+    while let Some(node) = current {
+        if i == index {
+            return Some(@const node.data)  # Return reference to data only
+        }
+        current = node.next;
+        i = i + 1;
+    }
+    return None
+}
+
+# Gets a mutable reference to the nth node's data in the list
+# Returns None if index is out of bounds
+# Note: This requires exclusive access to the list
+fn get_mut<T>(list: @mut LinkedList[T], index: Int) -> Option[@mut T] {
+    let mut current = list.head;
+    let mut i = 0;
+    
+    while let Some(node) = current {
+        if i == index {
+            return Some(@mut node.data)  # Return mutable reference to data
+        }
+        current = node.next;
+        i = i + 1;
+    }
+    return None
+}
+
+# Takes ownership of the nth node in the list
+# Returns None if index is out of bounds
+# Note: This removes the node from the list
+fn take_node<T>(list: @mut LinkedList[T], index: Int) -> Option[Node[T]> {
+    if index == 0 {
+        # Special case for head
+        return list.head
+    }
+    
+    # Find the node before the one we want
+    let mut i = 0;
+    let mut current = list.head;
+    
+    while let Some(node) = current {
+        if i == index - 1 {
+            # Found the previous node, take ownership of the next node
+            return node.next
+        }
+        current = node.next;
+        i = i + 1;
+    }
+    return None
+}
+
+# Example usage of the linked list
+fn main() {
+    # Create a new list of integers
+    # Type parameter is inferred from usage
+    let @mut list = new_list();
+    
+    # Add some elements to the front
+    # Each push_front takes exclusive access to the list
+    push_front(list, 3);  # list: 3
+    push_front(list, 2);  # list: 2->3
+    push_front(list, 1);  # list: 1->2->3
+    
+    # Get immutable reference to second node's data (safe, can't modify)
+    let value = get(list, 1);  # Some(&2)
+    
+    # Get mutable reference to second node's data (requires exclusive access)
+    let mut_value = get_mut(list, 1);  # Some(&mut 2)
+    if let Some(value) = mut_value {
+        value = 42;  # Modify through mutable reference
+    }
+    
+    # Take ownership of second node (removes it from list)
+    let owned_node = take_node(list, 1);
+    if let Some(node) = owned_node {
+        # Now we can safely modify the owned node
+        node.data = 42;
+        # Would need to reinsert the node if we want it back in the list
+    }
+}

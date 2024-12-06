@@ -132,30 +132,12 @@
         "imports": {
             "patterns": [
                 {
-                    "name": "keyword.control.import.metaxu",
-                    "match": "\\b(import|from|as)\\b"
+                    "match": "\\b(import|from|as)\\b",
+                    "name": "keyword.control.import.metaxu"
                 },
                 {
-                    "match": "(?<=(from|import)\\s+)(\\.+)?([a-z][a-zA-Z0-9_]*(?:\\.[a-zA-Z0-9_]+)*)",
-                    "captures": {
-                        "2": { "name": "keyword.operator.import.metaxu" },
-                        "3": { "name": "entity.name.namespace.metaxu" }
-                    }
-                },
-                {
-                    "match": "(?<=(from|import)\\s+)(\\.+)?([A-Z][a-zA-Z0-9_]*(?:\\.[a-zA-Z0-9_]+)*)",
-                    "captures": {
-                        "2": { "name": "keyword.operator.import.metaxu" },
-                        "3": { "name": "entity.name.type.import.metaxu" }
-                    }
-                },
-                {
-                    "match": "\\b[A-Z][a-zA-Z0-9_]*\\b(?!\\s*\\()",
-                    "name": "entity.name.type.import.metaxu"
-                },
-                {
-                    "match": "\\b[a-z][a-zA-Z0-9_]*\\b(?!\\s*\\()",
-                    "name": "entity.name.function.import.metaxu"
+                    "match": "(?<=\\bfrom\\s+[a-zA-Z_][a-zA-Z0-9_]*\\s+import\\s)([a-zA-Z_][a-zA-Z0-9_]*)(?=\\s*(?:,|$|\\s+as\\s))",
+                    "name": "entity.name.import.metaxu"
                 }
             ]
         },
