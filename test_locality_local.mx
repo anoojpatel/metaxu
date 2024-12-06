@@ -1,0 +1,19 @@
+
+    struct Node<T> {
+        data: T,
+        @mut next: Option[Node[T]]
+    }
+
+    fn create_local_node() -> @const Node[Int] {
+        # Create a node in local scope
+        let node = Node[Int] {
+            data: 42,
+            next: None
+        };
+        return @const node  # Should fail - cannot return local variable
+    }
+
+    fn main() {
+        let escaped = create_local_node();  # Should fail
+    }
+    

@@ -1,0 +1,33 @@
+
+    struct Node<T> {
+        data: T,
+        @mut next: Option[Node[T]]
+    }
+
+    struct LinkedList<T> {
+        @mut head: Option[Node[T]>
+    }
+
+    fn new_list<T>() -> LinkedList<T> {
+        LinkedList[T] { head: None }
+    }
+
+    fn push_front<T>(list: @mut LinkedList<T>, value: T) {
+        let new_node = Node[T] {
+            data: value,
+            next: list.head
+        };
+        list.head = Some(new_node);
+    }
+
+    fn main() {
+        let @mut list = new_list();
+        push_front(@mut list, 42);
+        push_front(@mut list, 43);
+        
+        # This should type check correctly
+        if let Some(head) = list.head {
+            assert(head.data == 43);
+        }
+    }
+    

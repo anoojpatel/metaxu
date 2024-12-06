@@ -1,0 +1,17 @@
+
+    struct Node<T> {
+        data: T,
+        @mut next: Option[Node[T]]
+    }
+
+    fn main() {
+        let @mut node = Node[Int] {
+            data: 42,
+            next: None
+        };
+        
+        # Borrow checking error: multiple mutable references
+        let @mut ref1 = @mut node;
+        let @mut ref2 = @mut node;  # Should fail
+    }
+    
