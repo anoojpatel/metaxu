@@ -658,6 +658,48 @@ class VMToCCompiler:
             self.c_code += f"{indent}void* {result} = invoke_effect(EFFECT_BORROW, {domain});\n"
             self.stack_push(result)
 
+        elif opcode == Opcode.COMPARE_EQ:
+            right = self.stack_pop()
+            left = self.stack_pop()
+            result = self.get_temp_var()
+            self.c_code += f"{indent}bool {result} = ({left} == {right});\n"
+            self.stack_push(result)
+
+        elif opcode == Opcode.COMPARE_NE:
+            right = self.stack_pop()
+            left = self.stack_pop()
+            result = self.get_temp_var()
+            self.c_code += f"{indent}bool {result} = ({left} != {right});\n"
+            self.stack_push(result)
+
+        elif opcode == Opcode.COMPARE_LT:
+            right = self.stack_pop()
+            left = self.stack_pop()
+            result = self.get_temp_var()
+            self.c_code += f"{indent}bool {result} = ({left} < {right});\n"
+            self.stack_push(result)
+
+        elif opcode == Opcode.COMPARE_LE:
+            right = self.stack_pop()
+            left = self.stack_pop()
+            result = self.get_temp_var()
+            self.c_code += f"{indent}bool {result} = ({left} <= {right});\n"
+            self.stack_push(result)
+
+        elif opcode == Opcode.COMPARE_GT:
+            right = self.stack_pop()
+            left = self.stack_pop()
+            result = self.get_temp_var()
+            self.c_code += f"{indent}bool {result} = ({left} > {right});\n"
+            self.stack_push(result)
+
+        elif opcode == Opcode.COMPARE_GE:
+            right = self.stack_pop()
+            left = self.stack_pop()
+            result = self.get_temp_var()
+            self.c_code += f"{indent}bool {result} = ({left} >= {right});\n"
+            self.stack_push(result)
+
     def get_temp_var(self):
         temp_var = f"t{self.temp_var_count}"
         self.temp_var_count += 1

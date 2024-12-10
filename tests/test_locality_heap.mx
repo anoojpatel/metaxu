@@ -1,0 +1,19 @@
+
+    struct Node<T> {
+        data: T,
+        @mut next: Option[Node[T]]
+    }
+
+    fn create_heap_node() -> Node[Int] {
+        # This should work since Node is heap allocated
+        Node[Int] {
+            data: 42,
+            next: None
+        }
+    }
+
+    fn main() {
+        let node = create_heap_node();  # Should succeed
+        assert(node.data == 42);
+    }
+    

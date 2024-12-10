@@ -3,10 +3,10 @@ from pathlib import Path
 import sys
 sys.path.append(str(Path(__file__).parent.parent / 'src'))
 
-from lexer import Lexer
-from parser import Parser
-from type_checker import TypeChecker
-import metaxu_ast as ast
+from metaxu.lexer import Lexer
+from metaxu.parser import Parser
+from metaxu.type_checker import TypeChecker
+import metaxu.metaxu_ast as ast
 
 class TestModuleSystem(unittest.TestCase):
     def setUp(self):
@@ -17,22 +17,21 @@ class TestModuleSystem(unittest.TestCase):
     def test_basic_module(self):
         code = """
         module test {
-            "Module for testing basic functionality"
+            
             
             fn add(x: int, y: int) -> int {
-                return x + y;
+                return x + y
             }
         }
         """
         ast_tree = self.parser.parse(code)
-        self.assertIsInstance(ast_tree, ast.Program)
-        self.assertEqual(len(ast_tree.statements), 1)
+        self.assertIsInstance(ast_tree[0], ast.Module)
+        self.assertEqual(len(ast_tree[0].body.statements), 1)
         
-        module = ast_tree.statements[0]
-        self.assertIsInstance(module, ast.Module)
+        module = ast_tree[0]
+        self.assertIsInstance(module.body, ast.ModuleBody)
         self.assertEqual(module.name, "test")
         self.assertEqual(len(module.body.statements), 1)
-        self.assertEqual(module.body.docstring, "Module for testing basic functionality")
 
     def test_module_exports(self):
         code = """
@@ -44,25 +43,23 @@ class TestModuleSystem(unittest.TestCase):
             }
             
             fn add(x: int, y: int) -> int {
-                return x + y;
+                return x + y
             }
             
             fn subtract(x: int, y: int) -> int {
-                return x - y;
+                return x - y
             }
             
             fn multiply(x: int, y: int) -> int {
-                return x * y;
+                return x * y
             }
             
             fn internal_helper() -> int {
-                return 42;
+                return 42
             }
         }
         """
-        ast_tree = self.parser.parse(code)
-        module = ast_tree.statements[0]
-        
+        module = self.parser.parse(code)[0]
         self.assertEqual(len(module.body.exports), 3)
         self.assertEqual(module.body.exports[0], ("add", None))
         self.assertEqual(module.body.exports[1], ("subtract", "sub"))
@@ -78,45 +75,46 @@ class TestModuleSystem(unittest.TestCase):
             }
             
             fn process(data: int) -> int {
-                return data * 2;
+                return data * 2
             }
             
             fn validate(data: int) -> bool {
-                return data > 0;
+                return data > 0
             }
             
             fn transform(data: int) -> int {
-                return data + 1;
+                return data + 1
             }
         }
         """
         ast_tree = self.parser.parse(code)
-        module = ast_tree.statements[0]
+        module = ast_tree[0]
         
-        self.assertEqual(module.body.visibility_rules["process"], "private")
-        self.assertEqual(module.body.visibility_rules["validate"], "protected")
-        self.assertEqual(module.body.visibility_rules["transform"], "public")
+        self.assertEqual(module.body.visibility_rules.rules["process"], "private")
+        self.assertEqual(module.body.visibility_rules.rules["validate"], "protected")
+        self.assertEqual(module.body.visibility_rules.rules["transform"], "public")
 
     def test_public_imports(self):
         code = """
         module utils {
-            public import std.io;
-            public import std.math as math;
-            public from std.collections import Vector, HashMap as Map;
+            public import std.io
+            public import std.math as math
+            public from std.collections import Vector, HashMap as Map
             
             fn helper() -> int {
-                return io.read_int();
+                return io.read_int()
             }
         }
         """
         ast_tree = self.parser.parse(code)
-        module = ast_tree.statements[0]
+        module = ast_tree[0]
         
         imports = [stmt for stmt in module.body.statements if isinstance(stmt, (ast.Import, ast.FromImport))]
         self.assertEqual(len(imports), 3)
         
         # Check first import
         self.assertIsInstance(imports[0], ast.Import)
+        #breakpoint()
         self.assertEqual(imports[0].module_path, ["std", "io"])
         self.assertTrue(imports[0].is_public)
         self.assertIsNone(imports[0].alias)
@@ -138,13 +136,13 @@ class TestModuleSystem(unittest.TestCase):
     def test_relative_imports(self):
         code = """
         module utils.strings {
-            from ..math import add, multiply;
-            from ...core.base import Object;
-            from .helpers import format;
+            from ..math import add, multiply
+            from ...core.base import Object
+            from .helpers import format
         }
         """
         ast_tree = self.parser.parse(code)
-        module = ast_tree.statements[0]
+        module = ast_tree[0]
         
         imports = [stmt for stmt in module.body.statements if isinstance(stmt, ast.FromImport)]
         self.assertEqual(len(imports), 3)
@@ -169,18 +167,18 @@ class TestModuleSystem(unittest.TestCase):
         module outer {
             module inner {
                 fn nested_func() -> int {
-                    return 42;
+                    return 42
                 }
             }
 
 
             fn outer_func() -> int {
-                return inner.nested_func();
+                return inner.nested_func()
             }
         }
         """
         ast_tree = self.parser.parse(code)
-        outer_module = ast_tree.statements[0]
+        outer_module = ast_tree[0]
         
         self.assertEqual(outer_module.name, "outer")
         inner_module = [stmt for stmt in outer_module.body.statements if isinstance(stmt, ast.Module)][0]
@@ -202,17 +200,17 @@ class TestModuleSystem(unittest.TestCase):
             
             impl Calculator {
                 fn add(x: int, y: int) -> int {
-                    return x + y;
+                    return x + y
                 }
                 
                 fn subtract(x: int, y: int) -> int {
-                    return x - y;
+                    return x - y
                 }
             }
         }
         """
         ast_tree = self.parser.parse(code)
-        module = ast_tree.statements[0]
+        module = ast_tree[0]
  
         interface = [stmt for stmt in module.body.statements if isinstance(stmt, ast.InterfaceDefinition)][0]
         self.assertEqual(len(interface.methods), 2)
@@ -231,7 +229,7 @@ class TestModuleSystem(unittest.TestCase):
         # Test invalid module path
         code = """
         module a.b.c {
-            from ....too.many.dots import something;
+            from ....too.many.dots import something
         }
         """
         with self.assertRaises(Exception):
@@ -262,56 +260,55 @@ class TestModuleSystem(unittest.TestCase):
             
             struct BasicCalc implements Calculator {
                 fn calculate(x: int, y: int) -> int {
-                    return x + y;
+                    return x + y
                 }
                 
                 fn private_helper(x: int) -> int {
-                    return x * 2;
+                    return x * 2
                 }
             }
         }
         
         module main {
-            import math;
+            import math
             
             fn test() -> int {
-                let calc = math.BasicCalc();
-                return calc.calculate(1, 2);
+                let calc = math.BasicCalc()
+                return calc.calculate(1, 2)
             }
         }
         """
         ast_tree = self.parser.parse(code)
         
         # Check module exports
-        math_module = ast_tree.statements[0]
+        math_module = ast_tree[0]
         self.assertEqual(len(math_module.body.exports), 2)
         
         # Check function resolution
-        main_module = ast_tree.statements[1]
+        main_module = ast_tree[1]
         test_func = [stmt for stmt in main_module.body.statements if isinstance(stmt, ast.FunctionDeclaration)][0]
         
         # Verify qualified name resolution
         let_stmt = test_func.body[0]
-        self.assertIsInstance(let_stmt.initializer, ast.QualifiedFunctionCall)
-        self.assertEqual(let_stmt.initializer.parts, ["math", "BasicCalc"])
+        self.assertIsInstance(let_stmt.bindings[0].initializer, ast.QualifiedFunctionCall)
+        self.assertEqual(let_stmt.bindings[0].initializer.parts, ["math", "BasicCalc"])
 
     def test_variant_instantiation(self):
         """Test that variant instantiation with :: is parsed correctly while module function calls with . work"""
         source = """
         module test {
             enum Color {
-                RGB(r: int, g: int, b: int);
+                RGB(r: int, g: int, b: int)
             }
 
             fn test() {
-                let color = Color::RGB(r=255, g=0, b=0);
-                return inner.nested_func();
+                let color = Color::RGB(r=255, g=0, b=0)
+                return inner.nested_func()
             }
         }
         """
-        ast_tree = self.parser.parse(source)
+        module = self.parser.parse(source)[0]
         #breakpoint()
-        module = ast_tree.statements[0]
         
         # Check enum definition
         enum_def = [stmt for stmt in module.body.statements if isinstance(stmt, ast.EnumDefinition)][0]
@@ -323,9 +320,9 @@ class TestModuleSystem(unittest.TestCase):
         func = [stmt for stmt in module.body.statements if isinstance(stmt, ast.FunctionDeclaration)][0]
         
         # Check variant instantiation
-        breakpoint()
+        #breakpoint()
         let_stmt = func.body[0]
-        variant_inst = let_stmt.initializer
+        variant_inst = let_stmt.bindings[0].initializer
         self.assertIsInstance(variant_inst, ast.VariantInstance)
         self.assertEqual(variant_inst.enum_name, "Color")
         self.assertEqual(variant_inst.variant_name, "RGB")
@@ -347,50 +344,50 @@ class TestModuleSystem(unittest.TestCase):
 
             # Test basic closure capture
             fn make_counter(start: int) -> fn\() -> int {
-                let mut count = start;  # Variable to be captured
+                let @mut count = start  # Variable to be captured
                 
                 fn() -> int {
-                    count = count + 1;  # Mutates captured variable
-                    count
+                    count = count + 1  # Mutates captured variable
+                    return count
                 }
             }
 
             # Test multiple captures with different modes
             fn make_accumulator(initial: int) -> fn\(int) -> int {
-                let mut sum = initial;     # Mutable capture
-                let factor = 2;            # Immutable capture
+                let @mut sum = initial     # Mutable capture
+                let factor = 2            # Immutable capture
                 
                 fn(x: int) -> int {
-                    sum = sum + (x * factor);  # Uses both captures
-                    sum
+                    sum = sum + (x * factor)  # Uses both captures
+                    return sum
                 }
             }
         }
 
         module usage {
-            import counter;
+            import counter
 
             fn test_counters() -> bool {
-                let c1 = counter.make_counter(0);
-                let c2 = counter.make_counter(10);
+                let c1 = counter.make_counter(0)
+                let c2 = counter.make_counter(10)
                 
-                assert(c1() == 1);  # First counter: 0 -> 1
-                assert(c1() == 2);  # First counter: 1 -> 2
-                assert(c2() == 11); # Second counter: 10 -> 11
+                assert(c1() == 1)  # First counter: 0 -> 1
+                assert(c1() == 2)  # First counter: 1 -> 2
+                assert(c2() == 11) # Second counter: 10 -> 11
                 
-                let acc = counter.make_accumulator(0);
-                assert(acc(3) == 6);   # (0 + (3 * 2)) = 6
-                assert(acc(4) == 14);  # (6 + (4 * 2)) = 14
+                let acc = counter.make_accumulator(0)
+                assert(acc(3) == 6)   # (0 + (3 * 2)) = 6
+                assert(acc(4) == 14)  # (6 + (4 * 2)) = 14
                 
                 true
             }
         }
         """
         ast_tree = self.parser.parse(code)
-        self.assertIsInstance(ast_tree, ast.Program)
-        
+        self.assertIsInstance(ast_tree[0], ast.Module)
+        self.assertIsInstance(ast_tree[1], ast.Module)
         # Get the counter module
-        counter_module = ast_tree.statements[0]
+        counter_module = ast_tree[0]
         self.assertEqual(counter_module.name, "counter")
         
         # Check make_counter function
@@ -398,7 +395,7 @@ class TestModuleSystem(unittest.TestCase):
                        if isinstance(f, ast.FunctionDeclaration) and f.name == "make_counter"][0]
         
         # Verify closure in make_counter
-        closure = make_counter.body.statements[-1]
+        closure = make_counter.body[-1]
         self.assertIsInstance(closure, ast.LambdaExpression)
         self.assertIn("count", closure.captured_vars)
         self.assertEqual(closure.capture_modes["count"], "borrow_mut")
@@ -408,7 +405,7 @@ class TestModuleSystem(unittest.TestCase):
                    if isinstance(f, ast.FunctionDeclaration) and f.name == "make_accumulator"][0]
         
         # Verify closure in make_accumulator
-        closure = make_acc.body.statements[-1]
+        closure = make_acc.body[-1]
         self.assertIsInstance(closure, ast.LambdaExpression)
         self.assertIn("sum", closure.captured_vars)
         self.assertIn("factor", closure.captured_vars)

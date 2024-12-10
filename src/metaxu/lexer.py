@@ -23,7 +23,7 @@ class Lexer:
         'with': 'WITH',
         'in': 'IN',
         'let': 'LET',
-        'mut': 'MUT',
+        #'mut': 'MUT',
         'type': 'TYPE',
         'extern': 'EXTERN',
         'const': 'CONST',
@@ -81,6 +81,7 @@ class Lexer:
         'async': 'ASYNC',    # Add async keyword
         'void': 'VOID',      # Add void type
         'size_t': 'SIZE_T',  # Add size_t type
+        'as': 'AS',          # Ensure 'as' is in the reserved keywords
     }
 
     # List of token names
@@ -90,22 +91,31 @@ class Lexer:
         'LPAREN', 'RPAREN', 'LBRACE', 'RBRACE', 'LBRACKET', 'RBRACKET',
         'EQUALS', 'SEMICOLON', 'COLON', 'COMMA', 'DOT', 'TRIPLE_DOT',
         'DOUBLECOLON', 'ARROW', 'BACKSLASH', 'AT', 'AMPERSAND',
-        'LESS', 'GREATER', 'STAR',  # Add STAR for pointer types
-        'AS'  # Add AS for type casts
+        'LESS', 'GREATER', 'LESSEQUAL', 'GREATEREQUAL', 'EQUALEQUAL', 'NOTEQUAL',
+        'MUT', 'AS'  # Add AS for type casts
     ] + list(reserved.values())
+
+    # Ensure AS is recognized as a keyword
+    t_AS = r'as'
 
     # Regular expression rules for simple tokens
     t_PLUS = r'\+'
     t_MINUS = r'-'
     t_TIMES = r'\*'
     t_DIVIDE = r'/'
+    t_EQUALS = r'='
+    t_EQUALEQUAL = r'=='
+    t_NOTEQUAL = r'!='
+    t_LESSEQUAL = r'<='
+    t_GREATEREQUAL = r'>='
+    t_LESS = r'<'
+    t_GREATER = r'>'
     t_LPAREN = r'\('
     t_RPAREN = r'\)'
     t_LBRACE = r'\{'
     t_RBRACE = r'\}'
     t_LBRACKET = r'\['
     t_RBRACKET = r'\]'
-    t_EQUALS = r'='
     t_SEMICOLON = r';'
     t_COLON = r':'
     t_COMMA = r','
@@ -116,16 +126,13 @@ class Lexer:
     t_BACKSLASH = r'\\' # Added for function type annotations
     t_AT = r'@'
     t_AMPERSAND = r'&'
-    t_LESS = r'<'
-    t_GREATER = r'>'
-    t_STAR = r'\*'  # Add rule for STAR token
-    t_AS = r'as'    # Add rule for AS token
 
     # Regular expression rules with actions
     def t_IDENTIFIER(self, t):
         r'[a-zA-Z_][a-zA-Z_0-9]*'
         # Check for reserved words
-        t.type = self.reserved.get(t.value, 'IDENTIFIER') 
+        t.type = self.reserved.get(t.value, 'IDENTIFIER')
+        print(f"Token recognized: {t.type}, value: {t.value}")  # Debug statement
         return t
 
     def t_NUMBER(self, t):
@@ -160,7 +167,8 @@ class Lexer:
 
     # Error handling rule
     def t_error(self, t):
-        print(f"Illegal character '{t.value[0]}' at line {t.lexer.lineno}")
+        print(f"\n=== Lexer Error ===")
+        print(f"Illegal character '{t.value[0]}' at line {t.lineno}, position {t.lexpos}")
         t.lexer.skip(1)
 
     # Build the lexer

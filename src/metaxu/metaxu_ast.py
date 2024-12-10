@@ -325,6 +325,22 @@ class BinaryOperation(Expression):
         
         return ComptimeValue(value, left.type_info)
 
+class ComparisonOperator:
+    EQUAL = "=="
+    NOT_EQUAL = "!="
+    LESS = "<"
+    LESS_EQUAL = "<="
+    GREATER = ">"
+    GREATER_EQUAL = ">="
+
+class ComparisonExpression(Expression):
+    """A comparison between two expressions"""
+    def __init__(self, left, operator, right):
+        super().__init__()
+        self.left = self.add_child(left)
+        self.operator = operator  # ComparisonOperator
+        self.right = self.add_child(right)
+
 class FunctionDeclaration(Statement):
     def __init__(self, name, params, body, return_type=None, performs=None, type_params=None):
         self.name = name
@@ -465,20 +481,33 @@ class BorrowUnique(Expression):
         self.variable = variable
 
 # Structs and Enums
+class StructLifetime:
+    LOCAL = "local"    # Stack allocated, automatically freed
+    GLOBAL = "global"  # Program lifetime
+    HEAP = "heap"      # Dynamically allocated
+
 class StructDefinition(Node):
-    def __init__(self, name, fields, type_params=None, implements=None, methods=None):
+    """A struct definition with lifetime and reference tracking"""
+    def __init__(self, name, fields, lifetime=StructLifetime.HEAP):
+        super().__init__()
         self.name = name
-        self.fields = fields
-        self.type_params = type_params
-        self.implements = implements
-        self.methods = methods if methods is not None else []
+        self.fields = self.add_children(fields)
+        self.lifetime = lifetime
+        self.references_globals = False  # Set during analysis
+        
+    def mark_references_globals(self):
+        """Mark if this struct contains references to global data"""
+        for field in self.fields:
+            if field.type_info and field.type_info.is_global_reference():
+                self.references_globals = True
+                break
 
 class StructField(Node):
-    def __init__(self, name, type_expr=None, value=None, visibility=None):
+    """A field in a struct with reference tracking"""
+    def __init__(self, name, type_info, is_reference=False):
         self.name = name
-        self.type_expr = type_expr
-        self.value = value
-        self.visibility = visibility
+        self.type_info = type_info
+        self.is_reference = is_reference
 
 class StructInstantiation(Node):
     def __init__(self, struct_name, field_assignments):
@@ -577,9 +606,9 @@ class Parameter(Node):
 
 # Mode System
 class ModeAnnotation(Node):
-    def __init__(self, mode_type, base_expression):
+    def __init__(self, mode_type):
         self.mode_type = mode_type  # UniquenessMode, LocalityMode, or LinearityMode
-        self.base_expression = base_expression
+        
 
 class UniquenessMode(Node):
     UNIQUE = "unique"
