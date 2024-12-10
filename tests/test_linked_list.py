@@ -4,7 +4,7 @@ import os
 
 def run_mx_compiler(source_file):
     """Helper function to run the compiler on a source file and return the result."""
-    result = subprocess.run(['uv', 'run', 'python', '-m', 'metaxu.compiler', source_file], 
+    result = subprocess.run(['python', '-m', 'metaxu.metaxu', source_file], 
                           capture_output=True, 
                           text=True)
     return result

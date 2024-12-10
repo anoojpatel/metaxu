@@ -332,6 +332,12 @@ class CodeGenerator:
                 '-': Opcode.SUB,
                 '*': Opcode.MUL,
                 '/': Opcode.DIV,
+                '==': Opcode.COMPARE_EQ,
+                '!=': Opcode.COMPARE_NE,
+                '<': Opcode.COMPARE_LT,
+                '<=': Opcode.COMPARE_LE,
+                '>': Opcode.COMPARE_GT,
+                '>=': Opcode.COMPARE_GE,
             }
             self.emit(op_map[expr.operator])
 
@@ -460,6 +466,12 @@ class CodeGenerator:
                 '-': Opcode.SUB,
                 '*': Opcode.MUL,
                 '/': Opcode.DIV,
+                '==': Opcode.COMPARE_EQ,
+                '!=': Opcode.COMPARE_NE,
+                '<': Opcode.COMPARE_LT,
+                '<=': Opcode.COMPARE_LE,
+                '>': Opcode.COMPARE_GT,
+                '>=': Opcode.COMPARE_GE,
             }
         self.emit(op_map[node.operator])
 
