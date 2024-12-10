@@ -52,14 +52,19 @@ class Parser:
             print("\n=== Starting Parse ===")
             # Initialize lexer with source
             self.lexer.source_file = file_path
+            
+
+            self._enter_scope(ast.Scope())
             # Parse using PLY
             result = self.parser.parse(source, lexer=self.lexer, debug=False)
+            #program_node.statements.extend(result)
             if isinstance(result, ast.Module): 
                 result.source_file = file_path
             elif isinstance(result, list):
                 for module in result:
                     if isinstance(module, ast.Module):
                         module.source_file = file_path
+            self._exit_scope()
             return result
             
         except Exception as e:
@@ -155,9 +160,7 @@ class Parser:
         self.log_rule('statement', p)
         p[0] = p[1]
 
-    def p_lambda_statement(self, p):
-        '''lambda_statement : lambda_expression'''
-        p[0] = p[1]
+
 
     def p_for_statement(self, p):
         '''for_statement : FOR IDENTIFIER IN expression LBRACE statement_list RBRACE'''
@@ -181,10 +184,11 @@ class Parser:
     def p_let_statement(self, p):
         '''let_statement : let_binding
                         | let_binding COMMA let_bindings'''
-        if len(p) == 2:
-            p[0] = ast.LetStatement(bindings=[p[1]])
-        else:
-            p[0] = ast.LetStatement(bindings=[p[1]] + p[3])
+        # Add each let binding to the current scope
+        bindings = [p[1]] + (p[3] if len(p) > 2 else [])
+        for binding in bindings:
+            self.current_scope.add_symbol(binding.identifier, binding)
+        p[0] = ast.LetStatement(bindings=bindings)
 
     def p_let_bindings(self, p):
         '''let_bindings : let_binding
@@ -205,7 +209,10 @@ class Parser:
 
     def p_return_statement(self, p):
         '''return_statement : RETURN expression_or_empty'''
-        p[0] = ast.ReturnStatement(p[2])
+        if p[2] is None:
+            p[0] = ast.ReturnStatement(expression=None)
+        else:
+            p[0] = ast.ReturnStatement(expression=p[2])
 
     def p_expression_or_empty(self, p):
         '''expression_or_empty : expression
@@ -216,15 +223,24 @@ class Parser:
         '''module_declaration : MODULE module_path LBRACE module_body RBRACE
                             | MODULE module_path LBRACE RBRACE
                             | MODULE module_path'''
-        name = p[2]
-        module = ast.Module(name=name, body=[])
-        self._enter_scope(module)
-        
+        # Enter a new scope for the module
+        module_scope = ast.Scope(parent=self.current_scope)
+        self._enter_scope(module_scope)
+
+        name = p[2].parts[-1] if isinstance(p[2], ast.QualifiedName) else p[2]
         if len(p) >= 5:  # Has a body
-            if isinstance(p[4], list):
-                module.body = p[4]
-            # Handle empty body case
-        
+            if len(p) == 6:  # Non-empty body
+                body = p[4]
+            else:  # Empty body
+                body = ast.ModuleBody(statements=[], exports=[], visibility_rules=None)
+        else:  # No body
+            body = ast.ModuleBody(statements=[], exports=[], visibility_rules=None)
+         
+        module = ast.Module(name=name, body=body)
+        # Check for duplicate module names
+        if name in self.module_names:
+            raise Exception(f"Duplicate module name: {name}")
+        self.module_names.add(name)
         self._exit_scope()
         p[0] = module
 
@@ -232,25 +248,25 @@ class Parser:
         '''module_path : IDENTIFIER
                       | module_path DOT IDENTIFIER'''
         if len(p) == 2:
-            p[0] = p[1]
+            p[0] = ast.QualifiedName(parts=[p[1]])
         else:
-            p[0] = f"{p[1]}.{p[3]}"
+            parts = p[1].parts + [p[3]] if isinstance(p[1], ast.QualifiedName) else [p[1], p[3]]
+            p[0] = ast.QualifiedName(parts=parts)
 
     def p_module_body(self, p):
         '''module_body : exports statement_list'''
         self.log_rule('module_body', p)
         statements = []
         visibility_rules = None
-        
         if p[2]:
             # Extract visibility rules from statements if present
             for stmt in p[2]:
                 if isinstance(stmt, ast.VisibilityRules):
-                    visibility_rules = stmt
+                    visibility_rules = stmt.rules
                 else:
                     statements.append(stmt)
-        print("exports found: ", p[1])        
-        p[0] = ast.ModuleBody(statements=statements, exports=p[1], visibility_rules=visibility_rules)
+                    
+        p[0] = ast.ModuleBody(statements=statements, exports=p[1] or [], visibility_rules=visibility_rules)
 
     #def p_docstring(self, p):
     #    '''docstring : STRING'''
@@ -307,19 +323,19 @@ class Parser:
                           | IMPORT module_path
                           | IMPORT module_path AS IDENTIFIER'''
         if len(p) == 6:  # public import with alias
-            p[0] = ast.Import(module_path=p[3].split('.'), alias=p[5], is_public=True)
+            p[0] = ast.Import(module_path=p[3].parts, alias=p[5], is_public=True)
         elif len(p) == 4:  # public import without alias
-            p[0] = ast.Import(module_path=p[3].split('.'), alias=None, is_public=True)
+            p[0] = ast.Import(module_path=p[3].parts, alias=None, is_public=True)
         elif len(p) == 5:  # private import with alias
-            p[0] = ast.Import(module_path=p[2].split('.'), alias=p[4], is_public=False)
+            p[0] = ast.Import(module_path=p[2].parts, alias=p[4], is_public=False)
         else:  # private import without alias
-            p[0] = ast.Import(module_path=p[2].split('.'), alias=None, is_public=False)
+            p[0] = ast.Import(module_path=p[2].parts, alias=None, is_public=False)
 
     def p_from_import_statement(self, p):
         '''from_import_statement : PUBLIC FROM relative_path IMPORT import_names
-                                | PUBLIC FROM module_path IMPORT import_names
-                                | FROM relative_path IMPORT import_names
-                                | FROM module_path IMPORT import_names'''
+                               | PUBLIC FROM module_path IMPORT import_names
+                               | FROM relative_path IMPORT import_names
+                               | FROM module_path IMPORT import_names'''
         if len(p) == 6:  # public from import
             if isinstance(p[3], ast.RelativePath):
                 p[0] = ast.FromImport(module_path=p[3].path.split('.'), names=p[5], relative_level=p[3].level, is_public=True)
@@ -333,9 +349,9 @@ class Parser:
 
     def p_relative_path(self, p):
         '''relative_path : DOT module_path
-                        | DOT DOT module_path
-                        | DOT DOT DOT module_path
-                        | TRIPLE_DOT module_path'''
+                       | DOT DOT module_path
+                       | DOT DOT DOT module_path
+                       | TRIPLE_DOT module_path'''
         if len(p) == 3 and p[1] == '.':  # .module_path
             p[0] = ast.RelativePath(1, p[2])
         elif len(p) == 4 and p[1] == '.' and p[2] == '.':  # ..module_path
@@ -363,7 +379,10 @@ class Parser:
 
     def p_assignment(self, p):
         '''assignment : IDENTIFIER EQUALS expression'''
-        p[0] = ast.Assignment(p[1], p[3])
+        # Check if the variable is defined in the current or parent scope
+        if not self._is_variable_defined(p[1], self.current_scope):
+            raise SyntaxError(f"Variable '{p[1]}' is not defined in the current scope")
+        p[0] = ast.Assignment(name=p[1], expression=p[3])
 
     def p_expression(self, p):
         '''expression : comparison_expression'''
@@ -404,6 +423,7 @@ class Parser:
                 | IDENTIFIER LPAREN argument_list RPAREN
                 | IDENTIFIER LPAREN RPAREN
                 | LPAREN expression RPAREN'''
+        self.log_rule('factor', p)
         if len(p) == 2:
             if isinstance(p[1], tuple) and p[1][1] == 'string':
                 p[0] = ast.Literal(p[1][0])  # Create string literal
@@ -433,26 +453,19 @@ class Parser:
 
     def p_function_call(self, p):
         '''function_call : IDENTIFIER LPAREN argument_list RPAREN
-                        | IDENTIFIER LPAREN RPAREN
-                        | qualified_name LPAREN argument_list RPAREN
-                        | qualified_name LPAREN RPAREN'''
+                       | IDENTIFIER LPAREN RPAREN
+                       | qualified_name LPAREN argument_list RPAREN
+                       | qualified_name LPAREN RPAREN'''
         if len(p) == 5:  # With arguments
-            if isinstance(p[1], str):
-                # Handle built-in functions like print specially
-                if p[1] == 'print':
-                    p[0] = ast.PrintStatement(p[3] if p[3] is not None else [])
-                else:
-                    p[0] = ast.FunctionCall(p[1], p[3] if p[3] is not None else [])
-            elif isinstance(p[1], ast.QualifiedName):
-                p[0] = ast.QualifiedFunctionCall(p[1].parts, p[3] if p[3] is not None else [])
-        else:  # No arguments (len(p) == 4)
-            if isinstance(p[1], str):
-                if p[1] == 'print':
-                    p[0] = ast.PrintStatement([])
-                else:
-                    p[0] = ast.FunctionCall(p[1], [])
-            elif isinstance(p[1], ast.QualifiedName):
-                p[0] = ast.QualifiedFunctionCall(p[1].parts, [])
+            if isinstance(p[1], ast.QualifiedName):
+                p[0] = ast.QualifiedFunctionCall(parts=p[1].parts, arguments=p[3])
+            else:
+                p[0] = ast.FunctionCall(name=p[1], arguments=p[3])
+        else:  # Without arguments
+            if isinstance(p[1], ast.QualifiedName):
+                p[0] = ast.QualifiedFunctionCall(parts=p[1].parts, arguments=[])
+            else:
+                p[0] = ast.FunctionCall(name=p[1], arguments=[])
 
     def p_qualified_name(self, p):
         '''qualified_name : IDENTIFIER
@@ -462,7 +475,7 @@ class Parser:
             p[0] = ast.QualifiedName([p[1]])
         elif len(p) == 4:
             if isinstance(p[1], ast.QualifiedName):
-                parts = p[1].parts + [p[3]]
+                parts = p[1].parts + [p[3]] if isinstance(p[1], ast.QualifiedName) else [p[1], p[3]]
             else:
                 parts = [p[1], p[3]]
             p[0] = ast.QualifiedName(parts)
@@ -481,52 +494,42 @@ class Parser:
         else:  # argument_list COMMA expression
             p[0] = p[1] + [p[3]]
 
+    def p_type_annotation_func(self, p):
+        '''type_annotation_func : type_annotation
+                              | empty'''
     def p_function_declaration(self, p):
-        '''function_declaration : FN IDENTIFIER type_param_list LPAREN parameter_list RPAREN type_annotation LBRACE statement_list RBRACE
-                              | FN IDENTIFIER type_param_list LPAREN parameter_list RPAREN LBRACE statement_list RBRACE
-                              | FN IDENTIFIER type_param_list LPAREN RPAREN type_annotation LBRACE statement_list RBRACE
-                              | FN IDENTIFIER type_param_list LPAREN RPAREN LBRACE statement_list RBRACE
-                              | FN IDENTIFIER LPAREN parameter_list RPAREN type_annotation LBRACE statement_list RBRACE
-                              | FN IDENTIFIER LPAREN parameter_list RPAREN LBRACE statement_list RBRACE
-                              | FN IDENTIFIER LPAREN RPAREN type_annotation LBRACE statement_list RBRACE
-                              | FN IDENTIFIER LPAREN RPAREN LBRACE statement_list RBRACE'''
-        
+        '''function_declaration : FN IDENTIFIER type_param_list LPAREN parameter_list RPAREN type_annotation_func LBRACE statement_list RBRACE
+'''
+        # Enter a new scope for the function
+        function_scope = ast.Scope(parent=self.current_scope)
+        self._enter_scope(function_scope)
+
         self.log_rule('function_declaration', p)
         
         # Create function node
-        func = ast.FunctionDeclaration(name=p[2], params=[], body=[])
-        self._enter_scope(func)
         
-        if len(p) == 11:  # Full form with type params
-            func.type_params = p[3]
-            func.params = p[5] if p[5] else []
-            func.return_type = p[7]
-            func.body = p[9] if p[9] else []
-        elif len(p) == 10:  # No return type
-            func.type_params = p[3]
-            func.params = p[5] if p[5] else []
-            func.body = p[8] if p[8] else []
-        elif len(p) == 9:  # No params
-            if p[3] == '(':  # No type params
-                func.params = []
-                func.return_type = p[6]
-                func.body = p[8] if p[8] else []
-            else:  # Has type params
-                func.type_params = p[3]
-                func.params = []
-                func.body = p[7] if p[7] else []
-        else:  # Simplest form
-            func.params = p[4] if len(p) > 5 and p[4] else []
-            if len(p) > 6:
-                func.return_type = p[6]
-            func.body = p[-2] if p[-2] else []
         
+        name = p[2]
+        type_params = p[3] if p[3] != "(" else []
+        params = p[5] if len(p) > 6 and p[5] != ")" else []
+        return_type = p[7] if len(p) > 7 else None
+        
+        body = p[-2]
+        breakpoint()
+        # Add parameters to the function's scope
+        if params:
+            for param in params:
+                function_scope.add_symbol(param.name, param)
+
+        # Exit the function's scope
         self._exit_scope()
-        p[0] = func
+        p[0] = ast.FunctionDeclaration(name=name, type_params=type_params, params=params, return_type=return_type, body=body)
+
 
     def p_type_param_list(self, p):
-        '''type_param_list : LESS type_params GREATER'''
-        p[0] = p[2]
+        '''type_param_list : LESS type_params GREATER
+                          | empty'''
+        p[0] = p[2] if len(p) > 2 else []
 
     def p_type_params(self, p):
         '''type_params : type_param
@@ -660,12 +663,18 @@ class Parser:
 
     def p_block(self, p):
         '''block : LBRACE statement_list RBRACE'''
-        block = ast.Block(statements=[])
-        self._enter_scope(block)
-        if p[2]:
-            block.statements = p[2]
+        # Enter a new scope for the block
+        block_scope = ast.Scope(parent=self.current_scope)
+        self._enter_scope(block_scope)
+
+        # Parse the block statements
+        statements = p[2]
+
+        # Exit the block's scope
         self._exit_scope()
-        p[0] = block
+
+        # Create the Block node
+        p[0] = ast.Block(statements=statements)
 
     def p_struct_definition(self, p):
         '''struct_definition : STRUCT IDENTIFIER LBRACE struct_fields RBRACE
@@ -740,11 +749,11 @@ class Parser:
 
     def p_variant_instantiation(self, p):
         '''variant_instantiation : IDENTIFIER DOUBLECOLON IDENTIFIER LPAREN field_assignments RPAREN
-                                | IDENTIFIER DOUBLECOLON IDENTIFIER LPAREN RPAREN'''
+                               | IDENTIFIER DOUBLECOLON IDENTIFIER LPAREN RPAREN'''
         if len(p) == 7:
-            p[0] = ast.VariantInstance(p[1], p[3], p[5])
+            p[0] = ast.VariantInstance(enum_name=p[1], variant_name=p[3], field_values=p[5])
         else:
-            p[0] = ast.VariantInstance(p[1], p[3], [])
+            p[0] = ast.VariantInstance(enum_name=p[1], variant_name=p[3], field_values={})
 
     def p_field_assignments(self, p):
         '''field_assignments : field_assignment
@@ -756,7 +765,7 @@ class Parser:
 
     def p_field_assignment(self, p):
         '''field_assignment : IDENTIFIER EQUALS expression'''
-        p[0] = (p[1], p[3])
+        p[0] = (p[1], p[3])  # Return tuple of (name, value)
 
     def p_match_expression(self, p):
         '''match_expression : MATCH expression LBRACE match_cases RBRACE'''
@@ -796,52 +805,48 @@ class Parser:
 
     def p_lambda_expression(self, p):
         '''lambda_expression : FN LPAREN parameter_list RPAREN type_annotation lambda_body
-                           | FN LPAREN parameter_list RPAREN lambda_body
-                           | FN LPAREN RPAREN type_annotation lambda_body
-                           | FN LPAREN RPAREN lambda_body'''
-        lambda_expr = ast.LambdaExpression(params=[], body=None)
-        self._enter_scope(lambda_expr)
-        
+                            | FN LPAREN parameter_list RPAREN lambda_body
+                            | FN LPAREN RPAREN type_annotation lambda_body
+                            | FN LPAREN RPAREN lambda_body'''
+        # Create a new scope for the lambda expression
+        self.log_rule('lambda_expression', p)
+        lambda_scope = ast.Scope(parent=self.current_scope)
+        self._enter_scope(lambda_scope)
+        # Create the LambdaExpression node
+        lambda_expr = ast.LambdaExpression()
+
         if len(p) == 7:  # With params and return type
             lambda_expr.params = p[3] if p[3] else []
             lambda_expr.return_type = p[5]
             lambda_expr.body = p[6]
-        elif len(p) == 6:  # With params, no return type
-            lambda_expr.params = p[3] if p[3] else []
+        elif len(p) == 6 and p[3] != ")":  # With params, no return type
+            lambda_expr.params = p[3] if p[3] != ")" else []
             lambda_expr.body = p[5]
-        elif len(p) == 6:  # No params, with return type
+        elif len(p) == 6 and p[3] == ")":  # No params, with return type
             lambda_expr.return_type = p[4]
             lambda_expr.body = p[5]
         else:  # No params, no return type
             lambda_expr.body = p[4]
+        # Parse parameters and add them to the lambda's scope
         
-        # Analyze captured variables
-        lambda_expr.captured_vars = set()
-        lambda_expr.capture_modes = {}
-        
-        # Find all variable references in the body
+        for param in lambda_exprparams:
+            lambda_scope.add_symbol(param.name, param)
+
+        # Parse the lambda body
+        body = p[5] if len(p) > 5 else p[4]
+
+        # Exit the lambda's scope
+        self._exit_scope()
+ 
+
+        # Capture variables from the parent scope
         var_refs = self._find_variables_in_body(lambda_expr.body)
-        
+        #breakpoint()
         # For each variable reference, check if it's defined in parent scopes
         for var_name in var_refs:
-            # Skip parameters
-            if any(param.name == var_name for param in lambda_expr.params):
-                continue
-                
-            # Check if variable is defined in any parent scope
-            scope = self.current_scope.parent
-            while scope:
-                if self._is_variable_defined(var_name, scope):
-                    lambda_expr.captured_vars.add(var_name)
-                    # Check if the variable is mutated in the lambda
-                    if self._is_variable_mutated(var_name, lambda_expr.body):
-                        lambda_expr.capture_modes[var_name] = "borrow_mut"
-                    else:
-                        lambda_expr.capture_modes[var_name] = "borrow"
-                    break
-                scope = scope.parent
-        
-        self._exit_scope()
+            if not self._is_variable_defined(var_name, lambda_scope):
+                lambda_expr.add_capture(var_name)
+
         p[0] = lambda_expr
 
     def p_perform_expression(self, p):
@@ -1107,7 +1112,25 @@ class Parser:
 
     def p_handle_expression(self, p):
         '''handle_expression : HANDLE type_expression WITH LBRACE handle_cases RBRACE IN expression'''
-        p[0] = ast.HandleEffect(p[2], p[5], p[8])
+        # Enter a new scope for the handle expression
+        handle_scope = ast.Scope(parent=self.current_scope)
+        self._enter_scope(handle_scope)
+
+        # Parse the handle cases
+        cases = p[5]
+        for case in cases:
+            # Add case parameters to the handle scope
+            for param in case.params:
+                handle_scope.add_symbol(param.name, param)
+
+        # Parse the continuation expression
+        continuation = p[8]
+
+        # Exit the handle's scope
+        self._exit_scope()
+
+        # Create the HandleExpression node
+        p[0] = ast.HandleExpression(effect_name=p[2], handler=cases, continuation=continuation)
 
     def p_handle_cases(self, p):
         '''handle_cases : handle_case

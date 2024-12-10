@@ -481,33 +481,20 @@ class BorrowUnique(Expression):
         self.variable = variable
 
 # Structs and Enums
-class StructLifetime:
-    LOCAL = "local"    # Stack allocated, automatically freed
-    GLOBAL = "global"  # Program lifetime
-    HEAP = "heap"      # Dynamically allocated
-
 class StructDefinition(Node):
-    """A struct definition with lifetime and reference tracking"""
-    def __init__(self, name, fields, lifetime=StructLifetime.HEAP):
-        super().__init__()
+    def __init__(self, name, fields, type_params=None, implements=None, methods=None):
         self.name = name
-        self.fields = self.add_children(fields)
-        self.lifetime = lifetime
-        self.references_globals = False  # Set during analysis
-        
-    def mark_references_globals(self):
-        """Mark if this struct contains references to global data"""
-        for field in self.fields:
-            if field.type_info and field.type_info.is_global_reference():
-                self.references_globals = True
-                break
+        self.fields = fields
+        self.type_params = type_params
+        self.implements = implements
+        self.methods = methods if methods is not None else []
 
 class StructField(Node):
-    """A field in a struct with reference tracking"""
-    def __init__(self, name, type_info, is_reference=False):
+    def __init__(self, name, type_expr=None, value=None, visibility=None):
         self.name = name
-        self.type_info = type_info
-        self.is_reference = is_reference
+        self.type_expr = type_expr
+        self.value = value
+        self.visibility = visibility
 
 class StructInstantiation(Node):
     def __init__(self, struct_name, field_assignments):
