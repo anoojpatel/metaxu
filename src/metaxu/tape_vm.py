@@ -16,6 +16,13 @@ class Opcode(Enum):
     SUB = auto()
     MUL = auto()
     DIV = auto()
+    # Comparison opcodes
+    COMPARE_EQ = auto()
+    COMPARE_NE = auto()
+    COMPARE_LT = auto()
+    COMPARE_LE = auto()
+    COMPARE_GT = auto()
+    COMPARE_GE = auto()
     CREATE_FUNC = auto()
     CREATE_CLOSURE = auto()
     CALL_FUNC = auto()
@@ -421,6 +428,35 @@ class TapeVM:
         elif opcode == Opcode.PRINT_NEWLINE:
             # Print newline
             print()
+        elif opcode == Opcode.COMPARE_EQ:
+            right = self.stack.pop()
+            left = self.stack.pop()
+            self.stack.append(left == right)
+            
+        elif opcode == Opcode.COMPARE_NE:
+            right = self.stack.pop()
+            left = self.stack.pop()
+            self.stack.append(left != right)
+            
+        elif opcode == Opcode.COMPARE_LT:
+            right = self.stack.pop()
+            left = self.stack.pop()
+            self.stack.append(left < right)
+            
+        elif opcode == Opcode.COMPARE_LE:
+            right = self.stack.pop()
+            left = self.stack.pop()
+            self.stack.append(left <= right)
+            
+        elif opcode == Opcode.COMPARE_GT:
+            right = self.stack.pop()
+            left = self.stack.pop()
+            self.stack.append(left > right)
+            
+        elif opcode == Opcode.COMPARE_GE:
+            right = self.stack.pop()
+            left = self.stack.pop()
+            self.stack.append(left >= right)
         # TODO: Implement other opcodes...
         else:
             raise Exception(f"Unknown opcode {opcode}")

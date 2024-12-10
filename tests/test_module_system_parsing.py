@@ -343,10 +343,10 @@ class TestModuleSystem(unittest.TestCase):
             }
 
             # Test basic closure capture
-            fn make_counter(start: int) -> fn\() -> int {
+            fn make_counter(start: int) -> (fn\() -> int) {
                 let @mut count = start  # Variable to be captured
                 
-                fn() -> int {
+                return fn() -> int {
                     count = count + 1  # Mutates captured variable
                     return count
                 }
@@ -357,7 +357,7 @@ class TestModuleSystem(unittest.TestCase):
                 let @mut sum = initial     # Mutable capture
                 let factor = 2            # Immutable capture
                 
-                fn(x: int) -> int {
+                return fn(x: int) -> int {
                     sum = sum + (x * factor)  # Uses both captures
                     return sum
                 }
@@ -384,10 +384,11 @@ class TestModuleSystem(unittest.TestCase):
         }
         """
         ast_tree = self.parser.parse(code)
-        self.assertIsInstance(ast_tree[0], ast.Module)
-        self.assertIsInstance(ast_tree[1], ast.Module)
+        breakpoint()
+        self.assertIsInstance(ast_tree.statements[0], ast.Module)
+        self.assertIsInstance(ast_tree.statements[1], ast.Module)
         # Get the counter module
-        counter_module = ast_tree[0]
+        counter_module = ast_tree.statements[0]
         self.assertEqual(counter_module.name, "counter")
         
         # Check make_counter function
@@ -395,22 +396,23 @@ class TestModuleSystem(unittest.TestCase):
                        if isinstance(f, ast.FunctionDeclaration) and f.name == "make_counter"][0]
         
         # Verify closure in make_counter
-        closure = make_counter.body[-1]
-        self.assertIsInstance(closure, ast.LambdaExpression)
-        self.assertIn("count", closure.captured_vars)
-        self.assertEqual(closure.capture_modes["count"], "borrow_mut")
+        return_statement = make_counter.body[-1]
+        self.assertIsInstance(return_statement.expression, ast.LambdaExpression)
+        breakpoint()
+        self.assertIn("count", return_statement.expression.captured_vars)
+        self.assertEqual(return_statement.expression.capture_modes["count"], "borrow_mut")
         
         # Check make_accumulator function
         make_acc = [f for f in counter_module.body.statements 
                    if isinstance(f, ast.FunctionDeclaration) and f.name == "make_accumulator"][0]
         
         # Verify closure in make_accumulator
-        closure = make_acc.body[-1]
-        self.assertIsInstance(closure, ast.LambdaExpression)
-        self.assertIn("sum", closure.captured_vars)
-        self.assertIn("factor", closure.captured_vars)
-        self.assertEqual(closure.capture_modes["sum"], "borrow_mut")
-        self.assertEqual(closure.capture_modes["factor"], "borrow")
+        return_statement = make_acc.body[-1]
+        self.assertIsInstance(return_statement.expression, ast.LambdaExpression)
+        self.assertIn("sum", return_statement.expression.captured_vars)
+        self.assertIn("factor", return_statement.expression.captured_vars)
+        self.assertEqual(return_statement.expression.capture_modes["sum"], "borrow_mut")
+        self.assertEqual(return_statement.expression.capture_modes["factor"], "borrow")
         
         # Verify type checking passes
         self.type_checker.check(ast_tree)
