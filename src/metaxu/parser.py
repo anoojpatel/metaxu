@@ -20,10 +20,22 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+scoped_nodes = (ast.FunctionDeclaration, ast.LambdaExpression, ast.Block, ast.WhileStatement, ast.ForStatement,ast.ModuleBody)
+
 class Parser:
     start = 'program'
 
     def __init__(self):
+        self.logger = logging.getLogger(__name__)
+        self.precedence = (
+            ('left', 'PLUS', 'MINUS'),
+            ('left', 'TIMES', 'DIVIDE'),
+        )
+        
+        # Initialize deferred processing system
+        self.deferred_processing = []
+        
+        # Initialize the lexer
         self.lexer = Lexer()
         self.tokens = self.lexer.tokens  # Get token list from lexer
         self.parser = yacc.yacc(module=self)
@@ -32,7 +44,16 @@ class Parser:
         self.current_scope = None
         self.scope_stack = []  # Stack to track nested scopes
         self.logger = logging.getLogger(__name__)
-
+        # Explicitly add a StreamHandler to ensure output to stdout
+        handler = logging.StreamHandler()
+        handler.setLevel(logging.DEBUG)
+        formatter = logging.Formatter('%(name)s - %(levelname)s - %(message)s')
+        handler.setFormatter(formatter)
+        self.logger.addHandler(handler)
+        self.logger.setLevel(logging.WARNING)
+        self.logger.debug("Parser initialized with debug logging enabled.")
+        self.current_module = None
+        
     def log_rule(self, rule_name, p=None):
         try:
             if p:
@@ -52,14 +73,20 @@ class Parser:
             print("\n=== Starting Parse ===")
             # Initialize lexer with source
             self.lexer.source_file = file_path
+            self._enter_scope(ast.Scope(name="global"))
             # Parse using PLY
-            result = self.parser.parse(source, lexer=self.lexer, debug=False)
+            result = self.parser.parse(source, lexer=self.lexer, debug=False)  # Enable debug here too
             if isinstance(result, ast.Module): 
                 result.source_file = file_path
             elif isinstance(result, list):
                 for module in result:
                     if isinstance(module, ast.Module):
                         module.source_file = file_path
+            self._exit_scope()
+            # Process any pending lambda expressions
+            #self.process_pending_lambdas()
+            # Process deferred items
+            self.process_deferred()
             return result
             
         except Exception as e:
@@ -67,7 +94,9 @@ class Parser:
             token = self.lexer.current_token if hasattr(self.lexer, 'current_token') else None
             print(f"\n=== Parser Error ===")
             print(f"Current token: {token}")
-            print(f"Error: {str(e)}")
+            print(f"Error type: {type(e)}")
+            print(f"Error message: {str(e)}")
+            print(f"Error hierarchy: {type(e).__mro__}")
             location = SourceLocation(
                 file=file_path,
                 line=token.lineno if token else 0,
@@ -82,7 +111,11 @@ class Parser:
                 stack_trace=traceback.format_stack(),
                 notes=["Check syntax near this location"]
             )
+            print(f"Created CompileError: {error}")
             raise error from e
+        finally:
+            print("\n=== Exiting Parse ===")
+            self._exit_scope() if self.current_scope else None
 
     #def p_module(self, p):
     #    '''module : module_body'''
@@ -117,13 +150,11 @@ class Parser:
     def p_statement_list(self, p):
         '''statement_list : statements
                         | empty'''
-        self.log_rule('statement_list', p)
         p[0] = p[1] if p[1] else []
 
     def p_statements(self, p):
         '''statements : statement
                     | statements statement'''
-        self.log_rule('statements', p)
         if len(p) == 2:
             p[0] = [p[1]]
         else:
@@ -152,7 +183,6 @@ class Parser:
                     | comptime_block
                     | comptime_function
                     | extern_block'''
-        self.log_rule('statement', p)
         p[0] = p[1]
 
     def p_lambda_statement(self, p):
@@ -217,13 +247,35 @@ class Parser:
                             | MODULE module_path LBRACE RBRACE
                             | MODULE module_path'''
         name = p[2]
-        module = ast.Module(name=name, body=[])
-        self._enter_scope(module)
         
-        if len(p) >= 5:  # Has a body
-            if isinstance(p[4], list):
-                module.body = p[4]
-            # Handle empty body case
+        # Check for duplicate module names
+        if name in self.module_names:
+            self.logger.error(f"Duplicate module name '{name}'")
+            # Create a CompileError directly
+            raise CompileError(
+                message=f"Duplicate module name '{name}'",
+                error_type="ParseError",
+                location=SourceLocation(
+                    file=self.lexer.source_file,
+                    line=p.lineno(1),  # Get line number of MODULE token
+                    column=p.lexpos(1)  # Get position of MODULE token
+                ),
+                context=get_source_context(self.lexer.source_file, p.lineno(1)),
+                stack_trace=traceback.format_stack(),
+                notes=[f"Module '{name}' was already declared"]
+            )
+        
+        # Add the module name to our set
+        self.module_names.add(name)
+        
+        # Create a module body with empty statements if none provided
+        body = ast.ModuleBody(statements=[]) if len(p) == 3 or len(p) == 5 else p[4]
+        
+        # Create the module with the body
+        module = ast.Module(name=name, body=body)
+        
+        # Set up scope
+        self._enter_scope(ast.Scope())
         
         self._exit_scope()
         p[0] = module
@@ -238,7 +290,6 @@ class Parser:
 
     def p_module_body(self, p):
         '''module_body : exports statement_list'''
-        self.log_rule('module_body', p)
         statements = []
         visibility_rules = None
         
@@ -249,18 +300,14 @@ class Parser:
                     visibility_rules = stmt
                 else:
                     statements.append(stmt)
-        print("exports found: ", p[1])        
+               
         p[0] = ast.ModuleBody(statements=statements, exports=p[1], visibility_rules=visibility_rules)
 
-    #def p_docstring(self, p):
-    #    '''docstring : STRING'''
-    #    self.log_rule('docstring', p)
-    #    p[0] = p[1]
+
 
     def p_exports(self, p):
         '''exports : EXPORT LBRACE export_list RBRACE
                   | empty'''
-        self.log_rule('exports', p)
         if len(p) == 5:
             p[0] = p[3]
         else:
@@ -482,51 +529,61 @@ class Parser:
             p[0] = p[1] + [p[3]]
 
     def p_function_declaration(self, p):
-        '''function_declaration : FN IDENTIFIER type_param_list LPAREN parameter_list RPAREN type_annotation LBRACE statement_list RBRACE
+        '''function_declaration : FN IDENTIFIER type_param_list LPAREN parameter_list RPAREN type_annotation_opt LBRACE statement_list RBRACE
                               | FN IDENTIFIER type_param_list LPAREN parameter_list RPAREN LBRACE statement_list RBRACE
-                              | FN IDENTIFIER type_param_list LPAREN RPAREN type_annotation LBRACE statement_list RBRACE
+                              | FN IDENTIFIER type_param_list LPAREN RPAREN type_annotation_opt LBRACE statement_list RBRACE
                               | FN IDENTIFIER type_param_list LPAREN RPAREN LBRACE statement_list RBRACE
-                              | FN IDENTIFIER LPAREN parameter_list RPAREN type_annotation LBRACE statement_list RBRACE
+                              | FN IDENTIFIER LPAREN parameter_list RPAREN type_annotation_opt LBRACE statement_list RBRACE
                               | FN IDENTIFIER LPAREN parameter_list RPAREN LBRACE statement_list RBRACE
-                              | FN IDENTIFIER LPAREN RPAREN type_annotation LBRACE statement_list RBRACE
+                              | FN IDENTIFIER LPAREN RPAREN type_annotation_opt LBRACE statement_list RBRACE
                               | FN IDENTIFIER LPAREN RPAREN LBRACE statement_list RBRACE'''
         
-        self.log_rule('function_declaration', p)
         
         # Create function node
         func = ast.FunctionDeclaration(name=p[2], params=[], body=[])
-        self._enter_scope(func)
         
+        # Create function scope
+        func.scope = ast.Scope(name=f"function_{p[2]}")
+        self._enter_scope(func.scope)
+        # Parse function parameters and add them to scope
         if len(p) == 11:  # Full form with type params
             func.type_params = p[3]
             func.params = p[5] if p[5] else []
             func.return_type = p[7]
             func.body = p[9] if p[9] else []
         elif len(p) == 10:  # No return type
-            func.type_params = p[3]
-            func.params = p[5] if p[5] else []
+            func.type_params = p[3] if p[3] != "(" else None
+            func.return_type = p[6] if p[6] else NoneType
+            func.params = p[4] if p[4] else []
             func.body = p[8] if p[8] else []
         elif len(p) == 9:  # No params
             if p[3] == '(':  # No type params
                 func.params = []
                 func.return_type = p[6]
-                func.body = p[8] if p[8] else []
+                func.body = p[7] if p[7] else []
             else:  # Has type params
                 func.type_params = p[3]
                 func.params = []
                 func.body = p[7] if p[7] else []
         else:  # Simplest form
-            func.params = p[4] if len(p) > 5 and p[4] else []
-            if len(p) > 6:
-                func.return_type = p[6]
-            func.body = p[-2] if p[-2] else []
+            func.body = p[6] if p[6] else []
+            
+        # Add symbols and update child scopes
+        self._populate_scope_symbols(func, func.scope)
         
+        # Update any lambda scopes in the body to point to this function's scope
+        self._update_child_scopes(func)
+            
         self._exit_scope()
         p[0] = func
-
+        
     def p_type_param_list(self, p):
-        '''type_param_list : LESS type_params GREATER'''
-        p[0] = p[2]
+        '''type_param_list : LESS type_params GREATER
+                          | empty'''
+        if len(p) > 2:
+            p[0] = p[2]
+        else:
+            p[0] = []
 
     def p_type_params(self, p):
         '''type_params : type_param
@@ -661,9 +718,10 @@ class Parser:
     def p_block(self, p):
         '''block : LBRACE statement_list RBRACE'''
         block = ast.Block(statements=[])
-        self._enter_scope(block)
+        self._enter_scope(ast.Scope())
+        block.scope = self.current_scope
         if p[2]:
-            block.statements = p[2]
+            block.statements = [block.add_child(stmt) for stmt in p[2]]
         self._exit_scope()
         p[0] = block
 
@@ -799,48 +857,42 @@ class Parser:
                            | FN LPAREN parameter_list RPAREN lambda_body
                            | FN LPAREN RPAREN type_annotation lambda_body
                            | FN LPAREN RPAREN lambda_body'''
-        lambda_expr = ast.LambdaExpression(params=[], body=None)
-        self._enter_scope(lambda_expr)
+        #lambda_expr = ast.LambdaExpression(params=[], body=None)
+        #self._enter_scope(ast.Scope())
+        
+        # Debug parent scope before parsing lambda
+        self.logger.debug(f"Current scope: {self.current_scope}")
+        if self.current_scope:
+            self.logger.debug(f"Parent scope: {self.current_scope.parent}")
+            if self.current_scope.parent and hasattr(self.current_scope.parent, 'declarations'):
+                self.logger.debug(f"Parent scope declarations: {[decl.name for decl in self.current_scope.parent.declarations if hasattr(decl, 'name')]}")
+        
+        # Debug parent scope declarations
+        if self.current_scope.parent and hasattr(self.current_scope.parent, 'declarations'):
+            parent_declarations = [decl.name for decl in self.current_scope.parent.declarations if hasattr(decl, 'name')]
+            self.logger.debug(f"Parent scope declarations: {parent_declarations}")
+            if 'x' not in parent_declarations or 'y' not in parent_declarations:
+                self.logger.warning("Variables 'x' or 'y' not found in parent scope declarations.")
         
         if len(p) == 7:  # With params and return type
-            lambda_expr.params = p[3] if p[3] else []
-            lambda_expr.return_type = p[5]
-            lambda_expr.body = p[6]
+            lambda_expr = ast.LambdaExpression(params = p[3] if p[3] else [], return_type=p[5], body=p[6])
         elif len(p) == 6:  # With params, no return type
-            lambda_expr.params = p[3] if p[3] else []
-            lambda_expr.body = p[5]
+            lambda_expr = ast.LambdaExpression(params = p[3] if p[3] != ")" else [], body=p[5])
         elif len(p) == 6:  # No params, with return type
-            lambda_expr.return_type = p[4]
-            lambda_expr.body = p[5]
+            lambda_expr = ast.LambdaExpression(params= [], return_type = p[4], body=p[5])
         else:  # No params, no return type
-            lambda_expr.body = p[4]
+            lambda_expr = ast.LambdaExpression(params= [], body = p[4])
         
-        # Analyze captured variables
-        lambda_expr.captured_vars = set()
-        lambda_expr.capture_modes = {}
+        # Create scope and add parameters
+        lambda_expr.scope = ast.Scope(name=f"lambda_{id(lambda_expr)}")
+        self._enter_scope(lambda_expr.scope)
+        self._populate_scope_symbols(lambda_expr, lambda_expr.scope)
         
-        # Find all variable references in the body
-        var_refs = self._find_variables_in_body(lambda_expr.body)
-        
-        # For each variable reference, check if it's defined in parent scopes
-        for var_name in var_refs:
-            # Skip parameters
-            if any(param.name == var_name for param in lambda_expr.params):
-                continue
-                
-            # Check if variable is defined in any parent scope
-            scope = self.current_scope.parent
-            while scope:
-                if self._is_variable_defined(var_name, scope):
-                    lambda_expr.captured_vars.add(var_name)
-                    # Check if the variable is mutated in the lambda
-                    if self._is_variable_mutated(var_name, lambda_expr.body):
-                        lambda_expr.capture_modes[var_name] = "borrow_mut"
-                    else:
-                        lambda_expr.capture_modes[var_name] = "borrow"
-                    break
-                scope = scope.parent
-        
+        # Defer capture processing until we have proper parent scope
+        self.defer_processing(lambda_expr, 'captures')
+        # Queue for deferred processing
+        self.defer_processing(lambda_expr, 'scope')  # Will link scope
+        self.defer_processing(lambda_expr, 'captures')
         self._exit_scope()
         p[0] = lambda_expr
 
@@ -1074,6 +1126,15 @@ class Parser:
         '''mode_annotation : AT IDENTIFIER'''
         p[0] = ast.ModeAnnotation(p[2])
 
+    def p_type_annotation_opt(self, p):
+        '''type_annotation_opt : type_annotation
+                            | empty'''
+
+        if len(p) == 1:
+            p[0] = ast.TypeAnnotation(None)
+        else:
+            p[0] = p[1]
+
     def p_type_annotation(self, p):
         '''type_annotation : ARROW type_expression'''
         p[0] = p[2]
@@ -1243,7 +1304,7 @@ class Parser:
 
     def p_extern_type_declaration(self, p):
         '''extern_type_declaration : TYPE IDENTIFIER
-                                 | TYPE IDENTIFIER EQUALS STRUCT LBRACE RBRACE
+                                 | TYPE IDENTIFIER EQUALS STRUCT LBRACKET RBRACKET
                                  | TYPE IDENTIFIER EQUALS STRUCT IDENTIFIER'''
         if len(p) == 3:
             # Opaque type declaration: e.g. type FILE;
@@ -1316,109 +1377,113 @@ class Parser:
         self.current_scope = self.scope_stack.pop()
 
     def _is_variable_defined(self, var_name, scope):
-        """Check if a variable is defined in the given scope"""
-        if not scope:
-            return False
-        
-        # Check declarations in current scope
-        if hasattr(scope, 'declarations'):
-            for decl in scope.declarations:
-                if isinstance(decl, (ast.LetStatement, ast.Parameter)) and decl.name == var_name:
-                    return True
-                    
-        # Check parameters if it's a function scope
-        if isinstance(scope, (ast.FunctionDeclaration, ast.LambdaExpression)) and scope.params:
-            if any(param.name == var_name for param in scope.params):
+        """Check if a variable is defined in the given scope or its parents"""
+        current_scope = scope
+        while current_scope:
+            # Check function parameters
+            if hasattr(current_scope, 'params'):
+                for param in current_scope.params:
+                    if param.name == var_name:
+                        return True
+                        
+            # Check let bindings
+            if hasattr(current_scope, 'declarations'):
+                for decl in current_scope.declarations:
+                    if hasattr(decl, 'name') and decl.name == var_name:
+                        return True
+                        
+            # Check scope symbols
+            if var_name in current_scope.symbols:
                 return True
                 
+            current_scope = current_scope.parent
+            
         return False
-
-    def _find_variables_in_body(self, node):
-        """Recursively find all variable references in a node"""
-        vars = set()
-        print(f"Finding variables in node type: {type(node)}")
         
+    def _find_variable_in_node(self, var_name, node):
+        """Find a variable definition in a node or its parents"""
         if node is None:
-            print("Warning: None node encountered")
-            return vars
+            return None
             
-        if isinstance(node, list):
-            print(f"Warning: List encountered instead of AST node: {node}")
-            # Handle list case by processing each element
-            for item in node:
-                vars.update(self._find_variables_in_body(item))
-            return vars
-            
-        if isinstance(node, ast.Variable):
-            vars.add(node.name)
-        elif isinstance(node, ast.Block):
-            print(f"Processing Block node with statements: {type(node.statements)}")
-            for stmt in node.statements:
-                vars.update(self._find_variables_in_body(stmt))
-        elif isinstance(node, ast.BinaryOperation):
-            vars.update(self._find_variables_in_body(node.left))
-            vars.update(self._find_variables_in_body(node.right))
-        elif isinstance(node, ast.FunctionCall):
-            for arg in node.arguments:
-                vars.update(self._find_variables_in_body(arg))
-        elif isinstance(node, ast.LetBinding):
-            if node.initializer:
-                vars.update(self._find_variables_in_body(node.initializer))
+        # Check if this node defines the variable
+        if isinstance(node, ast.FunctionDeclaration):
+            # Check parameters
+            for param in node.params:
+                if param.name == var_name:
+                    return param
+            # Check let bindings in body
+                for stmt in node.body:
+                    if isinstance(stmt, ast.LetStatement):
+                        for binding in stmt.bindings:
+                            if binding.identifier == var_name:
+                                return binding
+                                
+        elif isinstance(node, ast.LambdaExpression):
+            # Check parameters
+            for param in node.params:
+                if param.name == var_name:
+                    return param
+            # Check let bindings in body if it's a block
+            if isinstance(node.body, list):
+                for stmt in node.body:
+                    if isinstance(stmt, ast.LetStatement):
+                        for binding in stmt.bindings:
+                            if binding.identifier == var_name:
+                                return binding
+                                
         elif isinstance(node, ast.LetStatement):
             for binding in node.bindings:
-                vars.update(self._find_variables_in_body(binding))
-        elif isinstance(node, ast.ReturnStatement):
-            if node.expression:
-                vars.update(self._find_variables_in_body(node.expression))
-        elif isinstance(node, ast.PrintStatement):
-            for arg in node.arguments:
-                vars.update(self._find_variables_in_body(arg))
-        elif isinstance(node, ast.Program):
-            print(f"Processing Program node with statements: {type(node.statements)}")
-            for stmt in node.statements:
-                vars.update(self._find_variables_in_body(stmt))
-                
-        return vars
-
-    def _is_mutable_in_scope(self, var_name, scope):
-        """Check if a variable is declared as mutable in the given scope"""
-        if not scope:
-            return False
-        
-        # Check declarations in current scope
-        if hasattr(scope, 'declarations'):
-            for decl in scope.declarations:
-                if isinstance(decl, (ast.LetStatement, ast.Parameter)) and decl.name == var_name:
-                    return decl.is_mutable
+                if binding.identifier == var_name:
+                    return binding
                     
-        # Check parameters if it's a function scope
-        if isinstance(scope, (ast.FunctionDeclaration, ast.LambdaExpression)) and scope.params:
-            if any(param.name == var_name and param.is_mutable for param in scope.params):
-                return True
-                
-        return self._is_mutable_in_scope(var_name, scope.parent)
+        # Recursively check parent
+        return self._find_variable_in_node(var_name, node.parent) if hasattr(node, 'parent') else None
 
     def _is_variable_mutated(self, var_name, node):
         """Check if a variable is mutated in the given AST node"""
-        print(f"Checking mutation for {var_name} in node type: {type(node)}")
+        self.logger.debug(f"Checking mutation for {var_name} in node type: {type(node)}")
         
         if node is None:
-            print("Warning: None node encountered in mutation check")
+            self.logger.warning("Warning: None node encountered in mutation check")
             return False
             
         if isinstance(node, list):
-            print(f"Warning: List encountered in mutation check: {node}")
+            self.logger.warning(f"Warning: List encountered in mutation check: {node}")
             return any(self._is_variable_mutated(var_name, item) for item in node)
             
-        if isinstance(node, ast.Assignment):
-            if node.name == var_name:
-                return True
+        # Direct mutations
+        if isinstance(node, ast.Assignment) and node.name == var_name:
+            return True
             
-        elif isinstance(node, ast.Block):
-            print(f"Checking Block node with statements: {type(node.statements)}")
+        # Mutations through function calls
+        if isinstance(node, ast.FunctionCall):
+            # Check if variable is passed as argument
+            for arg in node.args:
+                if isinstance(arg, ast.Variable) and arg.name == var_name:
+                    # Conservatively assume function calls might mutate
+                    return True
+                    
+        # Block statements
+        if isinstance(node, ast.Block):
             return any(self._is_variable_mutated(var_name, stmt) for stmt in node.statements)
             
+        # Check all child nodes
+        for child in node.children:
+            if self._is_variable_mutated(var_name, child):
+                return True
+                
         return False
+        
+    def _get_node_children(self, node):
+        """Helper to get all child nodes of an AST node"""
+        children = []
+        for attr_name in dir(node):
+            if attr_name.startswith('_'):
+                continue
+            attr = getattr(node, attr_name)
+            if isinstance(attr, (ast.Node, list)):
+                children.append(attr)
+        return children
 
     def parse_effect_type(self):
         """Parse an effect type (e.g., State[T])"""
@@ -1591,22 +1656,438 @@ class Parser:
 
     def p_error(self, p):
         if p:
-            print(f"Syntax error at token {p.type}, value: {p.value}, line: {p.lineno}, position: {p.lexpos}")  # Debug statement
+            # If p is a YaccProduction, get the last token
+            if hasattr(p, 'slice'):
+                token = p.slice[-1]
+                msg = f"Syntax error at '{token.value}'"
+                lineno = token.lineno
+                lexpos = token.lexpos
+            else:
+                # Regular token
+                msg = f"Syntax error at '{p.value}'"
+                lineno = p.lineno
+                lexpos = p.lexpos
+                
             raise CompileError(
-                message=f"Syntax error at token {p.type}",
+                message=msg,
                 error_type="ParseError",
                 location=SourceLocation(
                     file=self.lexer.source_file,
-                    line=p.lineno,
-                    column=p.lexpos
+                    line=lineno,
+                    column=lexpos
                 ),
-                context=get_source_context(self.lexer.source_file, p.lineno),
-                notes=[f"Unexpected token '{p.value}'"]
+                context=get_source_context(self.lexer.source_file, lineno),
+                stack_trace=traceback.format_stack(),
+                notes=["Check syntax near this location"]
             )
         else:
             raise CompileError(
                 message="Syntax error at EOF",
                 error_type="ParseError",
                 location=None,
+                context=None,
+                stack_trace=traceback.format_stack(),
                 notes=["Unexpected end of file"]
             )
+ 
+
+    def defer_processing(self, node, task):
+        """Queue a node for deferred processing"""
+        self.deferred_processing.append((node, task))
+        
+    def process_deferred(self):
+        """Process all deferred tasks"""
+        # First pass: link all scopes
+        for node, task in self.deferred_processing:
+            if isinstance(node, scoped_nodes):
+                parent_scope = self._find_parent_scope(node)
+                if parent_scope:
+                    self.logger.debug(f"Setting parent scope for {type(node)} to {parent_scope}")
+                    node.scope.parent = parent_scope
+        
+        # Second pass: process captures now that scopes are linked
+        for node, task in self.deferred_processing:
+            if task == 'captures':
+                self._process_captures(node)
+                
+    def _process_captures(self, node):
+        """Process variable captures for a node"""
+        if isinstance(node, ast.LambdaExpression):
+            self._process_lambda_captures(node)
+        elif isinstance(node, ast.HandleEffect):
+            self._process_handler_captures(node)
+        elif isinstance(node, ast.SpawnExpression):
+            self._process_spawn_captures(node)
+
+    def _process_lambda_captures(self, lambda_expr):
+        """Process variable captures for a lambda expression."""
+        lambda_expr.captured_vars = set()
+        lambda_expr.capture_modes = {}
+        
+        # Find all variable references in the lambda body
+        var_refs = self._find_variables_in_body(lambda_expr.body)
+        self.logger.debug(f"Found variable references in lambda: {var_refs}")
+        
+        # Process each variable reference
+        for var_name in var_refs:
+            # Skip lambda parameters
+            if any(param.name == var_name for param in lambda_expr.params):
+                continue
+                
+            # Check if variable exists in parent scope
+            if self._is_variable_defined(var_name, lambda_expr.scope.parent):
+                lambda_expr.captured_vars.add(var_name)
+                # Determine capture mode based on usage
+                if self._is_variable_mutated(var_name, lambda_expr.body):
+                    lambda_expr.capture_modes[var_name] = "borrow_mut"
+                else:
+                    lambda_expr.capture_modes[var_name] = "borrow"
+    
+    def _process_handler_captures(self, handler):
+        """Process variable captures for an effect handler."""
+        handler.captured_vars = set()
+        handler.capture_modes = {}
+        
+        # Find variables referenced in handler operations
+        for operation in handler.handler:
+            var_refs = self._find_variables_in_body(operation.body)
+            for var_name in var_refs:
+                if self._is_variable_defined(var_name, handler.scope.parent):
+                    handler.captured_vars.add(var_name)
+                    # Effect handlers typically need mutable access
+                    handler.capture_modes[var_name] = "borrow_mut"
+                    
+    def _process_spawn_captures(self, spawn):
+        """Process variable captures for a spawn expression."""
+        spawn.captured_vars = set()
+        spawn.capture_modes = {}
+        
+        # Find variables referenced in spawned function
+        var_refs = self._find_variables_in_body(spawn.function_expression)
+        for var_name in var_refs:
+            if self._is_variable_defined(var_name, spawn.scope.parent):
+                spawn.captured_vars.add(var_name)
+                # Spawned tasks need their own copies
+                spawn.capture_modes[var_name] = "move"
+                
+    def _check_borrow_lifetime(self, borrow, context):
+        """Check if a borrow expression respects lifetime rules."""
+        var_name = borrow.variable
+        if not self._is_variable_defined(var_name, context):
+            self.emit_error(f"Cannot borrow undefined variable '{var_name}'", borrow)
+            
+        # Check if the borrow outlives the borrowed value
+        if isinstance(borrow, ast.BorrowUnique):
+            # Track that this variable has a unique borrow
+            context.unique_borrows.add(var_name)
+        else:
+            # Track shared borrow
+            context.shared_borrows.add(var_name)
+            
+    def _check_move_validity(self, move, context):
+        """Check if a move expression is valid."""
+        var_name = move.variable
+        if not self._is_variable_defined(var_name, context):
+            self.emit_error(f"Cannot move undefined variable '{var_name}'", move)
+            
+        # Check if variable was already moved
+        if var_name in context.moved_vars:
+            self.emit_error(f"Cannot move variable '{var_name}' more than once", move)
+            
+        # Mark variable as moved
+        context.moved_vars.add(var_name)
+        
+    def _check_exclave_escape(self, exclave, context):
+        """Check if an exclave expression would cause invalid escapes."""
+        # Check if the expression contains any local variables
+        local_vars = self._find_local_variables(exclave.expression)
+        if local_vars:
+            self.emit_error(
+                f"Exclave expression would cause local variables to escape: {local_vars}",
+                exclave
+            )
+            
+    def _resolve_recursive_type(self, type_def, context):
+        """Resolve a recursive type definition."""
+        # Add the type name to the scope before resolving the body
+        context.add_type(type_def.name, type_def)
+        
+        # Now resolve the body which might reference the type name
+        self._resolve_type_expression(type_def.body, context)
+        
+    def _resolve_implementation(self, impl, context):
+        """Resolve an interface implementation."""
+        # Check that the interface exists
+        if not self._is_interface_defined(impl.interface_name, context):
+            self.emit_error(f"Undefined interface '{impl.interface_name}'", impl)
+            
+        # Check that all required methods are implemented
+        interface = self._get_interface(impl.interface_name, context)
+        for method in interface.methods:
+            if not any(m.name == method.name for m in impl.methods):
+                self.emit_error(
+                    f"Missing implementation for method '{method.name}'",
+                    impl
+                )
+                
+    def _find_variables_in_body(self, node):
+        """Recursively find all variable references in a node"""
+        vars = set()
+        self.logger.debug(f"Finding variables in node type: {type(node)}")
+        
+        if node is None:
+            self.logger.warning("Warning: None node encountered")
+            return vars
+            
+        if isinstance(node, list):
+            for item in node:
+                vars.update(self._find_variables_in_body(item))
+            return vars
+            
+        if isinstance(node, ast.Variable):
+            vars.add(node.name)
+            self.logger.debug(f"Found variable reference: {node.name}")
+        elif isinstance(node, ast.Block):
+            self.logger.debug(f"Processing Block node with statements: {len(node.statements)} statements")
+            for stmt in node.statements:
+                vars.update(self._find_variables_in_body(stmt))
+        elif isinstance(node, ast.BinaryOperation):
+            vars.update(self._find_variables_in_body(node.left))
+            vars.update(self._find_variables_in_body(node.right))
+        elif isinstance(node, ast.FunctionCall):
+            for arg in node.arguments:
+                vars.update(self._find_variables_in_body(arg))
+        elif isinstance(node, ast.LetBinding):
+            if node.initializer:
+                vars.update(self._find_variables_in_body(node.initializer))
+        elif isinstance(node, ast.LetStatement):
+            for binding in node.bindings:
+                vars.update(self._find_variables_in_body(binding))
+        elif isinstance(node, ast.Assignment):
+            vars.update(self._find_variables_in_body(node.name))
+            if node.expression:
+                vars.update(self._find_variables_in_body(node.expression))
+        elif isinstance(node, ast.LambdaExpression):
+            for param in node.params:
+                vars.add(param.name)
+            if isinstance(node.body, list):
+                for stmt in node.body:
+                    vars.update(self._find_variables_in_body(stmt))
+            elif isinstance(node.body, ast.Block):
+                for stmt in node.body.statements:
+                    vars.update(self._find_variables_in_body(stmt))
+            else:
+                vars.update(self._find_variables_in_body(node.body))
+        elif isinstance(node, ast.ReturnStatement):
+            if node.expression:
+                vars.update(self._find_variables_in_body(node.expression))
+        elif isinstance(node, ast.PrintStatement):
+            for arg in node.arguments:
+                vars.update(self._find_variables_in_body(arg))
+        elif isinstance(node, ast.Program):
+            for stmt in node.statements:
+                vars.update(self._find_variables_in_body(stmt))
+        
+        self.logger.debug(f"Variables found in {type(node).__name__}: {vars}")
+        return vars
+
+    def _set_parent_scope(self, node, init_scope=None):
+        """Set up scoping based on AST parent relationships"""
+        if node is None:
+            return node
+            
+        self.logger.debug(f"Setting parent scope for node type: {type(node)}")
+        self.logger.debug(f"Node AST parent: {type(node.parent) if node.parent else None}")
+        if hasattr(node, 'scope'):
+            self.logger.debug(f"Node scope: {node.scope}")
+            self.logger.debug(f"Node scope parent: {type(node.scope.parent) if node.scope and node.scope.parent else None}")
+            
+        # Find nearest parent that introduces a scope
+        current = node.scope
+        while current and not isinstance(current, scoped_nodes):
+            self.logger.debug(f"Walking up AST, current node: {type(current)}")
+            current = current.parent
+            
+        self.logger.debug(f"Found nearest scoping parent: {type(current) if current else None}")
+        
+        # Set up scope if we have one
+        if hasattr(node, 'scope'):
+            if current and hasattr(current, 'scope'):
+                self.logger.debug(f"Setting scope parent. Current scope: {current.scope}")
+                node.scope.parent = current.scope
+                if node.scope not in current.scope.children:
+                    current.scope.children.append(node.scope)
+            else:
+                self.logger.debug(f"No valid parent scope found for node type: {type(node)}")
+                    
+            # Process children in their own scope if needed
+            if isinstance(node, (ast.FunctionDeclaration, ast.LambdaExpression)):
+                old_scope = self.current_scope
+                self.current_scope = node.scope
+                self._process_children(node)
+                self.current_scope = old_scope
+            else:
+                self._process_children(node)
+        else:
+            self._process_children(node)
+            
+        return node
+
+    def _process_children(self, node):
+        """Process child nodes in the current scope."""
+        if hasattr(node, 'body') and node.body:
+            if isinstance(node.body, list):
+                for child in node.body:
+                    self._set_parent_scope(child)
+            else:
+                self._set_parent_scope(node.body)
+                
+        if hasattr(node, 'statements') and node.statements:
+            for stmt in node.statements:
+                self._set_parent_scope(stmt)
+    
+    def _populate_scope_symbols(self, node, scope):
+        """Populate a scope's symbol table with all declarations from a node."""
+        if isinstance(node, ast.FunctionDeclaration):
+            # Add parameters
+            for param in node.params:
+                scope.add_symbol(param.name, param)
+            # Process body for let bindings
+            for stmt in node.body:
+                if isinstance(stmt, ast.LetStatement):
+                    for binding in stmt.bindings:
+                        scope.add_symbol(binding.identifier, binding)
+        elif isinstance(node, ast.LambdaExpression):
+            # Add parameters
+            for param in node.params:
+                scope.add_symbol(param.name, param)
+            # Process body for let bindings
+            if isinstance(node.body, list):
+                for stmt in node.body:
+                    if isinstance(stmt, ast.LetStatement):
+                        for binding in stmt.bindings:
+                            scope.add_symbol(binding.identifier, binding)
+            elif isinstance(node.body, ast.Block):
+                for stmt in node.body.statements:
+                    if isinstance(stmt, ast.LetStatement):
+                        for binding in stmt.bindings:
+                            scope.add_symbol(binding.identifier, binding)
+            else:
+                if isinstance(node.body, ast.LetStatement):
+                    for binding in node.body.bindings:
+                        scope.add_symbol(binding.identifier, binding)
+
+    def _find_local_variables(self, node):
+        """Find local variables in a node"""
+        local_vars = set()
+        self.logger.debug(f"Finding local variables in node type: {type(node)}")
+        
+        if node is None:
+            self.logger.warning("Warning: None node encountered")
+            return local_vars
+            
+        if isinstance(node, list):
+            for item in node:
+                local_vars.update(self._find_local_variables(item))
+            return local_vars
+            
+        if isinstance(node, ast.Variable):
+            local_vars.add(node.name)
+            self.logger.debug(f"Found local variable reference: {node.name}")
+        elif isinstance(node, ast.Block):
+            self.logger.debug(f"Processing Block node with statements: {len(node.statements)} statements")
+            for stmt in node.statements:
+                local_vars.update(self._find_local_variables(stmt))
+        elif isinstance(node, ast.FunctionCall):
+            for arg in node.arguments:
+                local_vars.update(self._find_local_variables(arg))
+        elif isinstance(node, ast.LetBinding):
+            if node.initializer:
+                local_vars.update(self._find_local_variables(node.initializer))
+        elif isinstance(node, ast.LetStatement):
+            for binding in node.bindings:
+                local_vars.update(self._find_local_variables(binding))
+        elif isinstance(node, ast.ReturnStatement):
+            if node.expression:
+                local_vars.update(self._find_local_variables(node.expression))
+        elif isinstance(node, ast.PrintStatement):
+            for arg in node.arguments:
+                local_vars.update(self._find_local_variables(arg))
+        elif isinstance(node, ast.Program):
+            for stmt in node.statements:
+                local_vars.update(self._find_local_variables(stmt))
+        
+        self.logger.debug(f"Local variables found in {type(node).__name__}: {local_vars}")
+        return local_vars
+
+    def _find_parent_scope(self, node):
+        """Walk up the AST to find the nearest enclosing scope"""
+        self.logger.debug(f"Finding parent scope for {type(node)}")
+        current = node.parent
+        while current:
+            self.logger.debug(f"Checking node {type(current)}")
+            if hasattr(current, 'scope') and isinstance(current, scoped_nodes) and current.scope:
+                self.logger.debug(f"Found parent scope in {type(current)}")
+                return current.scope
+            current = current.parent
+        self.logger.debug("No parent scope found, using global")
+        return self.current_module.scope if self.current_module else None
+
+    def _update_child_scopes(self, node):
+        """Update scope parents for any child nodes that need it"""
+        
+        if isinstance(node, (ast.LambdaExpression, ast.FunctionDeclaration)):
+            # Find parent scope by walking up AST
+            parent_scope = self._find_parent_scope(node)
+            if parent_scope:
+                node.scope.parent = parent_scope
+            
+        # Process all children
+        for child in node.children:
+            self._update_child_scopes(child)
+
+    def _is_variable_mutated_new(self, var_name, node):
+        """Check if a variable is mutated in the given AST node"""
+        self.logger.debug(f"Checking mutation for {var_name} in node type: {type(node)}")
+        
+        if node is None:
+            return False
+            
+        # Check assignment statements
+        if isinstance(node, ast.Assignment):
+            if isinstance(node.target, ast.Variable) and node.target.name == var_name:
+                return True
+                
+        # Check let bindings
+        if isinstance(node, ast.LetStatement):
+            for binding in node.bindings:
+                if binding.identifier == var_name:
+                    return True
+                if binding.initializer:
+                    if self._is_variable_mutated(var_name, binding.initializer):
+                        return True
+                        
+        # Check function/lambda bodies
+        if isinstance(node, (ast.FunctionDeclaration, ast.LambdaExpression)):
+            if hasattr(node, 'body'):
+                if isinstance(node.body, list):
+                    for stmt in node.body:
+                        if self._is_variable_mutated(var_name, stmt):
+                            return True
+                else:
+                    return self._is_variable_mutated(var_name, node.body)
+                    
+        # Check block statements
+        if isinstance(node, ast.Block):
+            for stmt in node.statements:
+                if self._is_variable_mutated(var_name, stmt):
+                    return True
+                    
+        # Check binary operations (in case of compound assignment)
+        if isinstance(node, ast.BinaryOperation):
+            if self._is_variable_mutated(var_name, node.left):
+                return True
+            if self._is_variable_mutated(var_name, node.right):
+                return True
+                
+        return False

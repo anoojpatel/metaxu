@@ -4,6 +4,8 @@ struct List<T> {
     len: Int
 }
 
+
+
 fn empty<T>() -> List[T] {
     List { data: vector[T,N], len: 0 }
 }

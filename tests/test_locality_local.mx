@@ -9,7 +9,7 @@
         let node = Node[Int] {
             data: 42,
             next: None
-        };
+        }
         return @const node  # Should fail - cannot return local variable
     }
 

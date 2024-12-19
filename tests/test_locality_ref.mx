@@ -4,11 +4,11 @@
     }
 
     fn get_local_ref() -> @const Container {
-        let local = Container { value: 42 };
+        let local = Container { value: 42 }
         return @const local  # Should fail - reference to local variable
     }
 
     fn main() {
-        let escaped_ref = get_local_ref();  # Should fail
+        let escaped_ref = get_local_ref()  # Should fail
     }
     

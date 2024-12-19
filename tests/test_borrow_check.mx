@@ -11,7 +11,7 @@
         };
         
         # Borrow checking error: multiple mutable references
-        let @mut ref1 = @mut node;
-        let @mut ref2 = @mut node;  # Should fail
+        let @mut ref1 = @mut node
+        let @mut ref2 = @mut node  # Should fail
     }
     

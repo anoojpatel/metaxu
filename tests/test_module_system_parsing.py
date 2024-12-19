@@ -6,9 +6,10 @@ sys.path.append(str(Path(__file__).parent.parent / 'src'))
 from metaxu.lexer import Lexer
 from metaxu.parser import Parser
 from metaxu.type_checker import TypeChecker
+from metaxu.errors import CompileError
 import metaxu.metaxu_ast as ast
 
-class TestModuleSystem(unittest.TestCase):
+class TestModuleSystemAndBasicParsing(unittest.TestCase):
     def setUp(self):
         self.lexer = Lexer()
         self.parser = Parser()
@@ -220,11 +221,16 @@ class TestModuleSystem(unittest.TestCase):
     def test_module_error_cases(self):
         # Test duplicate module names
         code = """
-        module test {}
-        module test {}
+        module test { 
+        }
+        module test { 
+        }
         """
-        with self.assertRaises(Exception):
+        # Enable debug logging for parser
+        self.parser.parser.debug = True
+        with self.assertRaises(CompileError) as cm:
             self.parser.parse(code)
+        self.assertIn("Duplicate module name", str(cm.exception))
         
         # Test invalid module path
         code = """
@@ -333,6 +339,32 @@ class TestModuleSystem(unittest.TestCase):
         self.assertIsInstance(func_call, ast.QualifiedFunctionCall)
         self.assertEqual(func_call.parts, ["inner", "nested_func"])
 
+    def test_duplicate_module_names(self):
+        code1 = """
+        module test {
+            fn add(x: int, y: int) -> int {
+                return x + y
+            }
+        }
+        """
+        code2 = """
+        module test {
+            fn subtract(x: int, y: int) -> int {
+                return x - y
+            }
+        }
+        """
+        # First module should parse successfully
+        ast_tree1 = self.parser.parse(code1)
+        self.assertIsInstance(ast_tree1[0], ast.Module)
+        self.assertEqual(ast_tree1[0].name, "test")
+
+        # Second module with same name should raise SyntaxError
+        with self.assertRaises(CompileError) as context:
+            ast_tree2 = self.parser.parse(code2)
+        
+        self.assertIn("Duplicate module name 'test'", str(context.exception))
+
     def test_closure_capture(self):
         """Test closure capture semantics in module context"""
         code = """
@@ -389,7 +421,7 @@ class TestModuleSystem(unittest.TestCase):
         # Get the counter module
         counter_module = ast_tree[0]
         self.assertEqual(counter_module.name, "counter")
-        
+        #breakpoint()
         # Check make_counter function
         make_counter = [f for f in counter_module.body.statements 
                        if isinstance(f, ast.FunctionDeclaration) and f.name == "make_counter"][0]
@@ -415,6 +447,37 @@ class TestModuleSystem(unittest.TestCase):
         # Verify type checking passes
         self.type_checker.check(ast_tree)
         self.assertEqual(len(self.type_checker.errors), 0)
+
+    def test_lambda_variable_capture(self):
+        code = """
+        fn outer() {
+            let x = 10
+            let y = 20
+            let lambda = fn() {
+                return x + y
+            }
+            return lambda()
+        }
+        """
+        ast_tree = self.parser.parse(code)
+        lambda_expr = ast_tree[0].body[2].bindings[0].initializer
+        self.assertIn('x', lambda_expr.captured_vars)
+        self.assertIn('y', lambda_expr.captured_vars)
+
+    def test_lambda_capture_modes(self):
+        code = """
+        fn outer() {
+            let @mut x = 10
+            let lambda = fn() {
+                x = x + 1
+            }
+            lambda()
+        }
+        """
+        ast_tree = self.parser.parse(code)
+        lambda_expr = ast_tree[0].body[1].bindings[0].initializer
+        self.assertIn('x', lambda_expr.captured_vars)
+        self.assertEqual(lambda_expr.capture_modes['x'], 'borrow_mut')
 
 if __name__ == '__main__':
     unittest.main()
