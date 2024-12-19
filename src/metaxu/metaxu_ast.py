@@ -114,11 +114,13 @@ class Node:
         self.parent = None
         self.scope = None  # For tracking lexical scope
         self.location = None  # For source locations
+        self.children = []
     
     def add_child(self, child):
         """Add a child node and set its parent"""
         if hasattr(child, 'parent'):
             child.parent = self
+        self.children.append(child)
         return child
         
     def replace_with(self, new_node):
@@ -164,6 +166,9 @@ class Node:
                 except ValueError:
                     continue
         return False
+
+    def __repr__(self):
+        return f"{self.__class__.__name__}({self.__dict__}) at {hex(id(self))}"
     
     def get_scope(self):
         """Get the nearest scope containing this node"""
@@ -258,7 +263,8 @@ class Block(Node):
 
 class Scope:
     """Represents a lexical scope in the program"""
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, name=None):
+        self.name = name
         self.parent = parent
         self.symbols = {}
         self.children = []
@@ -276,11 +282,16 @@ class Scope:
                 return current.symbols[name]
             current = current.parent
         return None
+    def __repr(self):
+        return f"Scope(name={self.name}, symbols={self.symbols}, children={self.children}) at {hex(id(self))}"
 
+    def __str__(self):
+        return f"Scope(name={self.name}, symbols={self.symbols}, children={self.children}) at {hex(id(self))}"
 # --- Basic Expressions and Statements ---
 
 class Literal(Expression):
     def __init__(self, value):
+        super().__init__()
         self.value = value
 
     def eval(self, context):
@@ -292,6 +303,7 @@ class Literal(Expression):
 
 class Variable(Expression):
     def __init__(self, name):
+        super().__init__()
         self.name = name
 
     def eval(self, context):
@@ -299,6 +311,7 @@ class Variable(Expression):
 
 class Assignment(Statement):
     def __init__(self, name, expression):
+        super().__init__()
         self.name = name
         self.expression = expression
 
@@ -343,13 +356,19 @@ class ComparisonExpression(Expression):
 
 class FunctionDeclaration(Statement):
     def __init__(self, name, params, body, return_type=None, performs=None, type_params=None):
+        super().__init__()
         self.name = name
         self.params = params
-        self.body = body
+        self._body = [self.add_child(stmt) for stmt in body]
         self.return_type = return_type
         self.performs = performs or []  # List of effects this function performs
         self.type_params = type_params or []  # List of TypeParameter objects
-
+    @property
+    def body(self):
+        return self._body
+    @body.setter
+    def body(self, statements):
+        self._body = [self.add_child(stmt) for stmt in statements]
 class FunctionCall(Expression):
     def __init__(self, name, arguments):
         super().__init__()
@@ -376,18 +395,22 @@ class Pattern(Node):
 
 class LiteralPattern(Pattern):
     def __init__(self, value):
+        super().__init__()
         self.value = value
 
 class VariablePattern(Pattern):
     def __init__(self, name):
+        super().__init__()
         self.name = name
 
 class WildcardPattern(Pattern):
     def __init__(self):
+        super().__init__()
         pass
 
 class VariantPattern(Pattern):
     def __init__(self, enum_name, variant_name, patterns):
+        super().__init__()
         self.enum_name = enum_name
         self.variant_name = variant_name
         self.patterns = patterns  # List of patterns for variant fields
@@ -397,12 +420,13 @@ class LambdaExpression(Expression):
     def __init__(self, params, body, return_type=None):
         super().__init__()
         self.params = params
-        self.body = body
+        self.body = [self.add_child(stmt) for stmt in body] if isinstance(body, list) and body else body
         self.return_type = return_type
         self.captured_vars = set()  # Set of variable names captured from outer scope
         self.capture_modes = {}     # Map of variable name to capture mode (borrow/borrow_mut)
         self.scope = None          # Reference to the scope where lambda is defined
         self.linearity = LinearityMode.MANY  # Default to most permissive mode
+        self.needs_processing = False
 
     def add_capture(self, var_name, mode='borrow'):
         """Record a captured variable and its capture mode"""
@@ -424,6 +448,7 @@ class LambdaExpression(Expression):
 class EffectDeclaration(Node):
     """Definition of an effect type (e.g., effect Reader<T>)"""
     def __init__(self, name, type_params, operations):
+        super().__init__()
         self.name = name                # The effect name (e.g., "Reader")
         self.type_params = type_params  # List of TypeParameter (e.g., [T])
         self.operations = operations    # List of effect operations
@@ -431,6 +456,7 @@ class EffectDeclaration(Node):
 class EffectOperation(Node):
     """An operation in an effect (e.g., read() -> T)"""
     def __init__(self, name, params, return_type, c_effect=None):
+        super().__init__()
         self.name = name
         self.params = params
         self.return_type = return_type
@@ -442,6 +468,7 @@ class EffectExpression(Node):
 class EffectApplication(EffectExpression):
     """Application of concrete types to an effect (e.g., Reader[int] or Reader[G])"""
     def __init__(self, effect_name, type_args):
+        super().__init__()
         self.effect_name = effect_name  # Name of the effect (e.g., "Reader")
         self.type_args = type_args      # List of concrete types or type parameters
         
@@ -454,30 +481,36 @@ class EffectApplication(EffectExpression):
 
 class PerformEffect(Expression):
     def __init__(self, effect_name, arguments):
+        super().__init__()
         self.effect_name = effect_name
         self.arguments = arguments
 
 class HandleEffect(Expression):
     def __init__(self, effect_name, handler, continuation):
+        super().__init__()
         self.effect_name = effect_name
         self.handler = handler  # List of handle cases
         self.continuation = continuation  # Expression after IN
 
 class Resume(Expression):
     def __init__(self, value=None):
+        super().__init__()
         self.value = value
 
 # Ownership and Borrowing
 class Move(Expression):
     def __init__(self, variable):
+        super().__init__()
         self.variable = variable
 
 class BorrowShared(Expression):
     def __init__(self, variable):
+        super().__init__()
         self.variable = variable
 
 class BorrowUnique(Expression):
     def __init__(self, variable):
+        super().__init__()
         self.variable = variable
 
 # Structs and Enums
@@ -488,11 +521,14 @@ class StructLifetime:
 
 class StructDefinition(Node):
     """A struct definition with lifetime and reference tracking"""
-    def __init__(self, name, fields, lifetime=StructLifetime.HEAP):
+    def __init__(self, name, fields, implements, methods=None, lifetime=StructLifetime.HEAP):
         super().__init__()
         self.name = name
-        self.fields = self.add_children(fields)
+        self.implements = implements
+        self.methods = [self.add_child(method) for method in methods] if methods else []  # List of methods
+        self.fields = [self.add_child(field) for field in fields]
         self.lifetime = lifetime
+
         self.references_globals = False  # Set during analysis
         
     def mark_references_globals(self):
@@ -505,6 +541,7 @@ class StructDefinition(Node):
 class StructField(Node):
     """A field in a struct with reference tracking"""
     def __init__(self, name, type_info, is_reference=False):
+        super().__init__()
         self.name = name
         self.type_info = type_info
         self.is_reference = is_reference
@@ -513,7 +550,7 @@ class StructInstantiation(Node):
     def __init__(self, struct_name, field_assignments):
         super().__init__()
         self.struct_name = struct_name  # QualifiedName
-        self.field_assignments = field_assignments  # List of (field_name, value) tuples
+        self.field_assignments = [self.add_child(field) for field in field_assignments] if field_assignments else field_assignments  # List of (field_name, value) tuples
 
     def __str__(self):
         fields_str = ", ".join(f"{field}={value}" for field, value in self.field_assignments)
@@ -541,16 +578,19 @@ class FieldAccess(Node):
 
 class EnumDefinition(Statement):
     def __init__(self, name, variants):
+        super().__init__()
         self.name = name
         self.variants = variants  # List of VariantDefinition
 
 class VariantDefinition(Node):
     def __init__(self, name, fields):
+        super().__init__()
         self.name = name
         self.fields = fields  # List of (field_name, field_type)
 
 class VariantInstance(Expression):
     def __init__(self, enum_name, variant_name, field_values):
+        super().__init__()
         self.enum_name = enum_name
         self.variant_name = variant_name
         self.field_values = field_values  # Dict of field_name: expression
@@ -558,30 +598,36 @@ class VariantInstance(Expression):
 # Multithreading
 class SpawnExpression(Expression):
     def __init__(self, function_expression):
+        super().__init__()
         self.function_expression = function_expression
 
 # SIMD and GPU
 class VectorLiteral(Expression):
     def __init__(self, base_type, size, elements):
+        super().__init__()
         self.base_type = base_type
         self.size = size
         self.elements = elements  # List of expressions
 
 class KernelAnnotation(Node):
     def __init__(self, function_declaration):
+        super().__init__()
         self.function_declaration = function_declaration
 
 class ToDevice(Expression):
     def __init__(self, variable):
+        super().__init__()
         self.variable = variable
 
 class FromDevice(Expression):
     def __init__(self, variable):
+        super().__init__()
         self.variable = variable
 
 # Locality and Regions
 class LocalDeclaration(Node):
     def __init__(self, variable, type_annotation=None):
+        super().__init__()
         self.variable = variable
         self.type_annotation = type_annotation
 
@@ -590,16 +636,19 @@ class ExclaveExpression(Expression):
     only local to callee scope. Otherwise we will escape and leak after stack
     unwinding."""
     def __init__(self, expression):
+        super().__init__()
         self.expression = expression
 
 class LocalParameter(Node):
     def __init__(self, name, type_annotation=None):
+        super().__init__()
         self.name = name
         self.type_annotation = type_annotation
 
 # Function Parameters
 class Parameter(Node):
     def __init__(self, name, type=None, mode=None):
+        super().__init__()
         self.name = name
         self.type = type
         self.mode = mode
@@ -607,6 +656,7 @@ class Parameter(Node):
 # Mode System
 class ModeAnnotation(Node):
     def __init__(self, mode_type):
+        super().__init__()
         self.mode_type = mode_type  # UniquenessMode, LocalityMode, or LinearityMode
         
 
@@ -616,6 +666,7 @@ class UniquenessMode(Node):
     SHARED = "shared"
 
     def __init__(self, mode):
+        super().__init__()
         if mode not in [self.UNIQUE, self.EXCLUSIVE, self.SHARED]:
             raise ValueError(f"Invalid uniqueness mode: {mode}")
         self.mode = mode
@@ -625,6 +676,7 @@ class LocalityMode(Node):
     GLOBAL = "global"
 
     def __init__(self, mode):
+        super().__init__()
         if mode not in [self.LOCAL, self.GLOBAL]:
             raise ValueError(f"Invalid locality mode: {mode}")
         self.mode = mode
@@ -635,17 +687,20 @@ class LinearityMode(Node):
     ONCE = "once"
 
     def __init__(self, mode):
+        super().__init__()
         if mode not in [self.MANY, self.SEPARATE, self.ONCE]:
             raise ValueError(f"Invalid linearity mode: {mode}")
         self.mode = mode
 
 class BorrowExpression(Expression):
     def __init__(self, variable, mode):
+        super().__init__()
         self.variable = variable
         self.mode = mode  # UniquenessMode
 
 class ModeTypeAnnotation(Node):
     def __init__(self, base_type, uniqueness=None, locality=None, linearity=None):
+        super().__init__()
         self.base_type = base_type
         self.uniqueness = uniqueness
         self.locality = locality
@@ -653,6 +708,7 @@ class ModeTypeAnnotation(Node):
 
 class StructFieldDefinition(Node):
     def __init__(self, name, type_annotation, is_exclusively_mutable=False):
+        super().__init__()
         self.name = name
         self.type_annotation = type_annotation
         self.is_exclusively_mutable = is_exclusively_mutable
@@ -719,6 +775,7 @@ class FunctionType(TypeExpression):
 class InterfaceDefinition(Node):
     """Interface definition with methods and associated types"""
     def __init__(self, name, type_params, methods, extends=None):
+        super().__init__()
         self.name = name
         self.type_params = type_params or []  # List of TypeParameter
         self.methods = methods  # List of MethodDefinition
@@ -727,6 +784,7 @@ class InterfaceDefinition(Node):
 class MethodDefinition(Node):
     """Method definition in an interface"""
     def __init__(self, name, params, return_type, type_params=None):
+        super().__init__()
         self.name = name
         self.params = params  # List of Parameter
         self.return_type = return_type
@@ -735,6 +793,7 @@ class MethodDefinition(Node):
 class Implementation(Node):
     """Implementation of an interface for a type"""
     def __init__(self, interface_name, type_name, type_params, methods, where_clause=None):
+        super().__init__()
         self.interface_name = interface_name
         self.type_name = type_name
         self.type_params = type_params or []  # List of TypeParameter
@@ -744,6 +803,7 @@ class Implementation(Node):
 class MethodImplementation(Node):
     """Concrete implementation of an interface method"""
     def __init__(self, name, params, body, type_params=None, return_type=None):
+        super().__init__()
         self.name = name
         self.params = params  # List of Parameter
         self.body = body  # Block of statements
@@ -753,11 +813,13 @@ class MethodImplementation(Node):
 class WhereClause(Node):
     """Type constraints in implementations and generic functions"""
     def __init__(self, constraints):
+        super().__init__()
         self.constraints = constraints  # List of TypeConstraint
 
 class TypeConstraint(Node):
     """A constraint on a type parameter"""
     def __init__(self, type_param, bound_type, kind='extends'):
+        super().__init__()
         self.type_param = type_param  # TypeParameter
         self.bound_type = bound_type  # Type that bounds this parameter
         self.kind = kind  # 'extends', 'implements', or 'equals', default 'subtype e.g. T: Int'
@@ -765,6 +827,7 @@ class TypeConstraint(Node):
 class TypeAlias(Node):
     """Type alias definition"""
     def __init__(self, name, type_expr, type_params=None):
+        super().__init__()
         self.name = name
         self.type_expr = type_expr
         self.type_params = type_params or []  # List of TypeParameter
@@ -779,6 +842,7 @@ class Import(Node):
             alias (str, optional): Optional alias for the imported module, e.g. 'io' in 'import std.io as io'
             is_public (bool): Whether this import should be re-exported from the module
         """
+        super().__init__()
         self.module_path = module_path
         self.alias = alias
         self.is_public = is_public
@@ -793,6 +857,7 @@ class FromImport(Node):
             relative_level (int): Number of dots for relative imports, e.g. 2 for '..module'
             is_public (bool): Whether these imports should be re-exported from the module
         """
+        super().__init__()
         self.module_path = module_path
         self.names = names
         self.relative_level = relative_level
@@ -800,6 +865,7 @@ class FromImport(Node):
 
 class VisibilityRules(Node):
     def __init__(self, rules):
+        super().__init__()
         self.rules = rules  # Dictionary mapping identifiers to visibility levels
 
     def __str__(self):
@@ -816,7 +882,8 @@ class ModuleBody(Node):
             exports (list[tuple[str, str]], optional): List of (name, alias) tuples for exported symbols
             visibility_rules (dict[str, str], optional): Visibility rules for module items
         """
-        self.statements = statements
+        super().__init__()
+        self.statements = [self.add_child(statement) for statement in statements]  # List of statements
         self.docstring = docstring
         self.exports = exports if exports is not None else []
         self.visibility_rules = visibility_rules
@@ -833,6 +900,7 @@ class Module(Node):
             body (ModuleBody): Module contents
             parent (Module, optional): Parent module if this is a nested module
         """
+        super().__init__()
         self.name = name
         self.body = body
         self.parent = parent
@@ -864,6 +932,7 @@ class RelativePath(Node):
             level (int): Number of dots in the relative path (1 for '.', 2 for '..', etc.)
             path (str): The module path after the dots
         """
+        super().__init__()
         self.level = level
         self.path = path
 
@@ -879,13 +948,14 @@ class QualifiedFunctionCall(Node):
     def __init__(self, parts, arguments):
         super().__init__()
         self.parts = parts  # List of name parts
-        self.arguments = arguments  # List of expressions
+        self.arguments = [self.add_child(arg) for arg in arguments] if arguments else arguments  # List of expressions
 
     def __str__(self):
         return f"{'.'.join(self.parts)}({', '.join(str(arg) for arg in self.arguments)})"
 
 class ComptimeBlock(Node):
     def __init__(self, statements):
+        super().__init__()
         self.statements = statements
     
     def eval(self, context):
@@ -934,13 +1004,15 @@ class TypeInfo(Node):
     def is_enum(self):
         return bool(self.variants)
 
-class EnumVariant:
+class EnumVariant(Node):
     def __init__(self, name, fields=None):
+        super().__init__()
         self.name = name
         self.fields = fields or []  # List of FieldInfo
 
 class FieldInfo(Node):
     def __init__(self, name, type_info, modifiers=None):
+        super().__init__()
         self.name = name
         self.type_info = type_info
         self.modifiers = modifiers or []
@@ -951,9 +1023,10 @@ class FieldInfo(Node):
     def is_copy(self):
         return not self.is_reference() and self.type_info.is_copy
 
-class ComptimeValue:
+class ComptimeValue(Node):
     """Represents a value known at compile time"""
     def __init__(self, value, type_info):
+        super().__init__()
         self.value = value
         self.type_info = type_info
     
@@ -973,6 +1046,7 @@ class ComptimeValue:
 class GetType(Node):
     """Special compile-time function to get type information"""
     def __init__(self, type_name):
+        super().__init__()
         self.type_name = type_name
     
     def eval(self, context):
@@ -1203,30 +1277,35 @@ class EffectMapping:
         self.metaxu_effect = metaxu_effect  # Name of Metaxu effect
         self.c_effect = c_effect            # Name of C effect
         
-class WithClause:
+class WithClause(Node):
     """Effect mapping clause (e.g., 'with EFFECT_SPAWN')"""
     def __init__(self, c_effect):
+        super().__init__()
         self.c_effect = c_effect  # Name of C effect to map to
 
 class EffectApplication(EffectExpression):
     """Application of type arguments to an effect type (e.g., Reader[T])"""
     def __init__(self, effect_name, type_args):
+        super().__init__()
         self.effect_name = effect_name  # Name of the effect (e.g., "Reader")
         self.type_args = type_args      # List of type arguments (e.g., [T])
 
 class EffectReference(EffectExpression):
     """Reference to an effect parameter (e.g., E in performs E)"""
     def __init__(self, name):
+        super().__init__()
         self.name = name  # Name of the effect parameter
 
 class TypeReference(Node):
     """Reference to a type (e.g., Int)"""
     def __init__(self, name):
+        super().__init__()
         self.name = name
 
 class TypeApplication(Node):
     """Application of type parameters to a type constructor (e.g., Stack[Int])"""
     def __init__(self, type_constructor, type_args):
+        super().__init__()
         self.type_constructor = type_constructor  # Name of type (e.g., "Stack")
         self.type_args = type_args               # List of types/type params
         

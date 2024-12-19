@@ -159,29 +159,29 @@ class TestReferencesAndFunctions(unittest.TestCase):
         code = """
         module test {
             fn map(arr: []int, f: fn\(int) -> int) -> []int {
-                let mut result = vector [int];
+                let mut result = vector [int]
                 
                 for x in arr {
-                    result.push(f(x));
+                    result.push(f(x))
                 }
                 
-                return result;
+                return result
             }
 
             fn compose(f: fn(int) -> int, g: fn\(int) -> int) -> fn\(int) -> int {
                 return fn(x: int) -> int {
-                    return f(g(x));
+                    return f(g(x))
                 }
             }
 
             fn test() {
-                let double = fn(x: int) -> int { return x * 2; }
-                let add_one = fn(x: int) -> int { return x + 1; }
-                let double_then_add = compose(add_one, double);
+                let double = fn(x: int) -> int { return x * 2 }
+                let add_one = fn(x: int) -> int { return x + 1 }
+                let double_then_add = compose(add_one, double)
                 
-                let numbers = vector[int,3](1, 2, 3);
-                let doubled = map(numbers, double);  // [2, 4, 6]
-                let result = map(numbers, double_then_add);  // [3, 5, 7]
+                let numbers = vector[int,3](1, 2, 3)
+                let doubled = map(numbers, double)  // [2, 4, 6]
+                let result = map(numbers, double_then_add)  // [3, 5, 7]
             }
         }
         """

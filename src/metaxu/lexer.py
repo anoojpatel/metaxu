@@ -1,7 +1,7 @@
 import ply.lex as lex
 from metaxu.errors import CompileError, SourceLocation, get_source_context
 from typing import List
-
+import logging
 class Lexer:
     # A string containing ignored characters (spaces and tabs)
     t_ignore = ' \t'
@@ -132,7 +132,7 @@ class Lexer:
         r'[a-zA-Z_][a-zA-Z_0-9]*'
         # Check for reserved words
         t.type = self.reserved.get(t.value, 'IDENTIFIER')
-        print(f"Token recognized: {t.type}, value: {t.value}")  # Debug statement
+        logging.debug(f"Token recognized: {t.type}, value: {t.value}")  # Debug statement
         return t
 
     def t_NUMBER(self, t):
