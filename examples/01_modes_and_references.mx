@@ -23,22 +23,22 @@ fn print_stats(@const counter: Counter) {
 
 fn main() {
     # Local mutable binding
-    let @mut @local count = 0;
+    let @mut @local count = 0
     
     # Create counter with mixed modes
     let counter = Counter {
         value: 0,
         name: "main",
         temp: 0
-    };
+    }
     
     # Demonstrate mode safety
-    let new_value = update_counter(counter, 5);
-    print_stats(counter);  # Can share counter since print_stats takes @const
+    let new_value = update_counter(&mut counter, 5)
+    print_stats(counter)  # Can share counter since print_stats takes @const
     
     # Error: Cannot modify @const field
-    # counter.name = "new name";  
+    # counter.name = "new name"  
     
     # Error: Cannot access @local field outside its scope
-    # let t = counter.temp;
+    # let t = counter.temp
 }
