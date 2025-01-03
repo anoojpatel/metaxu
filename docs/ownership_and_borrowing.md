@@ -2,36 +2,76 @@
 
 Metaxu's type system includes a sophisticated ownership system that ensures memory safety and data race freedom without garbage collection. The system is built on three fundamental concepts: Modes, Locality, and Linearity.
 
-## 1. Modes
+## 1. Value Access Modes
 
-Values in Metaxu can be in one of three modes that determine how they can be accessed and shared:
+Metaxu's type system has two independent dimensions that control how values can be accessed and where they can live:
 
-### 1.1 Global Mode
+### 1.1 Uniqueness Modes
+
+These modes determine how variables can reference and access values:
+
+#### Owned Mode
 ```metaxu
-# Global values can be freely shared and copied
-let @global x: Int = 42  # Explicitly global
-let @global y: Int = 42  # Implicitly global for primitive types
+# Owned mode indicates a reference to a unique value
+let @owned file = File.open("data.txt")  # file uniquely owns the File value
+let @owned vec = Vec::new()  # vec uniquely owns the vector
+
+# Once moved, the original variable cannot be used
+let new_owner = file
+# Error: file has been moved
+# println(file)  
 ```
 
-### 1.2 Local Mode
+#### Mutable Mode
 ```metaxu
-# Local values are bound to a specific region
+# Mutable mode represents an exclusively owned reference to a value
+let @mutable x = &mut some_value
+x.modify()  # Can modify the referenced value
+let @mutable y = x  # Transfers the exclusive reference
+# Error: x no longer has access
+# x.modify()
+```
+
+#### Const Mode
+```metaxu
+# Const mode represents immutable shared references
+let @const x = &some_value
+let @const y = x  # Multiple const references are allowed
+println(x)  # Can read the value
+println(y)  # Can read through multiple references
+# Error: Cannot modify through a const reference
+# x.modify()
+```
+
+### 1.2 Locality Modes
+
+These modes determine where values can live and how they're allocated:
+
+#### Local Mode
+```metaxu
+# Local values are stack-allocated and bound to a specific region
 fn process() {
-    let @local x: String = "hello"  # x is local to this function
+    let @local x: String = "hello"  # x is local to this function's region
     let @local y: Vec<Int> = vec![1, 2, 3]  # Local array
     
-    # Error: Cannot return local value
+    # Error: Cannot return local value outside its region
     # return x  
 }
 ```
 
-### 1.3 Unique Mode
+#### Global Mode
 ```metaxu
-# Unique values have exactly one owner
-let @unique file: File = File.open("data.txt")
-# Error: file is moved
-# let copy = file  
+# Global values are heap-allocated and can be shared across regions
+let @global x: String = "hello"  # Explicitly global
+let @global data = Vec::new()    # Can be passed between regions
+
+fn process(data: @global String) {
+    # Can accept and return global values
+    return data
+}
 ```
+
+Note: These two dimensions are orthogonal - any uniqueness mode (@owned, @mutable, @const) can be combined with either locality mode (@local, @global) to control both how a value is accessed and where it can live.
 
 ## 2. Locality and Regions
 
@@ -65,18 +105,67 @@ fn returns_local() -> String {
 ```
 
 ### 2.3 Exclave Expressions
+
+Exclave expressions provide a way to initialize pre-declared variables in a parent region using values from an inner region. This includes both nested block regions and function returns:
+
 ```metaxu
+// Example 1: Block-level exclave
 fn process_data() {
-    region r1 {
-        let @local data: Vec<Int> = vec![1, 2, 3]
+    region outer {
+        let @local promoted_data: Vec<Int>;
         
-        # Move data to outer region temporarily
-        exclave {
-            process(data)  # data temporarily escapes
-        }  # data returns to r1
+        region inner {
+            let @local data: Vec<Int> = vec![1, 2, 3];
+            
+            exclave {
+                data  # Moves/copies data's value to promoted_data
+            }
+            
+            process(data);  # Original data still accessible
+        }
+        
+        use_data(promoted_data);  # promoted_data available here
+    }
+}
+
+// Example 2: Function return exclave
+fn create_buffer() -> @local Vec<Int> {
+    let @local buffer = vec![1, 2, 3];
+    
+    // Return local buffer to caller's scope
+    exclave {
+        buffer  # Promotes buffer to caller's scope
+    }
+}
+
+fn use_buffer() {
+    let @local my_buffer = create_buffer();  # Receives the promoted buffer
+    process(my_buffer);
+}
+
+// Example 3: Nested function calls with exclave
+fn inner_computation() -> @local Int {
+    let @local result = 42;
+    exclave {
+        result  # Promotes to caller's scope
+    }
+}
+
+fn outer_computation() -> @local Int {
+    let @local value = inner_computation();  # Receives from inner
+    exclave {
+        value  # Promotes further to its caller
     }
 }
 ```
+
+The exclave expression allows controlled initialization of variables in parent regions using values from inner regions. This works both for:
+1. Block-level promotion: Initializing pre-declared variables in parent block scopes
+2. Function returns: Promoting local variables to the caller's scope
+
+The compiler ensures that receiving variables are properly declared in the target scope before they can be initialized through exclave expressions. For function returns, the compiler handles the necessary setup in the caller's scope automatically.
+
+This pattern maps directly to C's scope rules, where each region corresponds to a C block scope, and function returns naturally promote values to the caller's stack frame.
 
 ## 3. Linearity and Separation
 
@@ -315,26 +404,26 @@ effect Logger {
 }
 
 fn unsafe_example() {
-    let @local local_data: String = "sensitive"
+    let @local local_buf: String = "hello"
     
     # Error: Cannot capture local value in effect operation
-    perform Logger.log(local_data)
+    perform Logger.log(local_buf)
     
     # Error: Cannot capture local in closure used with effect
     let closure = fn() {
-        perform Logger.log(local_data)
+        perform Logger.log(local_buf)
     }
 }
 
 fn safe_example() {
-    let @global global_data: String = "sharable"
+    let @global global_buf: String = "sharable"
     
     # OK: Effects can use global data
-    perform Logger.log(global_data)
+    perform Logger.log(global_buf)
     
     # OK: Closure captures global value
     let closure = fn() {
-        perform Logger.log(global_data)
+        perform Logger.log(global_buf)
     }
 }
 ```
@@ -573,7 +662,7 @@ struct LocalWorkspace {
     # Local vector of references to global resources
     @local resources: Vec[&GlobalResource],
     # Local temporary data
-    @local temp_data: Vec[u8]
+    @local temp_data: Vec[u8>
 }
 
 impl LocalWorkspace {
@@ -680,7 +769,7 @@ impl<T> MixedTree[T] {
         }
     }
     
-    fn add_child(@mut self, @global @const child: MixedTree[T]) {
+    fn add_child(@mut self, @global @const child: MixedTree<T>) {
         self.children.push(child)  # OK: Adding reference to global
     }
     

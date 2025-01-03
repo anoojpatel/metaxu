@@ -1,6 +1,6 @@
 import unittest
-from parser import Parser
-from extern_ast import ExternBlock, ExternFunctionDeclaration, ExternTypeDeclaration
+from metaxu.parser import Parser
+from metaxu.extern_ast import ExternBlock, ExternFunctionDeclaration, ExternTypeDeclaration
 
 class TestExternParsing(unittest.TestCase):
     def setUp(self):
@@ -17,7 +17,7 @@ class TestExternParsing(unittest.TestCase):
         code = '''
         extern "stdio.h" {
             @c_function(borrows_refs=true)
-            fn printf(fmt: *const char, ...) -> i32;
+            fn printf(fmt: *const char, ...) -> i32
         }
         '''
         result = self.parser.parse(code)
@@ -29,9 +29,9 @@ class TestExternParsing(unittest.TestCase):
     def test_extern_block_with_types(self):
         code = '''
         extern "sys/stat.h" {
-            type FILE;  # Opaque type
-            type stat = struct {};  # Anonymous struct type
-            type timespec = struct timespec;  # Named struct type
+            type FILE  # Opaque type
+            type stat = struct {}  # Anonymous struct type
+            type timespec = struct timespec  # Named struct type
         }
         '''
         result = self.parser.parse(code)
@@ -62,19 +62,19 @@ class TestExternParsing(unittest.TestCase):
     def test_complex_extern_block(self):
         code = '''
         extern "openssl/ssl.h" {
-            // Opaque types for handle-based API
-            type SSL_CTX;
-            type SSL;
+            # Opaque types for handle-based API
+            type SSL_CTX
+            type SSL
             
-            // Function that uses opaque types
+            # Function that uses opaque types
             @c_function(borrows_refs=true)
-            fn SSL_new(ctx: *SSL_CTX) -> *SSL;
+            fn SSL_new(ctx: *SSL_CTX) -> *SSL
             
-            // Anonymous struct for platform-specific types
-            type ssl_method = struct {};
+            # Anonymous struct for platform-specific types
+            type ssl_method = struct {}
             
-            // Named struct with explicit reference
-            type CRYPTO_dynlock = struct CRYPTO_dynlock_value;
+            # Named struct with explicit reference
+            type CRYPTO_dynlock = struct CRYPTO_dynlock_value
         }
         '''
         result = self.parser.parse(code)

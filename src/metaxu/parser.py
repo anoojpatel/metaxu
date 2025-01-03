@@ -1282,7 +1282,8 @@ class Parser:
     def p_extern_block(self, p):
         '''extern_block : EXTERN STRING LBRACE extern_declarations RBRACE
                        | EXTERN STRING LBRACE RBRACE'''
-        header_path = p[2].strip('"')  # Remove quotes from string
+        breakpoint()
+        header_path = p[2][0].strip('"')  # Remove quotes from string
         if len(p) == 6:
             declarations = p[4]
         else:
