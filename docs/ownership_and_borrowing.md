@@ -177,16 +177,17 @@ fn main() {
     let @local mut x: String = "hello"
     
     # Shared borrows
-    let @global r1: &String = &x
-    let @global r2: &String = &x  # Multiple shared borrows OK
+    let @global r1: String = &x # Implicit shared borrow
+    let @global @const r2: String = &x # Explicit with `@const`
+    let @global @const r3: String = &x  # Multiple shared borrows OK
     
     # Error: Cannot mutably borrow while shared borrows exist
-    # let @mut m1: &String = &mut x
+    # let @mut m1: String = &mut x
     
     # Mutable borrow
     drop(r1)
     drop(r2)
-    let @mut m1: &String = &mut x
+    let @mut m1: String = &mut x
     # Error: Cannot have multiple mutable borrows
     # let @mut m2: String = &mut x
 }
@@ -210,7 +211,7 @@ fn main() {
 }
 ```
 
-### 3.3 Separation of Mutable State
+### 3.3 Exclusivity of Mutable State
 ```metaxu
 struct Counter {
     value: Int
@@ -233,23 +234,11 @@ fn main() {
 
 ## 4. Advanced Features
 
-### 4.1 Mode Polymorphism
-```metaxu
-# Function that works with any mode
-fn process<M: Mode>(x: String M) {
-    # ...
-}
 
-# Can be called with any mode
-process("hello" global)
-process("world" local)
-process("unique" unique)
-```
-
-### 4.2 Mode Constraints
+### 4.1 Mode Constraints
 ```metaxu
 # Require specific mode capabilities
-trait Copyable: global {
+trait Copyable: @global {
     fn copy(self) -> Self;
 }
 
@@ -259,7 +248,7 @@ impl Copyable for Int {
 }
 ```
 
-### 4.3 Mode Conversion
+### 4.2 Mode Conversion
 ```metaxu
 fn convert_modes() {
     let @local x: String = "hello"
@@ -437,7 +426,7 @@ fn make_counter() -> fn() -> Int {
     move fn() -> Int {
         let current = count.get()
         count.set(current + 1)
-        current
+        return current
     }
 }
 
