@@ -1,38 +1,50 @@
 {
-    "name": "vscode-metaxu",
-    "displayName": "Metaxu Language Support",
-    "description": "Syntax highlighting for the Metaxu programming language",
-    "version": "0.1.0",
-    "publisher": "metaxu",
-    "engines": {
-        "vscode": "^1.60.0"
-    },
-    "categories": [
-        "Programming Languages"
-    ],
-    "contributes": {
-        "languages": [{
-            "id": "metaxu",
-            "aliases": ["Metaxu", "metaxu"],
-            "extensions": [".mx"],
-            "configuration": "./language-configuration.json"
-        }],
-        "grammars": [{
-            "language": "metaxu",
-            "scopeName": "source.metaxu",
-            "path": "./syntaxes/metaxu.tmLanguage.json"
-        }],
-        "themes": [
-            {
-                "label": "Metaxu Dark",
-                "uiTheme": "vs-dark",
-                "path": "./themes/metaxu-color-theme.json"
-            },
-            {
-                "label": "Metaxu Light",
-                "uiTheme": "vs",
-                "path": "./themes/metaxu-light-theme.json"
-            }
-        ]
-    }
+	"name": "vscode-metaxu",
+	"displayName": "Metaxu Language Support",
+	"description": "Syntax highlighting for the Metaxu programming language",
+	"version": "0.1.0",
+	"publisher": "metaxu",
+	"engines": {
+		"vscode": "^1.60.0"
+	},
+	"categories": [
+		"Programming Languages"
+	],
+	"contributes": {
+		"languages": [
+			{
+				"id": "metaxu",
+				"aliases": [
+					"Metaxu",
+					"metaxu"
+				],
+				"extensions": [
+					".mx"
+				],
+				"configuration": "./language-configuration.json"
+			}
+		],
+		"grammars": [
+			{
+				"language": "metaxu",
+				"scopeName": "source.metaxu",
+				"path": "./syntaxes/metaxu.tmLanguage.json"
+			}
+		],
+		"themes": [
+			{
+				"label": "Metaxu Dark",
+				"uiTheme": "vs-dark",
+				"path": "./themes/metaxu-color-theme.json"
+			},
+			{
+				"label": "Metaxu Light",
+				"uiTheme": "vs",
+				"path": "./themes/metaxu-light-theme.json"
+			}
+		]
+	},
+	"__metadata": {
+		"size": 14027
+	}
 }
