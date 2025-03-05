@@ -61,6 +61,13 @@ class Parser:
                 print(f"\n=== Parser Rule: {rule_name} ===")
                 print(f"Tokens: {' '.join(tokens)}")
                 print(f"Production: {p.slice[0].type} -> {' '.join(tok.type for tok in p.slice[1:])}")
+                
+                # Store location info in the resulting AST node if it has a location attribute
+                if hasattr(p[0], 'location') and len(p.slice) > 1:
+                    first_token = p.slice[1]
+                    p[0].line = first_token.lineno
+                    p[0].column = first_token.column if hasattr(first_token, 'column') else 0
+                    
         except Exception as e:
             print(f"Error in log_rule: {e}")
         production = f" -> {p.slice[1].type}" if p and len(p.slice) > 1 else ""
@@ -73,6 +80,7 @@ class Parser:
             print("\n=== Starting Parse ===")
             # Initialize lexer with source
             self.lexer.source_file = file_path
+            self.lexer.input(source)  # Make sure lexer has the source
             self._enter_scope(ast.Scope(name="global"))
             # Parse using PLY
             result = self.parser.parse(source, lexer=self.lexer, debug=False)  # Enable debug here too
@@ -93,6 +101,20 @@ class Parser:
             # Get current token for error location
             token = self.lexer.current_token if hasattr(self.lexer, 'current_token') else None
             print(f"\n=== Parser Error ===")
+            
+            # Get parser state information if available
+            if hasattr(self.parser, 'symstack'):
+                stack_state = self.parser.symstack
+                stack_str = ' '.join([str(sym.type) for sym in stack_state[1:]])
+                print(f"Parser stack: {stack_str}")
+                
+                # Get expected tokens in current state
+                if self.parser.state < len(self.parser.action):
+                    state = self.parser.state
+                    expected = [token for token in self.parser.action[state].keys() 
+                              if isinstance(token, str) and token != 'error']
+                    print(f"Expected one of: {', '.join(expected)}")
+            
             print(f"Current token: {token}")
             print(f"Error type: {type(e)}")
             print(f"Error message: {str(e)}")
@@ -100,7 +122,7 @@ class Parser:
             location = SourceLocation(
                 file=file_path,
                 line=token.lineno if token else 0,
-                column=token.lexpos if token else 0
+                column=token.column if token else 0
             ) if token else None
             
             error = CompileError(
@@ -169,6 +191,7 @@ class Parser:
                     | expression
                     | function_declaration
                     | struct_definition
+                    | struct_instantiation
                     | enum_definition
                     | interface_definition
                     | implementation
@@ -258,7 +281,7 @@ class Parser:
                 location=SourceLocation(
                     file=self.lexer.source_file,
                     line=p.lineno(1),  # Get line number of MODULE token
-                    column=p.lexpos(1)  # Get position of MODULE token
+                    column=p.slice[1].column if hasattr(p.slice[1], 'column') else 0  # Get column from token
                 ),
                 context=get_source_context(self.lexer.source_file, p.lineno(1)),
                 stack_trace=traceback.format_stack(),
@@ -431,6 +454,7 @@ class Parser:
                 | exclave_expression
                 | borrow_expression
                 | qualified_name
+                | struct_instantiation
                 | variant_instantiation
                 | vector_literal
                 | LPAREN expression RPAREN'''
@@ -473,10 +497,7 @@ class Parser:
             else:
                 p[0] = ast.FunctionCall(p[1], [])
         elif len(p) == 5:
-            if p[1].lower() == 'some':
-                p[0] = ast.SomeExpression(p[3])
-            else:
-                p[0] = ast.FunctionCall(p[1], p[3] if p[3] is not None else [])
+            p[0] = ast.FunctionCall(p[1], p[3] if p[3] is not None else [])
 
     def p_function_call(self, p):
         '''function_call : IDENTIFIER LPAREN argument_list RPAREN
@@ -726,15 +747,15 @@ class Parser:
         p[0] = block
 
     def p_struct_definition(self, p):
-        '''struct_definition : STRUCT IDENTIFIER LBRACE struct_fields RBRACE
-                           | STRUCT IDENTIFIER IMPLEMENTS IDENTIFIER LBRACE struct_fields method_impl_list RBRACE'''
-        if len(p) == 6:
+        '''struct_definition : STRUCT IDENTIFIER type_params_opt LBRACE struct_fields RBRACE
+                           | STRUCT IDENTIFIER  type_params_opt IMPLEMENTS IDENTIFIER LBRACE struct_fields method_impl_list RBRACE'''
+        if len(p) == 7:
             p[0] = ast.StructDefinition(name=p[2], fields=p[4])
         else:
             p[0] = ast.StructDefinition(name=p[2], fields=p[6], implements=p[4], methods=p[7])
 
     def p_struct_fields(self, p):
-        '''struct_fields : struct_fields struct_field
+        '''struct_fields : struct_fields COMMA struct_field
                         | struct_field
                         | empty'''
         if len(p) == 3:
@@ -751,12 +772,12 @@ class Parser:
                        | IDENTIFIER EQUALS expression'''
         if len(p) == 5:
             if p[3] == ':':
-                p[0] = ast.StructField(name=p[2], type_expr=p[4], visibility=p[1])
+                p[0] = ast.StructField(name=p[2], type_info=p[4], visibility=p[1])
             else:  # p[3] == '='
                     p[0] = ast.StructField(name=p[2], value=p[4], visibility=p[1])
         else:  # len(p) == 4
             if p[2] == ':':
-                p[0] = ast.StructField(name=p[1], type_expr=p[3])
+                p[0] = ast.StructField(name=p[1], type_info=p[3])
             else:  # p[2] == '='
                 p[0] = ast.StructField(name=p[1], value=p[3])
 
@@ -919,6 +940,7 @@ class Parser:
 
     def p_struct_instantiation(self, p):
         '''struct_instantiation : IDENTIFIER LBRACE field_assignments RBRACE
+                               | type_expression LBRACE field_assignments RBRACE
                                | qualified_name LPAREN argument_list RPAREN
                                | qualified_name LBRACE field_assignments RBRACE'''
         if len(p) == 5:
@@ -1044,16 +1066,14 @@ class Parser:
         '''type_alias : TYPE IDENTIFIER type_params_opt EQUALS type_expression'''
         p[0] = ast.TypeAlias(p[2], p[5], type_params=p[3])
 
-    def p_type_params(self, p):
-        '''type_params : LESS type_parameter_list GREATER'''
-        p[0] = p[2]
+    
 
     def p_param_list(self, p):
         '''param_list : parameter_list'''
         p[0] = p[1]
 
     def p_type_params_opt(self, p):
-        '''type_params_opt : type_params
+        '''type_params_opt : type_param_list
                         | empty'''
         p[0] = p[1]
 

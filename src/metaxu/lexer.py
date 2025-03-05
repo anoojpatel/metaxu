@@ -163,20 +163,33 @@ class Lexer:
     # Define a rule so we can track line numbers
     def t_newline(self, t):
         r'\n+'
+        # Track the position after each newline
+        for i in range(len(t.value)):
+            self.line_starts.append(t.lexpos + i + 1)
         t.lexer.lineno += len(t.value)
 
     # Error handling rule
     def t_error(self, t):
+        # Calculate column based on the last line start
+        line_start = self.line_starts[t.lineno - 1]
+        column = t.lexpos - line_start
         print(f"\n=== Lexer Error ===")
-        print(f"Illegal character '{t.value[0]}' at line {t.lineno}, position {t.lexpos}")
+        print(f"Illegal character '{t.value[0]}' at line {t.lineno}, column {column}")
         t.lexer.skip(1)
 
     # Build the lexer
     def __init__(self):
         self.lexer = lex.lex(module=self)
+        self.line_starts = [0]  # Track start of each line
 
     def input(self, data):
         self.lexer.input(data)
+        self.line_starts = [0]  # Reset line starts
 
     def token(self):
-        return self.lexer.token()
+        tok = self.lexer.token()
+        if tok:
+            # Calculate column based on the last line start
+            line_start = self.line_starts[min(tok.lineno - 1, len(self.line_starts) - 1)]
+            tok.column = tok.lexpos - line_start + 1  # Make columns 1-based
+        return tok

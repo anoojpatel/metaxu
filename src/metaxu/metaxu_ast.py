@@ -521,7 +521,7 @@ class StructLifetime:
 
 class StructDefinition(Node):
     """A struct definition with lifetime and reference tracking"""
-    def __init__(self, name, fields, implements, methods=None, lifetime=StructLifetime.HEAP):
+    def __init__(self, name, fields, implements=None, methods=None, lifetime=StructLifetime.HEAP):
         super().__init__()
         self.name = name
         self.implements = implements
@@ -540,17 +540,18 @@ class StructDefinition(Node):
 
 class StructField(Node):
     """A field in a struct with reference tracking"""
-    def __init__(self, name, type_info, is_reference=False):
+    def __init__(self, name, type_info=None, value=None, is_reference=False):
         super().__init__()
         self.name = name
         self.type_info = type_info
+        self.value = value
         self.is_reference = is_reference
 
 class StructInstantiation(Node):
     def __init__(self, struct_name, field_assignments):
         super().__init__()
         self.struct_name = struct_name  # QualifiedName
-        self.field_assignments = [self.add_child(field) for field in field_assignments] if field_assignments else field_assignments  # List of (field_name, value) tuples
+        self.field_assignments = [self.add_child(StructField(field[0], value=field[1])) for field in field_assignments] if field_assignments else field_assignments  # List of (field_name, value) tuples
 
     def __str__(self):
         fields_str = ", ".join(f"{field}={value}" for field, value in self.field_assignments)

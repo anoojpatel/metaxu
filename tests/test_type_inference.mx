@@ -1,0 +1,45 @@
+# Test basic variable type inference
+fn test_basic_inference() {
+    let x = 42  # Should infer Int
+    let y = "hello"  # Should infer String
+    let z = true  # Should infer Bool
+}
+
+# Test function return type inference
+fn add(x: Int, y: Int) {
+    x + y  # Should infer Int return type
+}
+
+# Test generic type inference
+struct Box<T> {
+    value: T
+}
+
+fn create_box<T>(value: T) -> Box[T] {
+    Box[T] { value=value }  # Should infer Box[T]
+}
+
+# Test complex nested type inference
+struct Pair<A, B> {
+    first: A,
+    second: B
+}
+
+fn test_complex_inference() {
+    # Should infer Pair[Box[Int], Box[String]]
+    let nested = Pair {
+        first= Box { value=42 },
+        second= Box { value="hello" }
+    }
+    
+    # Should infer Option[Box[Int]]
+    let maybe_box = Some(Box { value=123 })
+}
+
+fn main() {
+    test_basic_inference()
+    let sum = add(5, 3)  # Should infer Int
+    let int_box = create_box(42)  # Should infer Box[Int]
+    let str_box = create_box("hello")  # Should infer Box[String]
+    test_complex_inference()
+}
