@@ -8,7 +8,7 @@ from typing import Dict, List, Optional, Set, Tuple, Union
 from enum import Enum
 from metaxu.type_defs import (
     Type, FunctionType, TypeVar, TypeScheme, TypeConstructor,
-    CompactType, TypeBounds, unfold_once, unify, compose_variance,
+    CompactType, RecursiveType,TypeBounds, unfold_once, unify, compose_variance,
     substitute_compact, next_id
 )
 
