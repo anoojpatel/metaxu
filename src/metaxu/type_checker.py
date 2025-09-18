@@ -58,7 +58,7 @@ class TypeChecker:
             self.check_declaration(decl)
                 
         # Second pass: check expressions and statements
-        for decl in program.declarations:
+        for decl in sorted_declarations:
             self.check(decl)
             
         # Third pass: solve all type constraints using SimpleSub
@@ -76,9 +76,18 @@ class TypeChecker:
         
     def _apply_inferred_types(self, node):
         """Recursively apply inferred types to AST nodes after constraint solving"""
-        if isinstance(node, ast.Program):
-            for decl in node.declarations:
+        if isinstance(node, (ast.Program,)):
+            for decl in node.statements:
                 self._apply_inferred_types(decl)
+        elif isinstance(node, ast.Module):
+            # Recurse into the module body
+            if hasattr(node, 'body') and node.body:
+                self._apply_inferred_types(node.body)
+        elif isinstance(node, ast.ModuleBody):
+            # Apply to each statement in the module body
+            if hasattr(node, 'statements'):
+                for stmt in node.statements:
+                    self._apply_inferred_types(stmt)
                 
         elif isinstance(node, ast.FunctionDeclaration):
             # Apply inferred types to function body
@@ -196,8 +205,8 @@ class TypeChecker:
             
             if isinstance(decl, ast.TypeParameter):
                 # Type parameters depend on their bounds
-                if decl.bounds:
-                    deps.update(self.get_type_deps(bound) for bound in decl.bounds)
+                if decl.bound:
+                    deps.update(self.get_type_deps(bound) for bound in decl.bound)
                     
             elif isinstance(decl, ast.Parameter):
                 # Parameters depend on their type annotations
@@ -270,12 +279,12 @@ class TypeChecker:
         """Type check a declaration"""
         if isinstance(decl, ast.FunctionDeclaration):
             self.check_function_declaration(decl)
-        elif isinstance(decl, ast.TypeDeclaration):
+        elif isinstance(decl, ast.TypeDefinition):
             self.check_type_declaration(decl)
         elif isinstance(decl, ast.LetStatement):
             self.check_let_statement(decl)
             
-    def check_type_declaration(self, decl: 'ast.TypeDeclaration'):
+    def check_type_declaration(self, decl: 'ast.TypeDefinition'):
         """Check a type declaration and infer variance"""
         # First check if type expression contains qualified names
         def check_type_refs(type_expr):
@@ -357,7 +366,7 @@ class TypeChecker:
             self.check_where_clause(func.where_clause, type_env)
             
         # Check parameter types
-        for param in func.parameters:
+        for param in func.params:
             if param.type_annotation:
                 param_type = self.check_type(param.type_annotation)
                 if param_type:
@@ -379,7 +388,7 @@ class TypeChecker:
         # Create function type as CompactType
         param_types = [
             self.type_inferencer.to_compact_type(param.type_annotation)
-            for param in func.parameters
+            for param in func.params
         ]
         
         return_type = self.type_inferencer.to_compact_type(
@@ -395,7 +404,7 @@ class TypeChecker:
         )
         
         # Add parameters to scope
-        for param, param_type in zip(func.parameters, param_types):
+        for param, param_type in zip(func.params, param_types):
             self.current_scope[param.name] = param_type
             
         # Check body with polarity tracking
@@ -533,9 +542,16 @@ class TypeChecker:
         
     def _direct_infer_literal_types(self, node):
         """Directly infer types for let statements with literals"""
-        if isinstance(node, ast.Program):
-            for decl in node.declarations:
+        if isinstance(node, (ast.Program,)):
+            for decl in node.statements:
                 self._direct_infer_literal_types(decl)
+        elif isinstance(node, ast.Module):
+            if hasattr(node, 'body') and node.body:
+                self._direct_infer_literal_types(node.body)
+        elif isinstance(node, ast.ModuleBody):
+            if hasattr(node, 'statements'):
+                for stmt in node.statements:
+                    self._direct_infer_literal_types(stmt)
                 
         elif isinstance(node, ast.FunctionDeclaration):
             # Process function body
@@ -1010,8 +1026,8 @@ class TypeChecker:
                 type_params[param.name] = param_var
                 
                 # Add bounds from type parameter
-                if param.bounds:
-                    for bound in param.bounds:
+                if param.bound:
+                    for bound in param.bound:
                         bound_type = self.check_type(bound)
                         if bound_type:
                             self.type_inferencer.add_constraint(
@@ -1656,6 +1672,7 @@ class TypeChecker:
     def check_let_statement(self, stmt: 'ast.LetStatement'):
         """Process let statement during declaration pass"""
         for binding in stmt.bindings:
+            print(f"Checking let statement: {binding.identifier} with type annotation: {binding.type_annotation}")
             # Convert type annotation to CompactType if present
             var_type = None
             if binding.type_annotation:
@@ -2100,18 +2117,27 @@ class TypeChecker:
         
         # Handle different node types
         if isinstance(node, ast.Program):
-            # Process top-level declarations
-            declarations.extend(node.declarations)
-            # Recursively process each declaration
-            for decl in node.declarations:
-                declarations.extend(self.collect_declarations(decl))
+            # Process top-level statements
+            declarations.extend(node.statements)
+            # Recursively process each statement
+            for stmt in node.statements:
+                declarations.extend(self.collect_declarations(stmt))
+        elif isinstance(node, ast.Module):
+            # Recurse into module body
+            if hasattr(node, 'body') and node.body:
+                declarations.extend(self.collect_declarations(node.body))
+        elif isinstance(node, ast.ModuleBody):
+            # Process each statement in the module body
+            if hasattr(node, 'statements'):
+                for stmt in node.statements:
+                    declarations.extend(self.collect_declarations(stmt))
                 
         elif isinstance(node, ast.FunctionDeclaration):
             # Add type parameters as declarations
             if node.type_params:
                 declarations.extend(node.type_params)
             # Add parameters as declarations
-            declarations.extend(node.parameters)
+            declarations.extend(node.params)
             # Process function body
             if node.body:
                 declarations.extend(self.collect_declarations(node.body))
@@ -2160,8 +2186,8 @@ class TypeChecker:
             declarations.extend(node.fields)
             # Process field types
             for field in node.fields:
-                if field.type_expr:
-                    declarations.extend(self.collect_declarations(field.type_expr))
+                if field.type_info:
+                    declarations.extend(self.collect_declarations(field.type_info))
                     
         elif isinstance(node, ast.EnumDefinition):
             # Add variants as declarations
