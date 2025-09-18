@@ -168,7 +168,7 @@ class Node:
         return False
 
     def __repr__(self):
-        return f"{self.__class__.__name__}({self.__dict__}) at {hex(id(self))}"
+        return f"{self.__class__.__name__}at {hex(id(self))}"#({self.__dict__}) at {hex(id(self))}"
     
     def get_scope(self):
         """Get the nearest scope containing this node"""
@@ -212,11 +212,13 @@ class LetBinding(Node):
         self.type_annotation = type_annotation
         self.initializer = self.add_child(initializer) if initializer else None
         self.mode = mode
+        self.inferred_type = None  # Will be set during type checking
 
 class LetStatement(Statement):
     def __init__(self, bindings):
         super().__init__()
         self.bindings = [self.add_child(binding) for binding in bindings]
+        self.inferred_type = None  # Will be set during type checking
 
 class ReturnStatement(Statement):
     def __init__(self, expression):
