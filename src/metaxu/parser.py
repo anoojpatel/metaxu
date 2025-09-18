@@ -84,12 +84,20 @@ class Parser:
             self._enter_scope(ast.Scope(name="global"))
             # Parse using PLY
             result = self.parser.parse(source, lexer=self.lexer, debug=False)  # Enable debug here too
+            
+            # If the result is a list of statements and not a module, wrap it in a module
+            if isinstance(result, list) and result and not any(isinstance(stmt, ast.Module) for stmt in result):
+                module_body = ast.ModuleBody(statements=result)
+                result = ast.Module(name="main", body=module_body)
+            
+            # Set source file for all modules
             if isinstance(result, ast.Module): 
                 result.source_file = file_path
             elif isinstance(result, list):
                 for module in result:
                     if isinstance(module, ast.Module):
                         module.source_file = file_path
+                        
             self._exit_scope()
             # Process any pending lambda expressions
             #self.process_pending_lambdas()
