@@ -1,3 +1,6 @@
+# Minimal prelude for test-only Option type
+enum Option { Some(value:T), None }
+
 # Test basic variable type inference
 fn test_basic_inference() {
     let x = 42  # Should infer Int
@@ -33,7 +36,7 @@ fn test_complex_inference() {
     }
     
     # Should infer Option[Box[Int]]
-    let maybe_box = Some(Box { value=123 })
+    let maybe_box = Some{value= Box { value=123 }}
 }
 
 fn main() {

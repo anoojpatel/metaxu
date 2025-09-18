@@ -799,7 +799,7 @@ class Parser:
 
     def p_variant_list(self, p):
         '''variant_list : variant_definition
-                       | variant_list variant_definition'''
+                       | variant_list COMMA variant_definition'''
         if len(p) == 2:
             p[0] = [p[1]]
         else:
@@ -810,7 +810,7 @@ class Parser:
                             | IDENTIFIER'''
         if len(p) == 6:
             p[0] = ast.VariantDefinition(p[1], p[3])
-        else:
+        elif len(p) == 2:
             p[0] = ast.VariantDefinition(p[1], [])
 
     def p_variant_fields(self, p):
@@ -953,7 +953,7 @@ class Parser:
     def p_struct_instantiation(self, p):
         '''struct_instantiation : IDENTIFIER LBRACE field_assignments RBRACE
                                | type_expression LBRACE field_assignments RBRACE
-                               | qualified_name LPAREN argument_list RPAREN
+                               | qualified_name LBRACE argument_list RBRACE
                                | qualified_name LBRACE field_assignments RBRACE'''
         if len(p) == 5:
             if p[2] == '(':  # Function-style constructor

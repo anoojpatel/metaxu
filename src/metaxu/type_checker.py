@@ -52,7 +52,6 @@ class TypeChecker:
         
         # Sort declarations by dependency order
         sorted_declarations = self.sort_declarations(all_declarations)
-        
         # Process declarations in dependency order
         for decl in sorted_declarations:
             self.check_declaration(decl)
@@ -262,15 +261,19 @@ class TypeChecker:
         """Get declarations that an expression depends on"""
         deps = set()
         
-        if isinstance(expr, ast.VariableExpression):
+        if isinstance(expr, ast.Variable):
             # Find the declaration this variable refers to
             for decl in self.current_scope.values():
                 if isinstance(decl, (ast.Parameter, ast.LetBinding)) and decl.name == expr.name:
                     deps.add(decl)
                     
         elif isinstance(expr, ast.FunctionCall):
-            deps.update(self.get_expr_deps(expr.function))
+            # Function name is not an expression node in our AST; only process arguments
             for arg in expr.arguments:
+                deps.update(self.get_expr_deps(arg))
+        elif isinstance(expr, ast.QualifiedFunctionCall):
+            # Qualified function calls also only contribute deps via their arguments
+            for arg in (expr.arguments or []):
                 deps.update(self.get_expr_deps(arg))
                 
         return deps
@@ -675,7 +678,7 @@ class TypeChecker:
         try:
             # Process node attributes
             if hasattr(node, '__dict__'):
-                for key, value in node.__dict__.items():
+                for key, value in list(node.__dict__.items()):
                     if isinstance(value, ast.Node):
                         self.check(value)
                     elif isinstance(value, list):
@@ -2062,26 +2065,33 @@ class TypeChecker:
 
     def check_function_call(self, node, scope):
         """Type check a function call with linearity constraints and scope checking"""
-        # Get function type
-        func_type = self.check(node.function, scope)
+        # Resolve callee name from AST node
+        func_type = None
+        callee_name = None
+        if isinstance(node, ast.FunctionCall):
+            callee_name = node.name
+        elif isinstance(node, ast.QualifiedFunctionCall):
+            callee_name = '.'.join(node.parts)
+        elif isinstance(node, ast.LambdaExpression):
+            func_type = self.check_lambda_expression(node, scope)
         
-        # Handle lambda expressions
-        if isinstance(node.function, ast.LambdaExpression):
-            func_type = self.check_lambda_expression(node.function, scope)
-            
+        # Look up function type from current scope if not a direct lambda
+        if func_type is None and callee_name is not None:
+            func_type = self.current_scope.get(callee_name)
+        breakpoint()
         if not isinstance(func_type, ast.FunctionType):
             self.errors.append(f"Cannot call non-function type {func_type}")
             return ast.ErrorType()
             
         # Check linearity constraints
         if func_type.linearity == ast.LinearityMode.ONCE:
-            if node.function.is_consumed:
+            if getattr(node, 'is_consumed', False):
                 self.errors.append("Cannot call a once function multiple times")
-            node.function.is_consumed = True
+            node.is_consumed = True
         elif func_type.linearity == ast.LinearityMode.SEPARATE:
-            if node.function.is_active:
+            if getattr(node, 'is_active', False):
                 self.errors.append("Cannot make reentrant call to separate function")
-            node.function.is_active = True
+            node.is_active = True
             
         # Check arguments with SimpleSub and scope rules
         if len(node.arguments) != len(func_type.param_types):
@@ -2107,7 +2117,7 @@ class TypeChecker:
             
         # Reset active state after call completes
         if func_type.linearity == ast.LinearityMode.SEPARATE:
-            node.function.is_active = False
+            node.is_active = False
             
         return func_type.return_type
 
@@ -2131,7 +2141,9 @@ class TypeChecker:
             if hasattr(node, 'statements'):
                 for stmt in node.statements:
                     declarations.extend(self.collect_declarations(stmt))
-                
+        elif isinstance(node, list):
+            for stmt in node:
+                declarations.extend(self.collect_declarations(stmt))
         elif isinstance(node, ast.FunctionDeclaration):
             # Add type parameters as declarations
             if node.type_params:
