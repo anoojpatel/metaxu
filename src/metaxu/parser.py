@@ -758,16 +758,20 @@ class Parser:
         '''struct_definition : STRUCT IDENTIFIER type_params_opt LBRACE struct_fields RBRACE
                            | STRUCT IDENTIFIER  type_params_opt IMPLEMENTS IDENTIFIER LBRACE struct_fields method_impl_list RBRACE'''
         if len(p) == 7:
-            p[0] = ast.StructDefinition(name=p[2], fields=p[4])
+            # STRUCT IDENTIFIER type_params_opt LBRACE struct_fields RBRACE
+            # indexes:   1       2           3           4       5            6
+            p[0] = ast.StructDefinition(name=p[2], fields=p[5])
         else:
-            p[0] = ast.StructDefinition(name=p[2], fields=p[6], implements=p[4], methods=p[7])
+            # STRUCT IDENTIFIER type_params_opt IMPLEMENTS IDENTIFIER LBRACE struct_fields method_impl_list RBRACE
+            # indexes:   1       2           3              4         5         6       7             8                9
+            p[0] = ast.StructDefinition(name=p[2], fields=p[7], implements=p[5], methods=p[8])
 
     def p_struct_fields(self, p):
         '''struct_fields : struct_fields COMMA struct_field
                         | struct_field
                         | empty'''
-        if len(p) == 3:
-            p[0] = p[1] + [p[2]]
+        if len(p) == 4:
+            p[0] = p[1] + [p[3]]
         elif len(p) == 2 and p[1] is None:  # empty
             p[0] = []
         else:

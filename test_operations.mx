@@ -5,7 +5,7 @@
     }
 
     struct LinkedList<T> {
-        @mut head: Option[Node[T]>
+        @mut head: Option[Node[T]]>
     }
 
     fn new_list<T>() -> LinkedList<T> {

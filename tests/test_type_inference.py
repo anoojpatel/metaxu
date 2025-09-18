@@ -22,7 +22,7 @@ class TestTypeInference(unittest.TestCase):
         
         # Run type checker on the AST tree
         print("\nRunning type checker...")
-        self.type_checker.check(self.ast_tree)
+        self.type_checker.check_program(self.ast_tree)
         print("Type checking completed")
 
     def test_basic_type_inference(self):

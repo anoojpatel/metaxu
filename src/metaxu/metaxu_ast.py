@@ -650,10 +650,10 @@ class LocalParameter(Node):
 
 # Function Parameters
 class Parameter(Node):
-    def __init__(self, name, type=None, mode=None):
+    def __init__(self, name, type_annotation=None, mode=None):
         super().__init__()
         self.name = name
-        self.type = type
+        self.type_annotation = type_annotation
         self.mode = mode
 
 # Mode System
