@@ -40,11 +40,7 @@ fn test_complex_inference() {
     }
     
     # Should infer Option[Box[Int]]
-<<<<<<< Updated upstream
-    let maybe_box = Some{value= Box { value=123 }}
-=======
     let maybe_box = Some{value=Box { value=123 }}
->>>>>>> Stashed changes
 }
 
 fn main() {
