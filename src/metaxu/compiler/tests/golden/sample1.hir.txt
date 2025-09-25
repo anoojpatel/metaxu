@@ -1,0 +1,5 @@
+fun main : Unit
+  params: []
+  dict_params: []
+  where: []
+  body: Fn@1

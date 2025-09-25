@@ -1,0 +1,5 @@
+func main suspending=False
+  bb0:
+    ('params', ())
+    ('let', 'ret0', ('const_ty', 'Unit'), ())
+    term ('ret', 'ret0')

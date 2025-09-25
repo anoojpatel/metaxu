@@ -1,0 +1,5 @@
+func main suspending=False
+  bb0:
+    ('params', ())
+    ('let', 'b1', ('binop', '+'), ('c1', 'c2'))
+    term ('ret', 'b1')

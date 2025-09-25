@@ -11,7 +11,7 @@ A self-hosted Low level functional-style programming language <br>
 
 ## What is Metaxu?
 Metaxu is a modern systems functional programming language that prioritizes speed, safety, and developer joy. 
-Currently written in Python, it compiles through a TapeVM intermediate representation into optimized C code. 
+Currently written in Python, it compiles through several intermediate representations into optimized Cranelift codegen. 
 Our ultimate goal? To bootstrap Metaxu in itself, creating a language that's so elegant and intuitive 
 that writing its own compiler becomes a delightful challenge.
 
