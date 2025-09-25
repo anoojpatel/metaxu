@@ -1,0 +1,6 @@
+; function main
+function %main() {
+  block0:
+    ; ...
+    return
+}
