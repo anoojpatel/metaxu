@@ -758,6 +758,7 @@ class Parser:
         '''struct_definition : STRUCT IDENTIFIER type_params_opt LBRACE struct_fields RBRACE
                            | STRUCT IDENTIFIER  type_params_opt IMPLEMENTS IDENTIFIER LBRACE struct_fields method_impl_list RBRACE'''
         if len(p) == 7:
+<<<<<<< Updated upstream
             # STRUCT IDENTIFIER type_params_opt LBRACE struct_fields RBRACE
             # indexes:   1       2           3           4       5            6
             p[0] = ast.StructDefinition(name=p[2], fields=p[5])
@@ -765,6 +766,11 @@ class Parser:
             # STRUCT IDENTIFIER type_params_opt IMPLEMENTS IDENTIFIER LBRACE struct_fields method_impl_list RBRACE
             # indexes:   1       2           3              4         5         6       7             8                9
             p[0] = ast.StructDefinition(name=p[2], fields=p[7], implements=p[5], methods=p[8])
+=======
+            p[0] = ast.StructDefinition(name=p[2], fields=p[5], type_params=p[3])
+        else:
+            p[0] = ast.StructDefinition(name=p[2], fields=p[7], implements=p[5], methods=p[8], type_params=p[3])
+>>>>>>> Stashed changes
 
     def p_struct_fields(self, p):
         '''struct_fields : struct_fields COMMA struct_field

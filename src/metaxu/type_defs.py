@@ -652,6 +652,10 @@ class CompactType:
             return self.bounds.upper_bound
         return self
 
+    def __hash__(self) -> int:
+        """Allow CompactType to be used in sets/dicts, keyed by stable ID."""
+        return hash(self.id)
+
 def unify(t1: CompactType, t2: CompactType, variance: str = 'invariant') -> bool:
     """Unify two types with variance"""
     t1 = t1.find()
@@ -674,6 +678,10 @@ def unify(t1: CompactType, t2: CompactType, variance: str = 'invariant') -> bool
 
     if t1.kind != t2.kind:
         return False
+
+    if t1.kind == 'primitive':
+        # Primitives unify iff names match
+        return getattr(t1, 'name', None) == getattr(t2, 'name', None)
 
     if t1.kind == 'effect':
         # Effect types unify if they have the same name and operations

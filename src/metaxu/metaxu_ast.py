@@ -523,14 +523,14 @@ class StructLifetime:
 
 class StructDefinition(Node):
     """A struct definition with lifetime and reference tracking"""
-    def __init__(self, name, fields, implements=None, methods=None, lifetime=StructLifetime.HEAP):
+    def __init__(self, name, fields, implements=None, methods=None, lifetime=StructLifetime.HEAP, type_params=None):
         super().__init__()
         self.name = name
         self.implements = implements
         self.methods = [self.add_child(method) for method in methods] if methods else []  # List of methods
         self.fields = [self.add_child(field) for field in fields]
         self.lifetime = lifetime
-
+        self.type_params = type_params
         self.references_globals = False  # Set during analysis
         
     def mark_references_globals(self):
@@ -733,9 +733,9 @@ class GenericType:
 
 class TypeParameter(TypeExpression):
     """A type parameter used in generic types (e.g., T in List<T>)"""
-    def __init__(self, name, bound=None, effect=False):
+    def __init__(self, name, bounds=None, effect=False):
         self.name = name
-        self.bound = bound  # Optional bound (e.g., 'T: Display')
+        self.bounds = bounds  # Optional bound (e.g., 'T: Display')
         self.effect = effect  # Whether this is an effect parameter
 
 class RecursiveType(TypeExpression):
@@ -1205,10 +1205,10 @@ class TypeMatchExpression(Node):
             context.emit_error("Expected a type value")
             return False
         
-        type_info = type_value.value
+        type_params = type_value.value
         
         # For enums, check if all variants are covered
-        if hasattr(type_info, 'variants'):
+        if hasattr(type_params, 'variants'):
             covered_variants = set()
             has_wildcard = False
             
