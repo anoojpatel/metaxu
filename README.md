@@ -39,7 +39,7 @@ express their ideas clearly and efficiently, while ensuring their code remains f
 
 ### Prerequisites
 - Python 3.11 or higher
-- GCC compiler
+- Rust
 - uv (Fast Python package installer)
 
 ### Setup
