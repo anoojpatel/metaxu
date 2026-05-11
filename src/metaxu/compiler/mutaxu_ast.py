@@ -83,6 +83,19 @@ def _value_of(node: Any) -> Any | None:
             "params": [getattr(p, "name", None) for p in getattr(node, "params", [])],
             "performs": [_effect_name(e) for e in getattr(node, "performs", []) or []],
         }
+    if isinstance(node, fast.EffectDeclaration):
+        return {
+            "name": getattr(node, "name", None),
+            "effect_class": getattr(node, "effect_class", None),
+        }
+    if isinstance(node, fast.HandleEffect):
+        return {
+            "effect_name": getattr(node, "effect_name", None),
+        }
+    if isinstance(node, fast.Resume):
+        return {
+            "value": getattr(node, "value", None),
+        }
     if isinstance(node, fast.FunctionCall):
         return {"name": getattr(node, "name", None)}
     if isinstance(node, fast.Assignment):

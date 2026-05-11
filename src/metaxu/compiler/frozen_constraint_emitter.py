@@ -9,7 +9,7 @@ except Exception:
 
 from .mutaxu_ast import AstNode
 from .simplesub_adapter import SimpleSubFacade
-from .frozen_borrow_checker import FrozenBorrowChecker
+from .frozen_borrow_checker import FrozenBorrowChecker, BorrowError
 
 # Scaffold for emitting constraints over the frozen AST (mutaxu_ast).
 # This module intentionally does nothing substantive yet; it provides a stable
@@ -31,6 +31,11 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
     scopes: list[dict[str, Any]] = [{}]
     return_types: list[Any] = []
     borrow_checker = FrozenBorrowChecker()
+    effect_classes: dict[str, str] = {}  # effect_name -> effect_class (stack/suspend)
+    function_effects: dict[str, list[str]] = {}  # function_name -> list of effects it performs
+    handler_contexts: list[dict[str, str]] = []  # Stack of handler contexts: effect_name -> effect_class
+    handler_locals: list[set[str]] = []  # Track variables assigned in handler contexts
+    handler_operations: list[list[str]] = []  # Track operations in handler (for stack effect checking)
 
     def bind(name: Any, ty: Any) -> None:
         if isinstance(name, str):
@@ -91,6 +96,76 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
         node_ty = types.get(node.node_id)
         children = getattr(node, "children", ())
         kind = getattr(node, "kind", None)
+        # Record effect class from EffectDeclaration
+        if kind == "EffectDeclaration":
+            value = payload_dict(node)
+            effect_name = value.get("name")
+            effect_class = value.get("effect_class")
+            if effect_name and effect_class:
+                effect_classes[effect_name] = effect_class
+        if kind == "HandleEffect":
+            value = payload_dict(node)
+            effect_name = value.get("effect_name")
+            effect_class = effect_classes.get(effect_name)
+            if effect_name and effect_class:
+                handler_contexts.append({effect_name: effect_class})
+                handler_locals.append(set())
+                handler_operations.append([])
+            # Walk handler children
+            for child in children:
+                walk(child)
+            # Pop handler context after processing
+            if handler_contexts:
+                handler_contexts.pop()
+            if handler_locals:
+                handler_locals.pop()
+            if handler_operations:
+                handler_operations.pop()
+            return None
+        # Track Resume calls to check effect class restrictions
+        if kind == "Resume":
+            # Check if we're in a handler context
+            if handler_contexts:
+                current_handler = handler_contexts[-1]
+                for effect_name, effect_class in current_handler.items():
+                    # Resume is always allowed in handlers (it's how you return)
+                    # But for stack effects, it should be immediate, not stored
+                    if effect_class == "stack":
+                        # For stack effects, resume should be called immediately
+                        # If we're tracking continuation assignments, check if this resume
+                        # is using a stored continuation vs the implicit one
+                        pass
+        # Track assignments to detect continuation storage
+        if kind == "Assignment":
+            # Check if we're in a handler context
+            if handler_contexts:
+                # Track this assignment in the current handler
+                if handler_locals:
+                    value = payload_dict(node)
+                    var_name = value.get("name")
+                    if isinstance(var_name, str):
+                        handler_locals[-1].add(var_name)
+        # Track function calls to detect continuation escape
+        if kind == "FunctionCall" and node_ty is not None:
+            # Check if we're in a handler context
+            if handler_contexts:
+                # Track this operation in the current handler
+                if handler_operations:
+                    handler_operations[-1].append("FunctionCall")
+                current_handler = handler_contexts[-1]
+                for effect_name, effect_class in current_handler.items():
+                    if effect_class == "stack":
+                        # Check if any argument is a variable that was assigned in this handler
+                        for child in children:
+                            if child.kind == "Variable":
+                                var_name = payload_dict(child).get("name")
+                                if isinstance(var_name, str) and handler_locals and var_name in handler_locals[-1]:
+                                    borrow_checker.errors.append(
+                                        BorrowError(
+                                            message=f"Stack effect handler '{effect_name}' cannot pass handler-local variable '{var_name}' to function (potential continuation escape)",
+                                            node_id=child.node_id
+                                        )
+                                    )
         if kind == "Literal" and node_ty is not None:
             cls = literal_class(getattr(node, "value", None))
             if cls is not None:
@@ -109,6 +184,12 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
             pop_scope()
             return None
         if kind == "FunctionDeclaration" and node_ty is not None:
+            # Record effects performed by this function
+            value = payload_dict(node)
+            func_name = value.get("name")
+            performs = value.get("performs", []) or []
+            if func_name and isinstance(func_name, str):
+                function_effects[func_name] = performs
             # Construct CompactType function type first
             # so we can bind the function name to the function type
             value = payload_dict(node)
@@ -282,6 +363,15 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
                         var_name = payload_dict(child).get("name")
                         if isinstance(var_name, str):
                             borrow_checker.check_locality(var_name, None, child.node_id)
+                            # Check if callee performs suspend effects
+                            if isinstance(name, str) and name in function_effects:
+                                for effect in function_effects[name]:
+                                    effect_class = effect_classes.get(effect)
+                                    if effect_class == "suspend":
+                                        # Suspend effects cannot take local variables
+                                        borrow_checker.errors.append(
+                                            BorrowError(message=f"Local variable '{var_name}' passed to suspend effect '{effect}'", node_id=child.node_id)
+                                        )
         if kind in {"BinaryOperation", "ComparisonExpression"} and node_ty is not None and len(children) >= 2:
             left_ty = types.get(children[0].node_id)
             right_ty = types.get(children[1].node_id)
