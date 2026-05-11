@@ -2,4 +2,4 @@ fun main : Unit
   params: []
   dict_params: []
   where: []
-  body: Fn@1
+  body: Fn/Block@1

@@ -392,6 +392,13 @@ class MatchExpression(Expression):
         self.expression = expression
         self.cases = cases  # List of (Pattern, Expression)
 
+class IfExpression(Expression):
+    def __init__(self, condition, then_branch, else_branch):
+        super().__init__()
+        self.condition = self.add_child(condition) if condition else None
+        self.then_branch = self.add_child(then_branch) if then_branch else None
+        self.else_branch = self.add_child(else_branch) if else_branch else None
+
 class Pattern(Node):
     pass
 

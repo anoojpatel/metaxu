@@ -39,7 +39,7 @@ express their ideas clearly and efficiently, while ensuring their code remains f
 
 ### Prerequisites
 - Python 3.11 or higher
-- Rust
+- Rust (for Cranelift codegen)
 - uv (Fast Python package installer)
 
 ### Setup

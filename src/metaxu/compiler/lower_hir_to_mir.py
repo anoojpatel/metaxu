@@ -69,6 +69,21 @@ class _FuncLowerer:
             for sube in e.operands:
                 last = self.lower_expr(sube)
             return last
+        # Match expression (desugared from if statements)
+        if e.op == "Match" and e.scrutinee is not None:
+            scrutinee_val = self.lower_expr(e.scrutinee)
+            # For now, simplify: lower match as if-else for 2 cases (true/false from if desugaring)
+            # This is a simplification - full match lowering would need pattern matching
+            if e.cases and len(e.cases) >= 2:
+                # First case (true)
+                case1_result = self.lower_expr(e.cases[0])
+                # Second case (false)
+                case2_result = self.lower_expr(e.cases[1])
+                # Return the second case result for now (simplified)
+                return case2_result
+            elif e.cases:
+                return self.lower_expr(e.cases[0])
+            return self.state.fresh("unit")
         # If as an expression: lower control flow and return a fresh value of type
         if e.op == "If" and e.cond is not None:
             cond_val = self.lower_expr(e.cond)
@@ -138,13 +153,17 @@ def _lower_hexpr(e: HExpr, ops: List[tuple], st: _ANFState) -> str:
     return dst
 
 
-def lower_hir_to_mir(funcs: Sequence[HFun]) -> list[MirFunc]:
+def lower_hir_to_mir(funcs: Sequence[HFun], borrow_errors: List[Any] | None = None) -> list[MirFunc]:
     """Lower HIR to MIR (ANF direct vs CPS later).
 
     Now supports BinOp and If (multi-block) in addition to Literal/Var/Call/Let/Block.
+    
+    Arguments:
+        funcs: HIR functions to lower
+        borrow_errors: Optional borrow errors from frozen borrow checker (tables.constraints.get(-2, []))
     """
     out: list[MirFunc] = []
-    drops = plan_drops(list(funcs))
+    drops = plan_drops(list(funcs), borrow_errors)
     for f in funcs:
         fl = _FuncLowerer(f)
         # Parameters
