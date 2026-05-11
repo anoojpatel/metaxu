@@ -456,11 +456,12 @@ class LambdaExpression(Expression):
 # Algebraic Effects
 class EffectDeclaration(Node):
     """Definition of an effect type (e.g., effect Reader<T>)"""
-    def __init__(self, name, type_params, operations):
+    def __init__(self, name, type_params, operations, effect_class=None):
         super().__init__()
         self.name = name                # The effect name (e.g., "Reader")
         self.type_params = type_params  # List of TypeParameter (e.g., [T])
         self.operations = operations    # List of effect operations
+        self.effect_class = effect_class  # Effect class: "stack" or "suspend" (from continuation design)
 
 class EffectOperation(Node):
     """An operation in an effect (e.g., read() -> T)"""

@@ -10,6 +10,15 @@ Algebraic effects in Metaxu allow you to:
 - Optimize effect handling at compile time
 - Map effects directly to efficient runtime implementations
 
+## Continuation Model
+
+Metaxu uses CPS-based MIR with single-shot continuations. The effect system distinguishes between two effect classes:
+
+- **Stack effects**: Continuation may not escape current dynamic extent (fancy function call)
+- **Suspend effects**: Continuation may escape and resume later (async, fibers, schedulers)
+
+For detailed design of the continuation model, see [Continuation Design](continuation_design.md).
+
 ## Builtin Effect Categories
 
 These are the built-in effect categories in Metaxu that provide multithreading, safe mutable memory management, and concurrency primitives:

@@ -1179,16 +1179,30 @@ class Parser:
         p[0] = p[2]
  
     def p_effect_declaration(self, p):
-        '''effect_declaration : EFFECT IDENTIFIER EQUALS LBRACE effect_operation_list RBRACE
+        '''effect_declaration : EFFECT IDENTIFIER COLON IDENTIFIER EQUALS LBRACE effect_operation_list RBRACE
+                            | EFFECT IDENTIFIER COLON IDENTIFIER type_params EQUALS LBRACE effect_operation_list RBRACE
+                            | EFFECT IDENTIFIER EQUALS LBRACE effect_operation_list RBRACE
                             | EFFECT IDENTIFIER type_params EQUALS LBRACE effect_operation_list RBRACE'''
         name = p[2]
-        if len(p) == 7:
-            type_params = []
-            operations = p[5]
+        if p[3] == ':':
+            # New syntax with effect class: effect Name : stack { ... }
+            effect_class = p[4]
+            if len(p) == 9:
+                type_params = []
+                operations = p[7]
+            else:
+                type_params = p[5]
+                operations = p[8]
         else:
-            type_params = p[3]
-            operations = p[6]
-        p[0] = ast.EffectDeclaration(name, type_params, operations)
+            # Old syntax without effect class (default to stack for backwards compatibility)
+            effect_class = None
+            if len(p) == 7:
+                type_params = []
+                operations = p[5]
+            else:
+                type_params = p[3]
+                operations = p[6]
+        p[0] = ast.EffectDeclaration(name, type_params, operations, effect_class)
 
     def p_effect_operation_list(self, p):
         '''effect_operation_list : effect_operation
