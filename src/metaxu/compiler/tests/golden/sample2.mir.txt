@@ -1,5 +1,7 @@
 func main suspending=False
   bb0:
     ('params', ())
-    ('let', 'b1', ('binop', '+'), ('c1', 'c2'))
-    term ('ret', 'b1')
+    ('let', 'c1', ('const', 1), ())
+    ('let', 'c2', ('const', 2), ())
+    ('let', 'b3', ('binop', '+'), ('c1', 'c2'))
+    term ('ret', 'b3')

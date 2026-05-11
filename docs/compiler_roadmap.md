@@ -6,6 +6,8 @@ This document tracks high-level goals, status, and pointers across the new Pytho
 
 - Compiler package: `src/metaxu/compiler/`
   - Frozen AST: `mutaxu_ast.py`
+  - Frozen AST borrow checker: `frozen_borrow_checker.py` (new)
+  - Frozen constraint emitter: `frozen_constraint_emitter.py`
   - Types/TyEnv: `types.py`
   - Inferencer adapters: `infer_tables.py`
   - Constraints + MPTC+FD solver: `constraints.py`
@@ -38,6 +40,10 @@ This document tracks high-level goals, status, and pointers across the new Pytho
   - ANF lowering for: Literal, Var, Let, Call, BinOp; If → multi-block CFG
   - Minimal drop planning (end-of-function heuristic)
   - Golden tests: sample1 (pipeline skeleton), sample2 (binop MIR)
+  - Frozen AST borrow checker with full spec implementation (shared/unique/exclusive borrows, locality, linearity, reference conflicts, exclave)
+  - Frozen constraint emitter with borrow checker integration
+  - Borrow checker spec document (frozen_borrow_spec.md)
+  - Old BorrowChecker in type_checker.py deprecated
 
 - In Progress
   - HIR build over real AST (desugarings deferred)
@@ -47,10 +53,11 @@ This document tracks high-level goals, status, and pointers across the new Pytho
 
 - Pending (Highlights)
   - Trait dictionary desugaring; assoc type concretization; coherence checks
-  - Borrow-analysis v1 with region stack, aliasing, locality, effect-safety
+  - HIR-level borrow analysis (DropPlan from frozen AST borrow checker results)
   - Selective CPS for suspending functions; scheduler integration
   - Struct/enum field mode validation (deep ownership rules)
   - End-to-end goldens (Iterator/next_or, suspending read_u32)
+  - Comprehensive borrow checker tests
 
 ## Roadmap Details
 
@@ -75,17 +82,22 @@ This document tracks high-level goals, status, and pointers across the new Pytho
 - Tasks
   - ANF lowering for basics (done)
   - Control-flow lowering: If/Else (done), While/For/Match (pending)
+  - **Proper match lowering with pattern compilation and branching (HIGH PRIORITY)** - This will determine how we make progress lowering down and dealing with branching for match expressions
   - Drop insertion from DropPlan (end-only heuristic → per-block) (pending)
 
 ### 4) Borrow Checking & Drop Planning
-- Files: `borrow_analysis.py`, `hir.py`, docs: `docs/ownership_and_borrowing.md`
-- Goals
+- Files: `frozen_borrow_checker.py`, `frozen_borrow_spec.md`, `borrow_analysis.py`, `hir.py`, docs: `docs/ownership_and_borrowing.md`
+- Status
+  - Frozen AST borrow checker complete (shared/unique/exclusive borrows, locality, linearity, reference conflicts, exclave)
+  - Integrated with frozen constraint emitter
+  - Spec documented in frozen_borrow_spec.md
+- Goals (HIR-level)
   - Region stack across HIR blocks; def-use and last-use approximation
   - Aliasing rules: shared `&` vs exclusive `&mut`; overlap checks
   - Move semantics (owned values); use-after-move diagnostics
   - Locality rules: locals cannot escape; allow `exclave` promotion modeling
   - Effect safety: forbid locals in effect ops/handlers; allow globals
-  - Produce per-block `DropPlan` for MIR lowering
+  - Produce per-block `DropPlan` for MIR lowering from frozen AST borrow checker results
 
 ### 5) Struct/Enum Field Mode Validation (Deep Ownership)
 - Files: `hir.py` (mode annotations), `type_defs.py`, analysis pass TBD
@@ -143,8 +155,11 @@ python -m pytest -q src/metaxu/compiler/tests
 
 ## Immediate Next Actions
 
+- **Implement proper match lowering with pattern compilation and branching (HIGH PRIORITY)** - This will determine how we make progress lowering down and dealing with branching for match expressions
+- Add comprehensive borrow checker tests (UNIQUE vs EXCLUSIVE semantics, locality checking, global-to-local reference prevention, exclave)
+- Connect frozen AST borrow checker to full type checking pipeline
+- Integrate frozen AST borrow checker with HIR-level DropPlan generation
 - Add If-lowering golden test
-- Implement borrow-analysis v1 with region/aliasing checks → per-block DropPlan
 - Integrate selective CPS on a small example (read_u32) and extend CLIF for CPS
 - Implement trait dictionary desugaring + assoc types; add Iterator/next_or golden
 

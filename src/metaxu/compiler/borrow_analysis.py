@@ -44,14 +44,37 @@ def _collect_let_bindings(e: HExpr, out: List[tuple[str, object]]) -> None:
             _collect_let_bindings(ch, out)
 
 
-def plan_drops(funcs: List[HFun]) -> Dict[str, DropPlan]:
+def plan_drops(funcs: List[HFun], borrow_errors: List[Any] | None = None) -> Dict[str, DropPlan]:
+    """Plan drops based on type needs and borrow checker results.
+    
+    Arguments:
+        funcs: List of HIR functions
+        borrow_errors: Optional borrow errors from frozen borrow checker (tables.constraints.get(-2, []))
+    
+    Returns:
+        Dictionary mapping function symbols to DropPlans
+    """
     plans: Dict[str, DropPlan] = {}
+    # Parse borrow errors to find moved/invalidated variables
+    moved_vars: Set[str] = set()
+    if borrow_errors:
+        for err in borrow_errors:
+            err_str = str(err).lower()
+            if "moved" in err_str:
+                # Try to extract variable name from error message
+                # Error format: "Variable 'x' was moved"
+                import re
+                match = re.search(r"'(\w+)'", str(err))
+                if match:
+                    moved_vars.add(match.group(1))
+    
     for f in funcs:
         lets: List[tuple[str, object]] = []
         _collect_let_bindings(f.body, lets)
         drop_candidates: List[str] = []
         for (name, ty) in lets:
-            if _type_needs_drop(ty):
+            # Only drop if type needs dropping and variable wasn't moved
+            if _type_needs_drop(ty) and str(name) not in moved_vars:
                 drop_candidates.append(str(name))
         plans[str(f.sym)] = DropPlan(drop_at_end=drop_candidates)
     return plans

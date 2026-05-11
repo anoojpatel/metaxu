@@ -627,7 +627,7 @@ class StructField:
 class CompactType:
     """Compact representation of types for efficient unification and variance tracking"""
     id: int  # Unique identifier
-    kind: str  # 'var', 'constructor', 'recursive', or 'effect'
+    kind: str  # 'var', 'constructor', 'recursive', 'effect', or 'function'
     bounds: Optional['TypeBounds'] = None
     constructor: Optional[TypeConstructor] = None
     type_args: Optional[List['CompactType']] = None
@@ -635,6 +635,11 @@ class CompactType:
     variance: Optional[str] = None  # 'covariant', 'contravariant', 'invariant'
     name: Optional[str] = None
     operations: Optional[Dict[str, 'EffectOperation']] = None
+    # Function type fields
+    param_types: Optional[List['CompactType']] = None
+    return_type: Optional['CompactType'] = None
+    body: Optional['CompactType'] = None
+    linearity: Optional[str] = None  # 'once', 'separate', 'many'
 
     @staticmethod
     def fresh_var() -> 'CompactType':

@@ -8,13 +8,8 @@ from typing import Dict, List, Optional, Set, Tuple, Union
 from enum import Enum
 from metaxu.type_defs import (
     Type, FunctionType, TypeVar, TypeScheme, TypeConstructor,
-<<<<<<< Updated upstream
-    CompactType, RecursiveType,TypeBounds, unfold_once, unify, compose_variance,
-    substitute_compact, next_id
-=======
     CompactType, TypeBounds, unfold_once, unify, compose_variance,
     substitute_compact, next_id, RecursiveType, get_constructor_variances
->>>>>>> Stashed changes
 )
 import metaxu.metaxu_ast as ast
 
@@ -220,6 +215,16 @@ class TypeInferencer:
                 compact.bounds = TypeBounds(upper_bound=resolved)
             return compact
             
+        # Handle ast.FunctionType from metaxu_ast
+        if hasattr(ast, 'FunctionType') and isinstance(ty, ast.FunctionType):
+            return CompactType(
+                id=next_id(),
+                kind='function',
+                param_types=[self.to_compact_type(p) for p in ty.param_types],
+                return_type=self.to_compact_type(ty.return_type),
+                linearity=str(ty.linearity) if hasattr(ty, 'linearity') else 'many'
+            )
+
         # Default: create a fresh var when we don't recognize the type
         return CompactType.fresh_var()
 

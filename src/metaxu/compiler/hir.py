@@ -27,7 +27,7 @@ class HExpr:
     sym: Any | None
     span: mast.Span
     # Optional op-specific fields for lowering
-    op: str | None = None            # e.g., 'Literal', 'Var', 'Call', 'Let', 'Block'
+    op: str | None = None            # e.g., 'Literal', 'Var', 'Call', 'Let', 'Block', 'Match'
     literal: Any | None = None       # for Literal
     var_name: str | None = None      # for Var
     callee: str | None = None        # for Call (simple callee name)
@@ -42,6 +42,9 @@ class HExpr:
     cond: 'HExpr' | None = None
     then_ops: tuple['HExpr', ...] | None = None
     else_ops: tuple['HExpr', ...] | None = None
+    # Match
+    scrutinee: 'HExpr' | None = None
+    cases: tuple['HExpr', ...] | None = None
 
 
 @dataclass(slots=True)
@@ -199,6 +202,19 @@ class HIRBuilder:
                 return (h,)
             ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, "Unit"))
             return self._mk_hexpr(frozen_ctx.node_id, "Stmt", ty, frozen_ctx.span, op="If", cond=c, then_ops=as_ops(tb), else_ops=as_ops(eb) if eb else tuple())
+
+        # MatchExpression (desugared from if statements)
+        if isinstance(orig, fast.MatchExpression):
+            expr = self._from_orig_expr(getattr(orig, 'expression', None), frozen_ctx)
+            cases = getattr(orig, 'cases', []) or []
+            case_exprs = []
+            for pattern, case_body in cases:
+                # For now, just lower the case body
+                case_hexpr = self._from_orig_expr(case_body, frozen_ctx)
+                if case_hexpr is not None:
+                    case_exprs.append(case_hexpr)
+            ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, "Unit"))
+            return self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span, op="Match", scrutinee=expr, cases=tuple(case_exprs))
 
         # ReturnStatement: lower its expression if present
         if isinstance(orig, fast.ReturnStatement):

@@ -80,14 +80,6 @@ class TypeChecker:
         if isinstance(node, (ast.Program,)):
             for decl in node.statements:
                 self._apply_inferred_types(decl)
-<<<<<<< Updated upstream
-        elif isinstance(node, ast.Module):
-            # Recurse into the module body
-            if hasattr(node, 'body') and node.body:
-                self._apply_inferred_types(node.body)
-        elif isinstance(node, ast.ModuleBody):
-            # Apply to each statement in the module body
-=======
         
         elif isinstance(node, ast.Module):
             # Recurse into module body
@@ -95,7 +87,6 @@ class TypeChecker:
                 self._apply_inferred_types(node.body)
                 
         elif hasattr(ast, 'ModuleBody') and isinstance(node, ast.ModuleBody):
->>>>>>> Stashed changes
             if hasattr(node, 'statements'):
                 for stmt in node.statements:
                     self._apply_inferred_types(stmt)
@@ -445,19 +436,11 @@ class TypeChecker:
         if isinstance(decl, ast.FunctionDeclaration):
             self.check_function_declaration(decl)
         elif isinstance(decl, ast.TypeDefinition):
-<<<<<<< Updated upstream
-            self.check_type_declaration(decl)
-        elif isinstance(decl, ast.LetStatement):
-            self.check_let_statement(decl)
-            
-    def check_type_declaration(self, decl: 'ast.TypeDefinition'):
-=======
             self.check_type_definition(decl)
         elif isinstance(decl, ast.LetStatement):
             self.check_let_statement(decl)
             
     def check_type_definition(self, decl: 'ast.TypeDefinition'):
->>>>>>> Stashed changes
         """Check a type declaration and infer variance"""
         # First check if type expression contains qualified names
         def check_type_refs(type_expr):
@@ -717,166 +700,6 @@ class TypeChecker:
                 self.type_inferencer.constraints = []
 
         return result
-<<<<<<< Updated upstream
-        
-    def _direct_infer_literal_types(self, node):
-        """Directly infer types for let statements with literals"""
-        if isinstance(node, (ast.Program,)):
-            for decl in node.statements:
-                self._direct_infer_literal_types(decl)
-        elif isinstance(node, ast.Module):
-            if hasattr(node, 'body') and node.body:
-                self._direct_infer_literal_types(node.body)
-        elif isinstance(node, ast.ModuleBody):
-            if hasattr(node, 'statements'):
-                for stmt in node.statements:
-                    self._direct_infer_literal_types(stmt)
-                
-        elif isinstance(node, ast.FunctionDeclaration):
-            # Process function body
-            if node.body:
-                self._direct_infer_literal_types(node.body)
-                
-        elif isinstance(node, ast.Block):
-            # Process each statement in the block
-            for stmt in node.statements:
-                self._direct_infer_literal_types(stmt)
-                
-        elif isinstance(node, ast.LetStatement):
-            # Process each binding in the let statement
-            for binding in node.bindings:
-                if binding.initializer and isinstance(binding.initializer, ast.Literal):
-                    # Infer type from literal value
-                    if isinstance(binding.initializer.value, int):
-                        binding.inferred_type = ast.BasicType('Int')
-                    elif isinstance(binding.initializer.value, str):
-                        binding.inferred_type = ast.BasicType('String')
-                    elif isinstance(binding.initializer.value, bool):
-                        binding.inferred_type = ast.BasicType('Bool')
-                    else:
-                        binding.inferred_type = ast.BasicType('Unknown')
-                    
-                    # Also set the type on the initializer
-                    binding.initializer.inferred_type = binding.inferred_type
-            
-            # Set the inferred_type on the LetStatement to match the first binding
-            if node.bindings and hasattr(node.bindings[0], 'inferred_type'):
-                node.inferred_type = node.bindings[0].inferred_type
-
-    def visit_generic(self, node):
-        # Initialize recursion tracking if not already present
-        if not hasattr(self, '_visited_nodes_stack'):
-            self._visited_nodes_stack = []
-            self._recursion_depth = 0
-            self._max_recursion_depth = 100  # Adjust as needed
-            self._recursion_path = []
-            self._known_cyclic_pairs = {
-                # Known cyclic relationships that should be handled specially
-                ('ModuleBody', 'StructDefinition'): 0
-            }
-            # Track nodes we've already processed to avoid duplicate work
-            self._processed_nodes = set()
-        
-        # Generate a unique identifier for this node
-        node_id = id(node)
-        node_type = node.__class__.__name__
-        
-        # Special handling for known problematic node type pairs that cause recursion
-        if len(self._recursion_path) >= 2:
-            last_two = (self._recursion_path[-1], node_type) if len(self._recursion_path) >= 1 else None
-            reversed_pair = (node_type, self._recursion_path[-1]) if len(self._recursion_path) >= 1 else None
-            
-            # Check if this is a known cyclic relationship
-            if last_two in self._known_cyclic_pairs or reversed_pair in self._known_cyclic_pairs:
-                cycle_count = self._known_cyclic_pairs.get(last_two, 0) + 1
-                self._known_cyclic_pairs[last_two] = cycle_count
-                
-                # If we've seen this cycle too many times, break it
-                if cycle_count > 3:  # Allow a few cycles before breaking
-                    print(f"INFO: Breaking known cyclic dependency between {last_two[0]} and {last_two[1]}")
-                    self._recursion_path.append(node_type)  # Add for completeness in logs
-                    self._recursion_path.pop()  # Then remove it
-                    return
-        
-        # Skip if we've already processed this exact node
-        if node_id in self._processed_nodes:
-            return
-            
-        # Add to processed nodes to avoid duplicate work
-        self._processed_nodes.add(node_id)
-            
-        # Track the path for better debugging
-        self._recursion_path.append(node_type)
-        
-        # Check for recursion by examining the current path
-        if len(self._recursion_path) > 10:  # Only check when path is sufficiently deep
-            # Count occurrences of this node type in the path
-            type_count = self._recursion_path.count(node_type)
-            if type_count > 5:  # Threshold for suspecting recursion
-                print(f"WARNING: Potential infinite recursion detected")
-                print(f"Current node type: {node_type}")
-                print(f"Recent path: {' -> '.join(self._recursion_path[-10:])}")
-                
-                # Print node details to help debugging
-                if hasattr(node, '__dict__'):
-                    attrs = {}
-                    for k, v in node.__dict__.items():
-                        if not isinstance(v, (list, dict, ast.Node)):
-                            attrs[k] = str(v)[:50]
-                    print(f"Node attributes: {attrs}")
-                
-                # If we've seen this exact node too many times, stop recursion
-                if self._recursion_depth > self._max_recursion_depth:
-                    print(f"ERROR: Maximum recursion depth exceeded. Stopping recursion.")
-                    self._recursion_path.pop()
-                    return
-        
-        # Track recursion depth
-        self._recursion_depth += 1
-        
-        # Create a new set for this recursion level if needed
-        if len(self._visited_nodes_stack) <= self._recursion_depth:
-            self._visited_nodes_stack.append(set())
-        
-        # Get the current level's visited nodes set
-        current_visited = self._visited_nodes_stack[self._recursion_depth - 1]
-        
-        # Check if we've seen this exact node at this level
-        if node_id in current_visited:
-            print(f"WARNING: Node visited multiple times at same recursion level: {node_type}")
-            self._recursion_path.pop()
-            self._recursion_depth -= 1
-            return
-        
-        # Add this node to the current level's visited set
-        current_visited.add(node_id)
-        
-        try:
-            # Process node attributes
-            if hasattr(node, '__dict__'):
-                for key, value in list(node.__dict__.items()):
-                    if isinstance(value, ast.Node):
-                        self.check(value)
-                    elif isinstance(value, list):
-                        for item in value:
-                            if isinstance(item, ast.Node):
-                                self.check(item)
-        except Exception as e:
-            print(f"ERROR in visit_generic: {str(e)}")
-            print(f"Node type: {node_type}")
-            print(f"Recursion path: {' -> '.join(self._recursion_path)}")
-            raise
-        finally:
-            # Clean up for this recursion level
-            self._recursion_depth -= 1
-            self._recursion_path.pop()
-            
-            # Reset tracking when we're back at the top level
-            if self._recursion_depth == 0:
-                self._visited_nodes_stack = []
-                self._recursion_path = []
-                self._processed_nodes = set()
-=======
 
     def visit_generic(self, node):
         """Safe traversal:
@@ -905,7 +728,6 @@ class TypeChecker:
                         self.check(item)
         # No constructor synthesis here; rely on SimpleSub visitors to generate constraints
         return None
->>>>>>> Stashed changes
 
     def visit_ModuleBody(self, node):
         """Specific visitor for ModuleBody to prevent infinite recursion."""
@@ -3067,8 +2889,22 @@ class TypeChecker:
 
 
 class BorrowChecker:
+    """DEPRECATED: This borrow checker is deprecated in favor of the frozen AST borrow checker.
+    
+    Use the frozen AST borrow checker in src/metaxu/compiler/frozen_borrow_checker.py instead.
+    This class is kept for legacy compatibility but should not be used in new code.
+    """
     def __init__(self, symbol_table):
-        """Used for a single symbol_table and children symbol_tables"""
+        """Used for a single symbol_table and children symbol_tables
+        
+        DEPRECATED: Use frozen AST borrow checker instead.
+        """
+        import warnings
+        warnings.warn(
+            "BorrowChecker is deprecated. Use frozen AST borrow checker in src/metaxu/compiler/frozen_borrow_checker.py instead.",
+            DeprecationWarning,
+            stacklevel=2
+        )
         self.symbol_table = symbol_table
         self.shared_borrows = {}  # variable_name -> count
         self.mutable_borrows = set()  # variable_names with exclusive borrows
