@@ -45,6 +45,18 @@ class HExpr:
     # Match
     scrutinee: 'HExpr' | None = None
     cases: tuple['HExpr', ...] | None = None
+    # Struct: op="Struct"
+    struct_name: str | None = None                          # for Struct
+    fields: tuple[tuple[str, 'HExpr'], ...] | None = None  # for Struct: ((field_name, expr), ...)
+    locality: str | None = None                             # 'local'|'global' allocation site
+    # FieldGet/FieldSet: op="FieldGet" | "FieldSet"
+    base: 'HExpr | None' = None      # receiver object
+    field_name: str | None = None    # field being accessed/set
+    field_val: 'HExpr | None' = None # for FieldSet: new value
+    # Lambda/Closure: op="Lambda"
+    lambda_params: tuple[str, ...] | None = None           # parameter names
+    lambda_body: 'HExpr | None' = None                     # body expression
+    captures: tuple[tuple[str, str], ...] | None = None    # ((name, mode), ...) captured vars
 
 
 @dataclass(slots=True)
@@ -245,6 +257,54 @@ class HIRBuilder:
                     ops.append(he)
             ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, "Unit"))
             return self._mk_hexpr(frozen_ctx.node_id, "Block", ty, frozen_ctx.span, op="Block", operands=tuple(ops))
+
+        # StructInstantiation
+        if isinstance(orig, fast.StructInstantiation):
+            sname_node = getattr(orig, 'struct_name', None)
+            sname = str(sname_node) if sname_node is not None else "Unknown"
+            field_assigns = getattr(orig, 'field_assignments', []) or []
+            field_exprs: list[tuple[str, HExpr]] = []
+            for sf in field_assigns:
+                fname = getattr(sf, 'name', None)
+                fval_node = getattr(sf, 'value', None)
+                fval = self._from_orig_expr(fval_node, frozen_ctx)
+                if fname and fval is not None:
+                    field_exprs.append((str(fname), fval))
+            ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, "Unknown"))
+            return self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span,
+                                  op="Struct", struct_name=sname,
+                                  fields=tuple(field_exprs),
+                                  locality="local")  # default local; borrow checker promotes to global
+
+        # FieldAccess
+        if isinstance(orig, fast.FieldAccess):
+            base_node = getattr(orig, 'base', None) or getattr(orig, 'expression', None)
+            base_he = self._from_orig_expr(base_node, frozen_ctx)
+            field_names = getattr(orig, 'fields', ()) or ()
+            # Chain: for a.b.c, build nested FieldGet(FieldGet(a, b), c)
+            current = base_he
+            ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, "Unknown"))
+            for fname in field_names:
+                if current is not None:
+                    current = self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span,
+                                             op="FieldGet", base=current, field_name=str(fname))
+            return current
+
+        # LambdaExpression
+        if isinstance(orig, fast.LambdaExpression):
+            params = getattr(orig, 'params', []) or []
+            param_names = tuple(str(getattr(p, 'name', p)) for p in params)
+            body_nodes = getattr(orig, 'body', None)
+            body_he = self._from_orig_expr(body_nodes, frozen_ctx)
+            captured_vars = getattr(orig, 'captured_vars', set()) or set()
+            capture_modes = getattr(orig, 'capture_modes', {}) or {}
+            captures = tuple((str(v), str(capture_modes.get(v, 'borrow'))) for v in sorted(captured_vars))
+            ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, "Unknown"))
+            return self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span,
+                                  op="Lambda",
+                                  lambda_params=param_names,
+                                  lambda_body=body_he,
+                                  captures=captures)
 
         # Fallback: None
         return None

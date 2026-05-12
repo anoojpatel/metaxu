@@ -23,6 +23,7 @@ class _FuncLowerer:
         self.blocks: List[MirBlock] = []
         self.ops: List[tuple] = []
         self.state = _ANFState()
+        self._pending_lambdas: List[MirFunc] = []
 
     def new_block(self) -> int:
         idx = len(self.blocks)
@@ -110,6 +111,54 @@ class _FuncLowerer:
             self.emit(("let", dst, ("const_ty", str(e.ty)), ()))
             # Do not seal join yet; caller will decide terminator
             return dst
+        # Struct instantiation
+        if e.op == "Struct" and e.struct_name is not None:
+            field_vals: List[tuple] = []
+            for (fname, fexpr) in (e.fields or ()):
+                fval = self.lower_expr(fexpr)
+                field_vals.append((fname, fval))
+            dst = self.state.fresh("s")
+            locality = e.locality or "local"
+            self.emit(("let", dst, ("alloc_struct", e.struct_name, locality), tuple(field_vals)))
+            return dst
+        # Field access
+        if e.op == "FieldGet" and e.base is not None and e.field_name is not None:
+            base_val = self.lower_expr(e.base)
+            dst = self.state.fresh("f")
+            self.emit(("let", dst, ("field_get", e.field_name), (base_val,)))
+            return dst
+        if e.op == "FieldSet" and e.base is not None and e.field_name is not None and e.field_val is not None:
+            base_val = self.lower_expr(e.base)
+            new_val = self.lower_expr(e.field_val)
+            dst = self.state.fresh("fs")
+            self.emit(("let", dst, ("field_set", e.field_name), (base_val, new_val)))
+            return dst
+        # Lambda / closure
+        if e.op == "Lambda" and e.lambda_params is not None:
+            # Inline the lambda body as a synthetic MirFunc and emit make_closure
+            from .mir import MirFunc as _MirFunc, MirBlock as _MirBlock
+            lname = self.state.fresh("lambda")
+            # Capture current env values
+            cap_names: List[tuple] = []
+            for (cname, _cmode) in (e.captures or ()):
+                cval = self.state.env.get(cname, cname)
+                cap_names.append((cname, cval))
+            dst = self.state.fresh("cl")
+            self.emit(("let", dst, ("make_closure", lname, e.lambda_params), tuple(cap_names)))
+            # Store lambda body as a deferred sub-function for the interpreter to resolve
+            if e.lambda_body is not None:
+                sub_ops: List[tuple] = [("params", e.lambda_params)]
+                for pn in e.lambda_params:
+                    self.state.env[pn] = pn
+                body_result = self.lower_expr(e.lambda_body)
+                sub_ops.extend(self.ops)
+                self.ops = []  # consumed into sub-func
+                self._pending_lambdas.append(
+                    _MirFunc(name=lname, ty_sig=e.ty,
+                             blocks=[_MirBlock(ops=sub_ops, term=("ret", body_result))],
+                             suspending=bool(e.suspends))
+                )
+            return dst
         # Fallback: const of type
         dst = self.state.fresh("ret")
         self.emit(("let", dst, ("const_ty", str(e.ty)), ()))
@@ -183,4 +232,6 @@ def lower_hir_to_mir(funcs: Sequence[HFun], borrow_errors: List[Any] | None = No
         if not blocks:
             blocks = [MirBlock(ops=[], term=("ret", res))]
         out.append(MirFunc(name=str(f.sym), ty_sig=f.ret_ty, blocks=blocks, suspending=bool(f.body.suspends)))
+        # Emit any lambdas that were inlined during lowering
+        out.extend(fl._pending_lambdas)
     return out
