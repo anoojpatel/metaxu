@@ -495,12 +495,20 @@ class PerformEffect(Expression):
         self.effect_name = effect_name
         self.arguments = arguments
 
+class HandleCase(Node):
+    """One arm of a handle expression: op_name(param) -> body"""
+    def __init__(self, op_name, param_name, body):
+        super().__init__()
+        self.op_name = op_name
+        self.param_name = param_name
+        self.body = self.add_child(body) if body is not None and hasattr(body, 'children') else body
+
 class HandleEffect(Expression):
     def __init__(self, effect_name, handler, continuation):
         super().__init__()
         self.effect_name = effect_name
-        self.handler = handler  # List of handle cases
-        self.continuation = continuation  # Expression after IN
+        self.handler = handler  # List of HandleCase
+        self.continuation = self.add_child(continuation) if continuation is not None and hasattr(continuation, 'children') else continuation
 
 class Resume(Expression):
     def __init__(self, value=None):

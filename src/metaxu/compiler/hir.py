@@ -57,6 +57,13 @@ class HExpr:
     lambda_params: tuple[str, ...] | None = None           # parameter names
     lambda_body: 'HExpr | None' = None                     # body expression
     captures: tuple[tuple[str, str], ...] | None = None    # ((name, mode), ...) captured vars
+    # Perform: op="Perform"
+    effect_op: str | None = None        # effect operation name, e.g. 'emit'
+    perform_args: tuple['HExpr', ...] | None = None  # arguments to the operation
+    # Handle: op="Handle"
+    handle_effect: str | None = None    # effect type name being handled
+    handle_cases: tuple[tuple[str, str, 'HExpr'], ...] | None = None  # ((op, param, body), ...)
+    handle_body: 'HExpr | None' = None  # the continuation expression
 
 
 @dataclass(slots=True)
@@ -76,9 +83,20 @@ class HIRBuilder:
     def __init__(self, tables: InferSideTables, id_map: dict[int, Any] | None = None) -> None:
         self.t = tables
         self.id_map = id_map or {}
+        # Reverse map: id(orig_obj) -> frozen AstNode, built lazily in build()
+        self._orig_to_frozen: dict[int, mast.AstNode] = {}
 
     def build(self, root: mast.AstNode) -> list[HFun]:
         funcs: list[HFun] = []
+
+        # Build reverse map: id(orig_obj) -> frozen AstNode
+        def index_nodes(n: mast.AstNode) -> None:
+            orig = self.id_map.get(n.node_id)
+            if orig is not None:
+                self._orig_to_frozen[id(orig)] = n
+            for c in n.children:
+                index_nodes(c)
+        index_nodes(root)
 
         def visit(n: mast.AstNode) -> None:
             orig = self.id_map.get(n.node_id)
@@ -157,17 +175,31 @@ class HIRBuilder:
             **kw,
         )
 
+    def _frozen_for(self, orig: Any, fallback: mast.AstNode) -> mast.AstNode:
+        """Return the frozen AstNode corresponding to orig, or fallback."""
+        return self._orig_to_frozen.get(id(orig), fallback)
+
     def _from_orig_expr(self, orig: Any, frozen_ctx: mast.AstNode) -> HExpr | None:
         """Build an HExpr from an original AST node or list of nodes.
 
         frozen_ctx: a frozen node to provide node_id/span context when the original
         node lacks a corresponding frozen node in id_map traversal.
         """
+        if orig is None:
+            return None
+
+        # Resolve the best frozen node for this orig object
+        if not isinstance(orig, list):
+            frozen_ctx = self._frozen_for(orig, frozen_ctx)
+
+        def ctx_for(child: Any) -> mast.AstNode:
+            return self._frozen_for(child, frozen_ctx) if child is not None else frozen_ctx
+
         # Lists become Block
         if isinstance(orig, list):
             ops: list[HExpr] = []
             for item in orig:
-                he = self._from_orig_expr(item, frozen_ctx)
+                he = self._from_orig_expr(item, self._frozen_for(item, frozen_ctx) if item is not None else frozen_ctx)
                 if he is not None:
                     ops.append(he)
             return self._mk_hexpr(frozen_ctx.node_id, "Block", self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, "Unit")), frozen_ctx.span, op="Block", operands=tuple(ops))
@@ -182,29 +214,53 @@ class HIRBuilder:
             ty = self.t.apply_tyenv(getattr(orig, 'type_var', None) or self.t.types.get(frozen_ctx.node_id, "Unknown"))
             return self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span, op="Var", var_name=getattr(orig, 'name', None))
 
+        # QualifiedName: `a` → Var; `a.b.c` → chained FieldGet
+        if isinstance(orig, fast.QualifiedName):
+            parts = list(getattr(orig, 'parts', []) or [])
+            if not parts:
+                return None
+            ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, "Unknown"))
+            if len(parts) == 1:
+                return self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span, op="Var", var_name=str(parts[0]))
+            # Build chained FieldGet: start from the first part as a Var
+            current: HExpr = self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span, op="Var", var_name=str(parts[0]))
+            for field in parts[1:]:
+                current = self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span, op="FieldGet", base=current, field_name=str(field))
+            return current
+
         # Function calls
         if isinstance(orig, fast.FunctionCall):
             callee = getattr(orig, 'name', None)
             args_exprs = []
             for a in getattr(orig, 'arguments', []) or []:
-                he = self._from_orig_expr(a, frozen_ctx)
+                he = self._from_orig_expr(a, ctx_for(a))
                 if he is not None:
                     args_exprs.append(he)
             ty = self.t.apply_tyenv(getattr(orig, 'type_var', None) or self.t.types.get(frozen_ctx.node_id, "Unknown"))
             return self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span, op="Call", callee=str(callee), operands=tuple(args_exprs))
 
-        # BinaryOperation
-        if isinstance(orig, fast.BinaryOperation):
-            l = self._from_orig_expr(getattr(orig, 'left', None), frozen_ctx)
-            r = self._from_orig_expr(getattr(orig, 'right', None), frozen_ctx)
+        # BinaryOperation / ComparisonExpression (same structure, both use left/operator/right)
+        if isinstance(orig, (fast.BinaryOperation, fast.ComparisonExpression)):
+            lnode = getattr(orig, 'left', None)
+            rnode = getattr(orig, 'right', None)
+            l = self._from_orig_expr(lnode, ctx_for(lnode))
+            r = self._from_orig_expr(rnode, ctx_for(rnode))
             ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, "Unknown"))
-            return self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span, op="BinOp", binop=getattr(orig, 'operator', None), left=l, right=r)
+            op_sym = getattr(orig, 'operator', None)
+            # ComparisonOperator may be an enum instance; get its value string
+            if hasattr(op_sym, 'value'):
+                op_sym = op_sym.value
+            return self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span, op="BinOp", binop=op_sym, left=l, right=r)
 
-        # IfStatement
-        if isinstance(orig, fast.IfStatement):
-            c = self._from_orig_expr(getattr(orig, 'condition', None), frozen_ctx)
-            tb = self._from_orig_expr(getattr(orig, 'then_body', None), frozen_ctx)
-            eb = self._from_orig_expr(getattr(orig, 'else_body', None), frozen_ctx) if getattr(orig, 'else_body', None) is not None else None
+        # IfStatement / IfExpression
+        if isinstance(orig, (fast.IfStatement, fast.IfExpression)):
+            cond_node = getattr(orig, 'condition', None)
+            c = self._from_orig_expr(cond_node, ctx_for(cond_node))
+            # IfStatement uses then_body/else_body; IfExpression uses then_branch/else_branch
+            then_node = getattr(orig, 'then_body', None) or getattr(orig, 'then_branch', None)
+            else_node = getattr(orig, 'else_body', None) or getattr(orig, 'else_branch', None)
+            tb = self._from_orig_expr(then_node, ctx_for(then_node))
+            eb = self._from_orig_expr(else_node, ctx_for(else_node)) if else_node is not None else None
             # Flatten block bodies into operand lists
             def as_ops(h: HExpr | None) -> tuple[HExpr, ...]:
                 if h is None:
@@ -275,6 +331,55 @@ class HIRBuilder:
                                   op="Struct", struct_name=sname,
                                   fields=tuple(field_exprs),
                                   locality="local")  # default local; borrow checker promotes to global
+
+        # QualifiedFunctionCall: effect_name.op(args) or module.fn(args)
+        if isinstance(orig, fast.QualifiedFunctionCall):
+            parts = list(getattr(orig, 'parts', []) or [])
+            arguments = list(getattr(orig, 'arguments', []) or [])
+            arg_exprs = []
+            for a in arguments:
+                he = self._from_orig_expr(a, ctx_for(a))
+                if he is not None:
+                    arg_exprs.append(he)
+            ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, 'Unknown'))
+            # Treat as a plain call with dotted callee name
+            callee = '.'.join(str(p) for p in parts)
+            return self._mk_hexpr(frozen_ctx.node_id, 'Expr', ty, frozen_ctx.span,
+                                  op='Call', callee=callee, operands=tuple(arg_exprs))
+
+        # PerformEffect: perform effect_name(args)
+        if isinstance(orig, fast.PerformEffect):
+            eff_name = str(getattr(orig, 'effect_name', '') or '')
+            arguments = list(getattr(orig, 'arguments', []) or [])
+            arg_exprs = []
+            for a in arguments:
+                he = self._from_orig_expr(a, ctx_for(a))
+                if he is not None:
+                    arg_exprs.append(he)
+            ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, 'Unknown'))
+            return self._mk_hexpr(frozen_ctx.node_id, 'Expr', ty, frozen_ctx.span,
+                                  op='Perform', effect_op=eff_name, perform_args=tuple(arg_exprs))
+
+        # HandleEffect: handle EffectType with { cases } in body
+        if isinstance(orig, fast.HandleEffect):
+            eff_name = str(getattr(orig, 'effect_name', '') or '')
+            cases_raw = list(getattr(orig, 'handler', []) or [])
+            cont = getattr(orig, 'continuation', None)
+            case_triples: list[tuple[str, str, HExpr]] = []
+            for c in cases_raw:
+                if isinstance(c, fast.HandleCase):
+                    op_name = str(c.op_name)
+                    param_name = str(c.param_name)
+                    case_body = self._from_orig_expr(c.body, ctx_for(c.body) if c.body is not None else frozen_ctx)
+                    if case_body is not None:
+                        case_triples.append((op_name, param_name, case_body))
+            body_he = self._from_orig_expr(cont, ctx_for(cont) if cont is not None else frozen_ctx)
+            ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, 'Unknown'))
+            return self._mk_hexpr(frozen_ctx.node_id, 'Expr', ty, frozen_ctx.span,
+                                  op='Handle',
+                                  handle_effect=eff_name,
+                                  handle_cases=tuple(case_triples),
+                                  handle_body=body_he)
 
         # FieldAccess
         if isinstance(orig, fast.FieldAccess):

@@ -121,6 +121,8 @@ class MirInterpreter:
         self._funcs: Dict[str, MirFunc] = {}
         self._effect_handlers: Dict[str, EffectHandler] = {}
         self._builtins: Dict[str, Callable[..., Any]] = {}
+        # Dynamic handler stack: list of {op_name -> (param_name, handler_func_name)}
+        self._handler_stack: List[Dict[str, tuple]] = []
         self._register_builtins()
 
     # ------------------------------------------------------------------
@@ -253,6 +255,36 @@ class MirInterpreter:
             lv = env.get(args[0], args[0])
             rv = env.get(args[1], args[1])
             return _eval_binop(op_name, lv, rv)
+        elif kind == "select":
+            # ("select",), (cond, then_val, else_val) — phi merge for if/else
+            cond = env.get(args[0], args[0])
+            return env.get(args[1], args[1]) if _is_truthy(cond) else env.get(args[2], args[2])
+        elif kind == "push_handler":
+            # ("push_handler", effect_name), ((op, param_name), ...)
+            # Register handler cases on the dynamic stack
+            frame: Dict[str, tuple] = {}
+            for (op_name, param_name) in args:
+                handler_fn_name = f"__handler_{op_name}"
+                frame[op_name] = (param_name, handler_fn_name)
+            self._handler_stack.append(frame)
+            return UNIT
+        elif kind == "pop_handler":
+            if self._handler_stack:
+                self._handler_stack.pop()
+            return UNIT
+        elif kind == "perform":
+            # ("perform", op_name), (arg1, arg2, ...)
+            op_name: str = rhs[1]
+            perform_args = [env.get(a, a) for a in args]
+            # Search handler stack top-to-bottom
+            for frame in reversed(self._handler_stack):
+                if op_name in frame:
+                    _param_name, handler_fn_name = frame[op_name]
+                    target = self._funcs.get(handler_fn_name)
+                    if target is not None:
+                        return self._call_func(target, perform_args, {})
+            # No handler found: raise
+            raise InterpError(f"Unhandled effect operation: {op_name!r}")
         elif kind == "alloc_struct":
             # ("alloc_struct", struct_name, locality), ((field, val_name), ...)
             struct_name: str = rhs[1]

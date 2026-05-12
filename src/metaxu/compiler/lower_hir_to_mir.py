@@ -85,11 +85,13 @@ class _FuncLowerer:
             elif e.cases:
                 return self.lower_expr(e.cases[0])
             return self.state.fresh("unit")
-        # If as an expression: lower control flow and return a fresh value of type
+        # If as an expression: lower control flow and phi-merge the result.
+        # Layout: entry(br_if) -> then_bb -> join_bb
+        #                      -> else_bb -> join_bb
+        # The join block uses a "select" op to pick the right arm's result.
         if e.op == "If" and e.cond is not None:
             cond_val = self.lower_expr(e.cond)
-            # end current ops as entry and branch
-            then_label = len(self.blocks) + 1  # optimistic labels: entry -> then -> else -> join
+            then_label = len(self.blocks) + 1
             else_label = then_label + 1
             join_label = else_label + 1
             self.seal_current_as_block(("br_if", cond_val, then_label, else_label))
@@ -105,11 +107,9 @@ class _FuncLowerer:
                 for sub in e.else_ops:
                     else_ops_result = self.lower_expr(sub)
             self.seal_current_as_block(("br", join_label))
-            # Join block
-            # For now, produce a const ty as the If-result; future: select based on phi
+            # Join block: select(cond, then_result, else_result) → phi merge
             dst = self.state.fresh("if")
-            self.emit(("let", dst, ("const_ty", str(e.ty)), ()))
-            # Do not seal join yet; caller will decide terminator
+            self.emit(("let", dst, ("select",), (cond_val, then_ops_result, else_ops_result)))
             return dst
         # Struct instantiation
         if e.op == "Struct" and e.struct_name is not None:
@@ -154,11 +154,54 @@ class _FuncLowerer:
                 sub_ops.extend(self.ops)
                 self.ops = []  # consumed into sub-func
                 self._pending_lambdas.append(
-                    _MirFunc(name=lname, ty_sig=e.ty,
-                             blocks=[_MirBlock(ops=sub_ops, term=("ret", body_result))],
-                             suspending=bool(e.suspends))
+                    MirFunc(name=lname, ty_sig=e.ty,
+                            blocks=[MirBlock(ops=sub_ops, term=("ret", body_result))],
+                            suspending=bool(e.suspends))
                 )
             return dst
+        # Perform: perform effect_op(args)
+        if e.op == "Perform" and e.effect_op is not None:
+            arg_names: List[str] = [self.lower_expr(a) for a in (e.perform_args or ())]
+            dst = self.state.fresh("pv")
+            self.emit(("let", dst, ("perform", e.effect_op), tuple(arg_names)))
+            return dst
+        # Handle: handle effect with cases in body
+        if e.op == "Handle" and e.handle_body is not None:
+            # Emit handler registration, run body, emit handler teardown
+            # Each case becomes a handler entry: (op_name, param_name, body_label)
+            # Simplified: inline the body, and for each perform op found, dispatch via select
+            # We encode the handler cases as a "push_handler" op followed by the body
+            cases_encoded = tuple(
+                (op_name, param_name)
+                for (op_name, param_name, _body_he) in (e.handle_cases or ())
+            )
+            case_bodies: dict[str, str] = {}
+            # Lower each handler body into a sub-function
+            for (op_name, param_name, body_he) in (e.handle_cases or ()):
+                handler_fn = f"__handler_{op_name}_{self.state.fresh('h')}"
+                # Save the handler body as a lambda keyed by op name
+                # For now store as pending: param bound to op arg, body lowered inline
+                case_bodies[op_name] = (param_name, body_he)
+            handler_id = self.state.fresh("hid")
+            # Emit: push_handler(effect_name, {op: handler_label})
+            encoded = tuple((op, pn) for (op, (pn, _)) in case_bodies.items())
+            self.emit(("let", handler_id, ("push_handler", e.handle_effect or ""), encoded))
+            body_val = self.lower_expr(e.handle_body)
+            self.emit(("let", handler_id, ("pop_handler", e.handle_effect or ""), ()))
+            # Register case bodies so interpreter can look them up
+            for op_name, (param_name, body_he) in case_bodies.items():
+                lname = f"__handler_{op_name}"
+                sub_ops: List[tuple] = [("params", (param_name,))]
+                self.state.env[param_name] = param_name
+                body_result = self.lower_expr(body_he)
+                sub_ops.extend(self.ops)
+                self.ops = []
+                self._pending_lambdas.append(
+                    MirFunc(name=lname, ty_sig=e.ty,
+                            blocks=[MirBlock(ops=sub_ops, term=("ret", body_result))],
+                            suspending=False)
+                )
+            return body_val
         # Fallback: const of type
         dst = self.state.fresh("ret")
         self.emit(("let", dst, ("const_ty", str(e.ty)), ()))

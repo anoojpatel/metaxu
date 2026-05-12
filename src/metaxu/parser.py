@@ -852,7 +852,7 @@ class Parser:
         '''if_expression : IF expression LBRACE expression_or_empty RBRACE ELSE LBRACE expression_or_empty RBRACE
                         | IF expression LBRACE expression_or_empty RBRACE'''
         if len(p) == 10:  # if ... else ...
-            p[0] = ast.IfExpression(p[2], p[4], p[7])
+            p[0] = ast.IfExpression(p[2], p[4], p[8])
         else:  # if ... without else
             p[0] = ast.IfExpression(p[2], p[4], None)
 
@@ -2098,7 +2098,8 @@ class Parser:
             
         # Process all children
         for child in node.children:
-            self._update_child_scopes(child)
+            if hasattr(child, 'children'):
+                self._update_child_scopes(child)
 
     def _is_variable_mutated_new(self, var_name, node):
         """Check if a variable is mutated in the given AST node"""
