@@ -85,6 +85,8 @@ class HIRBuilder:
         self.id_map = id_map or {}
         # Reverse map: id(orig_obj) -> frozen AstNode, built lazily in build()
         self._orig_to_frozen: dict[int, mast.AstNode] = {}
+        # Effect op names collected from EffectDeclaration nodes
+        self._effect_op_names: set[str] = set()
 
     def build(self, root: mast.AstNode) -> list[HFun]:
         funcs: list[HFun] = []
@@ -97,6 +99,14 @@ class HIRBuilder:
             for c in n.children:
                 index_nodes(c)
         index_nodes(root)
+
+        # Collect effect operation names so bare FunctionCall(name=op) can be identified as Perform
+        self._effect_op_names: set[str] = set()
+        for orig in self.id_map.values():
+            if isinstance(orig, fast.EffectDeclaration):
+                for op in (getattr(orig, 'operations', []) or []):
+                    if hasattr(op, 'name'):
+                        self._effect_op_names.add(str(op.name))
 
         def visit(n: mast.AstNode) -> None:
             orig = self.id_map.get(n.node_id)
@@ -228,16 +238,24 @@ class HIRBuilder:
                 current = self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span, op="FieldGet", base=current, field_name=str(field))
             return current
 
-        # Function calls
+        # Function calls (including perform-as-bare-call and resume)
         if isinstance(orig, fast.FunctionCall):
-            callee = getattr(orig, 'name', None)
+            callee = str(getattr(orig, 'name', None) or '')
             args_exprs = []
             for a in getattr(orig, 'arguments', []) or []:
                 he = self._from_orig_expr(a, ctx_for(a))
                 if he is not None:
                     args_exprs.append(he)
             ty = self.t.apply_tyenv(getattr(orig, 'type_var', None) or self.t.types.get(frozen_ctx.node_id, "Unknown"))
-            return self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span, op="Call", callee=str(callee), operands=tuple(args_exprs))
+            # `resume(v)` in a handle case → special Resume op (returns value to handler caller)
+            if callee == 'resume':
+                return self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span,
+                                      op="Resume", perform_args=tuple(args_exprs))
+            # Bare `perform emit(x)` parsed as FunctionCall when callee is a known effect op
+            if callee in self._effect_op_names:
+                return self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span,
+                                      op="Perform", effect_op=callee, perform_args=tuple(args_exprs))
+            return self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span, op="Call", callee=callee, operands=tuple(args_exprs))
 
         # BinaryOperation / ComparisonExpression (same structure, both use left/operator/right)
         if isinstance(orig, (fast.BinaryOperation, fast.ComparisonExpression)):
@@ -362,7 +380,14 @@ class HIRBuilder:
 
         # HandleEffect: handle EffectType with { cases } in body
         if isinstance(orig, fast.HandleEffect):
-            eff_name = str(getattr(orig, 'effect_name', '') or '')
+            eff_node = getattr(orig, 'effect_name', None)
+            # effect_name may be a TypeReference, QualifiedName, string, or AST node
+            if hasattr(eff_node, 'name'):
+                eff_name = str(eff_node.name)
+            elif hasattr(eff_node, 'parts'):
+                eff_name = '.'.join(str(p) for p in eff_node.parts)
+            else:
+                eff_name = str(eff_node or '')
             cases_raw = list(getattr(orig, 'handler', []) or [])
             cont = getattr(orig, 'continuation', None)
             case_triples: list[tuple[str, str, HExpr]] = []
