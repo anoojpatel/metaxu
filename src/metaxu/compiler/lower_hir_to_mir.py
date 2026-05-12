@@ -165,42 +165,41 @@ class _FuncLowerer:
             dst = self.state.fresh("pv")
             self.emit(("let", dst, ("perform", e.effect_op), tuple(arg_names)))
             return dst
+        # Resume: resume(value) inside a handle case — identity, just return the value
+        if e.op == "Resume":
+            args_list = list(e.perform_args or ())
+            if args_list:
+                return self.lower_expr(args_list[0])
+            return self.state.fresh("unit")
         # Handle: handle effect with cases in body
         if e.op == "Handle" and e.handle_body is not None:
-            # Emit handler registration, run body, emit handler teardown
-            # Each case becomes a handler entry: (op_name, param_name, body_label)
-            # Simplified: inline the body, and for each perform op found, dispatch via select
-            # We encode the handler cases as a "push_handler" op followed by the body
-            cases_encoded = tuple(
-                (op_name, param_name)
-                for (op_name, param_name, _body_he) in (e.handle_cases or ())
-            )
-            case_bodies: dict[str, str] = {}
-            # Lower each handler body into a sub-function
+            # First, compile each handler case body into a standalone sub-function.
+            # We snapshot/restore self.ops so handler compilation doesn't pollute the caller.
             for (op_name, param_name, body_he) in (e.handle_cases or ()):
-                handler_fn = f"__handler_{op_name}_{self.state.fresh('h')}"
-                # Save the handler body as a lambda keyed by op name
-                # For now store as pending: param bound to op arg, body lowered inline
-                case_bodies[op_name] = (param_name, body_he)
-            handler_id = self.state.fresh("hid")
-            # Emit: push_handler(effect_name, {op: handler_label})
-            encoded = tuple((op, pn) for (op, (pn, _)) in case_bodies.items())
-            self.emit(("let", handler_id, ("push_handler", e.handle_effect or ""), encoded))
-            body_val = self.lower_expr(e.handle_body)
-            self.emit(("let", handler_id, ("pop_handler", e.handle_effect or ""), ()))
-            # Register case bodies so interpreter can look them up
-            for op_name, (param_name, body_he) in case_bodies.items():
+                saved_ops = self.ops
+                saved_env = dict(self.state.env)
+                self.ops = []
                 lname = f"__handler_{op_name}"
-                sub_ops: List[tuple] = [("params", (param_name,))]
+                sub_header: List[tuple] = [("params", (param_name,))]
                 self.state.env[param_name] = param_name
                 body_result = self.lower_expr(body_he)
-                sub_ops.extend(self.ops)
-                self.ops = []
+                sub_ops = sub_header + self.ops
+                self.ops = saved_ops
+                self.state.env = saved_env
                 self._pending_lambdas.append(
                     MirFunc(name=lname, ty_sig=e.ty,
                             blocks=[MirBlock(ops=sub_ops, term=("ret", body_result))],
                             suspending=False)
                 )
+            # Emit push_handler, run body, pop_handler
+            encoded = tuple(
+                (op_name, param_name)
+                for (op_name, param_name, _) in (e.handle_cases or ())
+            )
+            handler_id = self.state.fresh("hid")
+            self.emit(("let", handler_id, ("push_handler", e.handle_effect or ""), encoded))
+            body_val = self.lower_expr(e.handle_body)
+            self.emit(("let", handler_id, ("pop_handler", e.handle_effect or ""), ()))
             return body_val
         # Fallback: const of type
         dst = self.state.fresh("ret")
