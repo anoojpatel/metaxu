@@ -1,82 +1,128 @@
-"""Tests for effect system's ability to capture escapes."""
+"""Tests for effect-class handling (stack vs suspend) and effect safety.
 
-from metaxu.compiler.infer_tables import build_tables_from_frozen_via_simplesub
-from metaxu.compiler.mutaxu_ast import build_frozen_ast_with_map
+Per docs/effects/continuation_design.md, V1 has exactly two effect classes:
+- stack:   continuation cannot escape the current dynamic extent; behaves
+           like a plain call and does NOT mark the function as suspending.
+- suspend: continuation may escape and resume later; the function suspends
+           and @local values may not cross the suspension point.
+Effects with no declared class are conservatively treated as suspend-class.
+"""
+
+import itertools
+
 import metaxu.metaxu_ast as fast
+from metaxu.compiler.infer_tables import build_tables_from_frozen_via_simplesub
+from metaxu.compiler.mutaxu_ast import AstNode, Span, build_frozen_ast_with_map
+
+SPAN = Span(file="<test>", start=0, end=0)
 
 
-def test_effect_class_parsing():
-    """Test that effect class is parsed and stored correctly."""
-    # Test effect declaration with class annotation
-    effect_decl = fast.EffectDeclaration("Async", [], fast.EffectOperation("yield", [], None), effect_class="suspend")
-    parsed = fast.Block([effect_decl])
-    
-    frozen, _ = build_frozen_ast_with_map(parsed)
-    tables = build_tables_from_frozen_via_simplesub(frozen)
-    
-    # Check that effect class is recorded in frozen AST
-    # The frozen AST stores the effect_class in the value dict
-    print(f"Effect classes tracked: {tables}")
-    print("Effect class parsing: OK (syntax supported)")
+def make_node_factory():
+    counter = itertools.count(1)
+
+    def node(kind, value=None, *children):
+        return AstNode(
+            node_id=next(counter), kind=kind, children=tuple(children), span=SPAN, value=value
+        )
+
+    return node
 
 
-def test_local_passed_to_suspend_effect():
-    """Test that local variable passed to suspend effect is caught."""
-    # Construct AST with suspend effect
-    effect = fast.EffectApplication("Async", [])
-    parsed = fast.Block([
-        fast.EffectDeclaration("Async", [], fast.EffectOperation("yield", [], None), effect_class="suspend"),
-        fast.FunctionDeclaration("suspend_fn", [fast.Parameter("x")], [fast.ReturnStatement(fast.Variable("x"))], performs=[effect]),
-        fast.FunctionDeclaration("test_escape", [], [
-            fast.LetStatement([fast.LetBinding("local", fast.Literal(42))]),
-            fast.FunctionCall("suspend_fn", [fast.Variable("local")])
-        ])
-    ])
-    
-    frozen, _ = build_frozen_ast_with_map(parsed)
-    tables = build_tables_from_frozen_via_simplesub(frozen)
-    
-    # Check if borrow checker caught the escape
-    constraints = tables.constraints_of(-2)  # Borrow checker errors
-    print(f"Borrow checker errors: {constraints}")
-    
-    # Should have an error about local passed to suspend effect
-    has_suspend_error = any("suspend" in str(err) for err in constraints)
-    if has_suspend_error:
-        print("Local passed to suspend effect: CAUGHT")
-    else:
-        print("Local passed to suspend effect: NOT CAUGHT (may need additional implementation)")
+def test_effect_class_is_frozen_into_ast():
+    """EffectDeclaration.effect_class survives freezing into the value payload."""
+    effect_decl = fast.EffectDeclaration(
+        "Async", [], fast.EffectOperation("yield", [], None), effect_class="suspend"
+    )
+    frozen, _ = build_frozen_ast_with_map(fast.Block([effect_decl]))
+
+    decl = next(n for n in _walk(frozen) if n.kind == "EffectDeclaration")
+    assert decl.value == {"name": "Async", "effect_class": "suspend"}
 
 
-def test_local_passed_to_stack_effect():
-    """Test that local variable passed to stack effect is allowed."""
-    # Construct AST with stack effect
-    effect = fast.EffectApplication("Console", [])
-    parsed = fast.Block([
-        fast.EffectDeclaration("Console", [], fast.EffectOperation("print", [fast.Parameter("msg")], None), effect_class="stack"),
-        fast.FunctionDeclaration("stack_fn", [fast.Parameter("x")], [fast.ReturnStatement(fast.Variable("x"))], performs=[effect]),
-        fast.FunctionDeclaration("test_stack", [], [
-            fast.LetStatement([fast.LetBinding("local", fast.Literal(42))]),
-            fast.FunctionCall("stack_fn", [fast.Variable("local")])
-        ])
-    ])
-    
-    frozen, _ = build_frozen_ast_with_map(parsed)
-    tables = build_tables_from_frozen_via_simplesub(frozen)
-    
-    # Check if borrow checker caught the escape
-    constraints = tables.constraints_of(-2)  # Borrow checker errors
-    print(f"Borrow checker errors for stack effect: {constraints}")
-    
-    # Should NOT have an error for stack effects
-    has_suspend_error = any("suspend" in str(err) for err in constraints)
-    if not has_suspend_error:
-        print("Local passed to stack effect: ALLOWED (correct)")
-    else:
-        print("Local passed to stack effect: ERROR (incorrect)")
+def _walk(node):
+    yield node
+    for child in node.children:
+        yield from _walk(child)
 
 
-if __name__ == "__main__":
-    test_effect_class_parsing()
-    test_local_passed_to_suspend_effect()
-    test_local_passed_to_stack_effect()
+def _program_with_effect(node, effect_class, declare_effect=True):
+    """A function performing effect E, with E optionally declared with a class."""
+    children = []
+    if declare_effect:
+        children.append(node("EffectDeclaration", {"name": "E", "effect_class": effect_class}))
+    fn = node("FunctionDeclaration", {"name": "eff_fn", "params": ["x"], "performs": ["E"]},
+        node("Parameter", {"name": "x", "mode": None}),
+        node("ReturnStatement", None, node("Variable", {"name": "x"})))
+    children.append(fn)
+    return node("Block", None, *children), fn
+
+
+def test_suspend_class_effect_marks_function_suspending():
+    node = make_node_factory()
+    prog, fn = _program_with_effect(node, "suspend")
+
+    tables = build_tables_from_frozen_via_simplesub(prog)
+
+    assert fn.node_id in tables.suspends
+    assert "E" in tables.effects.get(fn.node_id, set())
+
+
+def test_stack_class_effect_does_not_mark_function_suspending():
+    node = make_node_factory()
+    prog, fn = _program_with_effect(node, "stack")
+
+    tables = build_tables_from_frozen_via_simplesub(prog)
+
+    assert fn.node_id not in tables.suspends
+    # The effect itself is still tracked; only the suspend classification changes.
+    assert "E" in tables.effects.get(fn.node_id, set())
+
+
+def test_undeclared_effect_class_defaults_to_suspend():
+    """Effects with no declared class are conservatively suspend-class."""
+    node = make_node_factory()
+    prog, fn = _program_with_effect(node, None, declare_effect=False)
+
+    tables = build_tables_from_frozen_via_simplesub(prog)
+
+    assert fn.node_id in tables.suspends
+
+
+def test_local_passed_to_suspend_effect_is_caught():
+    """A @local value crossing a suspension point is an error."""
+    node = make_node_factory()
+    prog = node("Block", None,
+        node("EffectDeclaration", {"name": "Async", "effect_class": "suspend"}),
+        node("FunctionDeclaration", {"name": "suspend_fn", "params": ["x"], "performs": ["Async"]},
+            node("Parameter", {"name": "x", "mode": None}),
+            node("ReturnStatement", None, node("Variable", {"name": "x"}))),
+        node("FunctionDeclaration", {"name": "test_escape", "params": []},
+            node("Block", None,
+                node("LetBinding", {"name": "local_v", "mode": "local"}, node("Literal", 42)),
+                node("FunctionCall", {"name": "suspend_fn"},
+                    node("Variable", {"name": "local_v"})))))
+
+    tables = build_tables_from_frozen_via_simplesub(prog)
+    errors = list(tables.constraints.get(-2, []))
+
+    assert any(e.kind == "suspend-local" and e.variable == "local_v" for e in errors)
+
+
+def test_local_passed_to_stack_effect_is_allowed():
+    """Stack effects behave like plain calls: locals may be passed."""
+    node = make_node_factory()
+    prog = node("Block", None,
+        node("EffectDeclaration", {"name": "Console", "effect_class": "stack"}),
+        node("FunctionDeclaration", {"name": "stack_fn", "params": ["x"], "performs": ["Console"]},
+            node("Parameter", {"name": "x", "mode": None}),
+            node("ReturnStatement", None, node("Variable", {"name": "x"}))),
+        node("FunctionDeclaration", {"name": "test_stack", "params": []},
+            node("Block", None,
+                node("LetBinding", {"name": "local_v", "mode": "local"}, node("Literal", 42)),
+                node("FunctionCall", {"name": "stack_fn"},
+                    node("Variable", {"name": "local_v"})))))
+
+    tables = build_tables_from_frozen_via_simplesub(prog)
+    errors = list(tables.constraints.get(-2, []))
+
+    assert errors == []
