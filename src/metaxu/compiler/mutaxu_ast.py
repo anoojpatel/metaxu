@@ -97,9 +97,13 @@ def _value_of(node: Any) -> Any | None:
             "value": getattr(node, "value", None),
         }
     if isinstance(node, fast.FunctionCall):
-        return {"name": getattr(node, "name", None)}
+        name = getattr(node, "name", None)
+        return {"name": name if isinstance(name, str) or name is None else str(name)}
     if isinstance(node, fast.Assignment):
-        return {"name": getattr(node, "name", None)}
+        # The assignment target may be a complex expression (field access,
+        # indexing); stringify it so the frozen AST stays JSON serializable.
+        name = getattr(node, "name", None)
+        return {"name": name if isinstance(name, str) or name is None else str(name)}
     if isinstance(node, fast.LambdaExpression):
         return {
             "params": [getattr(p, "name", None) for p in getattr(node, "params", [])],
