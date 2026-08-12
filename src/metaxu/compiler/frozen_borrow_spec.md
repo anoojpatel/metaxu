@@ -167,7 +167,7 @@ Collect errors with node IDs for precise error reporting:
 ### Deprecation Plan
 
 Deprecate the following to avoid two-world state:
-1. `build_tables_with_promoted_borrow_checks()` in infer_tables.py
+1. `build_tables_with_promoted_borrow_checks()` in infer_tables.py (DONE: removed)
 2. Original BorrowChecker in type_checker.py (mark as legacy)
 3. Remove borrow operation visitors from original type_checker
 

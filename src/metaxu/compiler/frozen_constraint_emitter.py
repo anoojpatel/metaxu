@@ -11,13 +11,70 @@ from .mutaxu_ast import AstNode
 from .simplesub_adapter import SimpleSubFacade
 from .frozen_borrow_checker import FrozenBorrowChecker, BorrowError
 
-# Scaffold for emitting constraints over the frozen AST (mutaxu_ast).
-# This module intentionally does nothing substantive yet; it provides a stable
-# interface for future work to replay constraints against SimpleSub using
-# CompactType variables keyed by frozen node_id.
+# Emits type/effect constraints over the frozen AST (mutaxu_ast) and drives
+# the frozen borrow checker (modes, locality, regions, linearity, exclave).
 
 
-def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) -> Tuple[None, List[Tuple[str, int]]]:
+_UNIQUENESS_MODES = {"shared", "unique", "exclusive"}
+# Surface syntax spellings (@owned/@mut/@const) map onto spec uniqueness modes.
+_UNIQUENESS_ALIASES = {"owned": "unique", "mut": "exclusive", "const": "shared"}
+_LOCALITY_MODES = {"local", "global"}
+_LINEARITY_MODES = {"once", "separate", "many"}
+
+
+def _split_mode(value: dict) -> tuple[str, str, str | None]:
+    """Interpret frozen mode payloads into (uniqueness, locality, linearity).
+
+    Handles the shapes the frozen AST can carry today or in the near future:
+    - a bare string mode (e.g. "unique", "local", "once", "@mut" spellings)
+    - a list/tuple of such strings
+    - a dict with explicit "uniqueness"/"locality"/"linearity" entries
+    - separate top-level "uniqueness"/"locality"/"linearity" payload keys
+    Anything absent defaults to the permissive ("shared", "global", None) so
+    unannotated code keeps compiling exactly as before.
+    """
+    uniqueness: str | None = None
+    locality: str | None = None
+    linearity: str | None = None
+
+    def absorb(token: Any) -> None:
+        nonlocal uniqueness, locality, linearity
+        if not isinstance(token, str):
+            return
+        tok = token.lower().lstrip("@")
+        tok = _UNIQUENESS_ALIASES.get(tok, tok)
+        if tok in _UNIQUENESS_MODES and uniqueness is None:
+            uniqueness = tok
+        elif tok in _LOCALITY_MODES and locality is None:
+            locality = tok
+        elif tok in _LINEARITY_MODES and linearity is None:
+            linearity = tok
+
+    raw = value.get("mode")
+    if isinstance(raw, dict):
+        absorb(raw.get("uniqueness"))
+        absorb(raw.get("locality"))
+        absorb(raw.get("linearity"))
+    elif isinstance(raw, (list, tuple)):
+        for token in raw:
+            absorb(token)
+    else:
+        absorb(raw)
+    absorb(value.get("uniqueness"))
+    absorb(value.get("locality"))
+    absorb(value.get("linearity"))
+
+    return uniqueness or "shared", locality or "global", linearity
+
+
+_BORROW_NODE_MODES = {
+    "BorrowShared": "shared",
+    "BorrowUnique": "unique",
+    "BorrowExclusive": "exclusive",
+}
+
+
+def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) -> Tuple[None, List[BorrowError]]:
     """Walk the frozen AST and emit constraints through the provided facade.
 
     Arguments:
@@ -26,13 +83,16 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
       simplesub: an adapter/facade with add_* APIs and solve()
 
     Returns:
-      Tuple of (None, borrow_errors) where borrow_errors contains (message, node_id) tuples
+      Tuple of (None, borrow_errors) where borrow_errors is a list of
+      structured BorrowError objects (kind, variable, node_id, message).
     """
     scopes: list[dict[str, Any]] = [{}]
     return_types: list[Any] = []
     borrow_checker = FrozenBorrowChecker()
     effect_classes: dict[str, str] = {}  # effect_name -> effect_class (stack/suspend)
     function_effects: dict[str, list[str]] = {}  # function_name -> list of effects it performs
+    declared_linearity: dict[str, str] = {}  # callable_name -> linearity ("once"/"separate"/"many")
+    function_region_stack: list[int] = []  # region id at each enclosing function's entry
     handler_contexts: list[dict[str, str]] = []  # Stack of handler contexts: effect_name -> effect_class
     handler_locals: list[set[str]] = []  # Track variables assigned in handler contexts
     handler_operations: list[list[str]] = []  # Track operations in handler (for stack effect checking)
@@ -163,7 +223,9 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
                                     borrow_checker.errors.append(
                                         BorrowError(
                                             message=f"Stack effect handler '{effect_name}' cannot pass handler-local variable '{var_name}' to function (potential continuation escape)",
-                                            node_id=child.node_id
+                                            node_id=child.node_id,
+                                            kind="stack-continuation-escape",
+                                            variable=var_name,
                                         )
                                     )
         if kind == "Literal" and node_ty is not None:
@@ -172,6 +234,7 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
                 simplesub.add_class_constraint(cls, [node_ty], node.node_id)
         if kind == "Block":
             push_scope()
+            borrow_checker.enter_region()
             last_child_ty = None
             for child in children:
                 child_ty = types.get(child.node_id)
@@ -181,6 +244,7 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
                 last_child_ty = child_ty
             if kind == "Block" and node_ty is not None and last_child_ty is not None:
                 simplesub.add_unify(node_ty, last_child_ty)
+            borrow_checker.exit_region()
             pop_scope()
             return None
         if kind == "FunctionDeclaration" and node_ty is not None:
@@ -189,28 +253,15 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
             func_name = value.get("name")
             performs = value.get("performs", []) or []
             if func_name and isinstance(func_name, str):
-                function_effects[func_name] = performs
-            # Construct CompactType function type first
-            # so we can bind the function name to the function type
-            value = payload_dict(node)
+                function_effects[func_name] = [str(e) for e in performs]
             params = value.get("params", [])
             param_children = param_nodes(children)
-            param_tys: list[Any] = []
-            for name, child in zip(params, param_children):
-                child_ty = types.get(child.node_id)
-                if child_ty is not None:
-                    bind(name, child_ty)
-                    param_tys.append(child_ty)
-                    simplesub.add_class_constraint("Param", [child_ty], child.node_id)
-                    mode = payload_dict(child).get("mode")
-                    if isinstance(mode, str):
-                        simplesub.add_class_constraint(f"Mode:{mode}", [child_ty], child.node_id)
-                        # Declare parameter in borrow checker
-                        locality = "global"  # Parameters are global by default
-                        borrow_checker.declare_variable(name, mode or "shared", locality, child.node_id)
-            
-            # Construct CompactType function type
-            # Store in types dict for proper representation
+            param_tys: list[Any] = [
+                types[child.node_id] for child in param_children if types.get(child.node_id) is not None
+            ]
+
+            # Construct CompactType function type first so we can bind the
+            # function name to the function type in the *enclosing* scope.
             if CompactType is not None:
                 from metaxu.type_defs import next_id
                 fn_compact = CompactType(
@@ -234,13 +285,33 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
                     simplesub.add_effect(node_ty, str(effect_name), node.node_id)
                     simplesub.add_class_constraint("Effectful", [node_ty], node.node_id)
                 bind(payload_name(node), node_ty)
-            
+
+            # Function body is a fresh scope *and* a fresh region: locals
+            # (and @local params) belong to the function's region and may not
+            # escape to the caller's region except through exclave.
             push_scope()
-            
+            borrow_checker.enter_region()
+            function_region_stack.append(borrow_checker.current_region())
+
+            for name, child in zip(params, param_children):
+                child_ty = types.get(child.node_id)
+                if child_ty is not None:
+                    bind(name, child_ty)
+                    simplesub.add_class_constraint("Param", [child_ty], child.node_id)
+                    param_payload = payload_dict(child)
+                    mode = param_payload.get("mode")
+                    if isinstance(mode, str):
+                        simplesub.add_class_constraint(f"Mode:{mode}", [child_ty], child.node_id)
+                    # Declare parameter with its real uniqueness/locality modes
+                    # (defaults: shared/global for unannotated parameters).
+                    uniqueness, locality, _linearity = _split_mode(param_payload)
+                    if isinstance(name, str):
+                        borrow_checker.declare_variable(name, uniqueness, locality, child.node_id)
+
             # Push the return type (not the function type) for return statements
             # Must do this BEFORE walking the body
             return_types.append(node_ty)
-            
+
             for child in non_param_nodes(children):
                 child_ty = types.get(child.node_id)
                 # Subtype from child to function's return type
@@ -252,12 +323,15 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
                     simplesub.add_subtype(child_ty, node_ty)
                 walk(child)
             return_types.pop()
+            function_region_stack.pop()
+            borrow_checker.exit_region()
             pop_scope()
             return None
         if kind == "LambdaExpression" and node_ty is not None:
             outer_bindings = {name: lookup(name) for name in payload_dict(node).get("captures", {})}
             push_scope()
-            return_types.append(node_ty)
+            borrow_checker.enter_region()
+            function_region_stack.append(borrow_checker.current_region())
             value = payload_dict(node)
             params = value.get("params", [])
             param_children = param_nodes(children)
@@ -268,12 +342,14 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
                     bind(name, child_ty)
                     param_tys.append(child_ty)
                     simplesub.add_class_constraint("Param", [child_ty], child.node_id)
-                    mode = payload_dict(child).get("mode")
+                    param_payload = payload_dict(child)
+                    mode = param_payload.get("mode")
                     if isinstance(mode, str):
                         simplesub.add_class_constraint(f"Mode:{mode}", [child_ty], child.node_id)
-                        # Declare parameter in borrow checker
-                        locality = "global"  # Parameters are global by default
-                        borrow_checker.declare_variable(name, mode or "shared", locality, child.node_id)
+                    # Declare parameter with its real uniqueness/locality modes
+                    uniqueness, locality, _linearity = _split_mode(param_payload)
+                    if isinstance(name, str):
+                        borrow_checker.declare_variable(name, uniqueness, locality, child.node_id)
             linearity = value.get("linearity") or "many"
             captures = value.get("captures", {}) or {}
             for captured_name, mode in captures.items():
@@ -316,6 +392,8 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
                     simplesub.add_subtype(child_ty, node_ty)
                 walk(child)
             return_types.pop()
+            function_region_stack.pop()
+            borrow_checker.exit_region()
             pop_scope()
             if CompactType is not None:
                 simplesub.add_class_constraint("Callable", [fn_compact], node.node_id)
@@ -328,10 +406,33 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
                 if child_ty is not None:
                     simplesub.add_unify(node_ty, child_ty)
                     walk(child)
-            # Declare variable in borrow checker
+            # Declare variable in borrow checker with its real modes
+            # (defaults to shared/global for unannotated bindings).
             var_name = payload_name(node)
+            let_payload = payload_dict(node)
+            uniqueness, locality, linearity = _split_mode(let_payload)
             if isinstance(var_name, str):
-                borrow_checker.declare_variable(var_name, "shared", "global", node.node_id)
+                borrow_checker.declare_variable(var_name, uniqueness, locality, node.node_id)
+                # Register callable linearity when binding a lambda so calls can
+                # enforce once/separate semantics by name.
+                for child in children:
+                    if child.kind == "LambdaExpression":
+                        lam_linearity = payload_dict(child).get("linearity")
+                        if isinstance(lam_linearity, str):
+                            declared_linearity[var_name] = lam_linearity
+                        elif isinstance(linearity, str):
+                            declared_linearity[var_name] = linearity
+                if isinstance(linearity, str) and var_name not in declared_linearity:
+                    declared_linearity[var_name] = linearity
+                # Track reference relationships created by borrow initializers,
+                # e.g. `let r = &x` makes r hold a reference to x.
+                for child in children:
+                    ref_mode = _BORROW_NODE_MODES.get(child.kind)
+                    if ref_mode is not None:
+                        target = payload_dict(child).get("variable")
+                        if isinstance(target, str):
+                            borrow_checker.track_reference(var_name, target, ref_mode)
+                            borrow_checker.check_reference_conflicts(target, child.node_id)
             bind(payload_name(node), node_ty)
             return None
         if kind == "Variable" and node_ty is not None:
@@ -354,6 +455,10 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
                 simplesub.add_class_constraint("CallLinearity", [callee_ty, node_ty], node.node_id)
             elif isinstance(name, str):
                 simplesub.add_unresolved("callee", name, node.node_id)
+            # Enforce linearity for callables with a known linearity mode
+            # (e.g. once-lambdas bound to a name may only be invoked once).
+            if isinstance(name, str) and name in declared_linearity:
+                borrow_checker.check_linearity(name, declared_linearity[name], node.node_id)
             for child in children:
                 child_ty = types.get(child.node_id)
                 if child_ty is not None:
@@ -363,14 +468,29 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
                         var_name = payload_dict(child).get("name")
                         if isinstance(var_name, str):
                             borrow_checker.check_locality(var_name, None, child.node_id)
-                            # Check if callee performs suspend effects
-                            if isinstance(name, str) and name in function_effects:
+                            # @local values may not cross a suspension point:
+                            # the frame they live in can unwind before the
+                            # continuation resumes. Only suspend-class effects
+                            # are affected; stack-class effects behave like
+                            # ordinary calls. Effects with no declared class
+                            # are conservatively treated as suspend.
+                            var_info = borrow_checker.variables.get(var_name)
+                            if (
+                                var_info is not None
+                                and var_info.locality == "local"
+                                and isinstance(name, str)
+                                and name in function_effects
+                            ):
                                 for effect in function_effects[name]:
-                                    effect_class = effect_classes.get(effect)
+                                    effect_class = effect_classes.get(effect, "suspend")
                                     if effect_class == "suspend":
-                                        # Suspend effects cannot take local variables
                                         borrow_checker.errors.append(
-                                            BorrowError(message=f"Local variable '{var_name}' passed to suspend effect '{effect}'", node_id=child.node_id)
+                                            BorrowError(
+                                                message=f"Local variable '{var_name}' passed to suspend effect '{effect}'",
+                                                node_id=child.node_id,
+                                                kind="suspend-local",
+                                                variable=var_name,
+                                            )
                                         )
         if kind in {"BinaryOperation", "ComparisonExpression"} and node_ty is not None and len(children) >= 2:
             left_ty = types.get(children[0].node_id)
@@ -410,15 +530,25 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
                     simplesub.add_unify(target_ty, expr_ty)
                     if return_types:
                         simplesub.add_unify(return_types[-1], expr_ty)
-                    # Check locality if returning a variable
+                    # Returning a value sends it to the *caller's* region. A
+                    # @local value declared inside this function (params or
+                    # body) therefore escapes -> error. Exclave is the legal
+                    # way to promote a local value and is handled at the
+                    # ExclaveExpression node instead.
                     if children[0].kind == "Variable":
                         var_name = payload_dict(children[0]).get("name")
                         if isinstance(var_name, str):
-                            borrow_checker.check_locality(var_name, None, children[0].node_id)
+                            caller_region = (
+                                function_region_stack[-1] - 1
+                                if function_region_stack
+                                else borrow_checker.current_region()
+                            )
+                            borrow_checker.check_locality(var_name, caller_region, children[0].node_id)
             elif return_types:
                 simplesub.add_class_constraint("Unit", [return_types[-1]], node.node_id)
         if kind == "Assignment" and node_ty is not None:
-            binding_ty = lookup(payload_name(node))
+            target_name = payload_name(node)
+            binding_ty = lookup(target_name)
             if binding_ty is not None:
                 simplesub.add_unify(node_ty, binding_ty)
             for child in children:
@@ -432,6 +562,14 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
                         var_name = payload_dict(child).get("name")
                         if isinstance(var_name, str):
                             borrow_checker.check_locality(var_name, None, child.node_id)
+                # Track references created by borrow assignments, e.g.
+                # `r = &x` makes r hold a reference to x.
+                ref_mode = _BORROW_NODE_MODES.get(child.kind)
+                if ref_mode is not None and isinstance(target_name, str):
+                    ref_target = payload_dict(child).get("variable")
+                    if isinstance(ref_target, str):
+                        borrow_checker.track_reference(target_name, ref_target, ref_mode)
+                        borrow_checker.check_reference_conflicts(ref_target, child.node_id)
         if kind == "BorrowShared" and node_ty is not None:
             value = payload_dict(node)
             var_name = value.get("variable")
@@ -457,9 +595,15 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
                 borrow_checker.check_move(var_name, node.node_id)
                 simplesub.add_class_constraint("Move", [node_ty], node.node_id)
         if kind == "ExclaveExpression" and node_ty is not None:
-            value = payload_dict(node)
-            # Exclave uses copy semantics - value is copied to caller's frame
-            # No borrow checking errors needed for local variables
+            # Exclave uses copy semantics - the value is copied to the caller's
+            # frame, so it is the *legal* way for a @local value to escape.
+            # The only invalid case is exclaving an already-moved value.
+            inner_var = payload_dict(node).get("expression")
+            if not isinstance(inner_var, str):
+                inner = next((c for c in children if c.kind == "Variable"), None)
+                inner_var = payload_dict(inner).get("name") if inner is not None else None
+            if isinstance(inner_var, str):
+                borrow_checker.check_exclave(inner_var, node.node_id)
             simplesub.add_class_constraint("Exclave", [node_ty], node.node_id)
         if kind == "StructInstantiation" and node_ty is not None:
             simplesub.add_class_constraint("Struct", [node_ty], node.node_id)
@@ -485,4 +629,11 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
             walk(child)
 
     walk(frozen_root)
+    # Publish declared effect classes so the constraint checker can
+    # distinguish stack-class effects (which do not suspend) from
+    # suspend-class effects. Effects with no declared class are treated as
+    # suspend-class (conservative) by the checker.
+    if hasattr(simplesub, "add_effect_class"):
+        for effect_name, effect_class in effect_classes.items():
+            simplesub.add_effect_class(effect_name, effect_class)
     return None, borrow_checker.get_errors()

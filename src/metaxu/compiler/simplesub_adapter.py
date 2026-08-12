@@ -57,6 +57,10 @@ class SimpleSubFacade:
     def add_effect(self, fn_ty: Any, effect_name: str, node_id: int | None = None) -> None:
         self._constraints.append(("effect", fn_ty, effect_name, node_id))
 
+    def add_effect_class(self, effect_name: str, effect_class: str, node_id: int | None = None) -> None:
+        """Record the declared class ("stack" or "suspend") of an effect."""
+        self._constraints.append(("effect_class", effect_name, effect_class, node_id))
+
     def add_capture(
         self,
         fn_ty: Any,
