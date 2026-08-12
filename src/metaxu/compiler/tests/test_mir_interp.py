@@ -469,3 +469,63 @@ def test_pipeline_to_interp():
     interp = MirInterpreter()
     interp.load(mir_funcs)
     assert interp.call(found[0].name, [21]) == 42
+
+
+# ---------------------------------------------------------------------------
+# Strict name resolution
+# ---------------------------------------------------------------------------
+
+def test_unbound_variable_raises():
+    """Referencing a name that was never bound must raise, not silently
+    evaluate to the name string."""
+    f = make_func("f", [
+        simple_block(
+            [("let", "r", ("binop", "+"), ("nope", "nope"))],
+            ("ret", "r")
+        )
+    ])
+    interp = MirInterpreter()
+    interp.load([f])
+    with pytest.raises(InterpError, match="Unbound variable"):
+        interp.call("f", [])
+
+
+def test_unbound_call_arg_raises():
+    f = make_func("f", [
+        simple_block(
+            [("let", "r", ("call", "assert_eq"), ("missing", "missing"))],
+            ("ret", "r")
+        )
+    ])
+    interp = MirInterpreter()
+    interp.load([f])
+    with pytest.raises(InterpError, match="Unbound variable"):
+        interp.call("f", [])
+
+
+def test_use_after_drop_raises():
+    f = make_func("f", [
+        simple_block(
+            [
+                ("let", "x", ("const", 7), ()),
+                ("drop", "x"),
+                ("let", "y", ("binop", "+"), ("x", "x")),
+            ],
+            ("ret", "y")
+        )
+    ])
+    interp = MirInterpreter()
+    interp.load([f])
+    with pytest.raises(InterpError, match="Unbound variable"):
+        interp.call("f", [])
+
+
+def test_unbound_branch_condition_raises():
+    f = make_func("f", [
+        simple_block([], ("br_if", "ghost", 1, 1)),
+        simple_block([("let", "r", ("const", 1), ())], ("ret", "r")),
+    ])
+    interp = MirInterpreter()
+    interp.load([f])
+    with pytest.raises(InterpError, match="Unbound variable"):
+        interp.call("f", [])
