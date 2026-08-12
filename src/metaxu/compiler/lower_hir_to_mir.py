@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from typing import Sequence, List, Dict
+from typing import Any, Sequence, List, Dict
 
-from .hir import HFun, HExpr
+from .hir import HFun, HExpr, HPattern
 from .mir import MirFunc, MirBlock
 from .borrow_analysis import plan_drops
 
@@ -18,26 +18,119 @@ class _ANFState:
 
 
 class _FuncLowerer:
+    """Lowers one HIR function body into MIR blocks.
+
+    Block model: all blocks are allocated up-front as objects in ``self.blocks``
+    (so their indices/labels are stable no matter how many blocks a nested arm
+    creates), and ``self.cur`` points at the block currently being filled.
+    A freshly allocated block carries an ("unreachable",) placeholder terminator
+    which is overwritten via ``terminate`` once its real successor is known.
+    """
+
     def __init__(self, f: HFun) -> None:
         self.f = f
-        self.blocks: List[MirBlock] = []
-        self.ops: List[tuple] = []
+        self.blocks: List[MirBlock] = [MirBlock(ops=[], term=("unreachable",))]
+        self.cur: int = 0
         self.state = _ANFState()
         self._pending_lambdas: List[MirFunc] = []
 
+    # ------------------------------------------------------------------
+    # Block plumbing
+    # ------------------------------------------------------------------
+
     def new_block(self) -> int:
         idx = len(self.blocks)
-        self.blocks.append(MirBlock(ops=[], term=("br", idx)))  # placeholder
+        self.blocks.append(MirBlock(ops=[], term=("unreachable",)))
         return idx
 
-    def seal_current_as_block(self, term: tuple) -> int:
-        idx = len(self.blocks)
-        self.blocks.append(MirBlock(ops=self.ops, term=term))
-        self.ops = []
-        return idx
+    def switch_to(self, idx: int) -> None:
+        self.cur = idx
+
+    def terminate(self, term: tuple) -> None:
+        self.blocks[self.cur].term = term
 
     def emit(self, op: tuple) -> None:
-        self.ops.append(op)
+        self.blocks[self.cur].ops.append(op)
+
+    def unit_value(self) -> str:
+        """Emit a unit constant and return its name (always bound at runtime)."""
+        dst = self.state.fresh("unit")
+        self.emit(("let", dst, ("const_ty", "Unit"), ()))
+        return dst
+
+    # ------------------------------------------------------------------
+    # Sub-function compilation (lambdas, effect handler cases)
+    # ------------------------------------------------------------------
+
+    def _lower_subfunc(self, name: str, params: Sequence[str], body: HExpr,
+                       ty_sig: Any, suspending: bool) -> None:
+        """Compile ``body`` into a standalone MirFunc appended to pending lambdas.
+
+        Swaps out the block context so nested control flow inside the
+        sub-function cannot pollute the enclosing function's blocks.
+        """
+        saved_blocks, saved_cur = self.blocks, self.cur
+        saved_env = dict(self.state.env)
+        self.blocks = [MirBlock(ops=[("params", tuple(params))], term=("unreachable",))]
+        self.cur = 0
+        for pn in params:
+            self.state.env[pn] = pn
+        result = self.lower_expr(body)
+        self.terminate(("ret", result))
+        sub_blocks = self.blocks
+        self.blocks, self.cur = saved_blocks, saved_cur
+        self.state.env = saved_env
+        self._pending_lambdas.append(
+            MirFunc(name=name, ty_sig=ty_sig, blocks=sub_blocks, suspending=suspending)
+        )
+
+    # ------------------------------------------------------------------
+    # Pattern compilation
+    # ------------------------------------------------------------------
+
+    def compile_pattern(self, pat: HPattern, val_name: str, fail_bb: int) -> None:
+        """Emit test-and-branch ops for ``pat`` against ``val_name``.
+
+        On fall-through (staying in the current block chain) the pattern has
+        matched and all its variables are bound; on failure control jumps to
+        ``fail_bb``.
+        """
+        if pat.kind == "wildcard":
+            return
+        if pat.kind == "var":
+            dst = self.state.fresh("p")
+            self.emit(("let", dst, ("copy",), (val_name,)))
+            self.state.env[str(pat.name)] = dst
+            return
+        if pat.kind == "literal":
+            c = self.state.fresh("c")
+            self.emit(("let", c, ("const", pat.value), ()))
+            cond = self.state.fresh("t")
+            self.emit(("let", cond, ("binop", "=="), (val_name, c)))
+            ok_bb = self.new_block()
+            self.terminate(("br_if", cond, ok_bb, fail_bb))
+            self.switch_to(ok_bb)
+            return
+        if pat.kind == "ctor":
+            tag = self.state.fresh("tag")
+            self.emit(("let", tag, ("variant_tag",), (val_name,)))
+            c = self.state.fresh("c")
+            self.emit(("let", c, ("const", str(pat.name)), ()))
+            cond = self.state.fresh("t")
+            self.emit(("let", cond, ("binop", "=="), (tag, c)))
+            ok_bb = self.new_block()
+            self.terminate(("br_if", cond, ok_bb, fail_bb))
+            self.switch_to(ok_bb)
+            for i, sub in enumerate(pat.subpatterns):
+                fv = self.state.fresh("pf")
+                self.emit(("let", fv, ("variant_field", i), (val_name,)))
+                self.compile_pattern(sub, fv, fail_bb)
+            return
+        raise ValueError(f"Unknown pattern kind: {pat.kind!r}")
+
+    # ------------------------------------------------------------------
+    # Expression lowering
+    # ------------------------------------------------------------------
 
     def lower_expr(self, e: HExpr) -> str:
         # Handle expression forms that return a value
@@ -59,57 +152,97 @@ class _FuncLowerer:
             self.emit(("let", dst, ("binop", e.binop), (l, r)))
             return dst
         if e.op == "Let" and e.bindings is not None:
-            last_name = None
+            last_val: str | None = None
             for (name, sube) in e.bindings:
                 val = self.lower_expr(sube)
-                self.state.env[name] = val
-                last_name = name
-            return self.state.env.get(last_name, self.state.fresh("unit")) if last_name else self.state.fresh("unit")
+                # Bind into a dedicated slot (not an alias of the initializer's
+                # temp) so later assignments to this variable cannot clobber
+                # the initializer's own slot (e.g. `let j = b; j = j - 1`).
+                slot = self.state.fresh(f"{name}_")
+                self.emit(("let", slot, ("copy",), (val,)))
+                self.state.env[name] = slot
+                last_val = slot
+            return last_val if last_val is not None else self.unit_value()
         if e.op == "Block" and e.operands is not None:
-            last = self.state.fresh("unit")
+            last: str | None = None
             for sube in e.operands:
                 last = self.lower_expr(sube)
-            return last
-        # Match expression (desugared from if statements)
+            return last if last is not None else self.unit_value()
+        # Assignment: write through to the variable's runtime slot so loops see
+        # the updated value on the next iteration.
+        if e.op == "Assign" and e.var_name is not None:
+            val = self.unit_value() if e.assign_value is None else self.lower_expr(e.assign_value)
+            slot = self.state.env.get(e.var_name)
+            if slot is None:
+                # First assignment introduces the slot (named after the variable)
+                slot = e.var_name
+                self.state.env[e.var_name] = slot
+            self.emit(("let", slot, ("copy",), (val,)))
+            return slot
+        # Match: decision-tree lowering, first-match-wins top-to-bottom.
         if e.op == "Match" and e.scrutinee is not None:
-            scrutinee_val = self.lower_expr(e.scrutinee)
-            # For now, simplify: lower match as if-else for 2 cases (true/false from if desugaring)
-            # This is a simplification - full match lowering would need pattern matching
-            if e.cases and len(e.cases) >= 2:
-                # First case (true)
-                case1_result = self.lower_expr(e.cases[0])
-                # Second case (false)
-                case2_result = self.lower_expr(e.cases[1])
-                # Return the second case result for now (simplified)
-                return case2_result
-            elif e.cases:
-                return self.lower_expr(e.cases[0])
-            return self.state.fresh("unit")
-        # If as an expression: lower control flow and phi-merge the result.
-        # Layout: entry(br_if) -> then_bb -> join_bb
-        #                      -> else_bb -> join_bb
-        # The join block uses a "select" op to pick the right arm's result.
+            return self._lower_match(e)
+        # If as an expression: real control flow with a join block.
+        # Layout: cur(br_if) -> then_bb ... -> join_bb
+        #                    -> else_bb ... -> join_bb
+        # Each arm copies its result into a shared result variable before
+        # branching to the join, so the join sees exactly one binding.
         if e.op == "If" and e.cond is not None:
             cond_val = self.lower_expr(e.cond)
-            then_label = len(self.blocks) + 1
-            else_label = then_label + 1
-            join_label = else_label + 1
-            self.seal_current_as_block(("br_if", cond_val, then_label, else_label))
-            # Then block
-            then_ops_result = self.state.fresh("unit")
-            if e.then_ops:
-                for sub in e.then_ops:
-                    then_ops_result = self.lower_expr(sub)
-            self.seal_current_as_block(("br", join_label))
-            # Else block
-            else_ops_result = self.state.fresh("unit")
-            if e.else_ops:
-                for sub in e.else_ops:
-                    else_ops_result = self.lower_expr(sub)
-            self.seal_current_as_block(("br", join_label))
-            # Join block: select(cond, then_result, else_result) → phi merge
-            dst = self.state.fresh("if")
-            self.emit(("let", dst, ("select",), (cond_val, then_ops_result, else_ops_result)))
+            res_var = self.state.fresh("if")
+            then_bb = self.new_block()
+            else_bb = self.new_block()
+            join_bb = self.new_block()
+            self.terminate(("br_if", cond_val, then_bb, else_bb))
+            # Then arm
+            self.switch_to(then_bb)
+            saved_env = dict(self.state.env)
+            then_result: str | None = None
+            for sub in (e.then_ops or ()):
+                then_result = self.lower_expr(sub)
+            if then_result is None:
+                then_result = self.unit_value()
+            self.emit(("let", res_var, ("copy",), (then_result,)))
+            self.terminate(("br", join_bb))
+            self.state.env = dict(saved_env)
+            # Else arm
+            self.switch_to(else_bb)
+            else_result: str | None = None
+            for sub in (e.else_ops or ()):
+                else_result = self.lower_expr(sub)
+            if else_result is None:
+                else_result = self.unit_value()
+            self.emit(("let", res_var, ("copy",), (else_result,)))
+            self.terminate(("br", join_bb))
+            self.state.env = saved_env
+            # Join
+            self.switch_to(join_bb)
+            return res_var
+        # While loop: header/body/exit blocks with a back-edge to the header.
+        if e.op == "While" and e.cond is not None:
+            header_bb = self.new_block()
+            body_bb = self.new_block()
+            exit_bb = self.new_block()
+            self.terminate(("br", header_bb))
+            # Header: (re-)evaluate the condition each iteration
+            self.switch_to(header_bb)
+            cond_val = self.lower_expr(e.cond)
+            self.terminate(("br_if", cond_val, body_bb, exit_bb))
+            # Body
+            self.switch_to(body_bb)
+            saved_env = dict(self.state.env)
+            for sub in (e.loop_body or ()):
+                self.lower_expr(sub)
+            self.terminate(("br", header_bb))
+            self.state.env = saved_env
+            # Exit: a while loop evaluates to unit
+            self.switch_to(exit_bb)
+            return self.unit_value()
+        # Enum variant construction
+        if e.op == "MakeVariant" and e.variant_name is not None:
+            payload = [self.lower_expr(a) for a in (e.operands or ())]
+            dst = self.state.fresh("vt")
+            self.emit(("let", dst, ("make_variant", e.enum_name or "", e.variant_name), tuple(payload)))
             return dst
         # Struct instantiation
         if e.op == "Struct" and e.struct_name is not None:
@@ -135,8 +268,6 @@ class _FuncLowerer:
             return dst
         # Lambda / closure
         if e.op == "Lambda" and e.lambda_params is not None:
-            # Inline the lambda body as a synthetic MirFunc and emit make_closure
-            from .mir import MirFunc as _MirFunc, MirBlock as _MirBlock
             lname = self.state.fresh("lambda")
             # Capture current env values
             cap_names: List[tuple] = []
@@ -145,19 +276,10 @@ class _FuncLowerer:
                 cap_names.append((cname, cval))
             dst = self.state.fresh("cl")
             self.emit(("let", dst, ("make_closure", lname, e.lambda_params), tuple(cap_names)))
-            # Store lambda body as a deferred sub-function for the interpreter to resolve
+            # Compile the lambda body as a deferred sub-function
             if e.lambda_body is not None:
-                sub_ops: List[tuple] = [("params", e.lambda_params)]
-                for pn in e.lambda_params:
-                    self.state.env[pn] = pn
-                body_result = self.lower_expr(e.lambda_body)
-                sub_ops.extend(self.ops)
-                self.ops = []  # consumed into sub-func
-                self._pending_lambdas.append(
-                    MirFunc(name=lname, ty_sig=e.ty,
-                            blocks=[MirBlock(ops=sub_ops, term=("ret", body_result))],
-                            suspending=bool(e.suspends))
-                )
+                self._lower_subfunc(lname, e.lambda_params, e.lambda_body,
+                                    ty_sig=e.ty, suspending=bool(e.suspends))
             return dst
         # Perform: perform effect_op(args)
         if e.op == "Perform" and e.effect_op is not None:
@@ -170,27 +292,13 @@ class _FuncLowerer:
             args_list = list(e.perform_args or ())
             if args_list:
                 return self.lower_expr(args_list[0])
-            return self.state.fresh("unit")
+            return self.unit_value()
         # Handle: handle effect with cases in body
         if e.op == "Handle" and e.handle_body is not None:
-            # First, compile each handler case body into a standalone sub-function.
-            # We snapshot/restore self.ops so handler compilation doesn't pollute the caller.
+            # Compile each handler case body into a standalone sub-function.
             for (op_name, param_name, body_he) in (e.handle_cases or ()):
-                saved_ops = self.ops
-                saved_env = dict(self.state.env)
-                self.ops = []
-                lname = f"__handler_{op_name}"
-                sub_header: List[tuple] = [("params", (param_name,))]
-                self.state.env[param_name] = param_name
-                body_result = self.lower_expr(body_he)
-                sub_ops = sub_header + self.ops
-                self.ops = saved_ops
-                self.state.env = saved_env
-                self._pending_lambdas.append(
-                    MirFunc(name=lname, ty_sig=e.ty,
-                            blocks=[MirBlock(ops=sub_ops, term=("ret", body_result))],
-                            suspending=False)
-                )
+                self._lower_subfunc(f"__handler_{op_name}", (param_name,), body_he,
+                                    ty_sig=e.ty, suspending=False)
             # Emit push_handler, run body, pop_handler
             encoded = tuple(
                 (op_name, param_name)
@@ -206,49 +314,51 @@ class _FuncLowerer:
         self.emit(("let", dst, ("const_ty", str(e.ty)), ()))
         return dst
 
+    # ------------------------------------------------------------------
+    # Match lowering
+    # ------------------------------------------------------------------
 
-def _lower_hexpr(e: HExpr, ops: List[tuple], st: _ANFState) -> str:
-    """Lower an HExpr to ANF ops and return an SSA name for its value."""
-    # Pattern by op tag first, then fallback by kind/ty into a const-typed value.
-    if e.op == "Literal":
-        dst = st.fresh("c")
-        ops.append(("let", dst, ("const", e.literal), ()))
-        return dst
-    if e.op == "Var" and e.var_name:
-        # In SSA-lite, a variable refers to a previously bound name or parameter.
-        return st.env.get(e.var_name, e.var_name)
-    if e.op == "Call" and e.callee is not None and e.operands is not None:
-        arg_names: List[str] = []
-        for arg in e.operands:
-            arg_names.append(_lower_hexpr(arg, ops, st))
-        dst = st.fresh("v")
-        ops.append(("let", dst, ("call", e.callee), tuple(arg_names)))
-        return dst
-    if e.op == "Let" and e.bindings is not None:
-        last_name = None
-        for (name, sube) in e.bindings:
-            val = _lower_hexpr(sube, ops, st)
-            st.env[name] = val
-            last_name = name
-        # Value of let-expression: return last bound name if any, else unit-typed const
-        if last_name is not None:
-            return st.env[last_name]
-    if e.op == "Block" and e.operands is not None:
-        last = ""
-        for sube in e.operands:
-            last = _lower_hexpr(sube, ops, st)
-        return last
-    # Fallback: produce a const of the type for stability
-    dst = st.fresh("ret")
-    ops.append(("let", dst, ("const_ty", str(e.ty)), ()))
-    return dst
+    def _lower_match(self, e: HExpr) -> str:
+        scrut = self.lower_expr(e.scrutinee)  # type: ignore[arg-type]
+        res_var = self.state.fresh("m")
+        join_bb = self.new_block()
+        arms: tuple[tuple[HPattern, HExpr], ...]
+        if e.match_arms is not None:
+            arms = e.match_arms
+        elif e.cases:
+            # Legacy Match without patterns: first-match-wins means the first
+            # arm (irrefutable) always matches.
+            arms = tuple((HPattern(kind="wildcard"), body) for body in e.cases)
+        else:
+            arms = tuple()
+        if not arms:
+            self.emit(("match_fail", "empty match"))
+            self.terminate(("br", join_bb))
+            self.switch_to(join_bb)
+            return self.unit_value()
+        for (pat, body) in arms:
+            fail_bb = self.new_block()
+            saved_env = dict(self.state.env)
+            self.compile_pattern(pat, scrut, fail_bb)
+            body_val = self.lower_expr(body)
+            self.emit(("let", res_var, ("copy",), (body_val,)))
+            self.terminate(("br", join_bb))
+            self.state.env = saved_env
+            self.switch_to(fail_bb)
+        # Fell off the last arm: no pattern matched.
+        self.emit(("match_fail", "no pattern matched"))
+        self.terminate(("br", join_bb))
+        self.switch_to(join_bb)
+        return res_var
 
 
 def lower_hir_to_mir(funcs: Sequence[HFun], borrow_errors: List[Any] | None = None) -> list[MirFunc]:
     """Lower HIR to MIR (ANF direct vs CPS later).
 
-    Now supports BinOp and If (multi-block) in addition to Literal/Var/Call/Let/Block.
-    
+    Supports Literal/Var/Call/Let/Block/BinOp, real multi-block control flow
+    (If, While, Match with pattern decision trees), enum variant construction,
+    structs, lambdas, and effect perform/handle.
+
     Arguments:
         funcs: HIR functions to lower
         borrow_errors: Optional borrow errors from frozen borrow checker (tables.constraints.get(-2, []))
@@ -268,12 +378,9 @@ def lower_hir_to_mir(funcs: Sequence[HFun], borrow_errors: List[Any] | None = No
         if plan:
             for name in plan.drop_at_end:
                 fl.emit(("drop", name))
-        # Seal the final block as return
-        fl.seal_current_as_block(("ret", res))
-        blocks = fl.blocks
-        if not blocks:
-            blocks = [MirBlock(ops=[], term=("ret", res))]
-        out.append(MirFunc(name=str(f.sym), ty_sig=f.ret_ty, blocks=blocks, suspending=bool(f.body.suspends)))
-        # Emit any lambdas that were inlined during lowering
+        # Terminate the current (final) block with the return
+        fl.terminate(("ret", res))
+        out.append(MirFunc(name=str(f.sym), ty_sig=f.ret_ty, blocks=fl.blocks, suspending=bool(f.body.suspends)))
+        # Emit any lambdas that were compiled during lowering
         out.extend(fl._pending_lambdas)
     return out

@@ -16,6 +16,24 @@ class ModeInfo:
     locality: str | None = None     # 'local'|'global'
     linearity: str | None = None    # 'once'|'separate'|'many'
 
+@dataclass(slots=True, frozen=True)
+class HPattern:
+    """A match pattern in HIR.
+
+    kind:
+      'wildcard'  matches anything, binds nothing
+      'var'       matches anything, binds `name`
+      'literal'   matches when scrutinee == value
+      'ctor'      matches enum variant `name` (of enum `enum_name` when known),
+                  recursively matching `subpatterns` against the payload fields
+    """
+    kind: str
+    name: str | None = None          # binding name (var) or variant name (ctor)
+    value: Any | None = None         # literal value (literal)
+    enum_name: str | None = None     # enum type name (ctor), when known
+    subpatterns: tuple['HPattern', ...] = ()
+
+
 @dataclass(slots=True)
 class HExpr:
     node_id: int
@@ -44,7 +62,15 @@ class HExpr:
     else_ops: tuple['HExpr', ...] | None = None
     # Match
     scrutinee: 'HExpr' | None = None
-    cases: tuple['HExpr', ...] | None = None
+    cases: tuple['HExpr', ...] | None = None  # legacy: arm bodies only (no patterns)
+    match_arms: tuple[tuple[HPattern, 'HExpr'], ...] | None = None  # (pattern, body) pairs
+    # While loop: op="While" (cond field reused for the loop condition)
+    loop_body: tuple['HExpr', ...] | None = None
+    # Assignment: op="Assign" (var_name reused for the target)
+    assign_value: 'HExpr | None' = None
+    # Enum variant construction: op="MakeVariant" (operands reused for payload exprs)
+    enum_name: str | None = None
+    variant_name: str | None = None
     # Struct: op="Struct"
     struct_name: str | None = None                          # for Struct
     fields: tuple[tuple[str, 'HExpr'], ...] | None = None  # for Struct: ((field_name, expr), ...)
@@ -87,6 +113,8 @@ class HIRBuilder:
         self._orig_to_frozen: dict[int, mast.AstNode] = {}
         # Effect op names collected from EffectDeclaration nodes
         self._effect_op_names: set[str] = set()
+        # Enum variant constructors: variant_name -> enum_name
+        self._variant_to_enum: dict[str, str] = {}
 
     def build(self, root: mast.AstNode) -> list[HFun]:
         funcs: list[HFun] = []
@@ -107,6 +135,12 @@ class HIRBuilder:
                 for op in (getattr(orig, 'operations', []) or []):
                     if hasattr(op, 'name'):
                         self._effect_op_names.add(str(op.name))
+            if isinstance(orig, fast.EnumDefinition):
+                ename = str(getattr(orig, 'name', '') or '')
+                for v in (getattr(orig, 'variants', []) or []):
+                    vname = getattr(v, 'name', None)
+                    if vname is not None:
+                        self._variant_to_enum[str(vname)] = ename
 
         def visit(n: mast.AstNode) -> None:
             orig = self.id_map.get(n.node_id)
@@ -255,6 +289,11 @@ class HIRBuilder:
             if callee in self._effect_op_names:
                 return self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span,
                                       op="Perform", effect_op=callee, perform_args=tuple(args_exprs))
+            # Enum variant constructor call, e.g. `Some(5)` / `Cons(h, t)`
+            if callee in self._variant_to_enum:
+                return self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span,
+                                      op="MakeVariant", enum_name=self._variant_to_enum[callee],
+                                      variant_name=callee, operands=tuple(args_exprs))
             return self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span, op="Call", callee=callee, operands=tuple(args_exprs))
 
         # BinaryOperation / ComparisonExpression (same structure, both use left/operator/right)
@@ -289,18 +328,80 @@ class HIRBuilder:
             ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, "Unit"))
             return self._mk_hexpr(frozen_ctx.node_id, "Stmt", ty, frozen_ctx.span, op="If", cond=c, then_ops=as_ops(tb), else_ops=as_ops(eb) if eb else tuple())
 
-        # MatchExpression (desugared from if statements)
+        # MatchExpression: carry (pattern, body) pairs into HIR.
+        # TODO(pattern-typing): pattern variable types are not yet threaded through
+        # the constraint emitter; typing of bindings currently falls back to the
+        # arm-body node types (frozen_constraint_emitter is owned by another agent).
         if isinstance(orig, fast.MatchExpression):
             expr = self._from_orig_expr(getattr(orig, 'expression', None), frozen_ctx)
             cases = getattr(orig, 'cases', []) or []
-            case_exprs = []
-            for pattern, case_body in cases:
-                # For now, just lower the case body
+            case_exprs: list[HExpr] = []
+            arms: list[tuple[HPattern, HExpr]] = []
+            for case in cases:
+                # Parser Option sugar: ('some', var_name, body) / ('none', None, body)
+                if len(case) == 3 and case[0] in ('some', 'none'):
+                    tag, var, case_body = case
+                    if tag == 'some':
+                        pat = HPattern(kind="ctor", name="Some", enum_name="Option",
+                                       subpatterns=(HPattern(kind="var", name=str(var)),))
+                    else:
+                        pat = HPattern(kind="ctor", name="None", enum_name="Option")
+                else:
+                    pattern, case_body = case
+                    pat = self._convert_pattern(pattern)
                 case_hexpr = self._from_orig_expr(case_body, frozen_ctx)
                 if case_hexpr is not None:
                     case_exprs.append(case_hexpr)
+                    arms.append((pat, case_hexpr))
             ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, "Unit"))
-            return self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span, op="Match", scrutinee=expr, cases=tuple(case_exprs))
+            return self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span, op="Match",
+                                  scrutinee=expr, cases=tuple(case_exprs), match_arms=tuple(arms))
+
+        # VariantInstance: EnumName::Variant(field=expr, ...)
+        if isinstance(orig, fast.VariantInstance):
+            enum_name = str(getattr(orig, 'enum_name', '') or '')
+            variant_name = str(getattr(orig, 'variant_name', '') or '')
+            fvals = getattr(orig, 'field_values', None) or []
+            # field_values may be a dict {name: expr} or a list of (name, expr)
+            if isinstance(fvals, dict):
+                items = list(fvals.items())
+            else:
+                items = [(fn, fe) for (fn, fe) in fvals]
+            payload: list[HExpr] = []
+            for (_fname, fexpr) in items:
+                he = self._from_orig_expr(fexpr, ctx_for(fexpr))
+                if he is not None:
+                    payload.append(he)
+            ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, "Unknown"))
+            return self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span,
+                                  op="MakeVariant", enum_name=enum_name,
+                                  variant_name=variant_name, operands=tuple(payload))
+
+        # WhileStatement: while cond { body }
+        if isinstance(orig, fast.WhileStatement):
+            cond_node = getattr(orig, 'condition', None)
+            c = self._from_orig_expr(cond_node, ctx_for(cond_node))
+            body_node = getattr(orig, 'body', None)
+            body_he = self._from_orig_expr(body_node, ctx_for(body_node))
+            if body_he is not None and body_he.op == "Block" and body_he.operands is not None:
+                body_ops = body_he.operands
+            elif body_he is not None:
+                body_ops = (body_he,)
+            else:
+                body_ops = tuple()
+            ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, "Unit"))
+            return self._mk_hexpr(frozen_ctx.node_id, "Stmt", ty, frozen_ctx.span,
+                                  op="While", cond=c, loop_body=body_ops)
+
+        # Assignment: x = expr (rebinds an existing local/param)
+        if isinstance(orig, fast.Assignment):
+            target = getattr(orig, 'name', None)
+            value_node = getattr(orig, 'expression', None)
+            val_he = self._from_orig_expr(value_node, ctx_for(value_node))
+            ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, "Unit"))
+            return self._mk_hexpr(frozen_ctx.node_id, "Stmt", ty, frozen_ctx.span,
+                                  op="Assign", var_name=str(target) if target is not None else None,
+                                  assign_value=val_he)
 
         # ReturnStatement: lower its expression if present
         if isinstance(orig, fast.ReturnStatement):
@@ -360,6 +461,11 @@ class HIRBuilder:
                 if he is not None:
                     arg_exprs.append(he)
             ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, 'Unknown'))
+            # Enum variant constructor: Option.Some(x) / Option::Some(x)
+            if len(parts) == 2 and str(parts[1]) in self._variant_to_enum:
+                return self._mk_hexpr(frozen_ctx.node_id, 'Expr', ty, frozen_ctx.span,
+                                      op='MakeVariant', enum_name=str(parts[0]),
+                                      variant_name=str(parts[1]), operands=tuple(arg_exprs))
             # Treat as a plain call with dotted callee name
             callee = '.'.join(str(p) for p in parts)
             return self._mk_hexpr(frozen_ctx.node_id, 'Expr', ty, frozen_ctx.span,
@@ -438,6 +544,39 @@ class HIRBuilder:
 
         # Fallback: None
         return None
+
+    def _convert_pattern(self, p: Any) -> HPattern:
+        """Convert a frozen-AST pattern node into an HPattern.
+
+        Note: metaxu_ast defines two WildcardPattern classes (a value-level
+        Pattern and a TypePattern); the later definition shadows the former in
+        the module namespace, so we match by class name where needed.
+        """
+        if p is None:
+            return HPattern(kind="wildcard")
+        cls_name = type(p).__name__
+        if cls_name == "WildcardPattern":
+            return HPattern(kind="wildcard")
+        if isinstance(p, fast.VariablePattern):
+            return HPattern(kind="var", name=str(getattr(p, 'name', '_')))
+        if isinstance(p, fast.LiteralPattern):
+            v = getattr(p, 'value', None)
+            if isinstance(v, fast.Literal):
+                v = getattr(v, 'value', None)
+            return HPattern(kind="literal", value=v)
+        if isinstance(p, fast.VariantPattern):
+            subs = tuple(self._convert_pattern(sp) for sp in (getattr(p, 'patterns', []) or []))
+            enum_name = getattr(p, 'enum_name', None)
+            return HPattern(kind="ctor",
+                            name=str(getattr(p, 'variant_name', '')),
+                            enum_name=str(enum_name) if enum_name is not None else None,
+                            subpatterns=subs)
+        # Raw python literal used as a pattern (e.g. IfDesugarPass emits
+        # LiteralPattern(True); tolerate bare values defensively too)
+        if isinstance(p, (bool, int, float, str)):
+            return HPattern(kind="literal", value=p)
+        # Unknown pattern node: treat as wildcard so lowering stays total.
+        return HPattern(kind="wildcard")
 
     def _extract_modeinfo(self, mode: Any) -> ModeInfo:
         mi = ModeInfo()
