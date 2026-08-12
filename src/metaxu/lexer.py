@@ -2,9 +2,13 @@ import ply.lex as lex
 from metaxu.errors import CompileError, SourceLocation, get_source_context
 from typing import List
 import logging
+
+logger = logging.getLogger(__name__)
+
+
 class Lexer:
-    # A string containing ignored characters (spaces and tabs)
-    t_ignore = ' \t'
+    # A string containing ignored characters (spaces, tabs, carriage returns)
+    t_ignore = ' \t\r'
 
     # Keywords
     reserved = {
@@ -20,43 +24,34 @@ class Lexer:
         'effect': 'EFFECT',
         'handle': 'HANDLE',
         'perform': 'PERFORM',
+        'performs': 'PERFORMS',
+        'resume': 'RESUME',
         'with': 'WITH',
         'in': 'IN',
         'let': 'LET',
-        #'mut': 'MUT',
+        'mut': 'MUT',
         'type': 'TYPE',
         'extern': 'EXTERN',
         'const': 'CONST',
         'move': 'MOVE',
-        'local': 'LOCAL',
         'exclave': 'EXCLAVE',
         'once': 'ONCE',
         'spawn': 'SPAWN',
         'kernel': 'KERNEL',
         'to_device': 'TO_DEVICE',
         'from_device': 'FROM_DEVICE',
-        'print': 'PRINT',  # Add print keyword
-        # Control flow keywords
-        'if': 'IF',
-        'else': 'ELSE',
-        'while': 'WHILE',
-        'for': 'FOR',
-        'let': 'LET',
-        # Interface and implementation keywords
+        'print': 'PRINT',
+        # Interface / trait / implementation keywords
         'interface': 'INTERFACE',
+        'trait': 'TRAIT',
         'impl': 'IMPL',
-        'for': 'FOR',
-        'in': 'IN',
+        'implement': 'IMPLEMENT',
+        'implements': 'IMPLEMENTS',
         'where': 'WHERE',
         'extends': 'EXTENDS',
-        'implements': 'IMPLEMENTS',
-        'type': 'TYPE',
-        'fn': 'FN',
         # Mode-related keywords
         'unique': 'UNIQUE',
         'exclusive': 'EXCLUSIVE',
-        'const': 'CONST',
-        'global': 'GLOBAL',
         'separate': 'SEPARATE',
         'many': 'MANY',
         'borrow': 'BORROW',
@@ -76,27 +71,29 @@ class Lexer:
         'box': 'BOX',
         'option': 'OPTION',
         'vector': 'VECTOR',
-        'extern': 'EXTERN',
-        'unsafe': 'UNSAFE',  # Add unsafe keyword
-        'async': 'ASYNC',    # Add async keyword
-        'void': 'VOID',      # Add void type
-        'size_t': 'SIZE_T',  # Add size_t type
-        'as': 'AS',          # Ensure 'as' is in the reserved keywords
+        'unsafe': 'UNSAFE',
+        'async': 'ASYNC',
+        'void': 'VOID',
+        'size_t': 'SIZE_T',
+        'as': 'AS',
+        'try': 'TRY',
+        'catch': 'CATCH',
     }
 
     # List of token names
     tokens = [
-        'IDENTIFIER', 'NUMBER', 'FLOAT', 'STRING', 'BOOL',
+        'IDENTIFIER', 'NUMBER', 'FLOAT', 'STRING', 'FSTRING',
         'PLUS', 'MINUS', 'TIMES', 'DIVIDE',
         'LPAREN', 'RPAREN', 'LBRACE', 'RBRACE', 'LBRACKET', 'RBRACKET',
-        'EQUALS', 'SEMICOLON', 'COLON', 'COMMA', 'DOT', 'TRIPLE_DOT',
-        'DOUBLECOLON', 'ARROW', 'BACKSLASH', 'AT', 'AMPERSAND',
+        'EQUALS', 'SEMICOLON', 'COLON', 'COMMA', 'DOT', 'DOTDOT', 'TRIPLE_DOT',
+        'DOUBLECOLON', 'ARROW', 'FATARROW', 'BACKSLASH', 'AT', 'AMPERSAND',
+        'PIPE', 'OROR',
         'LESS', 'GREATER', 'LESSEQUAL', 'GREATEREQUAL', 'EQUALEQUAL', 'NOTEQUAL',
-        'MUT', 'AS'  # Add AS for type casts
-    ] + list(reserved.values())
-
-    # Ensure AS is recognized as a keyword
-    t_AS = r'as'
+        # Synthesized by the token-stream disambiguation filter (never produced
+        # directly by a regex): generic type argument brackets and the opening
+        # brace of a struct literal.
+        'LGENERIC', 'RGENERIC', 'LBRACE_STRUCT',
+    ] + list(set(reserved.values()))
 
     # Regular expression rules for simple tokens
     t_PLUS = r'\+'
@@ -120,19 +117,27 @@ class Lexer:
     t_COLON = r':'
     t_COMMA = r','
     t_DOT = r'\.'
+    t_DOTDOT = r'\.\.'
     t_TRIPLE_DOT = r'\.\.\.'
     t_DOUBLECOLON = r'::'
     t_ARROW = r'->'
-    t_BACKSLASH = r'\\' # Added for function type annotations
+    t_FATARROW = r'=>'
+    t_BACKSLASH = r'\\'  # Used in function type annotations (fn\(T) -> U)
     t_AT = r'@'
     t_AMPERSAND = r'&'
+    t_OROR = r'\|\|'
+    t_PIPE = r'\|'
 
-    # Regular expression rules with actions
-    def t_IDENTIFIER(self, t):
-        r'[a-zA-Z_][a-zA-Z_0-9]*'
-        # Check for reserved words
-        t.type = self.reserved.get(t.value, 'IDENTIFIER')
-        logging.debug(f"Token recognized: {t.type}, value: {t.value}")  # Debug statement
+    # Comments: both '#' and '//' styles
+    def t_COMMENT(self, t):
+        r'\#.*|//.*'
+        pass
+
+    # NOTE: function rules are matched in definition order; FLOAT must come
+    # before NUMBER so that "3.14" lexes as a single float.
+    def t_FLOAT(self, t):
+        r'\d+\.\d+|\.\d+'
+        t.value = float(t.value)
         return t
 
     def t_NUMBER(self, t):
@@ -140,13 +145,9 @@ class Lexer:
         t.value = int(t.value)
         return t
 
-    def t_FLOAT(self, t):
-        r'\d*\.\d+'
-        t.value = float(t.value)
-        return t
-    def t_BOOL(self, t):
-        r'(true|false)'
-        t.value = True if t.value == 'true' else False
+    def t_FSTRING(self, t):
+        r'f"[^"]*"'
+        t.value = (t.value[2:-1], 'string')  # Tuple with (value, type)
         return t
 
     def t_STRING(self, t):
@@ -154,11 +155,10 @@ class Lexer:
         t.value = (t.value[1:-1], 'string')  # Tuple with (value, type)
         return t
 
-
-    # Comments
-    def t_COMMENT(self, t):
-        r'\#.*'
-        pass
+    def t_IDENTIFIER(self, t):
+        r'[a-zA-Z_][a-zA-Z_0-9]*'
+        t.type = self.reserved.get(t.value, 'IDENTIFIER')
+        return t
 
     # Define a rule so we can track line numbers
     def t_newline(self, t):
@@ -170,26 +170,140 @@ class Lexer:
 
     # Error handling rule
     def t_error(self, t):
-        # Calculate column based on the last line start
-        line_start = self.line_starts[t.lineno - 1]
-        column = t.lexpos - line_start
-        print(f"\n=== Lexer Error ===")
-        print(f"Illegal character '{t.value[0]}' at line {t.lineno}, column {column}")
+        line_start = self.line_starts[min(t.lineno - 1, len(self.line_starts) - 1)]
+        column = t.lexpos - line_start + 1
+        logger.warning(
+            "Illegal character %r at line %d, column %d", t.value[0], t.lineno, column
+        )
         t.lexer.skip(1)
+
+    # ------------------------------------------------------------------
+    # Token-stream disambiguation
+    # ------------------------------------------------------------------
+
+    #: Keyword token types (values of ``reserved``)
+    _KEYWORD_TYPES = frozenset(reserved.values())
+
+    #: Tokens permitted inside a generic argument list ``< ... >``.
+    _GENERIC_INSIDE = frozenset({
+        'IDENTIFIER', 'NUMBER', 'COMMA', 'LBRACKET', 'RBRACKET',
+        'LESS', 'GREATER', 'CONST', 'COLON', 'DOT', 'VECTOR', 'MUT',
+    })
+
+    #: Tokens that may directly precede a ``<`` that opens generic args.
+    _GENERIC_PREV = frozenset({'IDENTIFIER', 'IMPLEMENT', 'IMPL'})
+
+    _GENERIC_SCAN_LIMIT = 80
+
+    def _transform(self, toks):
+        """Rewrite the raw token list to resolve context-sensitive ambiguity.
+
+        Pass A: keywords used as plain names (after '.', '@', 'fn', and a
+                contextual rule for 'handle') become IDENTIFIER tokens.
+        Pass B: '<' ... '>' pairs that enclose type arguments become
+                LGENERIC/RGENERIC so the grammar can distinguish generics
+                from comparisons.
+        Pass C: a '{' that opens a struct literal (previous token is a name
+                or a closing type-argument bracket and the next tokens look
+                like `field :`) becomes LBRACE_STRUCT.
+        """
+        # --- Pass A: contextual keywords -------------------------------
+        for i, tok in enumerate(toks):
+            prev = toks[i - 1] if i > 0 else None
+            nxt = toks[i + 1] if i + 1 < len(toks) else None
+            if tok.type in self._KEYWORD_TYPES and prev is not None and \
+                    prev.type in ('DOT', 'DOTDOT', 'TRIPLE_DOT', 'AT', 'FN'):
+                # Member access (thread.spawn), relative paths (..vector),
+                # mode names (@mut/@const), and function names
+                # (fn spawn[...]) may reuse keywords.
+                tok.type = 'IDENTIFIER'
+            elif tok.type in self._KEYWORD_TYPES and prev is not None and \
+                    prev.type in ('COMMA', 'IMPORT') and \
+                    nxt is not None and nxt.type in ('COMMA', 'SEMICOLON') and \
+                    tok.type != 'HANDLE':
+                # Imported names may shadow keywords:
+                #   from std.effects import Effect, handle, perform, resume;
+                tok.type = 'IDENTIFIER'
+            elif tok.type == 'HANDLE':
+                # 'handle' is only the keyword when introducing a handler
+                # (handle Effect with { ... } / handle f() { ... }); in other
+                # positions it is an ordinary identifier (e.g. file handles).
+                if nxt is None or nxt.type not in ('IDENTIFIER', 'VECTOR'):
+                    tok.type = 'IDENTIFIER'
+
+        # --- Pass B: generic angle brackets ----------------------------
+        i = 0
+        n = len(toks)
+        while i < n:
+            tok = toks[i]
+            if tok.type == 'LESS' and i > 0 and toks[i - 1].type in self._GENERIC_PREV:
+                depth = 1
+                angle_positions = [i]
+                j = i + 1
+                matched = -1
+                limit = min(n, i + 1 + self._GENERIC_SCAN_LIMIT)
+                while j < limit:
+                    tt = toks[j].type
+                    if tt == 'LESS':
+                        depth += 1
+                        angle_positions.append(j)
+                    elif tt == 'GREATER':
+                        depth -= 1
+                        angle_positions.append(j)
+                        if depth == 0:
+                            matched = j
+                            break
+                    elif tt not in self._GENERIC_INSIDE:
+                        break
+                    j += 1
+                if matched >= 0:
+                    for pos in angle_positions:
+                        toks[pos].type = 'LGENERIC' if toks[pos].type == 'LESS' else 'RGENERIC'
+                    i = matched + 1
+                    continue
+            i += 1
+
+        # --- Pass C: struct literal braces -----------------------------
+        for i, tok in enumerate(toks):
+            if tok.type != 'LBRACE':
+                continue
+            prev = toks[i - 1] if i > 0 else None
+            n1 = toks[i + 1] if i + 1 < len(toks) else None
+            n2 = toks[i + 2] if i + 2 < len(toks) else None
+            if prev is not None and prev.type in ('IDENTIFIER', 'RGENERIC', 'RBRACKET') \
+                    and n1 is not None and n1.type == 'IDENTIFIER' \
+                    and n2 is not None and n2.type == 'COLON':
+                tok.type = 'LBRACE_STRUCT'
+
+        return toks
 
     # Build the lexer
     def __init__(self):
         self.lexer = lex.lex(module=self)
         self.line_starts = [0]  # Track start of each line
+        self._tokens = []
+        self._index = 0
+        self.source_file = "<unknown>"
 
     def input(self, data):
+        self.lexer.lineno = 1
         self.lexer.input(data)
         self.line_starts = [0]  # Reset line starts
+        toks = []
+        while True:
+            tok = self.lexer.token()
+            if tok is None:
+                break
+            line_start = self.line_starts[min(tok.lineno - 1, len(self.line_starts) - 1)]
+            tok.column = tok.lexpos - line_start + 1  # 1-based column
+            toks.append(tok)
+        self._tokens = self._transform(toks)
+        self._index = 0
 
     def token(self):
-        tok = self.lexer.token()
-        if tok:
-            # Calculate column based on the last line start
-            line_start = self.line_starts[min(tok.lineno - 1, len(self.line_starts) - 1)]
-            tok.column = tok.lexpos - line_start + 1  # Make columns 1-based
+        if self._index >= len(self._tokens):
+            return None
+        tok = self._tokens[self._index]
+        self._index += 1
+        self.current_token = tok
         return tok

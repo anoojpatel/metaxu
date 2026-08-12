@@ -102,7 +102,7 @@ fn get_mut<T>(list: @mut LinkedList[T], index: Int) -> Option[@mut T] {
 # Takes ownership of the nth node in the list
 # Returns None if index is out of bounds
 # Note: This removes the node from the list
-fn take_node<T>(list: @mut LinkedList[T], index: Int) -> Option[Node[T]> {
+fn take_node<T>(list: @mut LinkedList[T], index: Int) -> Option[Node[T]] {
     if index == 0 {
         # Special case for head
         return list.head
