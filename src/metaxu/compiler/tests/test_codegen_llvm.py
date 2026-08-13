@@ -27,10 +27,22 @@ Increment 3 (variants + closures) adds: enums as %enum.E tagged unions
 (integer tag + [N x i64] payload slots; variant names mapped to dense
 module-wide integer tags so pattern tag tests compare integers, never
 strings), and closures as {fn ptr, env ptr} pairs over per-lambda stack env
-structs (direct locally-bound calls and closures passed DOWN as arguments;
-anything that would make the stack env dangle — returning a closure,
-storing it in a field/payload, capturing it in another closure, creating
-one in a loop — demotes honestly).
+structs (direct locally-bound calls and closures passed DOWN as arguments).
+
+Increment 4 (heap boxing for recursive data) adds: enum payload slots
+holding aggregates store a heap POINTER to a write-once boxed copy
+(make_variant boxes in, variant_field copies out — recursive enums like
+linked lists become representable), struct fields holding structs/enums are
+INLINED in the parent layout (recursive GEPs, no heap), and closures that
+escape (returned anywhere in the module, or created in a loop) malloc their
+env at the site.  FREE STRATEGY under test: payload boxes and heap closure
+envs LEAK BY DESIGN (shallow copies share the pointers, so no free is
+provably unique); ASan tests for box/heap-env programs therefore run with
+ASAN_OPTIONS=detect_leaks=0 and prove no use-after-free / no double-free
+only.  The @global struct malloc/free protocol is unchanged and its ASan
+tests still prove full leak-freedom.  Still demoted honestly: closures
+stored in struct fields / enum payloads / captured in other closures, and
+heterogeneous payload slots.
 """
 from __future__ import annotations
 
@@ -442,33 +454,59 @@ def test_multi_arg_print_joins_with_spaces():
         r"i64 %t\d+, ptr @\.str\.\d+, i64 3\)", ir)
 
 
-def test_escaping_and_malformed_closures_are_placeholders():
-    # Increment 3 lifts variants and direct local closures, so the honest
-    # demotions move to the genuinely unsupported shapes: a make_closure of a
-    # function that is not in the module (no fn pointer to take), and a
-    # closure created inside a loop (env re-init would alias earlier pairs).
+def test_unknown_closure_target_is_placeholder():
+    # A make_closure of a function that is not in the module has no fn
+    # pointer to take: demote honestly.
     fs = [
         make_func("c", [block([
             ("params", ()),
             ("let", "c1", ("make_closure", "lambda1", ("x",)), ()),
         ], ("ret", "c1"))]),
-        make_func("looper", [
-            block([("params", ())], ("br", 1)),
-            block([
-                ("let", "c2", ("make_closure", "inner", ("x",)), ()),
-            ], ("br", 1)),
-        ]),
-        make_func("inner", [block([
-            ("params", ("x",)),
-        ], ("ret", "x"))]),
     ]
     ir = emit_llvm(fs)
     assert "make_closure of unknown function 'lambda1'" in ir
-    assert "make_closure inside a loop" in ir
 
 
-def test_returned_closure_is_placeholder():
-    # `let f = fn(y) -> x + y; f` escaping upward would dangle its stack env.
+def test_closure_in_loop_gets_fresh_heap_env_per_iteration():
+    # Increment 4: a make_closure inside a CFG cycle no longer demotes — the
+    # site mallocs a FRESH env each execution (leaked by design), so earlier
+    # pair copies can never alias the new one.  Hand-built MIR: the front
+    # end's capture analysis for lambdas inside loop bodies is still a gap
+    # (see test_loop_lambda_capture_gap_demotes_honestly).
+    fs = [
+        make_func("looper", [
+            block([("params", ("n",)),
+                   ("let", "i0", ("const", 0), ()),
+                   ("let", "i", ("copy",), ("i0",))], ("br", 1)),
+            block([("let", "b", ("binop", "<"), ("i", "n"))],
+                  ("br_if", "b", 2, 3)),
+            block([
+                ("let", "c2", ("make_closure", "inner", ("x",)), (("k", "i"),)),
+                ("let", "r", ("call", "c2"), ("i",)),
+                ("let", "c1", ("const", 1), ()),
+                ("let", "i2", ("binop", "+"), ("i", "c1")),
+                ("let", "i", ("copy",), ("i2",)),
+            ], ("br", 1)),
+            block([], ("ret", "i")),
+        ]),
+        make_func("inner", [block([
+            ("params", ("x",)),
+            ("let", "s", ("binop", "+"), ("x", "k")),
+        ], ("ret", "s"))]),
+    ]
+    ir = emit_llvm(fs)
+    assert count_placeholders(ir) == 0
+    # env malloc'd at the site (inside the loop body), not alloca'd in entry
+    assert re.search(r"%t\d+ = call ptr @malloc\(i64 8\)  ; heap env", ir)
+    assert "leaks by design" in ir
+    assert not re.search(r"alloca %env\.inner", ir)
+
+
+def test_returned_closure_gets_heap_env_and_emits():
+    # Increment 4: `let f = fn(y) -> x + y; f` escaping upward is sound now —
+    # the lambda is marked heap-env (detected from make_adder's return kind)
+    # and its env is malloc'd at the site, never freed (leak by design), so
+    # the returned pair's env pointer can never dangle.
     ir = llvm_from_source("""
 fn make_adder(x: int) -> fn(int) -> int {
     let f = fn(y: int) -> x + y;
@@ -479,10 +517,12 @@ fn main() -> int {
     add2(40)
 }
 """)
-    assert "returns a closure" in ir
-    assert "stack env would dangle" in ir
-    # the caller of the demoted function is demoted too (cascade)
-    assert count_placeholders(ir) >= 2
+    assert count_placeholders(ir) == 0
+    # the closure return is sret-style: pair copied into the caller's slot
+    assert "define void @mx_make_adder(ptr %agg.ret, i64 %a.x)" in ir
+    assert re.search(r"call ptr @malloc\(i64 8\)  ; heap env for \w+ -> lambda\d+", ir)
+    # no free of the env anywhere: it leaks by design
+    assert "call void @free" not in ir
 
 
 def test_unknown_external_and_runtime_builtin_are_placeholders():
@@ -897,10 +937,9 @@ fn main() -> int { let o = mk(3); match o { Some(x) -> x, None -> 0 } }
     assert re.search(r"call void @mx_mk\(ptr %sv\.\w+, i64 3\)", ir)
 
 
-def test_recursive_enum_payload_demotes_honestly():
-    # A linked-list-style enum (payload holds another aggregate) cannot live
-    # in flat 8-byte payload slots: demote with the heap-boxing reason, never
-    # emit wrong code.
+def test_recursive_enum_payload_is_heap_boxed():
+    # Increment 4: a linked-list-style enum lives in flat 8-byte payload
+    # slots because the recursive slot holds a heap POINTER to a boxed copy.
     ir = llvm_from_source("""
 enum IntList { Cons(int, IntList), Nil }
 fn main() -> int {
@@ -908,9 +947,19 @@ fn main() -> int {
     match l { Cons(h, t) -> h, Nil -> 0 }
 }
 """)
-    assert count_placeholders(ir) >= 1
-    assert "payload slot 1 holds an aggregate" in ir
-    assert "heap-boxed payloads" in ir
+    assert count_placeholders(ir) == 0
+    # finite layout: tag + 2 slots (i64 head, boxed-tail ptr as 8 bytes)
+    assert "%enum.IntList = type { i64, [2 x i64] }" in ir
+    # make_variant boxes the aggregate payload: malloc(24) = the IntList size
+    assert re.search(
+        r"call ptr @malloc\(i64 24\)  ; boxed enum:IntList payload "
+        r"\(leaks by design\)", ir)
+    # the box is filled with a whole-aggregate copy, then the ptr stored
+    assert re.search(r"store %enum\.IntList %t\d+, ptr %t\d+", ir)
+    # variant_field on the boxed slot loads the ptr and copies the value out
+    assert re.search(r"%t\d+ = load ptr, ptr %t\d+", ir)
+    # no free anywhere: boxes leak by design (see module docstring contract)
+    assert "call void @free" not in ir
 
 
 def test_heterogeneous_payload_slot_demotes_instead_of_coercing():
@@ -992,9 +1041,14 @@ def test_closure_call_loads_fn_and_env_from_pair():
     assert re.search(r"%t\d+ = call i64 %t\d+\(ptr %t\d+, i64 5\)", ir)
 
 
-def test_closure_in_loop_demotes():
-    # Re-executing a make_closure site overwrites its shared stack env while
-    # earlier pair copies may still alias it: demote, never emit wrong code.
+def test_loop_lambda_capture_gap_demotes_honestly():
+    # KNOWN FRONT-END GAP (not a codegen limit): HIR capture analysis emits
+    # an EMPTY capture list for lambdas created inside loop bodies, so the
+    # lambda references its free variable with no definition — the MIR
+    # interpreter raises "Unbound variable" on this program too.  Codegen
+    # demotes honestly on the missing definition; the loop-aliasing hazard
+    # itself is solved by per-execution heap envs (see
+    # test_closure_in_loop_gets_fresh_heap_env_per_iteration).
     ir = llvm_from_source("""
 fn main() -> int {
     let mut i = 0;
@@ -1007,7 +1061,7 @@ fn main() -> int {
     s
 }
 """)
-    assert "make_closure inside a loop" in ir
+    assert re.search(r"references 'i_\d+' with no local definition", ir)
 
 
 # ---------------------------------------------------------------------------
@@ -1181,12 +1235,320 @@ fn main() -> int {
     assert ir.count("call void @free") == 1
 
 
+# ---------------------------------------------------------------------------
+# Increment 4 structural tests: boxed payloads, inline nested fields,
+# heap closure envs, and the demotions that (honestly) remain
+# ---------------------------------------------------------------------------
+
+def assert_native_matches_interp_asan_boxes(source: str, tmp_path,
+                                            entry: str = "main"):
+    """Differential + ASan for programs whose payload boxes / heap closure
+    envs LEAK BY DESIGN: runs with ASAN_OPTIONS=detect_leaks=0, so exit 0
+    proves no use-after-free and no double-free (NOT leak-freedom — that is
+    exactly the documented free-strategy contract).  Only call under
+    @needs_asan."""
+    result, expected_out = interp_run(source, entry)
+    assert result in (UNIT, 0), "ASan differential sources must exit 0"
+    ir = llvm_from_source(source)
+    exit_code, stdout = compile_and_run(
+        ir, entry, workdir=str(tmp_path),
+        clang_args=("-fsanitize=address",),
+        run_env={"ASAN_OPTIONS": "detect_leaks=0"})
+    assert stdout == expected_out
+    assert exit_code == 0
+    return ir
+
+
+_NESTED_STRUCT_SRC = """
+struct Inner { a: int, b: int }
+struct Outer { inner: Inner, k: int }
+fn main() -> int {
+    let mut o = Outer { inner: Inner { a: 1, b: 2 }, k: 3 };
+    o.k = o.inner.a + 10;
+    o.inner = Inner { a: 7, b: 8 };
+    print(o.k, o.inner.a, o.inner.b);
+    o.k + o.inner.b
+}
+"""
+
+
+def test_nested_struct_field_is_inlined_no_heap():
+    # Increment 4: struct-in-struct fields inline the nested type in the
+    # parent layout — recursive GEPs, pure stack, zero heap traffic.
+    ir = llvm_from_source(_NESTED_STRUCT_SRC)
+    assert count_placeholders(ir) == 0
+    assert "%struct.Inner = type { i64, i64 }" in ir
+    assert "%struct.Outer = type { %struct.Inner, i64 }" in ir
+    # field_get of the nested field copies the whole inner aggregate out
+    assert re.search(r"load %struct\.Inner, ptr %t\d+", ir)
+    # no heap anywhere: inline nesting is fully stack-based
+    assert "call ptr @malloc" not in ir
+    assert "call void @free" not in ir
+
+
+_LINKED_LIST_SHAPE_SRC = """
+struct Node { data: int, next: Option }
+fn prepend(list: Option, value: int) -> Option {
+    Some(Node { data: value, next: list })
+}
+fn sum(list: Option) -> int {
+    match list { Some(n) -> n.data + sum(n.next), None -> 0 }
+}
+fn main() -> int {
+    let l0 = None;
+    let l1 = prepend(l0, 3);
+    let l2 = prepend(l1, 2);
+    let l3 = prepend(l2, 1);
+    print(sum(l3));
+    sum(l3)
+}
+"""
+
+
+def test_struct_enum_mutual_recursion_boxes_at_the_enum_slot():
+    # The linked_list.mx shape: struct Node holds enum Option INLINE, and
+    # Option's payload slot boxes struct Node — the box is what makes the
+    # mutually recursive layout finite.
+    ir = llvm_from_source(_LINKED_LIST_SHAPE_SRC)
+    assert count_placeholders(ir) == 0
+    # Node inlines the Option enum; Option's slot holds the box ptr as i64
+    assert "%struct.Node = type { i64, %enum.Option }" in ir
+    assert "%enum.Option = type { i64, [1 x i64] }" in ir
+    # boxed payload: malloc of sizeof(Node) = 8 (data) + 16 (inline Option)
+    assert re.search(
+        r"call ptr @malloc\(i64 24\)  ; boxed struct:Node payload "
+        r"\(leaks by design\)", ir)
+    assert "call void @free" not in ir  # boxes leak by design
+
+
+def test_linked_list_example_compiles_fully_native():
+    # Target outcome of increment 4: every function of examples/linked_list.mx
+    # (previously demoted only on recursive-aggregate reasons) now emits.
+    ir = llvm_from_source(
+        (REPO_ROOT / "examples" / "linked_list.mx").read_text())
+    assert count_placeholders(ir) == 0
+    for fname in ("new_list", "push_front", "pop_front", "remove_next",
+                  "get", "get_mut", "take_node", "main"):
+        assert re.search(rf"^define (?:i64|double|ptr|void) @mx_{fname}\(",
+                         ir, re.M), f"{fname} did not emit"
+
+
+def test_struct_in_struct_cycle_demotes():
+    # A struct-in-struct cycle with no intervening enum box has no finite
+    # inline layout (hand-built MIR: the surface type system would reject
+    # constructing such a value, but codegen must still never diverge).
+    fs = [
+        make_func("f", [block([
+            ("params", ("x",)),
+            ("let", "a1", ("alloc_struct", "A", "local"), (("f", "x"),)),
+            ("let", "a2", ("alloc_struct", "A", "local"), (("f", "a1"),)),
+            ("let", "r", ("field_get", "f"), ("a2",)),
+        ], ("ret", "x"))]),
+    ]
+    ir = emit_llvm(fs)
+    assert count_placeholders(ir) == 1
+    assert "recursively inlined layout" in ir
+    # the impossible type must not be emitted either
+    assert "%struct.A = type" not in ir
+
+
+def test_closure_in_enum_payload_still_demotes():
+    # A closure pair stored in a boxed payload could outlive its stack env
+    # (and env-escape analysis does not chase payload flow): demote honestly.
+    ir = llvm_from_source("""
+enum Holder { Fn(fn(int) -> int), Nothing }
+fn main() -> int {
+    let x = 1;
+    let g = fn(y: int) -> x + y;
+    let h = Fn(g);
+    0
+}
+""")
+    assert count_placeholders(ir) >= 1
+    assert "payload slot 0 holds a closure" in ir
+
+
+def test_heterogeneous_aggregate_payload_slot_demotes():
+    # Leaf(int) | Fork(Tree, Tree) puts i64 and a boxed aggregate in the SAME
+    # slot; per-slot cells are flow-insensitive, so this demotes rather than
+    # guessing which representation a read expects.
+    ir = llvm_from_source("""
+enum Tree { Leaf(int), Fork(Tree, Tree) }
+fn main() -> int {
+    let t = Fork(Leaf(1), Leaf(2));
+    0
+}
+""")
+    assert count_placeholders(ir) >= 1
+    assert "heterogeneous payload slot 0 of enum 'Tree'" in ir
+
+
+# ---------------------------------------------------------------------------
+# Increment 4 native differentials: recursive data and escaping closures
+# ---------------------------------------------------------------------------
+
+_CONS_SUM_SRC = """
+enum IntList { Cons(int, IntList), Nil }
+fn sum(l: IntList) -> int {
+    match l { Cons(h, t) -> h + sum(t), Nil -> 0 }
+}
+fn main() -> int {
+    let l = Cons(1, Cons(2, Cons(3, Nil)));
+    print(sum(l));
+    sum(l)
+}
+"""
+
+
+@needs_clang
+def test_native_linked_list_three_node_sum(tmp_path):
+    # The increment's target program: build a 3-node list, sum it natively,
+    # match the interpreter.
+    assert_native_matches_interp(_CONS_SUM_SRC, tmp_path)
+
+
+@needs_clang
+def test_native_tree_nested_enum_two_levels(tmp_path):
+    # A tree-shaped enum nested two levels deep, recursively summed.  Slots
+    # stay homogeneous: slot 0 is always int, slots 1-2 always Tree.
+    assert_native_matches_interp("""
+enum Tree { Branch(int, Tree, Tree), Empty }
+fn total(t: Tree) -> int {
+    match t {
+        Branch(v, l, r) -> v + total(l) + total(r),
+        Empty -> 0
+    }
+}
+fn main() -> int {
+    let t = Branch(1, Branch(2, Empty, Branch(4, Empty, Empty)), Branch(3, Empty, Empty));
+    print(total(t));
+    total(t)
+}
+""", tmp_path)
+
+
+@needs_clang
+def test_native_struct_with_struct_field_value_semantics(tmp_path):
+    # Inline nested fields keep value semantics: copying the outer struct
+    # must deep-copy the inline inner region (it is part of the same bytes).
+    assert_native_matches_interp("""
+struct Inner { a: int, b: int }
+struct Outer { inner: Inner, k: int }
+fn main() -> int {
+    let mut o = Outer { inner: Inner { a: 1, b: 2 }, k: 3 };
+    let snapshot = o;
+    o.inner = Inner { a: 100, b: 200 };
+    o.k = 99;
+    print(o.inner.a, o.inner.b, o.k);
+    print(snapshot.inner.a, snapshot.inner.b, snapshot.k);
+    o.inner.a + snapshot.inner.a
+}
+""", tmp_path)
+
+
+@needs_clang
+def test_native_nested_struct_access_and_update(tmp_path):
+    ir = assert_native_matches_interp(_NESTED_STRUCT_SRC, tmp_path)
+    assert "%struct.Outer = type { %struct.Inner, i64 }" in ir
+
+
+@needs_clang
+def test_native_mutually_recursive_struct_enum_list(tmp_path):
+    # The linked_list.mx shape end-to-end: struct nodes chained through a
+    # boxed Option payload, built by calls and summed by recursive matching.
+    assert_native_matches_interp(_LINKED_LIST_SHAPE_SRC, tmp_path)
+
+
+@needs_clang
+def test_native_returned_closure(tmp_path):
+    # An escaping closure: created in make_adder, called after make_adder's
+    # frame is gone — only sound because the env is heap (leaked by design).
+    assert_native_matches_interp("""
+fn make_adder(x: int) -> fn(int) -> int {
+    let f = fn(y: int) -> x + y;
+    f
+}
+fn main() -> int {
+    let add2 = make_adder(2);
+    let add10 = make_adder(10);
+    print(add2(40));
+    print(add10(32));
+    add2(40)
+}
+""", tmp_path)
+
+
+@needs_clang
+@needs_asan
+def test_native_boxed_list_no_uaf_under_asan(tmp_path):
+    # FREE-STRATEGY PROOF, scoped to what the contract claims: with leak
+    # detection off (boxes leak BY DESIGN), ASan exit 0 proves the box
+    # traffic has no use-after-free and no double-free.
+    ir = assert_native_matches_interp_asan_boxes("""
+enum IntList { Cons(int, IntList), Nil }
+fn sum(l: IntList) -> int {
+    match l { Cons(h, t) -> h + sum(t), Nil -> 0 }
+}
+fn main() -> int {
+    let l = Cons(1, Cons(2, Cons(3, Nil)));
+    print(sum(l));
+    print(sum(Cons(10, l)));
+    0
+}
+""", tmp_path)
+    assert "boxed enum:IntList payload" in ir
+
+
+@needs_clang
+@needs_asan
+def test_native_boxes_next_to_freed_global_structs_under_asan(tmp_path):
+    # Boxes (leaked) and @global structs (freed at frame exit) coexist: with
+    # detect_leaks=0 ASan still catches any double-free or UAF, so exit 0
+    # proves the frees only ever hit the @global block, never a box.
+    ir = assert_native_matches_interp_asan_boxes("""
+struct Pair { a: int, b: int }
+enum IntList { Cons(int, IntList), Nil }
+fn sum(l: IntList) -> int {
+    match l { Cons(h, t) -> h + sum(t), Nil -> 0 }
+}
+fn main() -> int {
+    let @global p = Pair { a: 30, b: 12 };
+    let l = Cons(p.a, Cons(p.b, Nil));
+    print(sum(l));
+    0
+}
+""", tmp_path)
+    # the @global struct still gets its paired free; boxes get none
+    assert re.search(r"call void @free\(ptr %hv\.\w+\)", ir)
+    assert ir.count("call void @free") == 1
+
+
+@needs_clang
+@needs_asan
+def test_native_returned_closure_no_uaf_under_asan(tmp_path):
+    # Heap envs leak by design; detect_leaks=0 + exit 0 proves calling the
+    # escaped closure never touches freed memory.
+    assert_native_matches_interp_asan_boxes("""
+fn make_adder(x: int) -> fn(int) -> int {
+    let f = fn(y: int) -> x + y;
+    f
+}
+fn main() -> int {
+    let add2 = make_adder(2);
+    print(add2(40));
+    0
+}
+""", tmp_path)
+
+
 def test_examples_define_census_does_not_regress():
     # Aggregate emission census across all accepted examples: the number of
-    # real defines must not regress below the increment-3 level.
+    # real defines must not regress below the increment-4 level (increment 3
+    # emitted 18; boxing/inlining lifted linked_list.mx and the locality/
+    # operations fixtures to a total of 30).
     total_defines = 0
     for path in _example_files():
         ir = llvm_from_source(path.read_text())
         total_defines += len(re.findall(
             r"^define (?:i64|double|ptr|void) @mx_\w+\(", ir, re.M))
-    assert total_defines >= 18
+    assert total_defines >= 30
