@@ -596,14 +596,17 @@ class HIRBuilder:
                 eff_name = str(eff_node or '')
             cases_raw = list(getattr(orig, 'handler', []) or [])
             cont = getattr(orig, 'continuation', None)
-            case_triples: list[tuple[str, str, HExpr]] = []
+            case_triples: list[tuple[str, tuple, HExpr]] = []
             for c in cases_raw:
                 if isinstance(c, fast.HandleCase):
                     op_name = str(c.op_name)
-                    param_name = str(c.param_name) if c.param_name is not None else "_"
+                    raw_params = getattr(c, 'param_names', None)
+                    if raw_params is None:
+                        raw_params = [c.param_name] if c.param_name is not None else []
+                    params = tuple(str(p) for p in raw_params) or ("_",)
                     case_body = self._from_orig_expr(c.body, ctx_for(c.body) if c.body is not None else frozen_ctx)
                     if case_body is not None:
-                        case_triples.append((op_name, param_name, case_body))
+                        case_triples.append((op_name, params, case_body))
             body_he = self._from_orig_expr(cont, ctx_for(cont) if cont is not None else frozen_ctx)
             ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, 'Unknown'))
             return self._mk_hexpr(frozen_ctx.node_id, 'Expr', ty, frozen_ctx.span,

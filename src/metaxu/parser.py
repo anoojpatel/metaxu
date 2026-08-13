@@ -778,10 +778,12 @@ class Parser:
         else:
             op_name = str(pattern)
             args = []
-        if args:
-            first = args[0]
-            param_name = first.name if isinstance(first, ast.Variable) else str(first)
-        return ast.HandleCase(op_name, param_name, body)
+        param_names = [a.name if isinstance(a, ast.Variable) else str(a) for a in args]
+        if param_names:
+            param_name = param_names[0]
+        case = ast.HandleCase(op_name, param_name, body)
+        case.param_names = param_names  # full parameter list (multi-arg ops)
+        return case
 
     def p_in_target(self, p):
         '''in_target : expression
