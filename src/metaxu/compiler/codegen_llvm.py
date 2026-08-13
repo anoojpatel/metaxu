@@ -571,9 +571,10 @@ CLOSURES (increment 3) are fn-pointer + stack-environment pairs:
     in its prelude; its other free names still demote.
   * a call whose callee is a local variable of closure kind loads fn+env
     from the pair and calls ``fn(env, args...)`` — typed with the lambda's
-    signature, which kind inference pins because closure kinds
-    (``closure:L``) propagate like any other kind; two different lambdas
-    reaching one call site is a kind conflict and demotes.
+    signature when the kind is pinned to one non-participating lambda
+    (kind inference pins ``closure:L`` kinds like any other kind), or
+    through the word-uniform ABI below when the callee is dynamic or a
+    participant.
   * closures may be passed DOWN as call arguments (ptr + byval pair copy;
     the env outlives the callee because the creating frame is still
     live).
@@ -596,7 +597,45 @@ site:
     conservative, never precise).  Non-escaping lambdas keep their
     zero-cost stack envs.
   * still demoted honestly: storing a closure in a struct field or variant
-    payload, capturing a closure in another closure.
+    payload.
+
+INDIRECT CLOSURE CALLS (increment 13) — function-valued parameters and
+one-call-site-reached-by-many-lambdas shapes:
+  * two DIFFERENT lambdas of the same arity meeting at one flow point
+    join to the DYNAMIC closure kind ``closure:*{L1,L2}`` (the canonical
+    sorted member set) instead of conflicting; mismatched arities still
+    conflict (the interpreter's zip-binding would leave parameters
+    unbound at their first use too).
+  * WORD-UNIFORM ABI: a lambda PARTICIPATES in indirect calls when its
+    closure leaves simple local flow — it reaches a function parameter
+    position, it is merged into a dynamic kind anywhere, or it is
+    captured into an env (handle-site or another closure's).  A
+    participating lambda whose whole signature is word-encodable
+    (i64/f64/str/vec/vector/rawptr) is emitted with the uniform native
+    signature ``i64 (ptr env, i64 args...)`` — parameter words decoded in
+    the prelude, the return value encoded at every ret, using the
+    effect-boundary word conventions (f64 bitcast, pointers ptrtoint).
+    Non-participating lambdas keep their typed signatures (the
+    comprehension/SIMD and aggregate paths are untouched).
+  * an indirect call site (dynamic callee kind, or a pinned participant)
+    loads {fn, env} and calls the fn pointer with word-encoded arguments,
+    decoding the i64 result back to the site's inferred kind.  The site's
+    argument/result kinds unify two-way with EVERY member lambda's
+    signature during the module fixpoint, so all members and all sites
+    agree on the typed kinds under the words.
+  * env-captured closures: a closure pair may now be captured BY VALUE
+    into a handle-site env or another closure's env (this is how
+    std.stream's handler cases call ``f`` and how take/map/filter's
+    thunks hold ``producer``); every member lambda of an env-captured
+    closure kind is marked heap-env, so the pair's env pointer aims at an
+    immortal block and can never dangle wherever the capturing env
+    travels.
+  * still demoted honestly, with scalar-only reasons: aggregates
+    (structs, enums, closure pairs, konts) in indirect-call arguments or
+    returns, aggregate-signatured lambdas reaching an indirect site,
+    wrong-arity members reaching one site, dynamic closures as
+    comprehension bodies, and closures crossing the effect boundary as
+    perform/resume values (env capture is the supported route).
 
 Per-function value kinds (i64 / f64 / str / struct:T / enum:E /
 closure:L) are inferred exactly
@@ -933,6 +972,15 @@ _HEADER = (
     ";   two-word thunks over mx_fvec_zip_map (aborts on length\n"
     ";   mismatch, the interpreter's strict __zip); zip results are\n"
     ";   virtual and restricted to comprehension iterables;\n"
+    ";   INDIRECT CLOSURE CALLS (increment 13): different same-arity\n"
+    ";   lambdas meeting at one flow point join to a dynamic closure\n"
+    ";   kind closure:*{L1,L2} instead of conflicting; participating\n"
+    ";   lambdas (param-position flow, dynamic joins, env captures)\n"
+    ";   emit with the word-uniform ABI i64 (ptr env, i64 args...) and\n"
+    ";   indirect sites call the loaded fn pointer with word-encoded\n"
+    ";   args/results; closure pairs may be captured into handle-site\n"
+    ";   and closure envs (members forced heap-env so pairs never\n"
+    ";   dangle); aggregates through the word ABI stay demoted;\n"
     "; functions outside the subset appear as comment-only placeholders."
 )
 
@@ -1032,6 +1080,50 @@ def _is_closure(kind: str) -> bool:
 
 def _closure_lambda(kind: str) -> str:
     return kind[len(_CLOSURE_PREFIX):]
+
+
+# DYNAMIC CLOSURE KINDS (increment 13): two DIFFERENT lambdas of the same
+# arity meeting at one flow point join to `closure:*{L1,L2}` — the
+# canonical (sorted, deduplicated) set of every lambda whose closure can
+# reach that value — instead of conflicting.  A call through such a value
+# is an INDIRECT call: the {fn, env} pair is loaded and the fn pointer is
+# called through the WORD-UNIFORM ABI (`i64 (ptr env, i64 args...)`, the
+# effect-boundary word conventions: f64 bitcast, str/vec/rawptr
+# ptrtoint).  Mismatched arities still conflict (the interpreter's
+# zip-binding of a wrong-arity closure call errors at the first missing
+# parameter use; native demotion is the strict static form of that).
+_DYN_CLOSURE_PREFIX = _CLOSURE_PREFIX + "*{"
+
+# lambda name -> arity, set per emit_llvm invocation (module-global so the
+# pure kind lattice `_join` can validate arity agreement when merging
+# closure kinds; emission is single-threaded per module).
+_CLOSURE_ARITY: Dict[str, int] = {}
+
+
+def _is_dyn_closure(kind: str) -> bool:
+    return kind.startswith(_DYN_CLOSURE_PREFIX)
+
+
+def _closure_members(kind: str) -> Tuple[str, ...]:
+    """Every lambda a closure kind can name: the member set of a dynamic
+    kind, the single lambda of a pinned kind, () for non-closure kinds."""
+    if _is_dyn_closure(kind):
+        return tuple(kind[len(_DYN_CLOSURE_PREFIX):-1].split(","))
+    if _is_closure(kind):
+        return (kind[len(_CLOSURE_PREFIX):],)
+    return ()
+
+
+def _dyn_closure_of(members: Sequence[str]) -> str:
+    return _DYN_CLOSURE_PREFIX + ",".join(sorted(set(members))) + "}"
+
+
+def _word_abi_ok(kind: str) -> bool:
+    """Kinds that can cross the word-uniform indirect-call ABI: 8-byte
+    scalars with an exact word encoding.  Aggregates (structs, enums,
+    closure pairs), continuations and conflicts stay demoted — the word
+    ABI is scalar-only this increment."""
+    return kind in (I64, F64, STR, PTR) or _is_vec(kind) or _is_fvec(kind)
 
 
 def _is_vec(kind: str) -> bool:
@@ -1181,6 +1273,16 @@ def _join(a: str, b: str) -> str:
                 return CONFLICT
             merged[v] = js
         return _format_enum_kind(ename, merged)
+    if _is_closure(a) and _is_closure(b):
+        # Two different lambdas (or lambda sets) reaching one value: the
+        # join is the DYNAMIC closure kind naming their union, provided
+        # every member agrees on arity (call sites derive nargs from the
+        # site, so mixed arities have no sound indirect call).
+        members = sorted(set(_closure_members(a)) | set(_closure_members(b)))
+        arities = {_CLOSURE_ARITY.get(m, -1) for m in members}
+        if len(arities) == 1 and -1 not in arities:
+            return _dyn_closure_of(members)
+        return CONFLICT
     return CONFLICT
 
 
@@ -2353,11 +2455,17 @@ class _ScopeTable:
             self.bad.setdefault(m, reason)
 
 
-def _fn_defs_uses_sites(f: MirFunc) -> Tuple[Set[str], Set[str], List[str]]:
-    """(defined names, directly used names, handle sites contained) of a
-    function — the base facts for the free-name fixpoint."""
+def _fn_defs_uses_sites(
+        f: MirFunc) -> Tuple[Set[str], Set[str], Set[str], List[str]]:
+    """(defined names, directly used names, call CALLEE names, handle sites
+    contained) of a function — the base facts for the free-name fixpoint.
+    Callee names are kept separate: a callee is a free name only when the
+    handle site actually captured a binding of that name (interpreter
+    resolution order: the env shadows module functions and builtins), so
+    plain calls to module functions must not force phantom captures."""
     defs: Set[str] = set()
     uses: Set[str] = set()
+    callees: Set[str] = set()
     sites: List[str] = []
     for b in f.blocks:
         for op in b.ops:
@@ -2385,12 +2493,14 @@ def _fn_defs_uses_sites(f: MirFunc) -> Tuple[Set[str], Set[str], List[str]]:
                     # about unbound ones) — added during the fixpoint.
                 elif rk == "call":
                     uses.update(a for a in args if isinstance(a, str))
+                    if len(rhs) > 1 and isinstance(rhs[1], str):
+                        callees.add(rhs[1])
                 else:
                     uses.update(a for a in args if isinstance(a, str))
         t = b.term
         if t[0] in ("br_if", "ret") and isinstance(t[1], str):
             uses.add(t[1])
-    return defs, uses, sites
+    return defs, uses, callees, sites
 
 
 def _build_scope_table(funcs: Sequence[MirFunc]) -> _ScopeTable:
@@ -2477,12 +2587,19 @@ def _build_scope_table(funcs: Sequence[MirFunc]) -> _ScopeTable:
         for m in table.member_site:
             if m not in by_name:
                 continue
-            defs, uses, inner_sites = base[m]
+            defs, uses, callees, inner_sites = base[m]
+            site_caps = table.sites[table.member_site[m]].cap_vals
             need = set(uses)
+            # A call whose callee name the site captured resolves to the
+            # CAPTURED BINDING first (interpreter shadowing order): the
+            # member needs it from the env — this is how handler cases
+            # call function-valued parameters (`f(x)` inside `emit(x)`).
+            # Callee names the site did NOT capture are module functions /
+            # builtins and never become captures.
+            need |= {c for c in callees if c in site_caps}
             for s2 in inner_sites:
                 need |= site_needs(s2)
             nf = (need - defs) | (need & defs & wrapped_names)
-            site_caps = table.sites[table.member_site[m]].cap_vals
             nf -= {n for n in nf
                    if n in global_names and n not in site_caps}
             if nf != free[m]:
@@ -3179,12 +3296,16 @@ def _infer_kinds(info: _Info, sigs: Dict[str, _Sig], structs: _StructTable,
                     if callee in info.def_count:
                         # Closure call: types flow through the lambda's sig
                         # once the callee variable's closure kind is known.
+                        # A DYNAMIC kind flows through EVERY member lambda's
+                        # sig — the shared site transitively unifies the
+                        # members' parameter/return kinds with each other.
                         ck = get(callee)
-                        sig = sigs.get(_closure_lambda(ck)) if _is_closure(ck) else None
-                        if sig is not None and len(sig.params) == len(args):
-                            for a, pk in zip(args, sig.params):
-                                changed = mark(a, pk) or changed
-                            changed = mark(dst, sig.ret) or changed
+                        for m in _closure_members(ck):
+                            sig = sigs.get(m)
+                            if sig is not None and len(sig.params) == len(args):
+                                for a, pk in zip(args, sig.params):
+                                    changed = mark(a, pk) or changed
+                                changed = mark(dst, sig.ret) or changed
                     elif callee.startswith(TRAIT_CALL_PREFIX):
                         method = callee[len(TRAIT_CALL_PREFIX):]
                         if args:
@@ -3378,8 +3499,10 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                        closures: _ClosureTable, traits: _TraitTable,
                        scopes: _ScopeTable, module_names: Set[str],
                        cells: "_CellTable", gtable: "_GlobalTable",
+                       word_uniform: Optional[Set[str]] = None,
                        ) -> List[str]:
     probs: List[str] = []
+    word_uniform = word_uniform if word_uniform is not None else set()
 
     def ty(n: str) -> str:
         return kinds.get(n, I64)
@@ -3392,11 +3515,30 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                 "(only i64/f64/str/vec word kinds; no aggregate boxing "
                 "across scopes)")
 
+    def check_closure_cell(kind: str, what: str) -> bool:
+        """A closure kind stored in an env field (handle-site capture or
+        closure-in-closure capture) is a BY-VALUE {fn, env} pair copy —
+        legal since increment 13 provided every member lambda is known and
+        heap-env (the driver marks env-captured members heap-env before
+        checks run, so a live pair can never point into a dead frame).
+        Returns True when it handled a closure kind."""
+        if not _is_closure(kind):
+            return False
+        for m in _closure_members(kind):
+            if sigs.get(m) is None or m not in module_names:
+                probs.append(
+                    f"{what} holds a closure of unknown lambda {m!r}")
+            elif m not in closures.heap_env:
+                # Defensive: the driver's env-capture scan marks these.
+                probs.append(
+                    f"{what} holds a closure of lambda {m!r} not marked "
+                    "heap-env (a stack env could dangle)")
+        return True
+
     def check_env_cell(kind: str, what: str) -> None:
         """A handle-site env field must be storable like a closure capture."""
-        if _is_closure(kind):
-            probs.append(f"{what} is a closure ({kind}) (its env pointer may "
-                         "outlive the creating frame)")
+        if check_closure_cell(kind, what):
+            pass
         elif kind == KONT:
             probs.append(f"{what} is an effect continuation (resume must run "
                          "on its scope's owner stack)")
@@ -3710,6 +3852,12 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                     f"__vec_comprehension body {fnvar!r} is not a "
                     "statically-known closure")
                 return
+            if _is_dyn_closure(fk):
+                probs.append(
+                    f"__vec_comprehension body {fnvar!r} is a dynamic "
+                    f"closure ({fk}); the per-site thunk needs one "
+                    "statically-known lambda")
+                return
             lname = _closure_lambda(fk)
             lsig = sigs.get(lname)
             if lsig is None or lname not in module_names:
@@ -3997,32 +4145,83 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
             elif rk == "call":
                 callee = rhs[1]
                 if callee in info.def_count:
-                    # Closure call: the callee variable must be pinned to one
-                    # statically-known lambda whose signature matches.
+                    # Closure call: every lambda the callee variable can
+                    # name must be known and signature-compatible.  A
+                    # single pinned word-eligible participant or a dynamic
+                    # member set goes through the word-uniform indirect
+                    # ABI; a pinned non-participant stays a typed call.
                     ck = ty(callee)
                     if not _is_closure(ck):
                         probs.append(
                             f"call through local {callee!r} that is not a "
                             "statically-known closure")
                         continue
-                    lname = _closure_lambda(ck)
-                    sig = sigs.get(lname)
-                    if sig is None or lname not in module_names:
-                        probs.append(f"closure call to unknown lambda {lname!r}")
-                        continue
-                    if len(sig.params) != len(args):
+                    members = _closure_members(ck)
+                    unknown = [m for m in members
+                               if sigs.get(m) is None or m not in module_names]
+                    if unknown:
                         probs.append(
-                            f"closure call to {lname!r} with wrong arity")
+                            f"closure call to unknown lambda {unknown[0]!r}")
                         continue
-                    for a, pk in zip(args, sig.params):
-                        if ty(a) != pk:
+                    bad_arity = [m for m in members
+                                 if len(sigs[m].params) != len(args)]
+                    if bad_arity:
+                        m = bad_arity[0]
+                        probs.append(
+                            f"closure call through {callee!r} reaches lambda "
+                            f"{m!r} declaring {len(sigs[m].params)} "
+                            f"parameter(s) for {len(args)} argument(s) (the "
+                            "interpreter's call would leave parameters "
+                            "unbound too)")
+                        continue
+                    is_word = _is_dyn_closure(ck) or any(
+                        m in word_uniform for m in members)
+                    if is_word:
+                        for m in members:
+                            sigm = sigs[m]
+                            bad = [k for k in [*sigm.params, sigm.ret]
+                                   if not _word_abi_ok(k)]
+                            if bad:
+                                probs.append(
+                                    f"indirect closure call through "
+                                    f"{callee!r}: lambda {m!r} has "
+                                    f"signature kind {bad[0]} (the "
+                                    "word-uniform ABI is scalar-only this "
+                                    "increment; aggregates in indirect "
+                                    "args/returns stay demoted)")
+                            elif m not in word_uniform:
+                                probs.append(
+                                    f"indirect closure call through "
+                                    f"{callee!r}: lambda {m!r} is not "
+                                    "word-uniform (participation analysis "
+                                    "missed a flow)")
+                        for a in args:
+                            if not _word_abi_ok(ty(a)):
+                                probs.append(
+                                    f"indirect closure call through "
+                                    f"{callee!r}: arg {a!r} of kind {ty(a)} "
+                                    "has no word encoding (the word-uniform "
+                                    "ABI is scalar-only this increment; "
+                                    "aggregates in indirect args stay "
+                                    "demoted)")
+                        if not _word_abi_ok(ty(dst)):
                             probs.append(
-                                f"closure call to {lname!r}: arg {a!r} is "
-                                f"{ty(a)}, expects {pk}")
-                    if ty(dst) != sig.ret:
-                        probs.append(
-                            f"closure call to {lname!r}: result {dst!r} is "
-                            f"{ty(dst)}, returns {sig.ret}")
+                                f"indirect closure call through {callee!r}: "
+                                f"result {dst!r} of kind {ty(dst)} has no "
+                                "word encoding (the word-uniform ABI is "
+                                "scalar-only this increment; aggregates in "
+                                "indirect returns stay demoted)")
+                    for m in members:
+                        sigm = sigs[m]
+                        for a, pk in zip(args, sigm.params):
+                            if ty(a) != pk:
+                                probs.append(
+                                    f"closure call to {m!r}: arg {a!r} is "
+                                    f"{ty(a)}, expects {pk}")
+                        if ty(dst) != sigm.ret:
+                            probs.append(
+                                f"closure call to {m!r}: result {dst!r} is "
+                                f"{ty(dst)}, returns {sigm.ret}")
                 elif callee.startswith(TRAIT_CALL_PREFIX):
                     method = callee[len(TRAIT_CALL_PREFIX):]
                     if not args:
@@ -4332,24 +4531,27 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                 for (cn, _vn) in args:
                     ck = closures.cell_kind(lname, cn)
                     if _is_closure(ck):
-                        probs.append(
-                            f"lambda {lname!r} captures closure {cn!r} "
-                            "(closure-in-closure envs are a later increment)")
+                        # Closure-in-closure capture (increment 13): the
+                        # env field holds the pair by value; every member
+                        # must be a known heap-env lambda (marked by the
+                        # driver's env-capture scan).
+                        check_closure_cell(
+                            ck, f"lambda {lname!r} capture {cn!r}")
                     elif ck == CONFLICT:
                         probs.append(
                             f"lambda {lname!r} capture {cn!r} has conflicting kinds")
         if b.term[0] == "br_if" and ty(b.term[1]) != I64:
             probs.append(f"br_if condition {b.term[1]!r} is {ty(b.term[1])}")
-        if b.term[0] == "ret" and _is_closure(ty(b.term[1])) \
-                and _closure_lambda(ty(b.term[1])) not in closures.heap_env:
+        if b.term[0] == "ret" and _is_closure(ty(b.term[1])):
             # Defensive: the module driver marks every returned lambda
             # heap-env from its sig before this check runs, so this only
             # fires if that invariant is ever broken — a stack env crossing
             # a return would dangle.
-            probs.append(
-                f"returns closure of lambda "
-                f"{_closure_lambda(ty(b.term[1]))!r} not marked heap-env "
-                "(stack env would dangle)")
+            for m in _closure_members(ty(b.term[1])):
+                if m not in closures.heap_env:
+                    probs.append(
+                        f"returns closure of lambda {m!r} not marked "
+                        "heap-env (stack env would dangle)")
         # ret of a struct/enum value is fine: sret-style, the aggregate is
         # copied into the caller-provided %agg.ret slot (never a raw frame
         # pointer).  ret of a heap-env closure is fine: the pair is copied
@@ -4565,9 +4767,7 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
         for cap in info.env_captures:
             ck = closures.cell_kind(info.f.name, cap)
             if _is_closure(ck):
-                probs.append(
-                    f"capture {cap!r} is itself a closure (closure-in-closure "
-                    "envs are a later increment)")
+                check_closure_cell(ck, f"capture {cap!r}")
             elif ck == KONT:
                 probs.append(
                     f"capture {cap!r} is an effect continuation (resume must "
@@ -5455,9 +5655,16 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                    scopes: _ScopeTable, module_names: Set[str],
                    mod: _ModuleState, emitted_names: Set[str],
                    writeback_map: Dict[str, frozenset],
-                   cells: "_CellTable", gtable: "_GlobalTable") -> str:
+                   cells: "_CellTable", gtable: "_GlobalTable",
+                   word_uniform: Optional[Set[str]] = None) -> str:
     f = info.f
     sig = sigs[f.name]
+    word_uniform = word_uniform if word_uniform is not None else set()
+    # WORD-UNIFORM LAMBDA (increment 13): this lambda participates in
+    # indirect calls, so its native signature is `i64 (ptr env, i64...)`
+    # — incoming words are decoded to the typed kinds in the prelude and
+    # the typed return value is encoded back to a word at every ret.
+    is_uniform_lambda = info.is_lambda and f.name in word_uniform
 
     def kind(n: str) -> str:
         return kinds.get(n, I64)
@@ -6150,12 +6357,45 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                 setval(dst, a, lines)
         elif name == "__vec_comprehension":
             nvar, fnvar, itvar = opargs
+            if _is_dyn_closure(kind(fnvar)):
+                raise _Unsupported(
+                    f"comprehension body {fnvar!r} is a dynamic closure")
             lname = _closure_lambda(kind(fnvar))
             if lname not in emitted_names:
                 raise _Unsupported(
                     f"comprehension body lambda {lname!r} is not emitted")
             lsig = sigs[lname]
             dek = _fvec_elem(kind(dst))
+
+            def call_body_lambda(tl: List[str],
+                                 typed_args: List[Tuple[str, str]],
+                                 ret_kind: str) -> None:
+                """Thunk-side call of the body lambda, producing `%r` (its
+                typed result).  A word-uniform participant is called
+                through the word ABI (args encoded, result decoded)."""
+                if lname in word_uniform:
+                    words = []
+                    for i, (v, pkk) in enumerate(typed_args):
+                        enc, w = _word_encode(v, pkk, f"%wa{i}")
+                        tl += enc
+                        words.append(f"i64 {w}")
+                    argtxt = "".join(f", {w}" for w in words)
+                    dec, _rv = _word_decode("%rw", ret_kind, "%r")
+                    if dec:
+                        tl.append(
+                            f"  %rw = call i64 @{mangle(lname)}(ptr %env"
+                            f"{argtxt})  ; word-uniform lambda ABI")
+                        tl += dec
+                    else:
+                        tl.append(
+                            f"  %r = call i64 @{mangle(lname)}(ptr %env"
+                            f"{argtxt})  ; word-uniform lambda ABI")
+                else:
+                    argtxt = "".join(
+                        f", {_llscalar(pkk)} {v}" for (v, pkk) in typed_args)
+                    tl.append(
+                        f"  %r = call {_llscalar(ret_kind)} "
+                        f"@{mangle(lname)}(ptr %env{argtxt})")
 
             def decode_word(tl: List[str], w: str, ek: str, pk_: str,
                             tag: str) -> str:
@@ -6220,10 +6460,9 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                     "entry:"]
                 ea = decode_word(tl, "%wa", eks[0], lsig.params[0], "a")
                 eb = decode_word(tl, "%wb", eks[1], lsig.params[1], "b")
-                tl.append(
-                    f"  %r = call {_llscalar(lsig.ret)} @{mangle(lname)}"
-                    f"(ptr %env, {_llscalar(lsig.params[0])} {ea}, "
-                    f"{_llscalar(lsig.params[1])} {eb})")
+                call_body_lambda(
+                    tl, [(ea, lsig.params[0]), (eb, lsig.params[1])],
+                    lsig.ret)
                 encode_result(tl, lsig.ret)
                 tl.append("}")
                 mod.comp_thunks.setdefault(f.name, []).append("\n".join(tl))
@@ -6252,9 +6491,7 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                     f"  ; comprehension thunk: {lname}",
                     "entry:"]
                 ev = decode_word(tl, "%w", ek, pk_, "")
-                tl.append(
-                    f"  %r = call {_llscalar(rk_)} @{mangle(lname)}"
-                    f"(ptr %env, {_llscalar(pk_)} {ev})")
+                call_body_lambda(tl, [(ev, pk_)], rk_)
                 encode_result(tl, rk_)
                 tl.append("}")
                 mod.comp_thunks.setdefault(f.name, []).append("\n".join(tl))
@@ -6693,17 +6930,24 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                 # order), so the closure-call check comes first.
                 if callee in info.def_count:
                     # Closure call: load {fn, env} from the pair and call
-                    # fn(env, args...), typed with the pinned lambda's sig.
+                    # the fn pointer.  A pinned NON-participant lambda is
+                    # called with its typed signature; a dynamic member
+                    # set — or a pinned word-uniform participant — goes
+                    # through the word-uniform ABI (`i64 (ptr, i64...)`,
+                    # args word-encoded, result word-decoded per the
+                    # site's inferred kinds).
                     ck = kind(callee)
                     if not _is_closure(ck):
                         raise _Unsupported(
                             f"call through local {callee!r} that is not a "
                             "statically-known closure")
-                    lname = _closure_lambda(ck)
-                    if lname not in emitted_names:
-                        raise _Unsupported(
-                            f"closure call to non-emitted lambda {lname!r}")
-                    csig = sigs[lname]
+                    members = _closure_members(ck)
+                    for m in members:
+                        if m not in emitted_names:
+                            raise _Unsupported(
+                                f"closure call to non-emitted lambda {m!r}")
+                    is_word = _is_dyn_closure(ck) or any(
+                        m in word_uniform for m in members)
                     base = use(callee, lines)
                     fpp, envpp = fresh(), fresh()
                     lines.append(
@@ -6716,22 +6960,36 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                         f"ptr {base}, i32 0, i32 1")
                     envv = fresh()
                     lines.append(f"  {envv} = load ptr, ptr {envpp}")
-                    avals = [f"ptr {envv}"]
-                    for a, pk in zip(opargs, csig.params):
-                        avals.append(f"{_llparam(pk)} {use(a, lines)}")
-                    if _is_agg(csig.ret):
-                        if dst not in aggset:
-                            raise _Unsupported(
-                                f"call result {dst!r} not aggregate-kinded for "
-                                f"sret closure call to {lname!r}")
-                        avals.insert(0, f"ptr {struct_ref(dst)}")
-                        lines.append(f"  call void {fnv}({', '.join(avals)})")
-                    else:
+                    if is_word:
+                        avals = [f"ptr {envv}"]
+                        for a in opargs:
+                            w = to_word(kind(a), use(a, lines), lines)
+                            avals.append(f"i64 {w}")
                         v = fresh()
-                        rty = _llscalar(csig.ret)
                         lines.append(
-                            f"  {v} = call {rty} {fnv}({', '.join(avals)})")
-                        setval(dst, v, lines)
+                            f"  {v} = call i64 {fnv}({', '.join(avals)})"
+                            f"  ; indirect closure call "
+                            f"({'|'.join(members)}), word-uniform ABI")
+                        setval(dst, from_word(kind(dst), v, lines), lines)
+                    else:
+                        lname = members[0]
+                        csig = sigs[lname]
+                        avals = [f"ptr {envv}"]
+                        for a, pk in zip(opargs, csig.params):
+                            avals.append(f"{_llparam(pk)} {use(a, lines)}")
+                        if _is_agg(csig.ret):
+                            if dst not in aggset:
+                                raise _Unsupported(
+                                    f"call result {dst!r} not aggregate-kinded for "
+                                    f"sret closure call to {lname!r}")
+                            avals.insert(0, f"ptr {struct_ref(dst)}")
+                            lines.append(f"  call void {fnv}({', '.join(avals)})")
+                        else:
+                            v = fresh()
+                            rty = _llscalar(csig.ret)
+                            lines.append(
+                                f"  {v} = call {rty} {fnv}({', '.join(avals)})")
+                            setval(dst, v, lines)
                 elif callee.startswith(TRAIT_CALL_PREFIX):
                     # Statically-resolved trait dispatch (kind-driven; the
                     # consistency check validated the resolution).
@@ -7260,6 +7518,14 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                     agg_copy(_agg_ty(sig.ret), src, "%agg.ret", lines)
                     emit_frees(lines)
                     lines.append("  ret void")
+                elif is_uniform_lambda:
+                    rv = use(t[1], lines)
+                    emit_writebacks(lines)
+                    emit_frees(lines)
+                    rw = to_word(sig.ret, rv, lines)
+                    lines.append(
+                        f"  ret i64 {rw}  ; word-uniform lambda return "
+                        f"({sig.ret} encoded)")
                 else:
                     rv = use(t[1], lines)
                     emit_writebacks(lines)
@@ -7276,15 +7542,37 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
     # parameter (sret-style); a lambda takes its env struct as a leading
     # `ptr %cl.env` parameter (after %agg.ret when both are present).
     pdecls = []
+    uniform_decodes: List[str] = []
     if sret:
+        if is_uniform_lambda:  # unreachable: word-eligible rets are scalar
+            raise _Unsupported(
+                "word-uniform lambda with an aggregate return")
         pdecls.append("ptr %agg.ret")
     if info.is_lambda or info.is_scope_member:
         pdecls.append("ptr %cl.env")
     for p, pk in zip(info.params, sig.params):
-        pdecls.append(f"{_llparam(pk)} %a.{_sanitize(p)}")
-    rty = "void" if sret else _llscalar(sig.ret)
-    out = [f"define {rty} @{mangle(f.name)}({', '.join(pdecls)}) {{"]
-    entry: List[str] = []
+        if is_uniform_lambda:
+            # Word-uniform ABI: every parameter arrives as an i64 word;
+            # non-i64 kinds are decoded to their typed `%a.<p>` name in
+            # the prelude, so the body is oblivious to the ABI.
+            if not _word_abi_ok(pk):  # unreachable given eligibility
+                raise _Unsupported(
+                    f"word-uniform lambda parameter {p!r} of kind {pk}")
+            if _llscalar(pk) == "i64":
+                pdecls.append(f"i64 %a.{_sanitize(p)}")
+            else:
+                pdecls.append(f"i64 %aw.{_sanitize(p)}")
+                dec, _v = _word_decode(
+                    f"%aw.{_sanitize(p)}", pk, f"%a.{_sanitize(p)}")
+                uniform_decodes.extend(
+                    ln + f"  ; word-uniform param {p}: {pk} decoded"
+                    for ln in dec)
+        else:
+            pdecls.append(f"{_llparam(pk)} %a.{_sanitize(p)}")
+    rty = "i64" if is_uniform_lambda else ("void" if sret else _llscalar(sig.ret))
+    out = [f"define {rty} @{mangle(f.name)}({', '.join(pdecls)}) {{"
+           + ("  ; word-uniform lambda ABI" if is_uniform_lambda else "")]
+    entry: List[str] = list(uniform_decodes)
     for n in slots:
         entry.append(f"  {slot_ref(n)} = alloca {llty(n)}  ; mir slot: {n}")
     for n in agg_vars:
@@ -7542,6 +7830,11 @@ def emit_llvm(funcs: Sequence[MirFunc]) -> str:
     module_names = {f.name for f in funcs}
     structs = _build_struct_table(funcs)
     closures = _build_closure_table(funcs)
+    # Arm the kind lattice's closure-arity oracle for this module: _join
+    # merges same-arity closure kinds into dynamic member sets (see
+    # _DYN_CLOSURE_PREFIX); arities are static per make_closure site.
+    _CLOSURE_ARITY.clear()
+    _CLOSURE_ARITY.update(closures.arity)
     traits = _build_trait_table(module_names)
     scopes = _build_scope_table(funcs)
     cells = _build_cell_table(funcs, scopes)
@@ -7585,8 +7878,8 @@ def emit_llvm(funcs: Sequence[MirFunc]) -> str:
                      if m in module_names}
         for (_d, cvar, _a) in info.closure_calls:
             ck = kinds.get(cvar, I64)
-            if _is_closure(ck) and _closure_lambda(ck) in module_names:
-                deps.add(_closure_lambda(ck))
+            deps.update(m for m in _closure_members(ck)
+                        if m in module_names)
         # Reading a module constant is meaningless unless its initializer
         # emitted (the entry wrapper must be able to run it first): a
         # demoted __module_init cascades onto every global reader.
@@ -7664,8 +7957,8 @@ def emit_llvm(funcs: Sequence[MirFunc]) -> str:
                     resolved_calls.append((dst, callee, args))
                 for (dst, cvar, args) in info.closure_calls:
                     ck = kinds.get(cvar, I64)
-                    if _is_closure(ck):
-                        resolved_calls.append((dst, _closure_lambda(ck), args))
+                    for m in _closure_members(ck):
+                        resolved_calls.append((dst, m, args))
                 for (dst, method, targs) in info.trait_calls:
                     if not targs:
                         continue
@@ -7694,11 +7987,55 @@ def emit_llvm(funcs: Sequence[MirFunc]) -> str:
     # the pair crosses the creating frame's boundary, so a stack env would
     # dangle.  sig.ret is the join of every ret-var kind across the module
     # fixpoint, so this is complete for the emitted subset (storing a pair
-    # in a field/payload/env demotes the storing function instead).  Over-
-    # marking is sound — a heap env only leaks, it can never dangle.
+    # in a field/payload demotes the storing function instead; env-captured
+    # pairs are marked below).  Over-marking is sound — a heap env only
+    # leaks, it can never dangle.
     for sig in sigs.values():
-        if _is_closure(sig.ret):
-            closures.heap_env.add(_closure_lambda(sig.ret))
+        for m in _closure_members(sig.ret):
+            if m in module_names:
+                closures.heap_env.add(m)
+
+    # WORD-UNIFORM PARTICIPATION (increment 13).  A lambda participates in
+    # the indirect-call ABI — `i64 (ptr env, i64 args...)`, boundary word
+    # conventions for BOTH params and return — when its closure leaves
+    # simple local flow: it reaches a function parameter position, it is
+    # merged with another lambda into a dynamic kind anywhere, or it is
+    # captured into an env (a handle-site env or another closure's env —
+    # the aggregate/effect boundary).  Everything else keeps its typed
+    # signature (no regression to the comprehension/SIMD/aggregate paths).
+    # Only lambdas whose whole signature has a word encoding are marked;
+    # an aggregate-signatured participant stays typed and any indirect
+    # site naming it demotes with a scalar-only reason.  Env-captured
+    # members are additionally marked heap-env: the pair stored in an env
+    # could outlive the lambda's creating frame, and an immortal env can
+    # never dangle.
+    participants: Set[str] = set()
+    for sig in sigs.values():
+        for pk in sig.params:
+            participants.update(_closure_members(pk))
+    for store_kind in (
+            [k for ks in kind_sets.values() for k in ks.values()]
+            + [k for sig in sigs.values() for k in (*sig.params, sig.ret)]
+            + list(gtable.kinds.values())
+            + list(scopes.value_cells.values())
+            + list(scopes.op_results.values())
+            + list(scopes.op_args.values())
+            + list(structs.kinds.values())
+            + list(variants.cells.values())):
+        if _is_dyn_closure(store_kind):
+            participants.update(_closure_members(store_kind))
+    for env_kind in list(closures.cells.values()) + list(scopes.cells.values()):
+        ms = _closure_members(env_kind)
+        participants.update(ms)
+        closures.heap_env.update(m for m in ms if m in module_names)
+
+    def _word_eligible(m: str) -> bool:
+        s = sigs.get(m)
+        return (s is not None and m in module_names
+                and all(_word_abi_ok(pk) for pk in s.params)
+                and _word_abi_ok(s.ret))
+
+    word_uniform = {m for m in participants if _word_eligible(m)}
 
     # Mark module-wide variant cells whose stores disagree post-fixpoint:
     # the joined cell kind is then NOT the representation every writer used
@@ -7723,7 +8060,7 @@ def emit_llvm(funcs: Sequence[MirFunc]) -> str:
         kinds = kind_sets.get(info.f.name, {})
         for p in _check_consistency(info, kinds, sigs, structs, variants,
                                     closures, traits, scopes, module_names,
-                                    cells, gtable):
+                                    cells, gtable, word_uniform):
             info.add_reason(p)
 
     # WRITE-BACK MAP (increment 8, for copy elision): per function, the
@@ -7777,7 +8114,8 @@ def emit_llvm(funcs: Sequence[MirFunc]) -> str:
                 chunk = _emit_function(info, kinds, sigs, structs, variants,
                                        closures, traits, scopes,
                                        module_names, mod, emitted,
-                                       writeback_map, cells, gtable)
+                                       writeback_map, cells, gtable,
+                                       word_uniform)
             except _Unsupported as exc:
                 info.add_reason(exc.reason)
             except Exception as exc:  # never crash the pipeline
