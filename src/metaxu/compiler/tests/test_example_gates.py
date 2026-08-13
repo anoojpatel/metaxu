@@ -92,6 +92,15 @@ def test_effects_example_output():
     assert prints == ["Current value: 0", "New value: 1"]
 
 
+def test_effects_fstring_example_output():
+    """effects.mx logs f"Counter value: {x}"; with f-string interpolation
+    real (parse-time desugar to concat + to_string) the printed line is the
+    interpolated value, not the literal braces text.  x = State.get() + 1
+    with get resuming 0, so the value is 1."""
+    _, prints = execute("examples/effects.mx")
+    assert prints == ["Starting counter", "Counter value: 1", "Done"]
+
+
 def test_traits_example_output():
     """The example's own comment promises size 2 -> pops 17."""
     _, prints = execute("examples/10_traits_and_structs.mx")
