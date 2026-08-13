@@ -342,6 +342,22 @@ class _FuncLowerer:
         # compile to sub-functions; at runtime handle_scope pushes a delimited
         # handler frame, runs the body under it, and catches handler aborts
         # (a case returning without calling resume).
+        if e.op == "Try" and e.handle_body is not None and e.handle_cases:
+            scope_tag = self.state.fresh("tc")
+            (_, catch_params, catch_he) = e.handle_cases[0]
+            if isinstance(catch_params, str):
+                catch_params = (catch_params,)
+            catch_fn = f"__catch_{scope_tag}"
+            self._lower_subfunc(catch_fn, tuple(catch_params), catch_he,
+                                ty_sig=e.ty, suspending=False)
+            body_fn = f"__try_body_{scope_tag}"
+            self._lower_subfunc(body_fn, (), e.handle_body, ty_sig=e.ty,
+                                suspending=False)
+            captured = tuple(sorted({v for v in self.state.env.values() if isinstance(v, str)}))
+            captures = tuple((name, name) for name in captured)
+            dst = self.state.fresh("tres")
+            self.emit(("let", dst, ("try_scope", body_fn, catch_fn), captures))
+            return dst
         if e.op == "Handle" and e.handle_body is not None:
             effect = str(e.handle_effect or "")
             if "<" in effect:  # strip generic args: State<int> -> State
