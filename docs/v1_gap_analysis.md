@@ -22,6 +22,17 @@ to_string/len). The remaining non-executing examples need real FFI/threads
 (05, effect_mapping), a SimdOp handler + const-generic N at runtime (06),
 and try/catch lowering (04).
 
+Direction update (2026-08-13): the project targets LLVM for AOT native
+compilation (near-C, no GC; modes decide memory). Increment 1 is on this
+branch: codegen_llvm.py emits a verifier-clean LLVM module for the direct
+subset (scalars, control flow, calls, strings/print, local structs as
+stack allocas); llvm_run.py compiles with clang -O2 and executes;
+differential tests pin native results == interpreter results. try/catch
+is implemented per docs/try_catch.md (example 04 executes; run gate
+16/19). Deferred LLVM increments, always as reasoned placeholders:
+@global structs via malloc + drop-planned frees, aggregates across
+calls/returns, closures, variants, effect CPS at the LLVM level.
+
 Roadmap items completed on this branch beyond the v1 criteria:
 - Item 5 (deep field-mode validation): transitive @global/@local ownership
   rules enforced as kind="deep-locality" diagnostics.
