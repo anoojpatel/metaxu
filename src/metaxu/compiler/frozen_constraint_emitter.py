@@ -119,6 +119,7 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
     declared_linearity: dict[str, str] = {}  # callable_name -> linearity ("once"/"separate"/"many")
     function_region_stack: list[int] = []  # region id at each enclosing function's entry
     handler_contexts: list[dict[str, str]] = []  # Stack of handler contexts: effect_name -> effect_class
+    enclosing_performs: list[frozenset[str]] = []  # declared performs of enclosing functions
     handler_locals: list[set[str]] = []  # Track variables assigned in handler contexts
     handler_operations: list[list[str]] = []  # Track operations in handler (for stack effect checking)
     struct_defs: dict[str, dict[str, Any]] = {}  # struct name -> frozen payload (fields/type_params)
@@ -363,8 +364,11 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
             value = payload_dict(node)
             effect_name = value.get("effect_name")
             effect_class = effect_classes.get(effect_name)
-            if effect_name and effect_class:
-                handler_contexts.append({effect_name: effect_class})
+            if effect_name:
+                # Effects without a declared class default to "suspend" (the
+                # general case); the handler context must exist either way so
+                # lexically-enclosed performs are recognized as handled.
+                handler_contexts.append({effect_name: effect_class or "suspend"})
                 handler_locals.append(set())
                 handler_operations.append([])
             # Walk handler children
@@ -378,6 +382,20 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
             if handler_operations:
                 handler_operations.pop()
             return None
+        # A perform must be either lexically inside a handle for its effect
+        # or covered by the enclosing function's `performs` clause. Advisory
+        # diagnostic (checker channel), not a hard error: dynamically-scoped
+        # handlers installed by callers are legitimate and undecidable here.
+        if kind == "PerformEffect":
+            effect_ref = payload_dict(node).get("effect_name")
+            if isinstance(effect_ref, str) and effect_ref:
+                effect = effect_ref.split(".")[0]
+                handled = any(effect in ctx_frame for ctx_frame in handler_contexts)
+                declared = any(effect in ps for ps in enclosing_performs)
+                if not handled and not declared:
+                    simplesub.add_unresolved(
+                        "effect (performed without enclosing handler or "
+                        "performs declaration)", effect, node.node_id)
         # Track Resume calls to check effect class restrictions
         if kind == "Resume":
             # Check if we're in a handler context
@@ -492,6 +510,7 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
             # @global-container gating is per-function: bindings recorded in
             # one function must not poison same-named locals in another.
             saved_global_bindings = dict(global_struct_bindings)
+            enclosing_performs.append(frozenset(str(e) for e in performs))
             borrow_checker.enter_region()
             function_region_stack.append(borrow_checker.current_region())
 
@@ -536,6 +555,7 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
             borrow_checker.exit_function_state(fn_state)
             global_struct_bindings.clear()
             global_struct_bindings.update(saved_global_bindings)
+            enclosing_performs.pop()
             return None
         if kind == "LambdaExpression" and node_ty is not None:
             outer_bindings = {name: lookup(name) for name in payload_dict(node).get("captures", {})}

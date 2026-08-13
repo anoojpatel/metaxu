@@ -95,6 +95,9 @@ def _value_of(node: Any) -> Any | None:
         return {
             "effect_name": getattr(node, "effect_name", None),
         }
+    if isinstance(node, fast.PerformEffect):
+        name = getattr(node, "effect_name", None)
+        return {"effect_name": name if isinstance(name, str) or name is None else str(name)}
     if isinstance(node, fast.Resume):
         return {
             "value": getattr(node, "value", None),
