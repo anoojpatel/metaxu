@@ -296,8 +296,16 @@ class MirInterpreter:
                 raise InterpError(f"Unknown terminator: {term!r}")
 
     def _find_mir_frame(self, effect_name: str, op_name: str) -> Optional[Dict[str, Any]]:
-        """Innermost MIR handler frame handling op_name (and effect, if named)."""
+        """Innermost MIR handler frame handling op_name (and effect, if named).
+
+        Frames whose handler case is currently executing are skipped: a
+        handler body evaluates OUTSIDE its own delimitation, so a perform
+        inside it routes to an outer handler of the effect (previously this
+        posted to the frame's own queue, which nobody was pumping: deadlock).
+        """
         for frame in reversed(self._mir_handler_frames):
+            if frame.get("busy"):
+                continue
             if op_name not in frame["cases"]:
                 continue
             if effect_name and frame["effect"] and frame["effect"] != effect_name:
@@ -330,7 +338,11 @@ class MirInterpreter:
             raise InterpError(f"Missing handler function {handler_fn_name!r}")
         handler_env = dict(frame["captured"])
         handler_arg = arg_vals[0] if arg_vals else UNIT
-        handler_result = self._call_func(target, [handler_arg, sk], handler_env)
+        frame["busy"] = True
+        try:
+            handler_result = self._call_func(target, [handler_arg, sk], handler_env)
+        finally:
+            frame["busy"] = False
         if sk.used:
             # The handler resumed: resume() pumped the body to completion, so
             # handler_result already reflects the whole delimited body's value.
@@ -579,9 +591,20 @@ class MirInterpreter:
                 # Unblock the body thread at its perform site, then wait for
                 # the scope's next event. Deep handlers: resume() returns the
                 # final value of the whole delimited body, so a subsequent
-                # perform is handled (recursively) inside this pump.
+                # perform is handled (recursively) inside this pump. While the
+                # body runs, the frame's delimitation is re-armed (busy off);
+                # it re-engages for the post-resume handler code, which
+                # evaluates outside its own delimitation.
+                frame = scope.frame
+                was_busy = bool(frame and frame.get("busy"))
+                if frame is not None:
+                    frame["busy"] = False
                 k.reply_q.put(("resume", value))
-                return self._pump_scope(scope)
+                try:
+                    return self._pump_scope(scope)
+                finally:
+                    if frame is not None:
+                        frame["busy"] = was_busy
             if not isinstance(k, MxContinuation):
                 raise InterpError(f"resume: expected continuation, got {type(k).__name__!r}")
             return k.resume(value, self)
