@@ -1,0 +1,40 @@
+# std.early_return — the EarlyReturn effect.
+#
+# Design ported from Ante's stdlib (stdlib/src/EarlyReturn.an,
+# jfecher/ante): `early_return x` aborts the enclosing
+# `with_early_return` block, which evaluates to x. This gives ordinary
+# code multi-level early exit without a dedicated statement — the
+# handler simply declines to resume, so the rest of the computation
+# (including pending callers inside the block) never runs.
+#
+# The payload is unannotated for the same reason as std.throw's `throw`.
+
+export {
+    EarlyReturn,
+    with_early_return,
+    return_if
+}
+
+effect EarlyReturn {
+    early_return(x) -> Unit
+}
+
+# Run `f`; its result is f's normal return value, unless it performs
+# early_return(x), in which case the result is x.
+#
+#     with_early_return(fn() -> int {
+#         if done { perform EarlyReturn.early_return(0) } else { () };
+#         expensive_rest()
+#     })
+fn with_early_return(f) {
+    handle EarlyReturn with {
+        early_return(x) -> x
+    } in {
+        f()
+    }
+}
+
+# Early-return `x` if `cond` is true.
+fn return_if(cond: bool, x) performs EarlyReturn {
+    if cond { perform EarlyReturn.early_return(x) } else { () }
+}

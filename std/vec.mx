@@ -1,0 +1,207 @@
+# std.vec — helpers over Metaxu's builtin growable Vec.
+#
+# Design ported from Ante's stdlib (stdlib/src/Vec.an, jfecher/ante),
+# adapted to Metaxu: Vec itself (new/push/pop/len/indexing) is a runtime
+# builtin here, so this module is the combinator layer Ante spreads
+# between Vec.an and Stream.an. Everything is eager (Vec in, Vec out);
+# the lazy equivalents live in std.stream.
+#
+# Vec values are shared references at runtime: functions that build a
+# result push into a fresh Vec and return it; nothing here mutates its
+# argument except where documented.
+
+export {
+    of1,
+    of2,
+    of3,
+    range_vec,
+    sum,
+    product,
+    contains,
+    index_of,
+    first,
+    last,
+    is_empty,
+    map,
+    filter,
+    reverse,
+    concat,
+    max_of,
+    min_of
+}
+
+# Fresh one/two/three-element vectors (no Vec literals in the language yet).
+fn of1(a) -> Vec {
+    let @mut v = Vec.new();
+    v.push(a);
+    v
+}
+
+fn of2(a, b) -> Vec {
+    let @mut v = Vec.new();
+    v.push(a);
+    v.push(b);
+    v
+}
+
+fn of3(a, b, c) -> Vec {
+    let @mut v = Vec.new();
+    v.push(a);
+    v.push(b);
+    v.push(c);
+    v
+}
+
+# The integers a, a+1, .., b-1 as a Vec.
+fn range_vec(a: int, b: int) -> Vec {
+    let @mut v = Vec.new();
+    let @mut i = a;
+    while i < b {
+        v.push(i);
+        i = i + 1
+    }
+    v
+}
+
+# Sum of the elements (0 when empty).
+fn sum(v: Vec) {
+    let @mut total = 0;
+    let @mut i = 0;
+    while i < len(v) {
+        total = total + v[i];
+        i = i + 1
+    }
+    total
+}
+
+# Product of the elements (1 when empty).
+fn product(v: Vec) {
+    let @mut total = 1;
+    let @mut i = 0;
+    while i < len(v) {
+        total = total * v[i];
+        i = i + 1
+    }
+    total
+}
+
+# True when x occurs in v.
+fn contains(v: Vec, x) -> bool {
+    let @mut i = 0;
+    let @mut found = false;
+    while i < len(v) {
+        if v[i] == x { found = true } else { () };
+        i = i + 1
+    }
+    found
+}
+
+# Some(index of the first occurrence of x), else None.
+fn index_of(v: Vec, x) {
+    let @mut i = 0;
+    let @mut found = None;
+    while i < len(v) {
+        if is_none_priv(found) {
+            if v[i] == x { found = Some(i) } else { () }
+        } else { () };
+        i = i + 1
+    }
+    found
+}
+
+# Some(first element), else None.
+fn first(v: Vec) {
+    if len(v) > 0 { Some(v[0]) } else { None }
+}
+
+# Some(last element), else None.
+fn last(v: Vec) {
+    if len(v) > 0 { Some(v[len(v) - 1]) } else { None }
+}
+
+fn is_empty(v: Vec) -> bool {
+    len(v) == 0
+}
+
+# Fresh Vec of f(x) for each x in v.
+fn map(v: Vec, f) -> Vec {
+    let @mut out = Vec.new();
+    let @mut i = 0;
+    while i < len(v) {
+        out.push(f(v[i]));
+        i = i + 1
+    }
+    out
+}
+
+# Fresh Vec of the elements with pred(x) true.
+fn filter(v: Vec, pred) -> Vec {
+    let @mut out = Vec.new();
+    let @mut i = 0;
+    while i < len(v) {
+        if pred(v[i]) { out.push(v[i]) } else { () };
+        i = i + 1
+    }
+    out
+}
+
+# Fresh Vec with the elements in reverse order.
+fn reverse(v: Vec) -> Vec {
+    let @mut out = Vec.new();
+    let @mut i = len(v);
+    while i > 0 {
+        out.push(v[i - 1]);
+        i = i - 1
+    }
+    out
+}
+
+# Fresh Vec of a's elements followed by b's.
+fn concat(a: Vec, b: Vec) -> Vec {
+    let @mut out = Vec.new();
+    let @mut i = 0;
+    while i < len(a) {
+        out.push(a[i]);
+        i = i + 1
+    }
+    let @mut j = 0;
+    while j < len(b) {
+        out.push(b[j]);
+        j = j + 1
+    }
+    out
+}
+
+# Some(largest element), else None.
+fn max_of(v: Vec) {
+    let @mut i = 1;
+    if len(v) == 0 { None } else {
+        let @mut best = v[0];
+        while i < len(v) {
+            if v[i] > best { best = v[i] } else { () };
+            i = i + 1
+        }
+        Some(best)
+    }
+}
+
+# Some(smallest element), else None.
+fn min_of(v: Vec) {
+    let @mut i = 1;
+    if len(v) == 0 { None } else {
+        let @mut best = v[0];
+        while i < len(v) {
+            if v[i] < best { best = v[i] } else { () };
+            i = i + 1
+        }
+        Some(best)
+    }
+}
+
+# private helper (not exported)
+fn is_none_priv(o) -> bool {
+    match o {
+        Some(v) => false,
+        None => true
+    }
+}

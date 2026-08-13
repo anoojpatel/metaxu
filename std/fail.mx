@@ -1,0 +1,80 @@
+# std.fail — the Fail effect: failure without a payload.
+#
+# Design ported from Ante's stdlib (stdlib/src/Fail.an, jfecher/ante):
+# `Fail` is the effect of an operation that can give up with no error
+# value; handlers decide what failure means (None, a default, a retry).
+# Adaptations for Metaxu:
+# - Ante's `try` is `try_opt` here (`try` is a reserved word in Metaxu).
+# - Ante's `assert` is `ok_if` here (`assert` is an interpreter builtin).
+# - Ante's `panic_on_fail`/`or_panic`/`retry_until_success` are deferred:
+#   Metaxu has no panic primitive yet, and retry-in-handler recursion is
+#   not exercised by any gate, so we do not ship it untested.
+#
+# The op is declared `fail() -> Unit`: the return type is never observed
+# because every handler in this module aborts (returns without resume).
+
+export {
+    Fail,
+    try_opt,
+    on_fail,
+    on_fail_else,
+    fail_if,
+    ok_if,
+    ignore_fail
+}
+
+effect Fail {
+    fail() -> Unit
+}
+
+# Run `f`, answering None if it fails and Some(result) otherwise.
+#
+#     let r = try_opt(fn() -> int { fail_if(x == 0); 100 / x });
+#     match r { Some(v) => v, None => 0 }
+fn try_opt(f) {
+    handle Fail with {
+        fail() -> None
+    } in {
+        Some(f())
+    }
+}
+
+# Run `f`, answering `default` if it fails.
+fn on_fail(f, default) {
+    handle Fail with {
+        fail() -> default
+    } in {
+        f()
+    }
+}
+
+# Run `f`, answering `default()` if it fails (lazy default).
+fn on_fail_else(f, default) {
+    handle Fail with {
+        fail() -> default()
+    } in {
+        f()
+    }
+}
+
+# Fail if `cond` is true. The inverse of `ok_if`.
+fn fail_if(cond: bool) performs Fail {
+    if cond { perform Fail.fail() } else { () }
+}
+
+# Fail if `cond` is false (Ante's `assert`). The inverse of `fail_if`.
+fn ok_if(cond: bool) performs Fail {
+    if cond { () } else { perform Fail.fail() }
+}
+
+# Run `f` for its side effects, discarding both its result and any failure.
+# (The arm body is a block: a bare `-> ()` arm is dropped by the parser —
+# see the language-gaps section of std/README.md.)
+fn ignore_fail(f) {
+    handle Fail with {
+        fail() -> { () }
+    } in {
+        f();
+        ()
+    }
+}
