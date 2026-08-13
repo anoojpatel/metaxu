@@ -22,6 +22,20 @@ to_string/len). The remaining non-executing examples need real FFI/threads
 (05, effect_mapping), a SimdOp handler + const-generic N at runtime (06),
 and try/catch lowering (04).
 
+Roadmap items completed on this branch beyond the v1 criteria:
+- Item 5 (deep field-mode validation): transitive @global/@local ownership
+  rules enforced as kind="deep-locality" diagnostics.
+- Item 7 (CLIF direct codegen): real Cranelift IR text for the direct
+  subset (multi-block CFG, stack-slot slots, typed signatures, calls);
+  functions outside the subset emit declaration-only placeholders; a
+  structural validator covers all emitted output.
+- Item 6 (selective CPS): suspending functions in the i64 direct subset
+  emit defunctionalized frame layouts (cps_frames.py), %run_<f> br_table
+  state machines parking at performs via the runtime stub ABI
+  (enqueue/sched_read), and %resume_<f>_<k> shims. Not yet done: frame
+  chaining across suspending calls, CLIF-level effect dispatch (stays in
+  the interpreter), f64 CPS bodies.
+
 Highlights beyond the original list, found by an adversarial review of the
 branch diff and fixed with regression tests (`test_parsed_source_semantics.py`,
 `test_effect_continuations.py`, `test_closures_mir.py`,
