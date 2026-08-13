@@ -4,6 +4,17 @@
 directory, appends a tiny C-ABI ``@main`` wrapper, compiles it with
 ``clang -O2`` and executes the binary, returning ``(exit_code, stdout)``.
 
+The native metaxu runtime (``src/metaxu/runtime/native/metaxu_rt.c``:
+mx_vec_* / mx_str_* / mx_*_to_str) is compiled via its cached build recipe
+and linked into every binary, so modules emitted with native vec/string
+builtin lowerings resolve their ``mx_*`` declares.  When the caller passes
+``-fsanitize=address`` in ``clang_args`` the runtime object is rebuilt
+ASan-instrumented into a separate cache directory, so ASan differential
+tests also check the runtime's own memory traffic.  ``sqrt``/``sin``/
+``cos`` stay plain libm externs (``-lm`` below) — the documented choice:
+libm already matches the interpreter's ``math.*`` on the tested domain, so
+no mx_ wrappers or LLVM intrinsics are introduced.
+
 Entry-point convention (documented choice): the emitted metaxu entry
 function keeps its mangled name (``@mx_main`` etc.) and is never itself the
 C ``main``; instead we synthesize::
@@ -34,9 +45,23 @@ import re
 import subprocess
 import tempfile
 
+from metaxu.runtime.native.build import DEFAULT_BUILD_DIR, compile_runtime
+
 from .codegen_llvm import mangle
 
 __all__ = ["compile_and_run", "LlvmRunError"]
+
+
+def _runtime_object(clang_args: tuple[str, ...]) -> str:
+    """The native runtime object to link, ASan-instrumented when the module
+    itself is being sanitized (separate cache dir per flag set)."""
+    if any("-fsanitize=address" in a for a in clang_args):
+        obj = compile_runtime(
+            build_dir=DEFAULT_BUILD_DIR.parent / "_build_asan",
+            extra_cflags=("-fsanitize=address", "-fno-omit-frame-pointer"))
+    else:
+        obj = compile_runtime()
+    return str(obj)
 
 
 class LlvmRunError(RuntimeError):
@@ -122,7 +147,8 @@ def compile_and_run(llvm_ir: str, entry: str = "main", *,
         fh.write(full_ir)
 
     compile_proc = subprocess.run(
-        ["clang", "-O2", "-Wno-override-module", ll_path, "-o", bin_path, "-lm",
+        ["clang", "-O2", "-Wno-override-module", ll_path,
+         _runtime_object(clang_args), "-o", bin_path, "-lm",
          *clang_args],
         capture_output=True, text=True, timeout=timeout)
     if compile_proc.returncode != 0:
