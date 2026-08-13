@@ -120,6 +120,25 @@ void mx_vec_free(mx_vec *v) {
     free(v);
 }
 
+/* `vec.as_ptr()`: a fresh byte SNAPSHOT of the elements (interpreter parity
+ * with _ffi_as_ptr — an independent allocation, never a view into the
+ * vector's word buffer, so growth/free of the vector cannot invalidate it).
+ * len bytes, no NUL terminator.  Elements outside 0..255 abort, exactly the
+ * interpreter's "as_ptr: element i is not a byte (0..255)" strictness. */
+unsigned char *mx_vec_as_bytes(const mx_vec *v) {
+    mx_vec_check(v, "as_ptr");
+    unsigned char *out = (unsigned char *)mx_rt_malloc((size_t)v->len);
+    for (int64_t i = 0; i < v->len; i++) {
+        int64_t e = v->data[i];
+        if (e < 0 || e > 255) {
+            mx_rt_fail("as_ptr: element %lld is not a byte (0..255): %lld",
+                       (long long)i, (long long)e);
+        }
+        out[i] = (unsigned char)e;
+    }
+    return out;
+}
+
 /* ------------------------------------------------------------------------
  * Strings: NUL-terminated byte strings; results are fresh malloc'd buffers.
  * ---------------------------------------------------------------------- */

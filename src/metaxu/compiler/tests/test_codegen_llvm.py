@@ -114,6 +114,28 @@ Increment 8 (memory reclamation + copy elision) adds:
     same box.  `; elide-copy:` comments pin both structurally.  The cases
     that MUST NOT elide stay pinned: rebound params (byval + write-back)
     and params passed onward to rebinding callees.
+
+Increment 9 (native FFI) adds: the `rawptr` kind (raw C pointers, 8-byte
+scalars; `null` -> the ptr null constant; ==/!= -> pointer icmp; ordering,
+print, Vec storage and effect-boundary crossings demote honestly), extern
+C calls to the REAL libc symbols the interpreter shims over its simulated
+heap (malloc/free/memcpy/realloc/fopen/fclose — fclose declared with its C
+i32 return and sext'd), as_ptr (identity on strings; a fresh
+mx_vec_as_bytes byte snapshot on vecs — never a view into the vec's word
+buffer, whose 8-byte-element layout would be wrong bytes), inline
+ptr_read/ptr_write, __vec_lit -> mx_vec_new + pushes (identity semantics
+stand in for the interpreter's immutable MxVector; indistinguishable for
+accepted programs since MxVector supports no mutation), compile-time
+__static$Type$method resolution (the interpreter's _dispatch_static_call
+order), and assert -> inline branch-to-abort.  The interpreter's simulated
+heap rejects overruns/UAF/double-frees as errors; natively those programs
+are real UB — the same strict-error-vs-UB contract as division by zero —
+so the ASan differentials below pin the ACCEPTED side: the malloc/
+ptr_write/ptr_read/free round trip and memcpy-from-string run FULLY
+leak-checked (real allocator, program-managed frees), while vec snapshots
+and example 05's Ok-arm File box keep the detect_leaks=0 leak-by-design
+contract.  05_unsafe_and_ffi.mx emits with ZERO placeholders and runs
+natively end-to-end with the cwd pinned (both fopen outcomes).
 """
 from __future__ import annotations
 
@@ -660,20 +682,20 @@ def test_unknown_external_and_runtime_builtin_are_placeholders():
         ], ("ret", "r"))]),
         make_func("b", [block([
             ("params", ()),
-            ("let", "r", ("call", "__vec_lit"), ()),
+            ("let", "r", ("call", "__vec_comprehension"), ()),
         ], ("ret", "r"))]),
     ]
     ir = emit_llvm(fs)
     assert count_placeholders(ir) == 2
     assert "unknown external callee 'mystery_ffi'" in ir
-    assert "calls runtime builtin '__vec_lit'" in ir
+    assert "calls runtime builtin '__vec_comprehension'" in ir
 
 
 def test_caller_of_placeholder_is_demoted_for_linkability():
     fs = [
         make_func("bad", [block([
             ("params", ()),
-            ("let", "r", ("call", "__vec_lit"), ()),
+            ("let", "r", ("call", "__vec_comprehension"), ()),
         ], ("ret", "r"))]),
         make_func("good_but_calls_bad", [block([
             ("params", ()),
@@ -689,7 +711,7 @@ def test_llvm_run_refuses_placeholder_entry():
     f = make_func("main", [
         block([
             ("params", ()),
-            ("let", "r", ("call", "__vec_lit"), ()),
+            ("let", "r", ("call", "__vec_comprehension"), ()),
         ], ("ret", "r")),
     ])
     ir = emit_llvm([f])
@@ -2714,16 +2736,33 @@ def test_examples_elision_census_does_not_regress():
     assert total >= 22
 
 
-def test_ffi_example_demotes_honestly():
-    # 05_unsafe_and_ffi.mx: extern C calls have no native lowering yet.
-    # The placeholders must name the exact unlinked symbol (no fake empty
-    # defines, which is what the old silently-dropped unsafe bodies gave).
+def test_ffi_example_emits_fully_native():
+    # 05_unsafe_and_ffi.mx (increment 9): every function — the four impl
+    # methods over extern C calls AND main (vector literal + __static$
+    # dispatch + trait calls) — emits as a real define.  Zero placeholders,
+    # real C declares with C signatures, rawptr null compares, and the
+    # vec byte-snapshot accessor.
     ir = llvm_from_source(
         (REPO_ROOT / "examples" / "05_unsafe_and_ffi.mx").read_text())
-    assert "unknown external callee 'malloc'" in ir
-    assert "unknown external callee 'fopen'" in ir
-    assert "define" not in "\n".join(
-        l for l in ir.splitlines() if "@mx___impl__Buffer_new" in l)
+    assert count_placeholders(ir) == 0
+    assert "define void @mx___impl__Buffer_new(" in ir
+    assert "define i64 @mx_main()" in ir
+    assert "declare noalias ptr @malloc(i64)" in ir
+    assert "declare void @free(ptr)" in ir
+    assert "declare ptr @memcpy(ptr, ptr, i64)" in ir
+    assert "declare noalias ptr @fopen(ptr, ptr)" in ir
+    assert "declare i32 @fclose(ptr)" in ir       # C int, not i64
+    assert re.search(r"sext i32 %t\d+ to i64", ir)  # fclose result widened
+    # null pointer literal + pointer identity comparison
+    assert re.search(r"icmp (eq|ne) ptr %t\d+, null", ir)
+    assert "call ptr @mx_vec_as_bytes(ptr" in ir  # vec.as_ptr() snapshot
+    assert "; vector literal" in ir               # __vec_lit -> pushes
+    assert ir.count("call void @mx_vec_push") == 5
+    # __static$ calls resolved at compile time: no call instruction or
+    # demotion reason references a __static symbol (the module header
+    # comment legitimately documents the mechanism).
+    assert not re.search(r"call .*__static", ir)
+    assert not re.search(r"reason:.*__static", ir)
 
 
 def test_examples_define_census_does_not_regress():
@@ -2749,10 +2788,341 @@ def test_examples_define_census_does_not_regress():
     # blocks; with their real bodies restored they demote honestly
     # (extern C callees malloc/free/fopen/fclose/as_ptr have no native
     # lowering yet — the placeholders name the exact unlinked symbol),
-    # landing at 57.  A raw-pointer-kind increment can win these back.
+    # landing at 57.  Increment 9 (native FFI) won those back and more:
+    # the rawptr kind + real extern C calls + as_ptr/ptr_read/ptr_write
+    # lift all five 05_unsafe_and_ffi.mx impl fns, __vec_lit + __static$
+    # resolution lift its main plus ownership.mx's main, and the native
+    # assert lifts test_locality_heap.mx / test_operations.mx mains —
+    # landing at 69 (04_advanced_types' main stays demoted: its next
+    # blocker behind __vec_lit is the try/catch-shaped Result flow).
     total_defines = 0
     for path in _example_files():
         ir = llvm_from_source(path.read_text())
         total_defines += len(re.findall(
             r"^define (?:i64|double|ptr|void) @mx_\w+\(", ir, re.M))
-    assert total_defines >= 57
+    assert total_defines >= 69
+
+
+# ---------------------------------------------------------------------------
+# Increment 9: native FFI — rawptr kind, extern C calls, as_ptr/ptr_read/
+# ptr_write, __vec_lit, __static$ resolution, assert
+# ---------------------------------------------------------------------------
+
+_FFI_ROUNDTRIP_SRC = """
+extern "C" {
+    fn malloc(size: uint) -> *void;
+    fn free(ptr: *void);
+}
+
+fn main() -> int {
+    let p = malloc(8);
+    ptr_write(p, 0, 65);
+    ptr_write(p, 1, 66);
+    let a = ptr_read(p, 0);
+    let b = ptr_read(p, 1);
+    free(p);
+    print(a + b);
+    0
+}
+"""
+
+_MEMCPY_STR_SRC = """
+extern "C" {
+    fn malloc(size: uint) -> *void;
+    fn free(ptr: *void);
+    fn memcpy(dest: *void, src: *void, n: uint) -> *void;
+}
+
+fn main() -> int {
+    let d = malloc(2);
+    memcpy(d, "AB".as_ptr(), 2);
+    let x = ptr_read(d, 0) + ptr_read(d, 1);
+    free(d);
+    print(x);
+    0
+}
+"""
+
+_VEC_SNAPSHOT_SRC = """
+extern "C" {
+    fn malloc(size: uint) -> *void;
+    fn free(ptr: *void);
+    fn memcpy(dest: *void, src: *void, n: uint) -> *void;
+}
+
+fn main() -> int {
+    let data = vector[int,3](65, 66, 67);
+    let d = malloc(3);
+    memcpy(d, data.as_ptr(), 3);
+    let x = ptr_read(d, 2);
+    free(d);
+    print(x);
+    0
+}
+"""
+
+
+def test_extern_malloc_free_emit_real_c_calls():
+    ir = llvm_from_source(_FFI_ROUNDTRIP_SRC)
+    assert count_placeholders(ir) == 0
+    assert "declare noalias ptr @malloc(i64)" in ir
+    assert "declare void @free(ptr)" in ir
+    assert re.search(r"%t\d+ = call ptr @malloc\(i64 8\)  ; extern C", ir)
+    assert re.search(r"call void @free\(ptr %\w+\)  ; extern C free", ir)
+    # ptr_read / ptr_write inline as byte loads/stores through i8 GEPs
+    assert re.search(r"getelementptr inbounds i8, ptr %\w+, i64", ir)
+    assert re.search(r"%t\d+ = trunc i64 \d+ to i8", ir)
+    assert re.search(r"%t\d+ = zext i8 %t\d+ to i64", ir)
+
+
+def test_null_literal_and_pointer_identity_compare():
+    ir = llvm_from_source("""
+extern "C" {
+    fn malloc(size: uint) -> *void;
+    fn free(ptr: *void);
+}
+
+fn main() -> int {
+    let p = malloc(4);
+    let ok = p != null;
+    free(p);
+    if ok { 1 } else { 0 }
+}
+""")
+    assert count_placeholders(ir) == 0
+    # null lowers to the ptr null constant; ==/!= is pointer icmp
+    assert re.search(r"icmp ne ptr %t\d+, null", ir)
+
+
+def test_vector_literal_lowers_to_native_vec():
+    ir = llvm_from_source(
+        "fn main() -> int { let v = vector[int,3](7, 8, 9); v[0] + v[2] }")
+    assert count_placeholders(ir) == 0
+    assert "call ptr @mx_vec_new()  ; vector literal" in ir
+    assert ir.count("call void @mx_vec_push") == 3
+    assert "call i64 @mx_vec_get" in ir
+
+
+def test_vector_literal_confined_to_frame_is_freed():
+    # A vector literal that never escapes joins the provably-dead-vec
+    # analysis: freed on ret paths like a confined Vec.new.
+    ir = llvm_from_source(
+        "fn main() -> int { let v = vector[int,2](4, 5); v[0] + v[1] }")
+    assert "freed on ret paths (provably non-escaping)" in ir
+    assert "call void @mx_vec_free" in ir
+
+
+def test_static_method_call_resolves_at_compile_time():
+    ir = llvm_from_source("""
+struct Point { x: int, y: int }
+
+implement Point {
+    fn origin() -> Point { Point { x: 0, y: 0 } }
+}
+
+fn main() -> int {
+    let p = Point.origin();
+    p.x
+}
+""")
+    assert count_placeholders(ir) == 0
+    # resolved to a direct call of the impl fn; no call instruction or
+    # demotion reason references a __static symbol
+    assert not re.search(r"call .*__static", ir)
+    assert not re.search(r"reason:.*__static", ir)
+    assert re.search(r"call void @mx___impl__Point_origin\(ptr", ir)
+
+
+def test_static_call_without_impl_demotes_honestly():
+    # A __static$ call whose (type, method) pair has no impl and no dotted
+    # fallback demotes with the interpreter's failure named (hand-built
+    # MIR: the front end only produces __static$ for real dotted calls).
+    f = make_func("caller", [block([
+        ("params", ()),
+        ("let", "r", ("call", "__static$Widget$origin"), ()),
+    ], ("ret", "r"))])
+    ir = emit_llvm([f])
+    assert count_placeholders(ir) == 1
+    assert ("static method 'origin' on type 'Widget' has no impl and no "
+            "native dotted fallback") in ir
+
+
+def test_assert_lowers_to_branch_abort():
+    ir = llvm_from_source("fn main() -> int { assert(1 < 2); 7 }")
+    assert count_placeholders(ir) == 0
+    assert re.search(r"br i1 %t\d+, label %assert\.ok\.\w+, "
+                     r"label %assert\.fail\.\w+", ir)
+    assert "call void @abort()  ; assert failed" in ir
+
+
+def test_as_ptr_identity_on_string_no_snapshot():
+    # Native strings already ARE NUL-terminated byte pointers, so
+    # str.as_ptr() emits no call at all — identity, marked by a comment.
+    ir = llvm_from_source("""
+fn main() -> int {
+    let p = "abc".as_ptr();
+    if p != null { 1 } else { 0 }
+}
+""")
+    assert count_placeholders(ir) == 0
+    assert "; as_ptr: identity on a native" in ir
+    assert "call ptr @mx_vec_as_bytes" not in ir  # no snapshot for strings
+
+
+def test_rawptr_demotions_stay_honest():
+    # print of a raw pointer: the interpreter renders an MxPtr repr no
+    # native code can reproduce — demote, never guess.
+    ir = llvm_from_source("""
+extern "C" {
+    fn malloc(size: uint) -> *void;
+}
+
+fn main() -> int {
+    let p = malloc(4);
+    print(p);
+    0
+}
+""")
+    assert "print of unsupported kind rawptr" in ir
+    # pointer ordering: only ==/!= lower (identity); < is not comparable
+    ir2 = llvm_from_source("""
+extern "C" {
+    fn malloc(size: uint) -> *void;
+}
+
+fn main() -> int {
+    let a = malloc(4);
+    let b = malloc(4);
+    if a < b { 1 } else { 0 }
+}
+""")
+    assert "pointer ordering comparison '<'" in ir2
+    # rawptr Vec elements: not a word kind (a stored pointer would escape
+    # every ownership analysis) — demote.
+    ir3 = llvm_from_source("""
+extern "C" {
+    fn malloc(size: uint) -> *void;
+}
+
+fn main() -> int {
+    let v = Vec.new();
+    v.push(malloc(4));
+    0
+}
+""")
+    assert "Vec of rawptr elements" in ir3
+
+
+@needs_asan
+def test_native_malloc_ptr_write_read_free_roundtrip_asan_full(tmp_path):
+    # REAL malloc round trip: write bytes through ptr_write, read them
+    # back, free — under FULL ASan leak checking (nothing here leaks:
+    # as_ptr is not involved and the buffer is freed by the program).
+    ir = assert_native_matches_interp_asan(_FFI_ROUNDTRIP_SRC, tmp_path)
+    assert re.search(r"call ptr @malloc\(i64 8\)  ; extern C", ir)
+
+
+@needs_asan
+def test_native_memcpy_from_string_asan_full(tmp_path):
+    # memcpy out of a string's as_ptr (identity — zero allocation) into a
+    # real malloc'd buffer; fully leak-checked (the program frees its own
+    # allocation and no snapshot exists).
+    assert_native_matches_interp_asan(_MEMCPY_STR_SRC, tmp_path)
+
+
+@needs_asan
+def test_native_vec_as_ptr_snapshot_asan_no_uaf(tmp_path):
+    # vec.as_ptr() is a fresh byte snapshot (mx_vec_as_bytes) that LEAKS
+    # BY DESIGN, so detect_leaks=0: this proves no UAF/double-free — in
+    # particular that freeing the program's own buffer and the vec's
+    # frame-exit mx_vec_free never touch the snapshot.
+    result, expected_out = interp_run(_VEC_SNAPSHOT_SRC)
+    assert result in (UNIT, 0)
+    ir = llvm_from_source(_VEC_SNAPSHOT_SRC)
+    assert "call ptr @mx_vec_as_bytes(ptr" in ir
+    exit_code, stdout = compile_and_run(
+        ir, "main", workdir=str(tmp_path),
+        clang_args=("-fsanitize=address",),
+        run_env={"ASAN_OPTIONS": "detect_leaks=0"})
+    assert exit_code == 0
+    assert stdout == expected_out
+
+
+@needs_asan
+def test_native_vector_literal_differential_asan_full(tmp_path):
+    # A confined vector literal is freed at frame exit (see the structural
+    # test above), so this runs under FULL leak checking.
+    assert_native_matches_interp_asan("""
+fn main() -> int {
+    let v = vector[int,4](3, 5, 7, 11);
+    print(v[0] + v[3]);
+    print(v.len());
+    0
+}
+""", tmp_path)
+
+
+@needs_asan
+def test_native_assert_passing_differential(tmp_path):
+    assert_native_matches_interp_asan("""
+fn main() -> int {
+    let x = 6 * 7;
+    assert(x == 42);
+    print(x);
+    0
+}
+""", tmp_path)
+
+
+def _interp_run_in_cwd(source: str, cwd: str):
+    """interp_run with the interpreter's fopen paths pinned to cwd."""
+    import os
+    old = os.getcwd()
+    os.chdir(cwd)
+    try:
+        return interp_run(source)
+    finally:
+        os.chdir(old)
+
+
+@needs_asan
+@pytest.mark.parametrize("have_file", [False, True],
+                         ids=["fopen-fails", "fopen-succeeds"])
+def test_native_ffi_example_05_differential(tmp_path, have_file):
+    # 05_unsafe_and_ffi.mx end-to-end with the working directory pinned:
+    # without test.txt fopen returns null and the Err arm prints; with it
+    # the Ok arm boxes a File struct and fcloses the real stream.  The Ok
+    # box and the vec byte snapshot leak by design -> detect_leaks=0
+    # (proves no UAF / no double-free around real malloc/free/fopen).
+    src = (REPO_ROOT / "examples" / "05_unsafe_and_ffi.mx").read_text()
+    rundir = tmp_path / "cwd"
+    rundir.mkdir()
+    if have_file:
+        (rundir / "test.txt").write_text("hello\n")
+    result, expected_out = _interp_run_in_cwd(src, str(rundir))
+    assert result in (UNIT, 0)
+    ir = llvm_from_source(src)
+    exit_code, stdout = compile_and_run(
+        ir, "main", workdir=str(tmp_path),
+        clang_args=("-fsanitize=address",),
+        run_env={"ASAN_OPTIONS": "detect_leaks=0"},
+        run_cwd=str(rundir))
+    assert exit_code == 0
+    assert stdout == expected_out
+
+
+@needs_clang
+def test_native_static_dispatch_differential(tmp_path):
+    assert_native_matches_interp("""
+struct Counter { n: int }
+
+implement Counter {
+    fn make(start: int) -> Counter { Counter { n: start } }
+}
+
+fn main() -> int {
+    let c = Counter.make(41);
+    print(c.n + 1);
+    c.n + 1
+}
+""", tmp_path)
