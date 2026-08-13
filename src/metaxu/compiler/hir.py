@@ -8,6 +8,7 @@ from .infer_tables import InferSideTables
 from .constraints import ClassConstraint
 from . import mutaxu_ast as mast
 import metaxu.metaxu_ast as fast
+from metaxu.unsafe_ast import UnsafeBlock
 
 from .desugar import IMPL_SEP, parse_impl_method_name, type_base_name
 
@@ -24,6 +25,9 @@ _BUILTIN_METHODS = frozenset({
     "push", "pop",
     # math methods on numbers (runtime library)
     "sqrt", "sin", "cos",
+    # FFI: `x.as_ptr()` — raw pointer view of a string/vector's bytes
+    # (interpreter shim over the simulated C heap; see mir_interp).
+    "as_ptr",
 })
 
 # Callee-name prefix marking a runtime-dispatched trait method call:
@@ -316,6 +320,12 @@ class HIRBuilder:
         if isinstance(orig, fast.Variable):
             ty = self.t.apply_tyenv(getattr(orig, 'type_var', None) or self.t.types.get(frozen_ctx.node_id, "Unknown"))
             vname = getattr(orig, 'name', None)
+            # `null` is the null-pointer literal (the parser produces a plain
+            # Variable for it). Lowered as a literal so it never hits strict
+            # name resolution; the interpreter represents null as Python None.
+            if vname == "null":
+                return self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span,
+                                      op="Literal", literal=None)
             # A bare zero-arg enum variant name in expression position
             # (`Point`) constructs the variant, it is not a variable read.
             if isinstance(vname, str) and vname in self._variant_to_enum:
@@ -433,6 +443,13 @@ class HIRBuilder:
             if callee in ("Some", "None"):
                 return self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span,
                                       op="MakeVariant", enum_name="Option",
+                                      variant_name=callee, operands=tuple(args_exprs))
+            # Builtin Result constructors when no enum declares them: like
+            # Option, the docs treat Result<T, E> as language-provided (a user
+            # enum declaring Ok/Err takes precedence via _variant_to_enum).
+            if callee in ("Ok", "Err"):
+                return self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span,
+                                      op="MakeVariant", enum_name="Result",
                                       variant_name=callee, operands=tuple(args_exprs))
             return self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span, op="Call", callee=callee, operands=tuple(args_exprs))
 
@@ -655,6 +672,29 @@ class HIRBuilder:
                         he.locality = "global"
             ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, "Unit"))
             return self._mk_hexpr(frozen_ctx.node_id, "Stmt", ty, frozen_ctx.span, op="Let", bindings=tuple(binds), bind_modes=bind_modes)
+
+        # UnsafeBlock: `unsafe { stmts }` — at HIR level this is an ordinary
+        # block (unsafe-ness is a static permission, not runtime behavior);
+        # its value is the last statement's value, so constructor-return
+        # through `unsafe { let p = malloc(n); Buffer { ... } }` survives.
+        # This node used to fall through to the None fallback: every function
+        # whose body was an unsafe block silently degraded to `ret Unit`
+        # (which is how Buffer.new returned Unit and copy_from ended up
+        # dispatching on a Unit receiver). Un-lowerable statements inside the
+        # block fail loudly instead of being dropped.
+        if isinstance(orig, UnsafeBlock):
+            stmts = getattr(orig, 'body', []) or []
+            ops = []
+            for s in stmts:
+                he = self._from_orig_expr(s, ctx_for(s))
+                if he is None:
+                    raise NotImplementedError(
+                        "unsafe block: could not lower statement "
+                        f"{type(s).__name__} — refusing to drop it")
+                ops.append(he)
+            ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, "Unit"))
+            return self._mk_hexpr(frozen_ctx.node_id, "Block", ty, frozen_ctx.span,
+                                  op="Block", operands=tuple(ops))
 
         # Block
         if isinstance(orig, fast.Block):
@@ -1176,15 +1216,28 @@ class HIRBuilder:
             subs = (self._convert_pattern(inner),) if inner is not None else ()
             return HPattern(kind="ctor", name="Some",
                             enum_name=self._variant_to_enum.get("Some"), subpatterns=subs)
+        # A mode/borrow-annotated binding inside a pattern (`Ok(@mut file)`
+        # parses its payload as BorrowUnique('file')): at pattern level the
+        # annotation is a static property — the pattern just binds the name.
+        # Previously these fell through to the wildcard fallback, so the
+        # binding silently vanished and the arm body saw an unbound variable.
+        if isinstance(p, (fast.BorrowShared, fast.BorrowUnique, fast.Move)):
+            var = getattr(p, 'variable', None)
+            if isinstance(var, str):
+                return HPattern(kind="var", name=var)
+            return self._convert_pattern(var)
+        if isinstance(p, fast.ModeExpression):
+            return self._convert_pattern(getattr(p, 'expression', None))
         if isinstance(p, fast.FunctionCall):
             callee = str(getattr(p, 'name', '') or '')
-            # Builtin Option constructors match even without a user enum
-            # declaring them (mirrors the expression-position fallback).
-            if callee in self._variant_to_enum or callee in ("Some", "None"):
+            # Builtin Option/Result constructors match even without a user
+            # enum declaring them (mirrors the expression-position fallback).
+            if callee in self._variant_to_enum or callee in ("Some", "None", "Ok", "Err"):
+                default_enum = "Option" if callee in ("Some", "None") else "Result"
                 subs = tuple(self._convert_pattern(a)
                              for a in getattr(p, 'arguments', []) or [])
                 return HPattern(kind="ctor", name=callee,
-                                enum_name=self._variant_to_enum.get(callee, "Option"),
+                                enum_name=self._variant_to_enum.get(callee, default_enum),
                                 subpatterns=subs)
         if isinstance(p, fast.QualifiedFunctionCall):
             parts = list(getattr(p, 'parts', []) or [])
