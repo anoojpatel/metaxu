@@ -2714,6 +2714,18 @@ def test_examples_elision_census_does_not_regress():
     assert total >= 22
 
 
+def test_ffi_example_demotes_honestly():
+    # 05_unsafe_and_ffi.mx: extern C calls have no native lowering yet.
+    # The placeholders must name the exact unlinked symbol (no fake empty
+    # defines, which is what the old silently-dropped unsafe bodies gave).
+    ir = llvm_from_source(
+        (REPO_ROOT / "examples" / "05_unsafe_and_ffi.mx").read_text())
+    assert "unknown external callee 'malloc'" in ir
+    assert "unknown external callee 'fopen'" in ir
+    assert "define" not in "\n".join(
+        l for l in ir.splitlines() if "@mx___impl__Buffer_new" in l)
+
+
 def test_examples_define_census_does_not_regress():
     # Aggregate emission census across all accepted examples: the number of
     # real defines must not regress below the increment-6 level (increment 3
@@ -2730,10 +2742,17 @@ def test_examples_define_census_does_not_regress():
     # word kinds — all of 02_effects_and_handlers (except the generic
     # `map` helper) and effects.mx, plus effectful helpers elsewhere —
     # landing at 61.  Increment 8 (reclamation + copy elision) changes
-    # memory behavior only, never coverage: still 61.
+    # memory behavior only, never coverage: still 61.  The FFI front-end
+    # fix REMOVED 4 fake defines: 05_unsafe_and_ffi.mx's Buffer.new/
+    # Buffer.free/File.open/File.close previously lowered to empty
+    # `ret unit` bodies because the HIR builder silently dropped unsafe
+    # blocks; with their real bodies restored they demote honestly
+    # (extern C callees malloc/free/fopen/fclose/as_ptr have no native
+    # lowering yet — the placeholders name the exact unlinked symbol),
+    # landing at 57.  A raw-pointer-kind increment can win these back.
     total_defines = 0
     for path in _example_files():
         ir = llvm_from_source(path.read_text())
         total_defines += len(re.findall(
             r"^define (?:i64|double|ptr|void) @mx_\w+\(", ir, re.M))
-    assert total_defines >= 61
+    assert total_defines >= 57

@@ -37,6 +37,7 @@ MUST_RUN = [
     "examples/02_effects_and_handlers.mx",
     "examples/03_modules_and_imports.mx",
     "examples/04_advanced_types.mx",
+    "examples/05_unsafe_and_ffi.mx",
     "examples/10_traits_and_structs.mx",
     "examples/effects.mx",
     "examples/hello.mx",
@@ -111,3 +112,14 @@ def test_modules_example_output():
     """Dot product of (1,2)·(3,4) = 11."""
     _, prints = execute("examples/03_modules_and_imports.mx")
     assert any("11" in line for line in prints)
+
+
+def test_unsafe_ffi_example_output(monkeypatch, tmp_path):
+    """05_unsafe_and_ffi.mx: the Buffer path (malloc/memcpy/free over the
+    simulated C heap) runs silently; File.open("test.txt") hits the real
+    fopen shim, which returns null when the file does not exist, so the
+    match takes the Err arm and prints exactly the error line.  cwd is
+    pinned to an empty tmp dir so a stray test.txt cannot flip the arm."""
+    monkeypatch.chdir(tmp_path)
+    result, prints = execute("examples/05_unsafe_and_ffi.mx")
+    assert prints == ["Error: Failed to open file"]
