@@ -43,6 +43,22 @@ only.  The @global struct malloc/free protocol is unchanged and its ASan
 tests still prove full leak-freedom.  Still demoted honestly: closures
 stored in struct fields / enum payloads / captured in other closures, and
 heterogeneous payload slots.
+
+Increment 5 (native vec/string runtime) adds: the C runtime metaxu_rt.o is
+linked into every native binary; Vec.new/push/pop/len/__index_get lower to
+mx_vec_* (a Vec is an opaque mx_vec* with IDENTITY semantics — shallow
+pointer copies alias one shared vector, elements travel as opaque 8-byte
+words), to_string routes by kind to mx_i64_to_str / mx_f64_to_str /
+identity, string + is mx_str_concat and string ==/!= is mx_str_eq, and
+__trait$ method calls resolve STATICALLY against the receiver's inferred
+kind (impl fn for the type name, else builtin, else plain fn — mirroring
+mir_interp's dispatch order).  FREE STRATEGY under test: a Vec provably
+confined to its frame is mx_vec_free'd on every ret path and its programs
+are FULLY leak-checked under ASan; escaping vecs (and all concat/to_string
+results) leak by design, so their ASan tests use detect_leaks=0 and prove
+no-UAF/no-double-free only.  Known kind-erasure caveat (same as print):
+bools/unit erase to i64, so to_string of a bool natively yields "1"/"0",
+not "True"/"False" — differential sources stringify ints/floats/strings.
 """
 from __future__ import annotations
 
@@ -470,9 +486,9 @@ def test_unknown_closure_target_is_placeholder():
 def test_closure_in_loop_gets_fresh_heap_env_per_iteration():
     # Increment 4: a make_closure inside a CFG cycle no longer demotes — the
     # site mallocs a FRESH env each execution (leaked by design), so earlier
-    # pair copies can never alias the new one.  Hand-built MIR: the front
-    # end's capture analysis for lambdas inside loop bodies is still a gap
-    # (see test_loop_lambda_capture_gap_demotes_honestly).
+    # pair copies can never alias the new one.  Hand-built MIR variant; the
+    # parsed-source loop-lambda path is pinned by
+    # test_loop_lambda_captures_compile (the front-end capture gap is fixed).
     fs = [
         make_func("looper", [
             block([("params", ("n",)),
@@ -1041,15 +1057,7 @@ def test_closure_call_loads_fn_and_env_from_pair():
     assert re.search(r"%t\d+ = call i64 %t\d+\(ptr %t\d+, i64 5\)", ir)
 
 
-def test_loop_lambda_capture_gap_demotes_honestly():
-    # KNOWN FRONT-END GAP (not a codegen limit): HIR capture analysis emits
-    # an EMPTY capture list for lambdas created inside loop bodies, so the
-    # lambda references its free variable with no definition — the MIR
-    # interpreter raises "Unbound variable" on this program too.  Codegen
-    # demotes honestly on the missing definition; the loop-aliasing hazard
-    # itself is solved by per-execution heap envs (see
-    # test_closure_in_loop_gets_fresh_heap_env_per_iteration).
-    ir = llvm_from_source("""
+_LOOP_LAMBDA_SRC = """
 fn main() -> int {
     let mut i = 0;
     let mut s = 0;
@@ -1060,8 +1068,26 @@ fn main() -> int {
     }
     s
 }
-""")
-    assert re.search(r"references 'i_\d+' with no local definition", ir)
+"""
+
+
+def test_loop_lambda_captures_compile():
+    # The former front-end gap (empty capture lists for lambdas created in
+    # loop bodies) is FIXED: the lambda now captures `i` for real, so the
+    # whole program emits with zero placeholders.  The loop-aliasing hazard
+    # is handled by per-execution heap envs (the make_closure site sits in
+    # a CFG cycle, so each iteration mallocs a fresh env — see
+    # test_closure_in_loop_gets_fresh_heap_env_per_iteration).
+    ir = llvm_from_source(_LOOP_LAMBDA_SRC)
+    assert count_placeholders(ir) == 0
+    assert re.search(r"call ptr @malloc\(i64 8\)  ; heap env", ir)
+    assert re.search(r"define i64 @mx_lambda\d+\(ptr %cl\.env, i64 %a\.\w+\)", ir)
+
+
+@needs_clang
+def test_native_loop_lambda_captures(tmp_path):
+    # Differential for the fixed loop-lambda captures: (1+0)+(1+1)+(1+2)=6.
+    assert_native_matches_interp(_LOOP_LAMBDA_SRC, tmp_path)
 
 
 # ---------------------------------------------------------------------------
@@ -1321,16 +1347,24 @@ def test_struct_enum_mutual_recursion_boxes_at_the_enum_slot():
     assert "call void @free" not in ir  # boxes leak by design
 
 
-def test_linked_list_example_compiles_fully_native():
-    # Target outcome of increment 4: every function of examples/linked_list.mx
-    # (previously demoted only on recursive-aggregate reasons) now emits.
+def test_linked_list_example_emits_honestly():
+    # HONEST POST-FRONT-END-FIX CENSUS: pop_front/remove_next/get/get_mut
+    # previously lowered to empty unit bodies (an if-let front-end bug), so
+    # increment 4's "fully native 8/8" was partly vacuous.  Their REAL
+    # bodies put both ints (Some(node.data)) and Nodes (Some(next_node))
+    # into Option's payload slot 0, which this backend refuses to coerce
+    # through tagged-union storage — those four demote with the
+    # heterogeneous-payload reason, and main demotes on a unit/Node merge.
+    # The structural builders still emit.
     ir = llvm_from_source(
         (REPO_ROOT / "examples" / "linked_list.mx").read_text())
-    assert count_placeholders(ir) == 0
-    for fname in ("new_list", "push_front", "pop_front", "remove_next",
-                  "get", "get_mut", "take_node", "main"):
+    for fname in ("new_list", "push_front", "take_node"):
         assert re.search(rf"^define (?:i64|double|ptr|void) @mx_{fname}\(",
                          ir, re.M), f"{fname} did not emit"
+    for fname in ("pop_front", "remove_next", "get", "get_mut"):
+        assert f"; function @mx_{fname}: placeholder" in ir, (
+            f"{fname} expected to demote on the heterogeneous Option slot")
+    assert "heterogeneous payload slot 0 of enum 'Option'" in ir
 
 
 def test_struct_in_struct_cycle_demotes():
@@ -1541,14 +1575,313 @@ fn main() -> int {
 """, tmp_path)
 
 
+# ---------------------------------------------------------------------------
+# Increment 5: native vec/string runtime (mx_* lowering + linked metaxu_rt)
+# ---------------------------------------------------------------------------
+
+_VEC_SUM_SRC = """
+fn main() -> int {
+    let v = Vec.new();
+    let mut i = 0;
+    while i < 100 {
+        v.push(i);
+        i = i + 1;
+    }
+    let mut sum = 0;
+    let mut j = 0;
+    let n = v.len();
+    while j < n {
+        sum = sum + v[j];
+        j = j + 1;
+    }
+    print(sum);
+    let mut drained = 0;
+    while v.len() > 0 {
+        drained = drained + v.pop();
+    }
+    print(drained);
+    0
+}
+"""
+
+
+def test_vec_builtins_declare_runtime_symbols():
+    # Structural: every used mx_* symbol is declared, the vec is recognized
+    # as frame-confined (freed), and main is a real define.
+    ir = llvm_from_source(_VEC_SUM_SRC)
+    assert "define i64 @mx_main()" in ir
+    for decl in ("declare ptr @mx_vec_new()",
+                 "declare void @mx_vec_push(ptr, i64)",
+                 "declare i64 @mx_vec_pop(ptr)",
+                 "declare i64 @mx_vec_len(ptr)",
+                 "declare i64 @mx_vec_get(ptr, i64)",
+                 "declare void @mx_vec_free(ptr)"):
+        assert decl in ir, f"missing runtime declare: {decl}"
+    assert "call void @mx_vec_free" in ir
+    assert count_placeholders(ir) == 0
+
+
+def test_string_ops_declare_runtime_symbols():
+    ir = llvm_from_source("""
+fn main() -> int {
+    let s = "a" + to_string(1);
+    if s == "a1" { print(s); } else { print("no"); }
+    print(len(s));
+    0
+}
+""")
+    for decl in ("declare ptr @mx_str_concat(ptr, ptr)",
+                 "declare ptr @mx_i64_to_str(i64)",
+                 "declare i64 @mx_str_eq(ptr, ptr)",
+                 "declare i64 @mx_str_len(ptr)"):
+        assert decl in ir, f"missing runtime declare: {decl}"
+    assert count_placeholders(ir) == 0
+
+
+@needs_clang
+def test_native_vec_sum_loop(tmp_path):
+    # Differential: push 0..99, sum via index reads, drain via pop — the
+    # runtime object must link and match the interpreter exactly.
+    ir = assert_native_matches_interp(_VEC_SUM_SRC, tmp_path)
+    assert "call ptr @mx_vec_new()" in ir
+
+
+@needs_clang
+def test_native_vec_index_access(tmp_path):
+    assert_native_matches_interp("""
+fn main() -> int {
+    let v = Vec.new();
+    v.push(10);
+    v.push(20);
+    v.push(30);
+    print(v[0], v[1], v[2]);
+    v[2] - v[1] - v[0]
+}
+""", tmp_path)
+
+
+@needs_clang
+def test_native_string_concat_and_to_string(tmp_path):
+    ir = assert_native_matches_interp("""
+fn main() -> int {
+    let a = "answer: " + to_string(41 + 1);
+    print(a);
+    print("x" + "y" + "z");
+    0
+}
+""", tmp_path)
+    assert "@mx_str_concat" in ir
+    assert "@mx_i64_to_str" in ir
+
+
+@needs_clang
+def test_native_string_equality(tmp_path):
+    # ==/!= on strings is content equality via mx_str_eq (bool results are
+    # printed as ints: the documented bool kind-erasure divergence).
+    ir = assert_native_matches_interp("""
+fn main() -> int {
+    if "abc" == "abc" { print(1); } else { print(0); }
+    if "abc" != "abd" { print(3); } else { print(4); }
+    if "a" + "b" == "ab" { print(5); } else { print(6); }
+    0
+}
+""", tmp_path)
+    assert "@mx_str_eq" in ir
+
+
+@needs_clang
+def test_native_float_math_and_to_string(tmp_path):
+    # sqrt/sin/cos are libm externs (-lm, the documented pick) and
+    # mx_f64_to_str reproduces Python's str(float) exactly.
+    ir = assert_native_matches_interp("""
+fn main() -> int {
+    print(to_string(sqrt(2.25)));
+    print(to_string(sin(0.0)));
+    print(to_string(cos(0.0)));
+    print("pi-ish: " + to_string(3.14159));
+    0
+}
+""", tmp_path)
+    assert "@mx_f64_to_str" in ir
+    assert "declare double @sqrt(double)" in ir
+
+
+@needs_clang
+def test_native_vec_float_elements(tmp_path):
+    # f64 elements round-trip through the opaque i64 word slots (bitcast).
+    assert_native_matches_interp("""
+fn main() -> int {
+    let v = Vec.new();
+    v.push(1.5);
+    v.push(2.25);
+    print(to_string(v[0] + v.pop()));
+    0
+}
+""", tmp_path)
+
+
+@needs_clang
+def test_native_vec_string_elements(tmp_path):
+    # str elements round-trip through the word slots (ptrtoint/inttoptr).
+    assert_native_matches_interp("""
+fn main() -> int {
+    let v = Vec.new();
+    v.push("hello");
+    v.push("world");
+    print(v[0] + " " + v[1]);
+    0
+}
+""", tmp_path)
+
+
+@needs_clang
+def test_native_vec_returned_identity(tmp_path):
+    # A returned Vec is the SAME vector (identity semantics: the pointer
+    # crosses the frame shallowly) — and therefore is never freed.
+    ir = assert_native_matches_interp("""
+fn make() -> Vec<Int> {
+    let v = Vec.new();
+    v.push(1);
+    v
+}
+fn main() -> int {
+    let v = make();
+    v.push(2);
+    print(v.len(), v[0], v[1]);
+    0
+}
+""", tmp_path)
+    assert "call void @mx_vec_free" not in ir
+
+
+@needs_clang
+def test_native_vec_struct_enum_mix(tmp_path):
+    # Vec + struct + enum interplay: a vec field is a shared pointer inside
+    # a byval-copied struct (mutations visible through copies, exactly like
+    # the interpreter's MxVec-in-MxStruct), popped values box into enum
+    # payloads, and match dispatches on the tag.
+    assert_native_matches_interp("""
+struct Sensor { readings: Vec<Int>, id: int }
+enum Reading { Got(int), Empty }
+fn record(s: Sensor, x: int) -> int {
+    s.readings.push(x);
+    s.readings.len()
+}
+fn last(s: Sensor) -> Reading {
+    if s.readings.len() == 0 { return Empty; }
+    Got(s.readings.pop())
+}
+fn main() -> int {
+    let s = Sensor { readings: Vec.new(), id: 7 };
+    print(record(s, 10));
+    print(record(s, 32));
+    match last(s) {
+        Got(x) -> print(x),
+        Empty -> print(0 - 1),
+    }
+    0
+}
+""", tmp_path)
+
+
+@needs_clang
+def test_native_struct_param_write_back(tmp_path):
+    # Interpreter write-back parity (mir_interp._write_back_struct_args): a
+    # callee that rebinds its struct param (`c.n = ...`) mutates the
+    # CALLER's binding — natively a copy-out through the caller's pointer
+    # on every ret path.  11, 12, then c.n itself is 12.
+    ir = assert_native_matches_interp("""
+struct Counter { n: int }
+fn bump(c: Counter) -> int {
+    c.n = c.n + 1;
+    c.n
+}
+fn main() -> int {
+    let c = Counter { n: 10 };
+    print(bump(c));
+    print(bump(c));
+    print(c.n);
+    0
+}
+""", tmp_path)
+    assert "copy-out: rebound struct param" in ir
+
+
+@needs_clang
+def test_native_trait_dispatch_static_resolution(tmp_path):
+    # examples/10 end-to-end: __trait$ calls on a struct receiver resolve
+    # to the impl functions, on the Vec field to mx_vec_*; the whole module
+    # emits with zero placeholders and matches the interpreter.
+    src = (REPO_ROOT / "examples" / "10_traits_and_structs.mx").read_text()
+    _result, expected = interp_run(src, "example")
+    ir = llvm_from_source(src)
+    assert count_placeholders(ir) == 0
+    code, out = compile_and_run(ir, "example", workdir=str(tmp_path))
+    assert out == expected
+    assert code == 0
+
+
+@needs_clang
+def test_native_example_03_modules(tmp_path):
+    # examples/03 end-to-end: float math methods + to_string + concat; the
+    # module emits fully (including Python-style float formatting).
+    src = (REPO_ROOT / "examples" / "03_modules_and_imports.mx").read_text()
+    _result, expected = interp_run(src, "main")
+    ir = llvm_from_source(src)
+    assert count_placeholders(ir) == 0
+    code, out = compile_and_run(ir, "main", workdir=str(tmp_path))
+    assert out == expected
+    assert code == 0
+
+
+@needs_clang
+@needs_asan
+def test_native_vec_freed_fully_leak_checked_under_asan(tmp_path):
+    # THE FREE-CONTRACT PROOF, strong form: a vec provably confined to its
+    # frame is mx_vec_free'd on ret, so this runs under FULL ASan leak
+    # checking (no detect_leaks=0) — exit 0 proves leak-freedom AND
+    # no-UAF/no-double-free for the whole vec traffic.
+    ir = assert_native_matches_interp_asan(_VEC_SUM_SRC, tmp_path)
+    assert "call void @mx_vec_free" in ir
+
+
+@needs_clang
+@needs_asan
+def test_native_escaping_vec_no_uaf_under_asan(tmp_path):
+    # A vec stored in a struct field escapes its creating frame: it is
+    # never freed (leaks BY DESIGN — identity sharing makes any free
+    # potentially double), so leak detection is off; exit 0 proves the
+    # shared-pointer traffic has no use-after-free and no double-free.
+    ir = assert_native_matches_interp_asan_boxes("""
+struct Holder { items: Vec<Int>, id: int }
+fn fill(h: Holder) -> int {
+    h.items.push(4);
+    h.items.push(2);
+    h.items.len()
+}
+fn main() -> int {
+    let h = Holder { items: Vec.new(), id: 1 };
+    print(fill(h));
+    print(h.items.pop());
+    0
+}
+""", tmp_path)
+    assert "leaks by design (may escape)" in ir
+    assert "call void @mx_vec_free" not in ir
+
+
 def test_examples_define_census_does_not_regress():
     # Aggregate emission census across all accepted examples: the number of
-    # real defines must not regress below the increment-4 level (increment 3
-    # emitted 18; boxing/inlining lifted linked_list.mx and the locality/
-    # operations fixtures to a total of 30).
+    # real defines must not regress below the increment-5 level (increment 3
+    # emitted 18; increment 4's boxing/inlining reached 30; the native
+    # vec/string runtime + static trait dispatch lifted 01/03/06/10/
+    # collections to 45 — then the front-end if-let/early-return fixes gave
+    # linked_list.mx its REAL pop_front/remove_next/get/get_mut bodies
+    # (heterogeneous Option slots: 4 honest demotions + main) and
+    # test_operations.mx a real `assert` call (1 more), landing at 39).
     total_defines = 0
     for path in _example_files():
         ir = llvm_from_source(path.read_text())
         total_defines += len(re.findall(
             r"^define (?:i64|double|ptr|void) @mx_\w+\(", ir, re.M))
-    assert total_defines >= 30
+    assert total_defines >= 39
