@@ -5,6 +5,46 @@ Audit of `src/metaxu/compiler/` against the documented v1 language
 `docs/compiler_roadmap.md`), as of commit `7ddfa00`. This drives the v1
 completion work; it will be updated as gaps close.
 
+## Status: closed (this branch)
+
+All workstreams below landed on this branch, each verified by source-level
+tests (233 passing) and the example gate (`scripts/run_examples.py`:
+19/19 through parse -> desugar -> freeze -> infer -> HIR -> MIR -> CLIF,
+with `test_borrow_check.mx` / `test_type_error.mx` required to be REJECTED
+with borrow/type diagnostics — they are negative fixtures).
+
+Highlights beyond the original list, found by an adversarial review of the
+branch diff and fixed with regression tests (`test_parsed_source_semantics.py`,
+`test_effect_continuations.py`, `test_closures_mir.py`,
+`test_generic_angle_lexing.py`):
+
+- Parsed match arms carry expression nodes as patterns; they now convert to
+  real patterns instead of silently degrading to wildcards.
+- `Some(x)`/`None` in argument position were silently dropped at HIR.
+- Mode annotations survive freezing, so `@local` escape is actually rejected.
+- Borrow/move state is per-function; moves no longer poison other functions.
+- `&mut` in argument position is an exclusive borrow released after the call,
+  per `ownership_and_borrowing.md` — not an ownership transfer.
+- Lambda closures capture by slot name and let-bound closures are callable.
+- `f(a < b, c > d)` lexes as comparisons (generic-angle follow-set check).
+- `resume(v)` returns the value of the WHOLE delimited handle body (the
+  interpreter parks the body on its own thread per handle scope), so
+  non-tail resumes with performs in called functions are correct.
+
+Known remaining gaps (documented, not v1-blocking):
+
+- `codegen_clif.py` remains a stub; the MIR interpreter is the executable
+  backend.
+- Struct-literal field type checking covers literal fields against known
+  primitives (incl. substituted type params); full inference-driven field
+  checking is future work.
+- Multi-argument effect ops bind only the first argument to the handler
+  case parameter (the surface grammar has single-param handler cases).
+- A handler case performing its own scope's effect deadlocks rather than
+  routing to an outer handler of the same effect.
+- Traits/impls dictionary desugaring and deep field-mode validation remain
+  at their pre-branch level.
+
 ## Headline findings
 
 - 18 of 19 example programs (`examples/*.mx` + root `test_*.mx`) fail at the
