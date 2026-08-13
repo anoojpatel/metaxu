@@ -342,6 +342,16 @@ class MirInterpreter:
         elif kind == "call":
             callee_name: str = rhs[1]
             arg_vals = [self._lookup(a, env, f) for a in args]
+            # A local bound to a closure value (`let g = fn(y) ...; g(2)`, or a
+            # closure received as a parameter) shadows funcs/builtins: call the
+            # closure's MirFunc with its captured env seeding the frame.
+            local_val = env.get(callee_name)
+            if isinstance(local_val, MxClosure):
+                target = self._funcs.get(local_val.func_name)
+                if target is None:
+                    raise InterpError(
+                        f"call: no func {local_val.func_name!r} for closure {callee_name!r}")
+                return self._call_func(target, arg_vals, local_val.captured)
             # Builtins first
             if callee_name in self._builtins:
                 return self._builtins[callee_name](*arg_vals)
