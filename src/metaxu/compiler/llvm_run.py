@@ -87,11 +87,14 @@ def _placeholder_reasons(llvm_ir: str, sym: str) -> list[str]:
 
 def compile_and_run(llvm_ir: str, entry: str = "main", *,
                     workdir: str | None = None,
-                    timeout: float = 60.0) -> tuple[int, str]:
+                    timeout: float = 60.0,
+                    clang_args: tuple[str, ...] = ()) -> tuple[int, str]:
     """Compile ``llvm_ir`` with clang and run it; return (exit_code, stdout).
 
     ``entry`` is the metaxu function name (unmangled).  ``workdir`` keeps the
-    .ll/.bin files for inspection instead of a fresh temp dir.
+    .ll/.bin files for inspection instead of a fresh temp dir.  ``clang_args``
+    are appended to the clang invocation (e.g. ("-fsanitize=address",) so the
+    differential tests can prove the emitted malloc/free pairs sound).
     """
     sym = mangle(entry)
     m = re.search(
@@ -99,7 +102,9 @@ def compile_and_run(llvm_ir: str, entry: str = "main", *,
     if m is None:
         reasons = _placeholder_reasons(llvm_ir, sym)
         detail = ("; ".join(reasons) if reasons
-                  else "no zero-argument define found in the module")
+                  else "no zero-argument define found in the module "
+                       "(struct-returning entries have a ptr sret param and "
+                       "cannot be an OS entry point)")
         raise LlvmRunError(f"entry {entry!r} (@{sym}) is not natively runnable: {detail}")
     rty = m.group(1)
     full_ir = llvm_ir + "\n\n; native entry wrapper (llvm_run)\n" + _WRAPPERS[rty].format(sym=sym) + "\n"
@@ -112,7 +117,8 @@ def compile_and_run(llvm_ir: str, entry: str = "main", *,
         fh.write(full_ir)
 
     compile_proc = subprocess.run(
-        ["clang", "-O2", "-Wno-override-module", ll_path, "-o", bin_path, "-lm"],
+        ["clang", "-O2", "-Wno-override-module", ll_path, "-o", bin_path, "-lm",
+         *clang_args],
         capture_output=True, text=True, timeout=timeout)
     if compile_proc.returncode != 0:
         raise LlvmRunError(

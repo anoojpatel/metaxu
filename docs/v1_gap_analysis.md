@@ -29,9 +29,19 @@ subset (scalars, control flow, calls, strings/print, local structs as
 stack allocas); llvm_run.py compiles with clang -O2 and executes;
 differential tests pin native results == interpreter results. try/catch
 is implemented per docs/try_catch.md (example 04 executes; run gate
-16/19). Deferred LLVM increments, always as reasoned placeholders:
-@global structs via malloc + drop-planned frees, aggregates across
-calls/returns, closures, variants, effect CPS at the LLVM level.
+16/19). Increment 2 (ownership memory model) is also on this branch:
+structs cross call boundaries (params as ptr + callee byval-copy, returns
+sret-style via a leading result-slot pointer), @global structs live on the
+heap (entry-block malloc, GEP on the heap pointer, freed on every ret path
+-- sound because MIR value semantics never lets the storage pointer escape
+a frame; ASan-verified differential tests prove no leak/double-free), and
+print takes multiple arguments (space-joined printf, matching the
+interpreter). The `let @global x = S {...}` annotation now actually
+reaches MIR's alloc_struct (hir.py previously dropped string-token mode
+annotations -- the classic silently-degraded-mode seam). Deferred LLVM
+increments, always as reasoned placeholders: nested struct fields,
+borrow-informed copy elision for @const params, closures, variants,
+vec/string runtime, effect CPS at the LLVM level.
 
 Roadmap items completed on this branch beyond the v1 criteria:
 - Item 5 (deep field-mode validation): transitive @global/@local ownership
