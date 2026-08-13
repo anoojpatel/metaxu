@@ -38,6 +38,7 @@ MUST_RUN = [
     "examples/03_modules_and_imports.mx",
     "examples/04_advanced_types.mx",
     "examples/05_unsafe_and_ffi.mx",
+    "examples/06_vector_operations.mx",
     "examples/10_traits_and_structs.mx",
     "examples/effects.mx",
     "examples/hello.mx",
