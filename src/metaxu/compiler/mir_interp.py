@@ -4,7 +4,12 @@ Executes MirFunc/MirBlock ops directly, providing:
 - Arithmetic and comparison binary ops
 - Control flow: br, br_if, ret
 - Function calls (user-defined + builtins)
-- Effect perform/handle using single-shot continuations (stack and suspend classes)
+- Effect perform/handle with real delimited, single-shot continuations:
+  MIR handle_scope bodies run on their own (parked) thread so a perform deep
+  inside called functions suspends the whole delimited context; resume(v)
+  returns the final value of the whole handle body (deep handlers). Host
+  handlers registered via register_effect_handler keep the legacy frame-level
+  MxContinuation semantics (stack and suspend classes).
 - Enum variants (make_variant / variant_tag / variant_field)
 - Drop (removes the binding; any later use raises InterpError)
 - Strict name resolution: referencing an unbound variable raises InterpError
@@ -17,7 +22,9 @@ Usage:
 """
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
+from queue import SimpleQueue
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from .mir import MirBlock, MirFunc
@@ -134,15 +141,62 @@ class InterpError(Exception):
     pass
 
 
-@dataclass
-class _EffectReturn:
-    """Control sentinel: a perform op consumed this frame.
+class _ScopeAbort(BaseException):
+    """Raised inside a suspended handle-body thread to tear it down.
 
-    The handler (and, via resume, the rest of this frame) already ran; the
-    frame's overall result is `value`. _run_blocks unwraps this instead of
-    continuing into the resume block a second time.
+    Carries the scope being aborted so nested body threads can cascade the
+    unwind across thread boundaries: a body thread that catches an abort for
+    an OUTER scope forwards it to its own handler side (which unwinds too)
+    and then exits.
+
+    BaseException on purpose: interpreter-level `except Exception` handlers
+    must never swallow a teardown in progress.
     """
-    value: Any
+    def __init__(self, scope: "_EffectScope") -> None:
+        super().__init__(f"handle scope {scope.frame_id} aborted")
+        self.scope = scope
+
+
+class _EffectScope:
+    """Runtime state for one MIR handle_scope: the delimited boundary.
+
+    The handle body runs on its own thread so that a perform ANYWHERE in the
+    delimited context — including deep inside called functions — suspends the
+    whole body up to this boundary (the Python call stack between the handle
+    body and the perform site simply stays parked on the blocked body thread).
+
+    Messages flow body -> handler over `to_handler`:
+      ("perform", op_name, arg_vals, k)  a suspension point was reached
+      ("done", value)                    the body finished normally
+      ("error", exc)                     the body raised; re-raised handler-side
+      ("cascade", scope_abort)           an outer scope's teardown crossed this
+                                         boundary; keep unwinding handler-side
+
+    Each perform carries a private reply queue (`k.reply_q`) the body blocks
+    on until the handler resumes it (("resume", value)) or aborts it
+    (("abort", _ScopeAbort)). Exactly one side runs at a time, so the
+    interpreter's shared state never sees true concurrency.
+    """
+    def __init__(self, frame_id: int) -> None:
+        self.frame_id = frame_id
+        self.to_handler: SimpleQueue = SimpleQueue()
+        self.thread: Optional[threading.Thread] = None
+        self.frame: Optional[Dict[str, Any]] = None
+        self.pending_k: Optional["_ScopeContinuation"] = None
+
+
+@dataclass
+class _ScopeContinuation:
+    """Single-shot continuation for a perform caught by a MIR handle_scope.
+
+    The suspended state is the blocked body thread itself; resume(v) sends v
+    to `reply_q`, unblocking the body at the perform site, then waits for the
+    scope's next event. Deep-handler semantics: resume() returns the final
+    value of the WHOLE delimited body (subsequent performs included).
+    """
+    scope: _EffectScope
+    reply_q: SimpleQueue = field(default_factory=SimpleQueue)
+    used: bool = False
 
 
 class _EffectAbort(Exception):
@@ -220,10 +274,6 @@ class MirInterpreter:
                 raise InterpError(f"Block index {bi} out of range in {f.name!r}")
             block = f.blocks[bi]
             result = self._run_ops(block.ops, env, f)
-            if isinstance(result, _EffectReturn):
-                # A perform op consumed this frame (handler resumed and the
-                # rest of the frame already ran, or is aborting via its value).
-                return result.value
             # Process terminator
             term = block.term
             if term[0] == "ret":
@@ -254,6 +304,61 @@ class MirInterpreter:
                 continue
             return frame
         return None
+
+    def _pump_scope(self, scope: _EffectScope) -> Any:
+        """Handler side of a handle_scope: wait for the delimited body's next
+        event and produce the scope's final value.
+
+        Called from handle_scope (initial wait) and from resume() (waiting for
+        the body to finish or perform again). Returns the handle result;
+        raises _EffectAbort(frame_id) when a handler case declines to resume.
+        """
+        frame = scope.frame
+        msg = scope.to_handler.get()
+        kind = msg[0]
+        if kind == "done":
+            return msg[1]
+        if kind == "error":
+            raise msg[1]
+        if kind == "cascade":
+            raise msg[1]  # _ScopeAbort for an outer scope: keep unwinding
+        # ("perform", op_name, arg_vals, k)
+        _, op_name, arg_vals, sk = msg
+        param_name, handler_fn_name = frame["cases"][op_name]
+        target = self._funcs.get(handler_fn_name)
+        if target is None:
+            raise InterpError(f"Missing handler function {handler_fn_name!r}")
+        handler_env = dict(frame["captured"])
+        handler_arg = arg_vals[0] if arg_vals else UNIT
+        handler_result = self._call_func(target, [handler_arg, sk], handler_env)
+        if sk.used:
+            # The handler resumed: resume() pumped the body to completion, so
+            # handler_result already reflects the whole delimited body's value.
+            return handler_result
+        # The handler returned without resuming: abort the handle scope with
+        # the handler's value.
+        raise _EffectAbort(frame["id"], handler_result)
+
+    def _abort_scope(self, scope: _EffectScope) -> None:
+        """Tear down a scope's body thread if it is still suspended.
+
+        No-op when the body already finished. Otherwise the pending perform's
+        reply queue gets an abort message; the body thread raises _ScopeAbort
+        at the perform site, unwinds (cascading through any nested scopes),
+        and exits without ever running the suspended post-perform code.
+        """
+        t = scope.thread
+        if t is None or not t.is_alive():
+            return
+        sk = scope.pending_k
+        scope.pending_k = None
+        if sk is not None and not sk.used:
+            sk.used = True
+            sk.reply_q.put(("abort", _ScopeAbort(scope)))
+        # Wait for the full unwind so handler frames are cleaned up before the
+        # code after the handle expression continues. The timeout is a safety
+        # valve (the thread is a daemon) — it should never trip in practice.
+        t.join(timeout=10.0)
 
     def _lookup(self, a: Any, env: Dict[str, Any], f: MirFunc) -> Any:
         """Resolve an operand: strings are variable names (must be bound);
@@ -291,28 +396,32 @@ class MirInterpreter:
                 arg_vals = [self._lookup(a, env, f) for a in arg_names]
                 resume_block: int = op[5]
                 resume_slot: str = op[6]
+                # MIR-level handler frames first (innermost handle wins).
+                frame = self._find_mir_frame(effect_name, op_name)
+                if frame is not None:
+                    # We are running on the scope's (possibly indirect) body
+                    # thread. Park this whole call stack at the perform site:
+                    # ship (op, args, k) to the scope's handler side and block
+                    # until it resumes or aborts us. The Python frames between
+                    # the handle body and this perform stay suspended right
+                    # here, so resume(v) continues the FULL delimited context.
+                    scope: _EffectScope = frame["scope"]
+                    sk = _ScopeContinuation(scope=scope)
+                    scope.pending_k = sk
+                    scope.to_handler.put(("perform", op_name, arg_vals, sk))
+                    kind, payload = sk.reply_q.get()
+                    if kind == "abort":
+                        raise payload  # _ScopeAbort: tear down the delimited body
+                    # Resumed: the perform expression's value is payload; keep
+                    # executing this block (it branches to the resume block,
+                    # whose slot is this op's dst).
+                    env[dst] = payload
+                    last = payload
+                    continue
                 # The continuation captures the CURRENT env so that after the handler
                 # stores it and later calls k.resume(v), the env is correctly seeded.
                 k = MxContinuation(func=f, block_idx=resume_block, env=dict(env),
                                     result_slot=resume_slot)
-                # MIR-level handler frames first (innermost handle wins).
-                frame = self._find_mir_frame(effect_name, op_name)
-                if frame is not None:
-                    param_name, handler_fn_name = frame["cases"][op_name]
-                    target = self._funcs.get(handler_fn_name)
-                    if target is None:
-                        raise InterpError(f"Missing handler function {handler_fn_name!r}")
-                    handler_env = dict(frame["captured"])
-                    handler_arg = arg_vals[0] if arg_vals else UNIT
-                    handler_result = self._call_func(target, [handler_arg, k], handler_env)
-                    if k.used:
-                        # The handler resumed: the rest of this frame already ran
-                        # inside k.resume() and handler_result is the final value
-                        # of this frame. Do NOT fall through into resume_block.
-                        return _EffectReturn(handler_result)
-                    # The handler returned without resuming: abort the handle
-                    # scope with the handler's value.
-                    raise _EffectAbort(frame["id"], handler_result)
                 # Host-registered handlers (tests/embedding): legacy semantics —
                 # bind dst to the handler's return and keep running this block.
                 handler = self._effect_handlers.get(effect_name)
@@ -397,29 +506,72 @@ class MirInterpreter:
                     captured[cname] = cval
             frame_id = self._next_frame_id
             self._next_frame_id += 1
+            scope = _EffectScope(frame_id)
             frame = {
                 "id": frame_id,
                 "effect": scope_effect,
                 "cases": {op_name: (param, hfn) for (op_name, param, hfn) in case_encodings},
                 "captured": captured,
+                "scope": scope,
             }
+            scope.frame = frame
             body_func = self._funcs.get(body_fn_name)
             if body_func is None:
                 raise InterpError(f"Missing handle body function {body_fn_name!r}")
+
+            def _body_main(scope: _EffectScope = scope, body_func: MirFunc = body_func,
+                           captured: Dict[str, Any] = captured) -> None:
+                try:
+                    val = self._call_func(body_func, [], dict(captured))
+                except _ScopeAbort as sa:
+                    if sa.scope is not scope:
+                        # An outer scope is tearing down THROUGH this boundary:
+                        # forward the abort so our handler side unwinds too.
+                        scope.to_handler.put(("cascade", sa))
+                    return  # aborted: the suspended body code never completes
+                except BaseException as exc:  # noqa: BLE001 — re-raised handler-side
+                    scope.to_handler.put(("error", exc))
+                    return
+                scope.to_handler.put(("done", val))
+
+            scope.thread = threading.Thread(
+                target=_body_main, daemon=True,
+                name=f"mx-handle-{scope_effect or 'any'}-{frame_id}")
             self._mir_handler_frames.append(frame)
             try:
-                return self._call_func(body_func, [], dict(captured))
-            except _EffectAbort as abort:
-                if abort.frame_id != frame_id:
-                    raise
-                return abort.value
+                scope.thread.start()
+                try:
+                    return self._pump_scope(scope)
+                except _EffectAbort as abort:
+                    if abort.frame_id != frame_id:
+                        raise
+                    # A handler case returned without resuming: its value is
+                    # the handle expression's value (abort semantics).
+                    return abort.value
             finally:
-                self._mir_handler_frames.pop()
+                self._abort_scope(scope)
+                try:
+                    self._mir_handler_frames.remove(frame)
+                except ValueError:
+                    pass
         elif kind == "resume":
             # ("resume",), (k_name, value_name) — consume the single-shot
             # continuation: run the suspended frame from its resume block.
             k = self._lookup(args[0], env, f)
             value = self._lookup(args[1], env, f)
+            if isinstance(k, _ScopeContinuation):
+                if k.used:
+                    raise RuntimeError(
+                        "Continuation already consumed (single-shot violation)")
+                k.used = True
+                scope = k.scope
+                scope.pending_k = None
+                # Unblock the body thread at its perform site, then wait for
+                # the scope's next event. Deep handlers: resume() returns the
+                # final value of the whole delimited body, so a subsequent
+                # perform is handled (recursively) inside this pump.
+                k.reply_q.put(("resume", value))
+                return self._pump_scope(scope)
             if not isinstance(k, MxContinuation):
                 raise InterpError(f"resume: expected continuation, got {type(k).__name__!r}")
             return k.resume(value, self)
