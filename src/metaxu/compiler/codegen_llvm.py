@@ -23,12 +23,46 @@ loop) get HEAP environments.  See the dedicated sections below — and note
 the prominently documented free strategy: boxes and heap envs LEAK BY
 DESIGN this increment.
 
+Increment 5 links the NATIVE RUNTIME (src/metaxu/runtime/native/
+metaxu_rt.c, built+linked by llvm_run) and lowers the vec/string builtins
+to it:
+  * Vec values are a new scalar-like kind family ``vec:ELEM``: an opaque
+    ``mx_vec*`` pointer (8 bytes, stored like any ptr in struct fields,
+    enum payload slots and closure envs) with IDENTITY semantics — every
+    copy is a shallow pointer copy aliasing the one shared vector, exactly
+    the interpreter's MxVec.  ELEM is the unified element kind; elements
+    travel as opaque 8-byte words (f64 bitcast, str/vec ptrtoint) through
+    mx_vec_push/mx_vec_pop/mx_vec_get.  ``Vec.new``->mx_vec_new,
+    ``push``/``pop``->mx_vec_push/pop, ``__index_get``->mx_vec_get,
+    ``len``->mx_vec_len (or mx_str_len on a string receiver).
+  * ``to_string``/``int_to_str`` -> mx_i64_to_str / mx_f64_to_str /
+    identity on a string.  CAVEAT (same kind-erasure divergence as print):
+    bools and unit are erased to i64, so ``true.to_string()`` yields "1"
+    natively where the interpreter says "True"; tests stringify ints,
+    floats and strings.
+  * string ``+`` -> mx_str_concat and ``==``/``!=`` -> mx_str_eq; concat
+    and to_string results are fresh malloc'd strings that LEAK BY DESIGN
+    (the box/heap-env contract; ordering comparisons on strings demote).
+  * ``__trait$m`` calls resolve STATICALLY against the receiver's inferred
+    kind, mirroring the interpreter's dispatch order (impl for the
+    receiver's type name -> builtin -> plain function); an i64 receiver is
+    kind-erased (int/bool/unit), so it resolves only when no impl exists
+    for any of those type names.  Unresolvable dispatch demotes.
+  * FREE STRATEGY for vecs: mx_vec_free at frame exit ONLY for vecs
+    proven non-escaping by _provably_dead_vecs (created unconditionally in
+    the entry block; never returned, stored, captured, or passed anywhere
+    except as the receiver of the non-retaining vec builtins).  Everything
+    else leaks by design — identity sharing makes any other free
+    potentially a double-free.
+  * sqrt/sin/cos remain plain libm externs (documented choice, see
+    llvm_run) — no wrappers, no intrinsics.
+
 Everything else — suspending functions (perform/resume/handle_scope: the
 CPS lowering lives in codegen_clif for now), try_scope,
-vector/string runtime builtins — is emitted as a clearly marked,
-comment-only placeholder carrying the reasons, never as silently wrong
-code.  Functions that call a placeholder function are themselves demoted
-(the module must link), with an explicit reason.
+fixed-size vector literals/comprehensions/slices — is emitted as a
+clearly marked, comment-only placeholder carrying the reasons, never as
+silently wrong code.  Functions that call a placeholder function are
+themselves demoted (the module must link), with an explicit reason.
 
 Type model (documented conventions):
   * ints, bools and unit are all ``i64``; unit is the constant 0.
@@ -77,7 +111,12 @@ Type model (documented conventions):
         copies the aggregate into its own storage in the entry prelude
         (byval-copy).  A later borrow-informed increment can elide that
         copy for @const/read-only params once the borrow checker's results
-        are threaded into codegen.
+        are threaded into codegen.  COPY-OUT (interpreter write-back
+        parity): a struct param the callee REBINDS anywhere is copied back
+        through the caller's pointer on every ret path, matching
+        mir_interp._write_back_struct_args (`self.field = ...` methods
+        mutate the caller's binding); lambdas never copy out because the
+        interpreter's closure-call path performs no write-back.
       - struct returns are sret-style (the ONE convention used
         everywhere): the caller passes its result variable's storage as a
         leading ``ptr %agg.ret`` argument, the callee copies the returned
@@ -241,6 +280,8 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from .mir import MirFunc
 from .cps_frames import is_suspending
+from .desugar import parse_impl_method_name
+from .hir import TRAIT_CALL_PREFIX
 
 # Value kinds -----------------------------------------------------------------
 
@@ -251,6 +292,13 @@ CONFLICT = "conflict"
 _STRUCT_PREFIX = "struct:"
 _ENUM_PREFIX = "enum:"
 _CLOSURE_PREFIX = "closure:"
+# A growable Vec value: an opaque `mx_vec*` heap pointer (8 bytes) with
+# IDENTITY semantics, parameterized by its unified element kind
+# ("vec:i64" / "vec:f64" / "vec:str" / "vec:vec:i64" ...).  Copies are
+# shallow pointer copies, exactly matching the interpreter's MxVec (every
+# copy aliases the one shared vector).  Elements are opaque 8-byte words in
+# the native runtime; the element kind decides the bitcast at push/pop/get.
+_VEC_PREFIX = "vec:"
 
 _LLTY = {I64: "i64", F64: "double", STR: "ptr"}
 _SCALARS = (I64, F64, STR)
@@ -273,10 +321,42 @@ _PRINT_BUILTINS = {"print", "println"}
 _MATH_EXTERNS = {"sqrt", "sin", "cos"}  # double -> double libc functions
 _INLINE_BUILTINS = {"neg", "not"}
 
-# Callees implemented by the vec/string/trait interpreter runtime.
-_RUNTIME_PREFIXES = ("__vec_", "__index_", "__slice_", "__range", "__trait$", "__static$")
-_RUNTIME_NAMES = {"to_string", "int_to_str", "type_of", "len", "push", "pop",
-                  "Vec.new", "assert_eq"}
+# Vec/string builtins now lowered to the NATIVE runtime (metaxu_rt.c, linked
+# by llvm_run): these mirror the interpreter's builtins exactly.  Like the
+# interpreter's resolution order ("builtins first" for plain calls), these
+# names win over same-named module functions; local closure variables still
+# shadow them.
+#   Vec.new      -> mx_vec_new          push  -> mx_vec_push
+#   pop          -> mx_vec_pop          len   -> mx_vec_len / mx_str_len
+#   __index_get  -> mx_vec_get
+#   to_string / int_to_str -> mx_i64_to_str / mx_f64_to_str / identity(str)
+_NATIVE_RT_CALLS = {"Vec.new", "push", "pop", "len", "to_string",
+                    "int_to_str", "__index_get"}
+
+# Interpreter builtins that trait dispatch can fall back to when no user
+# impl matches the receiver type (mir_interp._dispatch_trait_call step 2).
+_TRAIT_BUILTIN_FALLBACK = {"to_string", "int_to_str", "len", "push", "pop",
+                           "sqrt", "sin", "cos"}
+
+# Callees still implemented only by the interpreter runtime (demote).
+_RUNTIME_PREFIXES = ("__vec_", "__index_", "__slice_", "__range", "__static$")
+_RUNTIME_NAMES = {"type_of", "assert_eq"}
+
+# Native runtime symbol signatures (metaxu_rt.h ABI): name -> (ret, params).
+_RT_SIGS = {
+    "mx_vec_new": ("ptr", ()),
+    "mx_vec_push": ("void", ("ptr", "i64")),
+    "mx_vec_pop": ("i64", ("ptr",)),
+    "mx_vec_len": ("i64", ("ptr",)),
+    "mx_vec_get": ("i64", ("ptr", "i64")),
+    "mx_vec_set": ("void", ("ptr", "i64", "i64")),
+    "mx_vec_free": ("void", ("ptr",)),
+    "mx_str_concat": ("ptr", ("ptr", "ptr")),
+    "mx_str_len": ("i64", ("ptr",)),
+    "mx_i64_to_str": ("ptr", ("i64",)),
+    "mx_f64_to_str": ("ptr", ("double",)),
+    "mx_str_eq": ("i64", ("ptr", "ptr")),
+}
 
 _I64_MIN, _I64_MAX = -(2 ** 63), 2 ** 63 - 1
 
@@ -296,6 +376,8 @@ _HEADER = (
     ";   design rather than risking a double-free/use-after-free;\n"
     ";   struct params pass as ptr + callee byval-copy into own storage\n"
     ";   (a borrow-informed increment can elide the copy for @const params);\n"
+    ";   rebound struct params copy OUT through the caller's pointer on ret\n"
+    ";   (interpreter write-back parity; lambdas never copy out);\n"
     ";   struct returns are sret-style: caller passes its result slot as a\n"
     ";   leading ptr %agg.ret arg, callee copies the aggregate in, rets void;\n"
     ";   print/println route by operand type to @metaxu_print_{i64,f64,str};\n"
@@ -316,14 +398,34 @@ _HEADER = (
     ";   out).  FREE STRATEGY: payload boxes and heap closure envs LEAK BY\n"
     ";   DESIGN (never freed) -- shallow pointer sharing makes ownership\n"
     ";   non-unique, and a leak is provably sound where a free is not.\n"
-    ";   @global struct blocks are still freed at frame exit as before.\n"
+    ";   @global struct blocks are still freed at frame exit as before;\n"
+    ";   Vec values -> opaque mx_vec* pointers (native runtime metaxu_rt.c,\n"
+    ";   linked by llvm_run) with IDENTITY semantics (shallow ptr copies,\n"
+    ";   matching the interpreter's MxVec); elements are opaque 8-byte\n"
+    ";   words (f64 bitcast, str/vec ptrtoint) through mx_vec_push/pop/get;\n"
+    ";   len routes by kind to mx_vec_len/mx_str_len; to_string routes to\n"
+    ";   mx_i64_to_str/mx_f64_to_str/identity; string + is mx_str_concat,\n"
+    ";   ==/!= is mx_str_eq.  Concat/to_string results leak by design; a\n"
+    ";   Vec is mx_vec_free'd at frame exit only when provably\n"
+    ";   non-escaping, otherwise it leaks by design too;\n"
+    ";   __trait$ method calls are resolved statically against the\n"
+    ";   receiver's inferred kind (impl fn -> builtin -> plain fn),\n"
+    ";   mirroring the interpreter's runtime dispatch;\n"
     "; functions outside the subset appear as comment-only placeholders."
 )
 
 
 def _llparam(kind: str) -> str:
     """The LLVM parameter/return-slot type for a value kind (aggregates -> ptr)."""
-    if _is_agg(kind):
+    if _is_agg(kind) or _is_vec(kind):
+        return "ptr"
+    return _LLTY.get(kind, "i64")
+
+
+def _llscalar(kind: str) -> str:
+    """The LLVM type of a non-aggregate (register-sized) value kind.
+    Vec values are opaque `mx_vec*` pointers."""
+    if _is_vec(kind):
         return "ptr"
     return _LLTY.get(kind, "i64")
 
@@ -366,6 +468,24 @@ def _closure_lambda(kind: str) -> str:
     return kind[len(_CLOSURE_PREFIX):]
 
 
+def _is_vec(kind: str) -> bool:
+    return kind.startswith(_VEC_PREFIX)
+
+
+def _vec_elem(kind: str) -> str:
+    """The element kind of a vec kind ('vec:f64' -> 'f64')."""
+    return kind[len(_VEC_PREFIX):]
+
+
+def _vec_of(elem: str) -> str:
+    return _VEC_PREFIX + elem
+
+
+def _is_word_kind(kind: str) -> bool:
+    """Kinds storable as an opaque 8-byte word in a Vec element slot."""
+    return kind in (I64, F64, STR) or _is_vec(kind)
+
+
 def _is_agg(kind: str) -> bool:
     """Aggregate kinds: stored in own allocas, cross calls by pointer."""
     return _is_struct(kind) or _is_enum(kind) or _is_closure(kind)
@@ -387,18 +507,24 @@ def _agg_ty(kind: str) -> str:
 
 def _llcell(kind: str) -> str:
     """The LLVM type of an INLINE storage cell for a kind: scalars map via
-    _LLTY, aggregates inline their named type (struct fields, env fields)."""
-    return _agg_ty(kind) if _is_agg(kind) else _LLTY.get(kind, "i64")
+    _llscalar (vec -> ptr), aggregates inline their named type (struct
+    fields, env fields)."""
+    return _agg_ty(kind) if _is_agg(kind) else _llscalar(kind)
 
 
 def _join(a: str, b: str) -> str:
-    """Kind lattice: i64 is bottom; f64/str/struct:T are incomparable tops."""
+    """Kind lattice: i64 is bottom; f64/str/struct:T are incomparable tops.
+    Vec kinds join pointwise on their element kind (vec:i64 is the vec
+    bottom: a fresh Vec.new before any push)."""
     if a == b:
         return a
     if a == I64:
         return b
     if b == I64:
         return a
+    if _is_vec(a) and _is_vec(b):
+        e = _join(_vec_elem(a), _vec_elem(b))
+        return CONFLICT if e == CONFLICT else _vec_of(e)
     return CONFLICT
 
 
@@ -449,6 +575,9 @@ class _Info:
     closure_defs: List[Tuple[str, str, Tuple[str, ...]]] = field(default_factory=list)
     # Calls through a local variable (closure calls): (dst, callee var, args).
     closure_calls: List[Tuple[str, str, Tuple[str, ...]]] = field(default_factory=list)
+    # Runtime-dispatched trait method calls: (dst, method name, args) —
+    # statically resolved against the receiver's inferred kind.
+    trait_calls: List[Tuple[str, str, Tuple[str, ...]]] = field(default_factory=list)
     # Capture names this function receives through its env (it is a lambda).
     env_captures: Tuple[str, ...] = ()
     is_lambda: bool = False
@@ -754,12 +883,24 @@ def _analyze_inner(info: _Info, module_names: Set[str],
             info.add_reason(f"unsupported terminator {t[0]!r}")
 
     # Calls: partition into closure calls (callee is a local variable — the
-    # interpreter's shadowing order: locals first) and direct calls, which
-    # must hit module functions or the supported builtins.
+    # interpreter's shadowing order: locals first), trait-dispatched calls
+    # (resolved statically against the receiver kind later), native runtime
+    # builtins (which, like the interpreter's "builtins first" order, win
+    # over same-named module functions), and direct calls, which must hit
+    # module functions or the supported builtins.
     direct_calls: List[Tuple[str, str, Tuple[str, ...]]] = []
     for (dst, callee, cargs) in info.calls:
         if callee in info.def_count:
             info.closure_calls.append((dst, callee, cargs))
+        elif callee.startswith(TRAIT_CALL_PREFIX):
+            method = callee[len(TRAIT_CALL_PREFIX):]
+            if not cargs:
+                info.add_reason(
+                    f"trait method call {method!r} with no receiver")
+            else:
+                info.trait_calls.append((dst, method, cargs))
+        elif callee in _NATIVE_RT_CALLS:
+            direct_calls.append((dst, callee, cargs))
         elif callee in closures.targets:
             # Lambdas are only callable through their closure value: a direct
             # call would skip the env parameter.
@@ -965,6 +1106,171 @@ def _build_closure_table(funcs: Sequence[MirFunc]) -> _ClosureTable:
 
 
 # ---------------------------------------------------------------------------
+# Module-wide trait-impl table and static trait-call resolution
+# ---------------------------------------------------------------------------
+#
+# `recv.m(args)` lowers to a `__trait$m` call; the interpreter dispatches on
+# the RECEIVER'S RUNTIME TYPE NAME (mir_interp._dispatch_trait_call):
+#   1. __impl$Trait$Type$m for the receiver's type (exact, then
+#      case-insensitive);  2. builtin m;  3. plain function m;  4. error.
+# Kind inference gives us the receiver's kind statically, so the same
+# resolution runs at compile time: struct:T/enum:E map to type name T/E,
+# vec to "Vec", str to "String", f64 to "Float".  A receiver whose kind is
+# i64 is AMBIGUOUS (ints, bools and unit are all kind-erased to i64), so an
+# i64 receiver resolves to a builtin only when NO impl exists for any of
+# Int/Bool/Unit — otherwise the native dispatch could pick a different
+# target than the interpreter and the function demotes instead.
+
+@dataclass
+class _TraitTable:
+    # method -> type name -> {trait name: impl function name}
+    by_method: Dict[str, Dict[str, Dict[str, str]]] = field(default_factory=dict)
+
+
+def _build_trait_table(module_names: Set[str]) -> _TraitTable:
+    table = _TraitTable()
+    for name in module_names:
+        parsed = parse_impl_method_name(name)
+        if parsed is None:
+            continue
+        trait_name, type_name, method = parsed
+        table.by_method.setdefault(method, {}).setdefault(
+            type_name, {})[trait_name] = name
+    return table
+
+
+# Scalar type names the interpreter reports for kind-erased i64 receivers.
+_I64_RUNTIME_TYPE_NAMES = {"int", "bool", "unit"}
+
+
+def _resolve_trait_call(method: str, recv_kind: str, traits: _TraitTable,
+                        module_names: Set[str], *, assume_final: bool,
+                        ) -> Tuple[str, Optional[str]]:
+    """Statically resolve a `__trait$method` call for a receiver kind.
+
+    Returns one of:
+      ("func", fname)     -- call the module function fname directly
+      ("builtin", name)   -- lower as the interpreter builtin `name`
+      ("pending", None)   -- receiver kind still i64/bottom; try again later
+                             (only when not assume_final)
+      ("demote", reason)  -- cannot be resolved soundly; demote the function
+    The mapping mirrors mir_interp._dispatch_trait_call exactly; anything it
+    would decide differently at runtime returns "demote", never a guess.
+    """
+    by_type = traits.by_method.get(method, {})
+
+    def impl_for(tyname: str) -> Tuple[Optional[Dict[str, str]], Optional[str]]:
+        """(trait->fn map, problem).  Exact name first, then case-insensitive
+        (the interpreter's order); two distinct case-folded keys demote."""
+        tm = by_type.get(tyname)
+        if tm is not None:
+            return tm, None
+        low = tyname.lower()
+        matches = [tm for k, tm in by_type.items() if k.lower() == low]
+        if len(matches) > 1:
+            return None, (f"trait method {method!r}: multiple case-folded "
+                          f"impl types match receiver type {tyname!r}")
+        return (matches[0] if matches else None), None
+
+    def from_impl(tyname: str) -> Optional[Tuple[str, Optional[str]]]:
+        tm, prob = impl_for(tyname)
+        if prob is not None:
+            return ("demote", prob)
+        if tm is None:
+            return None
+        if len(tm) > 1:
+            opts = ", ".join(sorted(tm))
+            return ("demote",
+                    f"ambiguous trait method {method!r} on type {tyname!r} "
+                    f"(implemented by traits: {opts})")
+        return ("func", next(iter(tm.values())))
+
+    def plain_fn_fallback(reason: str) -> Tuple[str, Optional[str]]:
+        # Interpreter step 3: a plain user function of the same name — but
+        # ONLY when the method is not a builtin (builtins win at step 2).
+        if method not in _TRAIT_BUILTIN_FALLBACK and method in module_names:
+            return ("func", method)
+        return ("demote", reason)
+
+    if recv_kind == CONFLICT:
+        return ("demote", f"trait method {method!r} receiver has conflicting kinds")
+
+    if _is_struct(recv_kind) or _is_enum(recv_kind):
+        tyname = _struct_name(recv_kind) if _is_struct(recv_kind) \
+            else _enum_name(recv_kind)
+        hit = from_impl(tyname)
+        if hit is not None:
+            return hit
+        # Builtin fallback on an aggregate receiver: to_string would use
+        # Python str() of the struct/variant, len/push/pop would raise —
+        # neither is representable natively.
+        if method in _TRAIT_BUILTIN_FALLBACK:
+            return ("demote",
+                    f"trait method {method!r} on {recv_kind} falls back to the "
+                    "interpreter builtin (not representable natively)")
+        return plain_fn_fallback(
+            f"trait method {method!r} has no impl for type {tyname!r}")
+
+    if _is_vec(recv_kind):
+        hit = from_impl("Vec")
+        if hit is not None:
+            return hit
+        if method in ("push", "pop", "len"):
+            return ("builtin", method)
+        if method in ("to_string", "int_to_str"):
+            return ("demote",
+                    "to_string of a Vec (interpreter renders 'Vec[...]'; no "
+                    "native equivalent)")
+        return plain_fn_fallback(
+            f"trait method {method!r} on a Vec receiver has no native lowering")
+
+    if recv_kind == STR:
+        hit = from_impl("String")
+        if hit is not None:
+            return hit
+        if method == "len":
+            return ("builtin", "len")
+        if method in ("to_string", "int_to_str"):
+            return ("builtin", "to_string")
+        return plain_fn_fallback(
+            f"trait method {method!r} on a string receiver has no native lowering")
+
+    if recv_kind == F64:
+        hit = from_impl("Float")
+        if hit is not None:
+            return hit
+        if method in _MATH_EXTERNS:
+            return ("builtin", method)
+        if method in ("to_string", "int_to_str"):
+            return ("builtin", "to_string")
+        return plain_fn_fallback(
+            f"trait method {method!r} on a float receiver has no native lowering")
+
+    if _is_closure(recv_kind):
+        return ("demote", f"trait method {method!r} on a closure receiver")
+
+    # recv_kind == I64: bottom (still unresolved) OR genuinely int/bool/unit.
+    if not assume_final:
+        return ("pending", None)
+    erased = [t for t in by_type if t.lower() in _I64_RUNTIME_TYPE_NAMES]
+    if erased:
+        return ("demote",
+                f"trait method {method!r} has impls for kind-erased scalar "
+                f"receiver types ({', '.join(sorted(erased))}); i64 receivers "
+                "cannot be dispatched statically")
+    if method in _MATH_EXTERNS:
+        return ("builtin", method)
+    if method in ("to_string", "int_to_str"):
+        return ("builtin", "to_string")
+    if method in ("push", "pop", "len"):
+        return ("demote",
+                f"trait method {method!r} on a receiver of kind i64 "
+                "(interpreter would reject a non-Vec receiver)")
+    return plain_fn_fallback(
+        f"trait method {method!r} on a receiver of kind i64 has no native lowering")
+
+
+# ---------------------------------------------------------------------------
 # Kind inference (i64 by default, monotone promotion; module fixpoint)
 # ---------------------------------------------------------------------------
 
@@ -976,11 +1282,17 @@ class _Sig:
 
 def _infer_kinds(info: _Info, sigs: Dict[str, _Sig], structs: _StructTable,
                  variants: _VariantTable, closures: _ClosureTable,
+                 traits: _TraitTable, module_names: Set[str],
+                 assume_final: bool = False,
                  ) -> Tuple[Dict[str, str], bool]:
     """One inner fixpoint over a function.  Returns (kinds, global_changed)
     where global_changed reports promotions written into shared cells
     (struct fields, enum payload slots, closure captures) so the module
-    driver keeps iterating."""
+    driver keeps iterating.
+
+    ``assume_final``: trait-call receivers still at the i64 bottom are
+    treated as genuinely-int receivers (the driver sets this only after the
+    unassuming fixpoint has converged, so nothing else can promote them)."""
     kinds: Dict[str, str] = {}
     global_changed = False
 
@@ -1002,6 +1314,55 @@ def _infer_kinds(info: _Info, sigs: Dict[str, _Sig], structs: _StructTable,
         for n in names:
             changed = mark(n, k) or changed
         return changed
+
+    # Field name -> owning struct, when the module has EXACTLY one struct
+    # with that field: a field_get/field_set receiver still at the i64
+    # bottom can then only be that struct (any other value would be an
+    # interpreter error), so its kind is pinned.  Ambiguous names stay
+    # unresolved and demote via the existing consistency check.
+    field_owner: Dict[str, Optional[str]] = {}
+    for sname_, fields_ in structs.fields.items():
+        for fn_ in fields_:
+            field_owner[fn_] = None if fn_ in field_owner else sname_
+
+    def apply_builtin(name: str, dst: str, args: Tuple[str, ...],
+                      plain_call: bool) -> bool:
+        """Kind constraints of a native runtime builtin call.  For PLAIN
+        calls (interpreter resolution: builtins first) receiver kinds are
+        pinned eagerly; for trait-resolved calls the receiver is already
+        known to be a vec/str (resolution is kind-driven)."""
+        ch = False
+        if name == "Vec.new":
+            ch = mark(dst, _vec_of(I64)) or ch
+        elif name in ("push", "pop", "__index_get"):
+            if not args:
+                return ch
+            if plain_call:
+                ch = mark(args[0], _vec_of(I64)) or ch
+            rk = get(args[0])
+            if _is_vec(rk):
+                # Two-way element unification: pushed values and read
+                # elements are one type per vec.  (push's own dst is unit.)
+                if name == "push":
+                    other = args[1] if len(args) == 2 else None
+                else:
+                    other = dst
+                if other is not None:
+                    nk = _join(_vec_elem(rk), get(other))
+                    if nk != CONFLICT:
+                        ch = mark(args[0], _vec_of(nk)) or ch
+                        ch = mark(other, nk) or ch
+                    else:
+                        ch = mark(args[0], CONFLICT) or ch
+        elif name == "len":
+            pass  # receiver may be vec or str; dst stays i64
+        elif name in ("to_string", "int_to_str"):
+            ch = mark(dst, STR) or ch
+        elif name in _MATH_EXTERNS:
+            for a in args:
+                ch = mark(a, F64) or ch
+            ch = mark(dst, F64) or ch
+        return ch
 
     fname = info.f.name
     own_sig = sigs.get(fname)
@@ -1065,6 +1426,26 @@ def _infer_kinds(info: _Info, sigs: Dict[str, _Sig], structs: _StructTable,
                             for a, pk in zip(args, sig.params):
                                 changed = mark(a, pk) or changed
                             changed = mark(dst, sig.ret) or changed
+                    elif callee.startswith(TRAIT_CALL_PREFIX):
+                        method = callee[len(TRAIT_CALL_PREFIX):]
+                        if args:
+                            res, target = _resolve_trait_call(
+                                method, get(args[0]), traits, module_names,
+                                assume_final=assume_final)
+                            if res == "func":
+                                sig = sigs.get(target)
+                                if sig is not None and len(sig.params) == len(args):
+                                    for a, pk in zip(args, sig.params):
+                                        changed = mark(a, pk) or changed
+                                    changed = mark(dst, sig.ret) or changed
+                            elif res == "builtin":
+                                changed = apply_builtin(
+                                    target, dst, args, plain_call=False) or changed
+                    elif callee in _NATIVE_RT_CALLS:
+                        # Interpreter resolution order: builtins first, so
+                        # these win over same-named module functions.
+                        changed = apply_builtin(
+                            callee, dst, args, plain_call=True) or changed
                     elif callee in _MATH_EXTERNS:
                         for a in args:
                             changed = mark(a, F64) or changed
@@ -1113,6 +1494,11 @@ def _infer_kinds(info: _Info, sigs: Dict[str, _Sig], structs: _StructTable,
                         changed = mark(fv, nk) or changed
                 elif rk == "field_get":
                     bk = get(args[0])
+                    if bk == I64 and field_owner.get(rhs[1]):
+                        changed = mark(
+                            args[0],
+                            _STRUCT_PREFIX + field_owner[rhs[1]]) or changed
+                        bk = get(args[0])
                     if _is_struct(bk):
                         sname = _struct_name(bk)
                         fk = structs.field_kind(sname, rhs[1])
@@ -1123,6 +1509,11 @@ def _infer_kinds(info: _Info, sigs: Dict[str, _Sig], structs: _StructTable,
                 elif rk == "field_set":
                     changed = unify((dst, args[0])) or changed
                     bk = get(args[0])
+                    if bk == I64 and field_owner.get(rhs[1]):
+                        changed = mark(
+                            args[0],
+                            _STRUCT_PREFIX + field_owner[rhs[1]]) or changed
+                        bk = get(args[0])
                     if _is_struct(bk):
                         sname = _struct_name(bk)
                         fk = structs.field_kind(sname, rhs[1])
@@ -1139,12 +1530,73 @@ def _infer_kinds(info: _Info, sigs: Dict[str, _Sig], structs: _StructTable,
 
 def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                        structs: _StructTable, variants: _VariantTable,
-                       closures: _ClosureTable,
+                       closures: _ClosureTable, traits: _TraitTable,
                        module_names: Set[str]) -> List[str]:
     probs: List[str] = []
 
     def ty(n: str) -> str:
         return kinds.get(n, I64)
+
+    def check_builtin(name: str, dst: str, args: Tuple[str, ...]) -> None:
+        """Validate a native-runtime builtin call's final kinds."""
+        if name == "Vec.new":
+            if args:
+                probs.append("Vec.new with arguments")
+            elif not _is_vec(ty(dst)):
+                probs.append(
+                    f"Vec.new result {dst!r} has kind {ty(dst)}, not a Vec")
+        elif name == "push":
+            if len(args) != 2:
+                probs.append(f"push with {len(args)} arguments (expects 2)")
+            elif not _is_vec(ty(args[0])):
+                probs.append(
+                    f"push receiver {args[0]!r} has kind {ty(args[0])}, not a Vec")
+            elif not _is_word_kind(_vec_elem(ty(args[0]))):
+                probs.append(
+                    f"Vec of {_vec_elem(ty(args[0]))} elements (only 8-byte "
+                    "word kinds fit native Vec slots)")
+            elif ty(args[1]) != _vec_elem(ty(args[0])):
+                probs.append(
+                    f"push of {ty(args[1])} into a Vec of "
+                    f"{_vec_elem(ty(args[0]))}")
+        elif name in ("pop", "__index_get"):
+            want = 1 if name == "pop" else 2
+            if len(args) != want:
+                probs.append(f"{name} with {len(args)} arguments (expects {want})")
+            elif not _is_vec(ty(args[0])):
+                probs.append(
+                    f"{name} receiver {args[0]!r} has kind {ty(args[0])}, "
+                    "not a Vec (string/vector indexing stays interpreted)")
+            elif name == "__index_get" and ty(args[1]) != I64:
+                probs.append(f"__index_get index {args[1]!r} is {ty(args[1])}")
+            elif not _is_word_kind(_vec_elem(ty(args[0]))):
+                probs.append(
+                    f"Vec of {_vec_elem(ty(args[0]))} elements (only 8-byte "
+                    "word kinds fit native Vec slots)")
+            elif ty(dst) != _vec_elem(ty(args[0])):
+                probs.append(
+                    f"{name} result {dst!r} is {ty(dst)}, Vec elements are "
+                    f"{_vec_elem(ty(args[0]))}")
+        elif name == "len":
+            if len(args) != 1:
+                probs.append(f"len with {len(args)} arguments (expects 1)")
+            elif not (_is_vec(ty(args[0])) or ty(args[0]) == STR):
+                probs.append(
+                    f"len receiver {args[0]!r} has kind {ty(args[0])} "
+                    "(only Vec and string lower natively)")
+            elif ty(dst) != I64:
+                probs.append(f"len result {dst!r} promoted to {ty(dst)}")
+        elif name in ("to_string", "int_to_str"):
+            if len(args) != 1:
+                probs.append(f"{name} with {len(args)} arguments (expects 1)")
+            elif ty(args[0]) not in (I64, F64, STR):
+                probs.append(
+                    f"{name} of kind {ty(args[0])} (only i64/f64/str lower "
+                    "to mx_i64_to_str/mx_f64_to_str/identity)")
+            elif ty(dst) != STR:
+                probs.append(f"{name} result {dst!r} is {ty(dst)}, not str")
+        elif name in _MATH_EXTERNS:
+            pass  # kinds pinned to f64 during inference
 
     for name in sorted(set(info.def_count) | set(info.use_blocks)):
         if ty(name) == CONFLICT:
@@ -1164,18 +1616,45 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                     probs.append(
                         f"constant {dst!r} promoted to aggregate kind "
                         f"{ty(dst)} (no scalar-to-aggregate coercion)")
+                elif _is_vec(ty(dst)) and dst not in info.dead_results \
+                        and not (rk == "const" and rhs[1] is None) \
+                        and rk != "const_ty":
+                    probs.append(
+                        f"constant {dst!r} promoted to Vec kind {ty(dst)} "
+                        "(no literal Vec values)")
             elif rk == "binop":
                 o = rhs[1]
-                if o in _CMP_INT:
+                if any(_is_vec(ty(x)) for x in (dst, *args)):
+                    # Vec ==/!= is item-wise in the interpreter but would be
+                    # pointer identity natively; no vec arithmetic exists.
+                    probs.append(
+                        f"binop {o!r} on Vec values (interpreter compares "
+                        "contents; native pointers cannot)")
+                elif o in _CMP_INT:
                     if ty(dst) not in (I64,):
                         probs.append(f"comparison result {dst!r} promoted to {ty(dst)}")
-                    if ty(args[0]) not in (I64, F64) or ty(args[1]) not in (I64, F64):
+                    elif ty(args[0]) == STR and ty(args[1]) == STR:
+                        # ==/!= on strings -> mx_str_eq (content equality,
+                        # exactly the interpreter's).  Ordering comparisons
+                        # on strings stay demoted.
+                        if o not in ("==", "!="):
+                            probs.append(
+                                f"string ordering comparison {o!r} (only "
+                                "==/!= lower to mx_str_eq)")
+                    elif ty(args[0]) not in (I64, F64) or ty(args[1]) not in (I64, F64):
                         probs.append(f"comparison {o!r} on non-numeric operands")
                 elif o in _LOGIC:
                     if any(ty(x) != I64 for x in (dst, *args)):
                         probs.append(f"logical binop {o!r} on non-i64 values")
                 else:
-                    if ty(dst) not in (I64, F64):
+                    if ty(dst) == STR:
+                        # str + str -> mx_str_concat (fresh malloc'd string,
+                        # leaked by design like boxes/heap envs).
+                        if o != "+" or ty(args[0]) != STR or ty(args[1]) != STR:
+                            probs.append(
+                                f"string arithmetic {o!r} (only + on two "
+                                "strings lowers to mx_str_concat)")
+                    elif ty(dst) not in (I64, F64):
                         probs.append(f"arithmetic {o!r} on non-numeric kind {ty(dst)}")
             elif rk == "select" and len(args) == 3:
                 if dst in info.dead_results:
@@ -1213,6 +1692,41 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                         probs.append(
                             f"closure call to {lname!r}: result {dst!r} is "
                             f"{ty(dst)}, returns {sig.ret}")
+                elif callee.startswith(TRAIT_CALL_PREFIX):
+                    method = callee[len(TRAIT_CALL_PREFIX):]
+                    if not args:
+                        probs.append(f"trait method call {method!r} with no receiver")
+                        continue
+                    res, target = _resolve_trait_call(
+                        method, ty(args[0]), traits, module_names,
+                        assume_final=True)
+                    if res == "builtin":
+                        check_builtin(target, dst, args)
+                    elif res == "func":
+                        sig = sigs.get(target)
+                        if sig is None or target not in module_names:
+                            probs.append(
+                                f"trait method {method!r} resolves to unknown "
+                                f"function {target!r}")
+                        elif len(sig.params) != len(args):
+                            probs.append(
+                                f"trait method {method!r} -> {target!r} with "
+                                "wrong arity")
+                        else:
+                            for a, pk in zip(args, sig.params):
+                                if ty(a) != pk:
+                                    probs.append(
+                                        f"trait call {method!r} -> {target!r}: "
+                                        f"arg {a!r} is {ty(a)}, expects {pk}")
+                            if ty(dst) != sig.ret:
+                                probs.append(
+                                    f"trait call {method!r} -> {target!r}: "
+                                    f"result {dst!r} is {ty(dst)}, returns {sig.ret}")
+                    else:  # demote (or a pending that survived assume_final)
+                        probs.append(target or
+                                     f"trait method {method!r} cannot be resolved")
+                elif callee in _NATIVE_RT_CALLS:
+                    check_builtin(callee, dst, args)
                 elif callee in _PRINT_BUILTINS:
                     for a in args:
                         if ty(a) not in (I64, F64, STR):
@@ -1378,6 +1892,135 @@ def _compute_slots(info: _Info, kinds: Dict[str, str]) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
+# Provably-dead Vec analysis (which Vec.new results may be freed at exit)
+# ---------------------------------------------------------------------------
+
+# Native runtime calls that only READ or MUTATE a Vec through its receiver
+# argument without retaining the pointer (metaxu_rt.c stores no receiver).
+_VEC_SAFE_RECEIVER_BUILTINS = {"push", "pop", "len", "__index_get"}
+
+
+def _provably_dead_vecs(f: MirFunc, kinds: Dict[str, str],
+                        builtin_of) -> List[str]:
+    """Vec.new result variables whose vector provably never escapes the
+    frame, so `mx_vec_free` at every ret path is sound.
+
+    The argument mirrors the @global-struct free proof: the malloc
+    (mx_vec_new) happens unconditionally in the ENTRY block, and the
+    pointer never leaves the frame — it is not returned, not stored in any
+    aggregate (struct field / enum payload / closure env / another Vec),
+    not captured, and not passed to any call except as the RECEIVER of the
+    non-retaining native vec builtins.  Aliases created by `copy` are
+    tracked (they hold the same pointer and are freed zero times — only the
+    defining variable is freed once).  Anything not provable simply leaks
+    by design (a leak is sound; a bad free is not), so this analysis bails
+    conservatively: selects, re-definitions, cyclic entry blocks, or any
+    unrecognized use disqualify the vec.
+
+    ``builtin_of(callee, args)`` names the native builtin a call lowers to
+    (None for anything else, including trait calls resolved to functions).
+    """
+    if not f.blocks:
+        return []
+    if 0 in _blocks_in_cycles(f):
+        return []  # a re-executed entry block would double-free
+
+    entry_ops = f.blocks[0].ops
+    candidates = [op[1] for op in entry_ops
+                  if op[0] == "let" and len(op) == 4
+                  and op[2][0] == "call" and op[2][1] == "Vec.new"
+                  and _is_vec(kinds.get(op[1], I64))]
+    if not candidates:
+        return []
+
+    # def map: var -> list of (rhs, args)
+    defs: Dict[str, List[Tuple[tuple, tuple]]] = {}
+    for b in f.blocks:
+        for op in b.ops:
+            if op[0] == "let" and len(op) == 4:
+                defs.setdefault(op[1], []).append((op[2], op[3]))
+
+    freed: List[str] = []
+    for site in candidates:
+        # Alias group closure over plain copies.
+        group: Set[str] = {site}
+        changed = True
+        while changed:
+            changed = False
+            for b in f.blocks:
+                for op in b.ops:
+                    if op[0] == "let" and len(op) == 4 and op[2][0] == "copy" \
+                            and op[3] and op[3][0] in group \
+                            and op[1] not in group:
+                        group.add(op[1])
+                        changed = True
+        # Every group member's every def must be the site's Vec.new (for the
+        # site itself, exactly once) or a copy from within the group.
+        ok = True
+        for m in group:
+            for (rhs, dargs) in defs.get(m, []):
+                if m == site and rhs[0] == "call" and rhs[1] == "Vec.new":
+                    continue
+                if rhs[0] == "copy" and dargs and dargs[0] in group:
+                    continue
+                ok = False
+        if len([1 for (rhs, _a) in defs.get(site, [])
+                if rhs[0] == "call" and rhs[1] == "Vec.new"]) != 1:
+            ok = False
+        # Every use of every member must be a whitelisted, non-escaping one.
+        if ok:
+            for b in f.blocks:
+                for op in b.ops:
+                    if not ok:
+                        break
+                    if op[0] == "drop":
+                        continue
+                    if op[0] == "match_fail" or op[0] == "params":
+                        continue
+                    if op[0] == "perform":
+                        if any(a in group for a in op[4]):
+                            ok = False
+                        continue
+                    if op[0] != "let" or len(op) != 4:
+                        # unknown op shape: bail if we cannot see its uses
+                        ok = False
+                        continue
+                    _, dst, rhs, oargs = op
+                    rk = rhs[0]
+                    if rk == "copy":
+                        # copies from the group were folded into the group;
+                        # a group member copied into a non-member cannot
+                        # happen (closure above), so nothing to check.
+                        continue
+                    if rk == "call":
+                        callee = rhs[1]
+                        bname = builtin_of(callee, oargs)
+                        if bname in _VEC_SAFE_RECEIVER_BUILTINS:
+                            # receiver-only use is safe; a group member in
+                            # any VALUE position escapes (stored in the vec)
+                            if any(a in group for a in oargs[1:]):
+                                ok = False
+                            continue
+                        if any(a in group for a in oargs):
+                            ok = False
+                        continue
+                    if rk == "alloc_struct" or rk == "make_closure":
+                        if any(v in group for (_n, v) in oargs):
+                            ok = False
+                        continue
+                    # binop / select / field ops / variants / everything else:
+                    # any appearance of a group member disqualifies.
+                    if any(a in group for a in oargs):
+                        ok = False
+                t = b.term
+                if t[0] in ("br_if", "ret") and t[1] in group:
+                    ok = False
+        if ok:
+            freed.append(site)
+    return freed
+
+
+# ---------------------------------------------------------------------------
 # Emission
 # ---------------------------------------------------------------------------
 
@@ -1391,6 +2034,7 @@ class _ModuleState:
         self.uses_abort = False
         self.uses_malloc = False   # @global structs: malloc/free declares
         self.uses_printf = False   # direct variadic printf (multi-arg print)
+        self.runtime_syms: Set[str] = set()  # mx_* native runtime declares
         self.used_enums: Set[str] = set()      # enum names needing %enum types
         self.uses_closure_pair = False         # %mx.closure type needed
         # lambda name -> ((capture name, kind), ...) for %env.L emission
@@ -1405,7 +2049,7 @@ class _ModuleState:
 def _emit_placeholder(info: _Info, sig: _Sig) -> str:
     sym = mangle(info.f.name)
     ptys = ", ".join(_llparam(k) for k in sig.params)
-    rty = "void (sret ptr)" if _is_agg(sig.ret) else _LLTY.get(sig.ret, "i64")
+    rty = "void (sret ptr)" if _is_agg(sig.ret) else _llscalar(sig.ret)
     lines = [f"; function @{sym}: placeholder -- unsupported for direct LLVM emission"]
     for r in info.reasons:
         lines.append(f";   reason: {r}")
@@ -1415,7 +2059,8 @@ def _emit_placeholder(info: _Info, sig: _Sig) -> str:
 
 def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                    structs: _StructTable, variants: _VariantTable,
-                   closures: _ClosureTable, mod: _ModuleState,
+                   closures: _ClosureTable, traits: _TraitTable,
+                   module_names: Set[str], mod: _ModuleState,
                    emitted_names: Set[str]) -> str:
     f = info.f
     sig = sigs[f.name]
@@ -1424,7 +2069,7 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
         return kinds.get(n, I64)
 
     def llty(n: str) -> str:
-        return _LLTY.get(kind(n), "i64")
+        return _llscalar(kind(n))
 
     def env_fields(lname: str) -> Tuple[Tuple[str, str], ...]:
         """The env struct layout of a lambda: (capture, kind) in list order."""
@@ -1483,6 +2128,10 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
 
     def scalar_const(name: str, value: Any) -> str:
         k = kind(name)
+        if _is_vec(k):
+            if value is None:
+                return "null"  # an uninitialized Vec slot (const None)
+            raise _Unsupported(f"non-None constant for Vec value {name!r}")
         if k == F64:
             if value is None:
                 value = 0.0
@@ -1528,15 +2177,181 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                 f"ptr {base_ptr}, i32 0, i32 1, i32 {payload}")
         return v
 
-    def emit_frees(lines: List[str]) -> None:
-        """Free every heap-backed @global struct block (called on ret paths).
+    def builtin_of(callee: str, cargs: Tuple[str, ...]) -> Optional[str]:
+        """The native builtin name a call op lowers to, or None (used both
+        by the vec-escape analysis and nowhere else; mirrors the emission
+        dispatch order below: locals shadow, then trait resolution, then
+        plain builtins)."""
+        if callee in info.def_count:
+            return None  # closure call through a local
+        if callee.startswith(TRAIT_CALL_PREFIX):
+            if not cargs:
+                return None
+            res, target = _resolve_trait_call(
+                callee[len(TRAIT_CALL_PREFIX):], kind(cargs[0]), traits,
+                module_names, assume_final=True)
+            return target if res == "builtin" else None
+        if callee in _NATIVE_RT_CALLS:
+            return callee
+        return None
 
-        Sound because the malloc unconditionally happens in the entry block
-        (exactly once per invocation) and value semantics guarantees the
-        storage pointer never escapes this frame (see module docstring)."""
+    # Vecs provably dead at frame exit (see _provably_dead_vecs): freed on
+    # every ret path.  All other Vec.new results LEAK BY DESIGN — identity
+    # semantics means the pointer may be shared anywhere it escaped to, so
+    # no free can be proven unique (same contract as boxes/heap envs).
+    vec_free_vars = _provably_dead_vecs(f, kinds, builtin_of)
+    vec_free_set = set(vec_free_vars)
+
+    # COPY-IN/COPY-OUT struct params: the interpreter WRITES BACK a struct
+    # argument when the callee rebinds the parameter (mir_interp.
+    # _write_back_struct_args — `self.field = ...` methods mutate the
+    # caller's binding).  Natively the caller already passes its storage
+    # pointer, so the callee copies the final param value back through it on
+    # every ret path.  Statically "rebinds anywhere" over-approximates the
+    # interpreter's per-execution identity test, but a not-taken rebind path
+    # writes back the unchanged aggregate — observationally a no-op.
+    # Closure calls get NO write-back in the interpreter, so lambdas never
+    # copy out.  Only struct kinds write back (enums/closures never do).
+    writeback_params = [] if info.is_lambda else [
+        p for p in info.params
+        if _is_struct(kinds.get(p, I64)) and info.def_count.get(p, 0) > 1]
+
+    def emit_writebacks(lines: List[str]) -> None:
+        for p in writeback_params:
+            agg_copy(_agg_ty(kinds.get(p, I64)), struct_ref(p),
+                     f"%a.{_sanitize(p)}", lines)
+            lines.append(f"  ; ^ copy-out: rebound struct param {p} "
+                         "written back to the caller")
+
+    def emit_frees(lines: List[str]) -> None:
+        """Free every heap-backed @global struct block and every provably
+        frame-local Vec (called on ret paths).
+
+        Sound because the mallocs unconditionally happen in the entry block
+        (exactly once per invocation) and the pointers provably never
+        escape this frame (value semantics for structs; the vec escape
+        analysis for Vecs — see module docstring)."""
         for n in heap_vars:
             lines.append(f"  call void @free(ptr {struct_ref(n)})"
                          f"  ; @global struct {n}: end of frame")
+        for n in vec_free_vars:
+            mod.runtime_syms.add("mx_vec_free")
+            lines.append(f"  call void @mx_vec_free(ptr {use(n, lines)})"
+                         f"  ; local Vec {n}: provably non-escaping")
+
+    def to_word(k: str, v: str, lines: List[str]) -> str:
+        """Reinterpret a value of word kind k as the opaque i64 element word
+        the native Vec ABI stores (the runtime never inspects elements)."""
+        if k == I64:
+            return v
+        t = fresh()
+        if k == F64:
+            lines.append(f"  {t} = bitcast double {v} to i64")
+        else:  # str / vec pointers
+            lines.append(f"  {t} = ptrtoint ptr {v} to i64")
+        return t
+
+    def from_word(k: str, v: str, lines: List[str]) -> str:
+        """Inverse of to_word: element word back to its typed value."""
+        if k == I64:
+            return v
+        t = fresh()
+        if k == F64:
+            lines.append(f"  {t} = bitcast i64 {v} to double")
+        else:
+            lines.append(f"  {t} = inttoptr i64 {v} to ptr")
+        return t
+
+    def emit_direct_call(dst: str, callee: str, opargs: Tuple[str, ...],
+                         lines: List[str]) -> None:
+        """A direct call to another emitted module function (also the target
+        of a statically-resolved trait call)."""
+        if callee not in emitted_names:
+            raise _Unsupported(f"call to non-emitted function {callee!r}")
+        csig = sigs[callee]
+        avals = []
+        for a, pk in zip(opargs, csig.params):
+            # aggregate args pass their storage pointer; the callee
+            # byval-copies the aggregate in its entry prelude.
+            avals.append(f"{_llparam(pk)} {use(a, lines)}")
+        if _is_agg(csig.ret):
+            # sret-style: dst's own storage is the result slot.
+            if dst not in aggset:
+                raise _Unsupported(
+                    f"call result {dst!r} not aggregate-kinded for "
+                    f"sret call to {callee!r}")
+            avals.insert(0, f"ptr {struct_ref(dst)}")
+            lines.append(
+                f"  call void @{mangle(callee)}({', '.join(avals)})")
+        else:
+            v = fresh()
+            rty = _llscalar(csig.ret)
+            lines.append(
+                f"  {v} = call {rty} @{mangle(callee)}({', '.join(avals)})")
+            setval(dst, v, lines)
+
+    def emit_rt_builtin(name: str, dst: str, opargs: Tuple[str, ...],
+                        lines: List[str]) -> None:
+        """Lower an interpreter builtin to its native runtime call
+        (metaxu_rt.c, linked by llvm_run).  The consistency check already
+        validated arities and kinds; anything off here is a hard error."""
+        if name == "Vec.new":
+            mod.runtime_syms.add("mx_vec_new")
+            v = fresh()
+            note = ("freed on ret paths (provably non-escaping)"
+                    if dst in vec_free_set else "leaks by design (may escape)")
+            lines.append(f"  {v} = call ptr @mx_vec_new()  ; Vec.new: {note}")
+            setval(dst, v, lines)
+        elif name == "push":
+            recv = use(opargs[0], lines)
+            elem = _vec_elem(kind(opargs[0]))
+            w = to_word(elem, use(opargs[1], lines), lines)
+            mod.runtime_syms.add("mx_vec_push")
+            lines.append(f"  call void @mx_vec_push(ptr {recv}, i64 {w})")
+            setval(dst, "0", lines)  # unit
+        elif name == "pop":
+            recv = use(opargs[0], lines)
+            elem = _vec_elem(kind(opargs[0]))
+            mod.runtime_syms.add("mx_vec_pop")
+            w = fresh()
+            lines.append(f"  {w} = call i64 @mx_vec_pop(ptr {recv})")
+            setval(dst, from_word(elem, w, lines), lines)
+        elif name == "__index_get":
+            recv = use(opargs[0], lines)
+            elem = _vec_elem(kind(opargs[0]))
+            idx = use(opargs[1], lines)
+            mod.runtime_syms.add("mx_vec_get")
+            w = fresh()
+            lines.append(f"  {w} = call i64 @mx_vec_get(ptr {recv}, i64 {idx})")
+            setval(dst, from_word(elem, w, lines), lines)
+        elif name == "len":
+            recv = use(opargs[0], lines)
+            sym = "mx_vec_len" if _is_vec(kind(opargs[0])) else "mx_str_len"
+            mod.runtime_syms.add(sym)
+            v = fresh()
+            lines.append(f"  {v} = call i64 @{sym}(ptr {recv})")
+            setval(dst, v, lines)
+        elif name in ("to_string", "int_to_str"):
+            k = kind(opargs[0])
+            a = use(opargs[0], lines)
+            if k == STR:
+                setval(dst, a, lines)  # to_string of a string is identity
+            else:
+                sym = "mx_f64_to_str" if k == F64 else "mx_i64_to_str"
+                mod.runtime_syms.add(sym)
+                v = fresh()
+                lines.append(
+                    f"  {v} = call ptr @{sym}({_llscalar(k)} {a})"
+                    "  ; fresh malloc'd string (leaks by design)")
+                setval(dst, v, lines)
+        elif name in _MATH_EXTERNS:
+            mod.math_used.add(name)
+            a = use(opargs[0], lines)
+            v = fresh()
+            lines.append(f"  {v} = call double @{name}(double {a})")
+            setval(dst, v, lines)
+        else:  # unreachable given resolution + consistency
+            raise _Unsupported(f"builtin {name!r} has no native lowering")
 
     # Params are visible from the entry block on: SSA args directly, spilled
     # params through their slot (the store happens in the entry prelude);
@@ -1625,7 +2440,31 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                 l = use(opargs[0], lines)
                 r = use(opargs[1], lines)
                 is_flt = kind(opargs[0]) == F64
-                if o in _CMP_INT:
+                is_str = kind(opargs[0]) == STR and kind(opargs[1]) == STR
+                if is_str and o == "+":
+                    # String concatenation -> fresh malloc'd string from the
+                    # native runtime; never freed (leaks by design, same
+                    # contract as boxes/heap envs this increment).
+                    mod.runtime_syms.add("mx_str_concat")
+                    v = fresh()
+                    lines.append(
+                        f"  {v} = call ptr @mx_str_concat(ptr {l}, ptr {r})"
+                        "  ; leaks by design")
+                    setval(dst, v, lines)
+                elif is_str and o in ("==", "!="):
+                    # Content equality via mx_str_eq (returns 0/1), exactly
+                    # the interpreter's string comparison.
+                    mod.runtime_syms.add("mx_str_eq")
+                    e = fresh()
+                    lines.append(f"  {e} = call i64 @mx_str_eq(ptr {l}, ptr {r})")
+                    if o == "==":
+                        setval(dst, e, lines)
+                    else:
+                        c, v = fresh(), fresh()
+                        lines.append(f"  {c} = icmp eq i64 {e}, 0")
+                        lines.append(f"  {v} = zext i1 {c} to i64")
+                        setval(dst, v, lines)
+                elif o in _CMP_INT:
                     c = fresh()
                     if is_flt:
                         lines.append(f"  {c} = fcmp {_CMP_FLT[o]} double {l}, {r}")
@@ -1702,10 +2541,29 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                         lines.append(f"  call void {fnv}({', '.join(avals)})")
                     else:
                         v = fresh()
-                        rty = _LLTY[csig.ret]
+                        rty = _llscalar(csig.ret)
                         lines.append(
                             f"  {v} = call {rty} {fnv}({', '.join(avals)})")
                         setval(dst, v, lines)
+                elif callee.startswith(TRAIT_CALL_PREFIX):
+                    # Statically-resolved trait dispatch (kind-driven; the
+                    # consistency check validated the resolution).
+                    method = callee[len(TRAIT_CALL_PREFIX):]
+                    if not opargs:
+                        raise _Unsupported(
+                            f"trait method call {method!r} with no receiver")
+                    res, target = _resolve_trait_call(
+                        method, kind(opargs[0]), traits, module_names,
+                        assume_final=True)
+                    if res == "builtin":
+                        emit_rt_builtin(target, dst, opargs, lines)
+                    elif res == "func":
+                        emit_direct_call(dst, target, opargs, lines)
+                    else:
+                        raise _Unsupported(
+                            target or f"unresolved trait method call {method!r}")
+                elif callee in _NATIVE_RT_CALLS:
+                    emit_rt_builtin(callee, dst, opargs, lines)
                 elif callee in _PRINT_BUILTINS:
                     if len(opargs) == 1:
                         a = use(opargs[0], lines)
@@ -1750,29 +2608,7 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                     lines.append(f"  {v} = call double @{callee}(double {a})")
                     setval(dst, v, lines)
                 else:
-                    if callee not in emitted_names:
-                        raise _Unsupported(f"call to non-emitted function {callee!r}")
-                    csig = sigs[callee]
-                    avals = []
-                    for a, pk in zip(opargs, csig.params):
-                        # aggregate args pass their storage pointer; the callee
-                        # byval-copies the aggregate in its entry prelude.
-                        avals.append(f"{_llparam(pk)} {use(a, lines)}")
-                    if _is_agg(csig.ret):
-                        # sret-style: dst's own storage is the result slot.
-                        if dst not in aggset:
-                            raise _Unsupported(
-                                f"call result {dst!r} not aggregate-kinded for "
-                                f"sret call to {callee!r}")
-                        avals.insert(0, f"ptr {struct_ref(dst)}")
-                        lines.append(
-                            f"  call void @{mangle(callee)}({', '.join(avals)})")
-                    else:
-                        v = fresh()
-                        rty = _LLTY[csig.ret]
-                        lines.append(
-                            f"  {v} = call {rty} @{mangle(callee)}({', '.join(avals)})")
-                        setval(dst, v, lines)
+                    emit_direct_call(dst, callee, opargs, lines)
             elif rk == "alloc_struct":
                 sname = rhs[1]
                 if dst not in aggset:
@@ -1786,7 +2622,7 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                         agg_copy(_agg_ty(fk), use(fv, lines), p, lines)
                     else:
                         lines.append(
-                            f"  store {_LLTY[fk]} {use(fv, lines)}, ptr {p}")
+                            f"  store {_llscalar(fk)} {use(fv, lines)}, ptr {p}")
             elif rk == "field_get":
                 sname = _struct_name(kind(opargs[0]))
                 base = use(opargs[0], lines)
@@ -1800,7 +2636,7 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                     agg_copy(_agg_ty(fk), p, struct_ref(dst), lines)
                 else:
                     v = fresh()
-                    lines.append(f"  {v} = load {_LLTY[fk]}, ptr {p}")
+                    lines.append(f"  {v} = load {_llscalar(fk)}, ptr {p}")
                     setval(dst, v, lines)
             elif rk == "field_set":
                 # Value semantics: dst = copy of base with one field updated.
@@ -1815,7 +2651,7 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                     agg_copy(_agg_ty(fk), use(opargs[1], lines), p, lines)
                 else:
                     lines.append(
-                        f"  store {_LLTY[fk]} {use(opargs[1], lines)}, ptr {p}")
+                        f"  store {_llscalar(fk)} {use(opargs[1], lines)}, ptr {p}")
             elif rk == "make_variant":
                 # Tagged union: store the integer tag, then the payload slots.
                 ename, vname = rhs[1], rhs[2]
@@ -1851,7 +2687,7 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                         lines.append(f"  store ptr {box}, ptr {p}")
                     else:
                         lines.append(
-                            f"  store {_LLTY[ck]} {use(fv, lines)}, ptr {p}")
+                            f"  store {_llscalar(ck)} {use(fv, lines)}, ptr {p}")
             elif rk == "variant_tag":
                 bk = kind(opargs[0])
                 if not _is_enum(bk):
@@ -1884,7 +2720,7 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                     agg_copy(_agg_ty(ck), box, struct_ref(dst), lines)
                 else:
                     v = fresh()
-                    lines.append(f"  {v} = load {_LLTY[ck]}, ptr {p}")
+                    lines.append(f"  {v} = load {_llscalar(ck)}, ptr {p}")
                     setval(dst, v, lines)
             elif rk == "make_closure":
                 # Fill this site's env struct with the captured values, then
@@ -1930,7 +2766,7 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                         agg_copy(_agg_ty(ck), use(vn, lines), p, lines)
                     else:
                         lines.append(
-                            f"  store {_LLTY[ck]} {use(vn, lines)}, ptr {p}")
+                            f"  store {_llscalar(ck)} {use(vn, lines)}, ptr {p}")
                 p0, p1 = fresh(), fresh()
                 lines.append(
                     f"  {p0} = getelementptr inbounds {_CLOSURE_PAIR_TY}, "
@@ -1958,16 +2794,22 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                         raise _Unsupported(
                             f"return value {t[1]!r} is {kind(t[1])}, "
                             f"function returns {sig.ret}")
-                    # Copy the aggregate into the caller's slot BEFORE any
-                    # frees (the returned value may live in a heap block).
+                    # Write back rebound struct params FIRST: if the caller
+                    # aliased its result slot with an argument (dst == arg),
+                    # the interpreter's order makes the RESULT win, so the
+                    # sret copy must come after the copy-outs.  Then copy the
+                    # aggregate into the caller's slot BEFORE any frees (the
+                    # returned value may live in a heap block).
+                    emit_writebacks(lines)
                     src = use(t[1], lines)
                     agg_copy(_agg_ty(sig.ret), src, "%agg.ret", lines)
                     emit_frees(lines)
                     lines.append("  ret void")
                 else:
                     rv = use(t[1], lines)
+                    emit_writebacks(lines)
                     emit_frees(lines)
-                    lines.append(f"  ret {_LLTY[sig.ret]} {rv}")
+                    lines.append(f"  ret {_llscalar(sig.ret)} {rv}")
             else:  # ("unreachable",) placeholder terminator (no frees: dead end)
                 lines.append("  unreachable")
         body.append(f"bb{bi}:")
@@ -1985,7 +2827,7 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
         pdecls.append("ptr %cl.env")
     for p, pk in zip(info.params, sig.params):
         pdecls.append(f"{_llparam(pk)} %a.{_sanitize(p)}")
-    rty = "void" if sret else _LLTY[sig.ret]
+    rty = "void" if sret else _llscalar(sig.ret)
     out = [f"define {rty} @{mangle(f.name)}({', '.join(pdecls)}) {{"]
     entry: List[str] = []
     for n in slots:
@@ -2032,11 +2874,11 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                 agg_copy(_agg_ty(ck), p, struct_ref(cn), entry)
             elif cn in slotset:
                 v = f"%capv.{_sanitize(cn)}"
-                entry.append(f"  {v} = load {_LLTY[ck]}, ptr {p}")
-                entry.append(f"  store {_LLTY[ck]} {v}, ptr {slot_ref(cn)}")
+                entry.append(f"  {v} = load {_llscalar(ck)}, ptr {p}")
+                entry.append(f"  store {_llscalar(ck)} {v}, ptr {slot_ref(cn)}")
             else:
                 entry.append(
-                    f"  %cap.{_sanitize(cn)} = load {_LLTY[ck]}, ptr {p}")
+                    f"  %cap.{_sanitize(cn)} = load {_llscalar(ck)}, ptr {p}")
     entry.append("  br label %bb0")
     out.append("entry:")
     out.extend(entry)
@@ -2079,6 +2921,10 @@ def _emit_runtime(mod: _ModuleState) -> List[str]:
         decls.append("declare void @free(ptr)")
     for name in sorted(mod.math_used):
         decls.append(f"declare double @{name}(double)")
+    # Native metaxu runtime symbols (metaxu_rt.c, linked by llvm_run).
+    for name in sorted(mod.runtime_syms):
+        rt, params = _RT_SIGS[name]
+        decls.append(f"declare {rt} @{name}({', '.join(params)})")
     if decls:
         chunks.append("\n".join(decls))
     if mod.print_helpers:
@@ -2139,7 +2985,7 @@ def _emit_closure_types(mod: _ModuleState) -> Optional[str]:
     for lname in sorted(mod.env_types):
         fields = mod.env_types[lname]
         ftys = ", ".join(
-            _agg_ty(k) if _is_agg(k) else _LLTY.get(k, "i64")
+            _agg_ty(k) if _is_agg(k) else _llscalar(k)
             for (_cn, k) in fields)
         desc = ", ".join(cn for (cn, _k) in fields)
         body = f"{{ {ftys} }}" if ftys else "{}"
@@ -2161,20 +3007,32 @@ def emit_llvm(funcs: Sequence[MirFunc]) -> str:
     module_names = {f.name for f in funcs}
     structs = _build_struct_table(funcs)
     closures = _build_closure_table(funcs)
+    traits = _build_trait_table(module_names)
     infos = [_analyze(f, module_names, closures) for f in funcs]
     variants = _build_variant_table(funcs, infos)
 
     def dep_names(info: _Info, kinds: Dict[str, str]) -> Set[str]:
         """Module functions this one references and cannot link without:
-        direct callees, make_closure targets, and resolved closure callees."""
+        direct callees, make_closure targets, resolved closure callees, and
+        statically-resolved trait-call targets.  Native runtime builtin
+        names never count, even when a module function shares the name (the
+        builtin wins, mirroring the interpreter's resolution order)."""
         deps = {callee for (_d, callee, _a) in info.calls
-                if callee in module_names}
+                if callee in module_names and callee not in _NATIVE_RT_CALLS}
         deps |= {lname for (_d, lname, _c) in info.closure_defs
                  if lname in module_names}
         for (_d, cvar, _a) in info.closure_calls:
             ck = kinds.get(cvar, I64)
             if _is_closure(ck) and _closure_lambda(ck) in module_names:
                 deps.add(_closure_lambda(ck))
+        for (_d, method, targs) in info.trait_calls:
+            if not targs:
+                continue
+            res, target = _resolve_trait_call(
+                method, kinds.get(targs[0], I64), traits, module_names,
+                assume_final=True)
+            if res == "func" and target in module_names:
+                deps.add(target)
         return deps
 
     # Duplicate MIR function names (e.g. lambda counters restarting per
@@ -2189,50 +3047,67 @@ def emit_llvm(funcs: Sequence[MirFunc]) -> str:
                 f"duplicate function name {info.f.name!r} in module (ambiguous symbol)")
 
     # Module-wide kind/signature fixpoint (params/ret and struct field cells
-    # promoted monotonically; callers and callees feed each other).
+    # promoted monotonically; callers and callees feed each other).  Two
+    # phases: the first never assumes anything about trait-call receivers
+    # still at the i64 bottom; once it converges, the second treats those
+    # receivers as genuinely int (nothing else can promote them anymore)
+    # and keeps iterating so the late resolutions' kinds propagate.
     sigs: Dict[str, _Sig] = {
         info.f.name: _Sig(params=[I64] * len(info.params)) for info in infos}
     kind_sets: Dict[str, Dict[str, str]] = {}
     candidates = [info for info in infos if not info.reasons]
-    for _round in range(12):
-        changed = False
-        for info in candidates:
-            kinds, cell_changed = _infer_kinds(info, sigs, structs, variants, closures)
-            changed = changed or cell_changed
-            if kind_sets.get(info.f.name) != kinds:
-                kind_sets[info.f.name] = kinds
-                changed = True
-            own = sigs[info.f.name]
-            for i, p in enumerate(info.params):
-                nk = _join(own.params[i], kinds.get(p, I64))
-                if nk != own.params[i]:
-                    own.params[i] = nk
+    for assume_final in (False, True):
+        for _round in range(12):
+            changed = False
+            for info in candidates:
+                kinds, cell_changed = _infer_kinds(
+                    info, sigs, structs, variants, closures, traits,
+                    module_names, assume_final=assume_final)
+                changed = changed or cell_changed
+                if kind_sets.get(info.f.name) != kinds:
+                    kind_sets[info.f.name] = kinds
                     changed = True
-            for r in info.ret_vars:
-                nk = _join(own.ret, kinds.get(r, I64))
-                if nk != own.ret:
-                    own.ret = nk
-                    changed = True
-            resolved_calls = list(info.calls)
-            for (dst, cvar, args) in info.closure_calls:
-                ck = kinds.get(cvar, I64)
-                if _is_closure(ck):
-                    resolved_calls.append((dst, _closure_lambda(ck), args))
-            for (dst, callee, args) in resolved_calls:
-                csig = sigs.get(callee)
-                if csig is None or len(csig.params) != len(args):
-                    continue
-                for i, a in enumerate(args):
-                    nk = _join(csig.params[i], kinds.get(a, I64))
-                    if nk != csig.params[i]:
-                        csig.params[i] = nk
+                own = sigs[info.f.name]
+                for i, p in enumerate(info.params):
+                    nk = _join(own.params[i], kinds.get(p, I64))
+                    if nk != own.params[i]:
+                        own.params[i] = nk
                         changed = True
-                nk = _join(csig.ret, kinds.get(dst, I64))
-                if nk != csig.ret:
-                    csig.ret = nk
-                    changed = True
-        if not changed:
-            break
+                for r in info.ret_vars:
+                    nk = _join(own.ret, kinds.get(r, I64))
+                    if nk != own.ret:
+                        own.ret = nk
+                        changed = True
+                resolved_calls = [
+                    (dst, callee, args) for (dst, callee, args) in info.calls
+                    if callee not in _NATIVE_RT_CALLS]
+                for (dst, cvar, args) in info.closure_calls:
+                    ck = kinds.get(cvar, I64)
+                    if _is_closure(ck):
+                        resolved_calls.append((dst, _closure_lambda(ck), args))
+                for (dst, method, targs) in info.trait_calls:
+                    if not targs:
+                        continue
+                    res, target = _resolve_trait_call(
+                        method, kinds.get(targs[0], I64), traits, module_names,
+                        assume_final=assume_final)
+                    if res == "func":
+                        resolved_calls.append((dst, target, targs))
+                for (dst, callee, args) in resolved_calls:
+                    csig = sigs.get(callee)
+                    if csig is None or len(csig.params) != len(args):
+                        continue
+                    for i, a in enumerate(args):
+                        nk = _join(csig.params[i], kinds.get(a, I64))
+                        if nk != csig.params[i]:
+                            csig.params[i] = nk
+                            changed = True
+                    nk = _join(csig.ret, kinds.get(dst, I64))
+                    if nk != csig.ret:
+                        csig.ret = nk
+                        changed = True
+            if not changed:
+                break
 
     # A lambda whose closure is RETURNED by any function needs a heap env:
     # the pair crosses the creating frame's boundary, so a stack env would
@@ -2248,7 +3123,7 @@ def emit_llvm(funcs: Sequence[MirFunc]) -> str:
     for info in candidates:
         kinds = kind_sets.get(info.f.name, {})
         for p in _check_consistency(info, kinds, sigs, structs, variants,
-                                    closures, module_names):
+                                    closures, traits, module_names):
             info.add_reason(p)
 
     # A function referencing a placeholder cannot link: cascade demotion
@@ -2283,7 +3158,8 @@ def emit_llvm(funcs: Sequence[MirFunc]) -> str:
             kinds = kind_sets.get(name, {})
             try:
                 chunk = _emit_function(info, kinds, sigs, structs, variants,
-                                       closures, mod, emitted)
+                                       closures, traits, module_names, mod,
+                                       emitted)
             except _Unsupported as exc:
                 info.add_reason(exc.reason)
             except Exception as exc:  # never crash the pipeline
