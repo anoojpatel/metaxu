@@ -666,6 +666,10 @@ class MirInterpreter:
         self._builtins["int_to_str"] = lambda x: str(x)
         self._builtins["neg"] = lambda x: -x
         self._builtins["not"] = lambda x: not x
+        # Builtin methods (receiver passed as first argument by HIR)
+        self._builtins["to_string"] = lambda x: "()" if x is UNIT else str(x)
+        self._builtins["len"] = lambda x: len(x)
+        self._builtins["assert"] = _builtin_assert
 
 
 # ---------------------------------------------------------------------------
@@ -711,4 +715,10 @@ def _eval_binop(op: str, lv: Any, rv: Any) -> Any:
 def _builtin_assert_eq(a: Any, b: Any) -> Any:
     if a != b:
         raise AssertionError(f"assert_eq failed: {a!r} != {b!r}")
+    return UNIT
+
+
+def _builtin_assert(cond: Any, *msg: Any) -> Any:
+    if not cond:
+        raise AssertionError(f"assert failed{': ' + ' '.join(str(m) for m in msg) if msg else ''}")
     return UNIT

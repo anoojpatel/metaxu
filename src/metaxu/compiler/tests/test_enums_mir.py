@@ -184,10 +184,25 @@ def test_non_variant_call_stays_a_call():
     """A FunctionCall whose name is not a declared variant remains a Call."""
     import metaxu.metaxu_ast as fast
 
-    hir = _build_hir_from_ast([fast.FunctionCall("Some", [fast.Literal(5)])], [])
-    # No EnumDefinition in scope: "Some" is an unknown callee, not a variant.
+    hir = _build_hir_from_ast([fast.FunctionCall("Foo", [fast.Literal(5)])], [])
+    # No EnumDefinition in scope: "Foo" is an unknown callee, not a variant.
     mir = lower_hir_to_mir(hir)
     interp = MirInterpreter()
     interp.load(mir)
     with pytest.raises(InterpError, match="Unknown callee"):
         interp.call("main", [])
+
+
+def test_some_without_enum_is_builtin_option():
+    """Some(5) with no Option enum declared builds the builtin Option variant
+    (the docs treat Option as language-provided; linked_list.mx relies on it)."""
+    import metaxu.metaxu_ast as fast
+
+    hir = _build_hir_from_ast([fast.FunctionCall("Some", [fast.Literal(5)])], [])
+    mir = lower_hir_to_mir(hir)
+    interp = MirInterpreter()
+    interp.load(mir)
+    result = interp.call("main", [])
+    assert isinstance(result, MxVariant)
+    assert result.enum_name == "Option" and result.tag == "Some"
+    assert result.fields == (5,)

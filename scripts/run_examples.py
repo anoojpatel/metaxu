@@ -42,6 +42,27 @@ def run_one(path: str, stage: str) -> tuple[bool, str]:
 
             Parser().parse(source, file_path=path)
             return True, "parsed"
+        if stage == "run":
+            from metaxu.compiler.pipeline import (
+                build_context_from_source,
+                run_pipeline_from_source,
+            )
+            from metaxu.compiler.hir import HIRBuilder
+            from metaxu.compiler.lower_hir_to_mir import lower_hir_to_mir
+            from metaxu.compiler.mir_interp import MirInterpreter, UNIT
+
+            run_pipeline_from_source(source)  # strict checks (raises on negative fixtures)
+            ctx = build_context_from_source(source)
+            hir_funcs = HIRBuilder(ctx.tables, id_map=ctx.id_map).build(ctx.frozen_root)
+            interp = MirInterpreter()
+            interp.load(lower_hir_to_mir(hir_funcs))
+            interp.register_builtin("print", lambda *a: UNIT)
+            if "main" not in interp._funcs:
+                return True, "no main (compile-only)"
+            result = interp.call("main", [])
+            if expected_error:
+                return False, f"expected a '{expected_error}' diagnostic but main() ran"
+            return True, f"main() = {result!r}"[:60]
         from metaxu.compiler.pipeline import run_pipeline_from_source
 
         _ast, hir, mir, clif = run_pipeline_from_source(source)
@@ -57,7 +78,7 @@ def run_one(path: str, stage: str) -> tuple[bool, str]:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--stage", choices=["parse", "pipeline"], default="pipeline")
+    ap.add_argument("--stage", choices=["parse", "pipeline", "run"], default="pipeline")
     ap.add_argument("paths", nargs="*")
     args = ap.parse_args()
 

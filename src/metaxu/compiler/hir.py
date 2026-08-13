@@ -9,6 +9,10 @@ from .constraints import ClassConstraint
 from . import mutaxu_ast as mast
 import metaxu.metaxu_ast as fast
 
+# Methods that are dispatched as interpreter builtins with the receiver as
+# first argument (`x.to_string()` -> to_string(x)).
+_BUILTIN_METHODS = frozenset({"to_string", "len"})
+
 
 @dataclass(slots=True)
 class ModeInfo:
@@ -272,6 +276,24 @@ class HIRBuilder:
                 current = self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span, op="FieldGet", base=current, field_name=str(field))
             return current
 
+        # Borrow/move/exclave expressions: at runtime these evaluate to the
+        # referenced value (aliasing and ownership rules are enforced earlier
+        # by the frozen borrow checker, not at HIR/MIR level).
+        if isinstance(orig, (fast.BorrowShared, fast.BorrowUnique, fast.Move)):
+            var = getattr(orig, 'variable', None)
+            if isinstance(var, str):
+                ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, 'Unknown'))
+                return self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span,
+                                      op="Var", var_name=var)
+            return self._from_orig_expr(var, ctx_for(var)) if var is not None else None
+        if isinstance(orig, fast.ExclaveExpression):
+            inner = getattr(orig, 'expression', None)
+            if isinstance(inner, str):
+                ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, 'Unknown'))
+                return self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span,
+                                      op="Var", var_name=inner)
+            return self._from_orig_expr(inner, ctx_for(inner)) if inner is not None else None
+
         # Option constructors in expression position: Some(x) / None.
         # (In pattern position these are handled by _convert_pattern.)
         if isinstance(orig, fast.SomeExpression):
@@ -334,6 +356,12 @@ class HIRBuilder:
             if callee in self._variant_to_enum:
                 return self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span,
                                       op="MakeVariant", enum_name=self._variant_to_enum[callee],
+                                      variant_name=callee, operands=tuple(args_exprs))
+            # Builtin Option constructors when no enum declares them: the docs
+            # treat Option as a language-provided type.
+            if callee in ("Some", "None"):
+                return self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span,
+                                      op="MakeVariant", enum_name="Option",
                                       variant_name=callee, operands=tuple(args_exprs))
             return self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span, op="Call", callee=callee, operands=tuple(args_exprs))
 
@@ -507,10 +535,41 @@ class HIRBuilder:
                 return self._mk_hexpr(frozen_ctx.node_id, 'Expr', ty, frozen_ctx.span,
                                       op='MakeVariant', enum_name=str(parts[0]),
                                       variant_name=str(parts[1]), operands=tuple(arg_exprs))
+            # Builtin method call on a value: `x.to_string()` — lower to a
+            # call with the receiver (Var or chained FieldGet) as first arg.
+            if len(parts) >= 2 and str(parts[-1]) in _BUILTIN_METHODS:
+                recv: HExpr = self._mk_hexpr(frozen_ctx.node_id, 'Expr', ty,
+                                             frozen_ctx.span, op='Var',
+                                             var_name=str(parts[0]))
+                for fname in parts[1:-1]:
+                    recv = self._mk_hexpr(frozen_ctx.node_id, 'Expr', ty,
+                                          frozen_ctx.span, op='FieldGet',
+                                          base=recv, field_name=str(fname))
+                return self._mk_hexpr(frozen_ctx.node_id, 'Expr', ty, frozen_ctx.span,
+                                      op='Call', callee=str(parts[-1]),
+                                      operands=(recv, *arg_exprs))
             # Treat as a plain call with dotted callee name
             callee = '.'.join(str(p) for p in parts)
             return self._mk_hexpr(frozen_ctx.node_id, 'Expr', ty, frozen_ctx.span,
                                   op='Call', callee=callee, operands=tuple(arg_exprs))
+
+        # MethodCall on a computed receiver: `expr.method(args)`
+        if isinstance(orig, fast.MethodCall):
+            recv_node = getattr(orig, 'receiver', None)
+            method = str(getattr(orig, 'method', '') or '')
+            recv_he = self._from_orig_expr(recv_node, ctx_for(recv_node)) if recv_node is not None else None
+            arg_exprs = []
+            for a in getattr(orig, 'arguments', []) or []:
+                he = self._from_orig_expr(a, ctx_for(a))
+                if he is not None:
+                    arg_exprs.append(he)
+            ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, 'Unknown'))
+            if recv_he is not None:
+                return self._mk_hexpr(frozen_ctx.node_id, 'Expr', ty, frozen_ctx.span,
+                                      op='Call', callee=method,
+                                      operands=(recv_he, *arg_exprs))
+            return self._mk_hexpr(frozen_ctx.node_id, 'Expr', ty, frozen_ctx.span,
+                                  op='Call', callee=method, operands=tuple(arg_exprs))
 
         # PerformEffect: perform effect_name(args)
         if isinstance(orig, fast.PerformEffect):
@@ -556,7 +615,13 @@ class HIRBuilder:
         # FieldAccess
         if isinstance(orig, fast.FieldAccess):
             base_node = getattr(orig, 'base', None) or getattr(orig, 'expression', None)
-            base_he = self._from_orig_expr(base_node, frozen_ctx)
+            if isinstance(base_node, str):
+                # The parser stores the base of `c.name` as a raw name string.
+                base_ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, "Unknown"))
+                base_he = self._mk_hexpr(frozen_ctx.node_id, "Expr", base_ty,
+                                         frozen_ctx.span, op="Var", var_name=base_node)
+            else:
+                base_he = self._from_orig_expr(base_node, frozen_ctx)
             field_names = getattr(orig, 'fields', ()) or ()
             # Chain: for a.b.c, build nested FieldGet(FieldGet(a, b), c)
             current = base_he
