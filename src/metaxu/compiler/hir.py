@@ -127,6 +127,9 @@ class HExpr:
     lambda_params: tuple[str, ...] | None = None           # parameter names
     lambda_body: 'HExpr | None' = None                     # body expression
     captures: tuple[tuple[str, str], ...] | None = None    # ((name, mode), ...) captured vars
+    # Call: explicit instantiation type args (`identity<Int>(x)`), as type
+    # display strings; None when the call spelled no type args.
+    type_args: tuple[str, ...] | None = None
     # Perform: op="Perform"
     effect_op: str | None = None        # effect operation name, e.g. 'emit'
     perform_args: tuple['HExpr', ...] | None = None  # arguments to the operation
@@ -546,7 +549,13 @@ class HIRBuilder:
                 return self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span,
                                       op="MakeVariant", enum_name="Result",
                                       variant_name=callee, operands=tuple(args_exprs))
-            return self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span, op="Call", callee=callee, operands=tuple(args_exprs))
+            # Preserve explicit instantiation type args (`identity<Int>(x)`)
+            # for the (optional) monomorphization pass.
+            raw_targs = getattr(orig, 'type_args', None) or ()
+            targs = tuple(t for t in (mast._type_display(a) for a in raw_targs)
+                          if isinstance(t, str))
+            return self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span, op="Call", callee=callee, operands=tuple(args_exprs),
+                                  type_args=targs or None)
 
         # BinaryOperation / ComparisonExpression (same structure, both use left/operator/right)
         if isinstance(orig, (fast.BinaryOperation, fast.ComparisonExpression)):
