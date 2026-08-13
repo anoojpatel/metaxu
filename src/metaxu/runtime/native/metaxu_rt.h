@@ -114,6 +114,8 @@
  * | mx_fvec_binop    | mx_fvec* (op, base, depth, mode, lhs, rhs)       |
  * | mx_fvec_promote  | mx_fvec* (const mx_fvec*)  flat -> Mx1 matrix    |
  * | mx_fvec_map      | mx_fvec* (v, fn, env, expected_n)  comprehension |
+ * | mx_fvec_set_copy | mx_fvec* (v, idx, word)  functional update copy  |
+ * | mx_fvec_zip_map  | mx_fvec* (a, b, fn2, env, expected_n)  zip compr.|
  * | mx_fvec_to_str   | char* (v, base, depth)  Python repr, fresh malloc|
  * | mx_fvec_as_bytes | unsigned char* (const mx_fvec*)  byte snapshot   |
  *
@@ -143,6 +145,17 @@
  *     (the compiled comprehension-body closure) and aborts when
  *     expected_n >= 0 differs from the length (the interpreter's
  *     "vector comprehension produced N elements ..." check).
+ *   - mx_fvec_set_copy is the FUNCTIONAL update behind `v[i] = x` on an
+ *     immutable vector[T,N] place: blocks are shallow-shared and
+ *     write-once, so the update COPIES the block, stores the element
+ *     word, and returns the fresh block for the compiler to rebind —
+ *     other shares never observe the write.  Aborts on out-of-bounds
+ *     with the interpreter's "index assignment out of bounds" message.
+ *   - mx_fvec_zip_map is the lockstep pair form of mx_fvec_map
+ *     (`f(a, b) for (a, b) in (xs, ys)`): aborts when the two lengths
+ *     differ (the interpreter's "zip: sequences have different lengths")
+ *     or when expected_n >= 0 differs from the common length, then
+ *     applies fn2(env, wa, wb) elementwise.
  *   - mx_fvec_to_str reproduces repr(MxVector): "vector[e0, e1, ...]"
  *     with elements rendered like mx_i64_to_str / mx_f64_to_str
  *     (base 0 / 1), recursing while depth > 0.
@@ -163,6 +176,9 @@ typedef struct mx_fvec mx_fvec;
 
 /* Comprehension body: compiled closure thunk (env, element word) -> word. */
 typedef int64_t (*mx_fvec_map_fn)(void *env, int64_t word);
+
+/* Zip-comprehension body: (env, word from a, word from b) -> word. */
+typedef int64_t (*mx_fvec_zip_fn)(void *env, int64_t wa, int64_t wb);
 
 /* --- Vec ---------------------------------------------------------------- */
 mx_vec *mx_vec_new(void);
@@ -189,6 +205,9 @@ mx_fvec *mx_fvec_binop(int64_t op, int64_t base, int64_t depth, int64_t mode,
 mx_fvec *mx_fvec_promote(const mx_fvec *v);
 mx_fvec *mx_fvec_map(const mx_fvec *v, mx_fvec_map_fn fn, void *env,
                      int64_t expected_n);
+mx_fvec *mx_fvec_set_copy(const mx_fvec *v, int64_t idx, int64_t word);
+mx_fvec *mx_fvec_zip_map(const mx_fvec *a, const mx_fvec *b,
+                         mx_fvec_zip_fn fn, void *env, int64_t expected_n);
 char    *mx_fvec_to_str(const mx_fvec *v, int64_t base, int64_t depth);
 unsigned char *mx_fvec_as_bytes(const mx_fvec *v);
 
