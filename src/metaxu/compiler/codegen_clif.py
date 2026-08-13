@@ -9,12 +9,41 @@ ops fall entirely in the DIRECT subset:
   declared externals), drop (no-op comment), match_fail (trap), and the
   br / br_if / ret terminators.
 
-Functions outside that subset — effects (perform/resume/handle_scope),
-closures (make_closure / indirect calls), structs, variants, vectors and
-string ops (including calls into the vec/string/trait runtime builtins),
-or suspending functions awaiting CPS lowering — are emitted as a clearly
-marked, comment-only placeholder carrying the reasons plus an extern-style
-declaration, never as silently wrong code.
+SUSPENDING functions (the ``MirFunc.suspending`` flag, or any function
+containing perform/resume/handle_scope ops) are lowered selectively to CPS
+at the CLIF level when their other ops stay inside the direct subset above
+restricted to i64 (no floats) and their calls avoid runtime builtins and
+other suspending functions.  For each such function we emit, using the
+frame layouts from ``cps_frames.compute_frame_layouts``:
+
+  * a ``; frame %f: size=NN, [0]=state:i64, [8]=result:i64, ...`` comment
+    table describing the defunctionalized frame;
+  * ``%run_<f>(i64) -> i64`` taking the frame pointer: its entry loads the
+    state discriminant and ``br_table``s to one block per resume point
+    (state 0 = function entry, reading params from the frame; state k =
+    after the k-th perform, restoring that point's live variables and the
+    frame's result slot).  Each perform is a PARK site: the segment stores
+    the live variables and the next state into the frame, calls the runtime
+    (``enqueue(frame)``, or ``sched_read(fd, buf, len, k, frame)`` with the
+    resume shim's address for ops named ``read``), and returns 0 (parked).
+    Final segments return the function's value.
+  * one ``%resume_<f>_<k>(i64, i64) -> i64`` shim per resume point that
+    stores the resumed value into the frame's result slot and tail-calls
+    (``return_call``) ``%run_<f>``.
+
+Honest scope note: general effect dispatch — locating the matching handler,
+single-shot continuation bookkeeping, handler aborts — stays in the MIR
+interpreter.  The CLIF-level CPS here is the roadmap's mechanical park/wake
+shape (state machine + frame traffic + scheduler calls), not full handler
+dispatch; the performed effect/op names appear only as comments at the park
+sites.
+
+Everything else — resume/handle_scope ops themselves, closures
+(make_closure / indirect calls), structs, variants, vectors and string ops
+(including calls into the vec/string/trait runtime builtins), f64 values
+inside suspending functions — is emitted as a clearly marked, comment-only
+placeholder carrying the reasons plus an extern-style declaration, never as
+silently wrong code.
 
 Type model (documented convention):
   * ints, bools and unit are all ``i64``; unit is the constant 0.
@@ -52,6 +81,8 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from .mir import MirFunc
+from .cps_frames import (RESULT_OFFSET, STATE_OFFSET, compute_frame_layouts,
+                         is_suspending, var_offset)
 
 I64 = "i64"
 F64 = "f64"
@@ -80,10 +111,14 @@ _RUNTIME_PREFIXES = ("__vec_", "__index_", "__slice_", "__range", "__trait$", "_
 _RUNTIME_NAMES = {"to_string", "int_to_str", "type_of", "len", "push", "pop", "Vec.new"}
 
 _HEADER = (
-    "; CLIF emitted by metaxu codegen_clif (direct subset)\n"
+    "; CLIF emitted by metaxu codegen_clif (direct subset + selective CPS)\n"
     "; conventions: ints/bools/unit -> i64 (unit = 0); floats -> f64;\n"
     ";   icmp/fcmp results are uextend-ed to i64; brif takes the i64 condition.\n"
-    "; functions outside the direct subset appear as comment-only placeholders."
+    "; suspending functions in the i64 direct subset are CPS-lowered:\n"
+    ";   %run_<f>(frame) br_tables on frame.state, parks at performs via\n"
+    ";   enqueue/sched_read, and %resume_<f>_<k> shims deliver resumed values;\n"
+    ";   effect dispatch itself stays in the interpreter (mechanical shape only).\n"
+    "; functions outside these subsets appear as comment-only placeholders."
 )
 
 
@@ -129,6 +164,7 @@ class _Info:
     ret_vars: List[str] = field(default_factory=list)
     calls: List[Tuple[int, str, str, Tuple[str, ...]]] = field(default_factory=list)
     slots: List[str] = field(default_factory=list)
+    suspending: bool = False
 
     def add_reason(self, r: str) -> None:
         if r not in self.reasons:
@@ -151,8 +187,7 @@ def _analyze_inner(info: _Info, module_names: Set[str]) -> None:
         return
     if f.blocks[0].ops and f.blocks[0].ops[0][0] == "params":
         info.params = tuple(f.blocks[0].ops[0][1])
-    if f.suspending:
-        info.add_reason("suspending function (CPS lowering pending)")
+    info.suspending = is_suspending(f)
 
     for p in info.params:
         info.def_count[p] = 1
@@ -174,7 +209,20 @@ def _analyze_inner(info: _Info, module_names: Set[str]) -> None:
                     info.add_reason("params op outside entry block")
                 continue
             if kind == "perform":
-                info.add_reason("uses effects (perform)")
+                # ("perform", dst, effect, op, args, resume_bb, dst) — a CPS
+                # suspension point, not a reason by itself: the driver routes
+                # suspending functions to CPS emission (or a placeholder if
+                # the rest of the function is outside the CPS subset).
+                if len(op) == 7:
+                    for a in op[4]:
+                        add_use(a, bi)
+                    add_def(op[1], bi)
+                    if not (isinstance(op[5], int) and 0 <= op[5] < n_blocks):
+                        info.add_reason(f"perform resume block bb{op[5]} out of range")
+                    if op is not b.ops[-1]:
+                        info.add_reason("perform is not the last op of its block")
+                else:
+                    info.add_reason(f"malformed perform op (arity {len(op)})")
                 continue
             if kind == "drop":
                 continue  # no-op for i64/f64 values; emitted as a comment
@@ -584,16 +632,340 @@ def _emit_direct(info: _Info, f64s: Set[str],
 
 
 # ---------------------------------------------------------------------------
+# Selective CPS emission for suspending functions
+# ---------------------------------------------------------------------------
+
+# Runtime ABI (src/metaxu/runtime/src/lib.rs):
+#   pub extern "C" fn enqueue(frame: *mut u8)
+#   pub extern "C" fn sched_read(fd: i64, buf: *mut u8, len: usize,
+#                                k: extern "C" fn(*mut u8, usize), frame: *mut u8)
+# Pointers, usize and function pointers are all i64 words in CLIF.
+_ENQUEUE_SIG: Tuple[Tuple[str, ...], Optional[str]] = ((I64,), None)
+_SCHED_READ_SIG: Tuple[Tuple[str, ...], Optional[str]] = ((I64, I64, I64, I64, I64), None)
+
+
+def _cps_blockers(info: _Info, suspending_names: Set[str],
+                  sigs: Dict[str, Tuple[Tuple[str, ...], str]]) -> List[str]:
+    """Reasons a reason-free suspending function still cannot get a CPS body."""
+    reasons: List[str] = []
+    f64s = _infer_f64(info, sigs)
+    if f64s:
+        sample = ", ".join(sorted(f64s)[:3])
+        reasons.append(f"CPS subset is i64-only (f64 values: {sample})")
+    for (_bi, _dst, callee, _args) in info.calls:
+        if callee in suspending_names:
+            reasons.append(
+                f"calls suspending function {callee!r} "
+                "(frame chaining across suspending calls not implemented)")
+    if not f64s:
+        for p in _check_consistency(info, set(), sigs):
+            reasons.append(f"type conflict: {p}")
+    return reasons
+
+
+def _frame_comment(layout: Dict[str, Any]) -> str:
+    sym = _sanitize(layout["name"])
+    entries = [(STATE_OFFSET, "state"), (RESULT_OFFSET, "result")]
+    entries += [(off, name) for name, off in layout["params"].items()]
+    entries += [(off, name) for name, off in layout["vars"].items()]
+    entries.sort()
+    cells = ", ".join(f"[{off}]={name}:i64" for off, name in entries)
+    return f"; frame %{sym}: size={layout['size']}, {cells}"
+
+
+def _emit_cps(info: _Info, layout: Dict[str, Any],
+              sigs: Dict[str, Tuple[Tuple[str, ...], str]]) -> str:
+    """Emit %run_<f> + %resume_<f>_<k> shims for one suspending function.
+
+    All values are i64.  Every MIR variable lives in an explicit stack slot
+    (the function has multiple entry points, so SSA dominance cannot be
+    assumed); params and live-across variables additionally have frame slots
+    (see cps_frames) that are written at park sites and read back by the
+    entry/resume prologues.
+    """
+    f = info.f
+    sym = _sanitize(f.name)
+    run_sym = f"run_{sym}"
+    points = layout["suspend_points"]
+    point_at = {(p["block"], p["op_index"]): p for p in points}
+    n = len(f.blocks)
+    m = len(points)
+
+    # Block numbering inside %run_<f>:
+    #   0                = dispatch (br_table on frame.state)
+    #   1                = state-0 prologue (load params from the frame)
+    #   2 + bi           = original MIR block bi
+    #   2 + n + (k - 1)  = state-k prologue (restore live vars + result)
+    #   2 + n + m        = invalid-state trap
+    def mapped(bi: int) -> int:
+        return 2 + bi
+
+    def resume_block(k: int) -> int:
+        return 2 + n + (k - 1)
+
+    trap_block = 2 + n + m
+
+    counter = 0
+
+    def fresh() -> str:
+        nonlocal counter
+        v = f"v{counter}"
+        counter += 1
+        return v
+
+    # Every variable gets a stack slot (uniform storage, always valid).
+    all_vars = sorted(info.def_count)
+    slotmap = {name: f"ss{i}" for i, name in enumerate(all_vars)}
+
+    # Function declarations. enqueue/sched_read are always declared (the
+    # scheduler ABI); resume shims and direct callees on demand.
+    fn_map: Dict[Tuple[str, Tuple[Tuple[str, ...], Optional[str]]], str] = {}
+
+    def declare(callee: str, sig: Tuple[Tuple[str, ...], Optional[str]]) -> str:
+        key = (_sanitize(callee), sig)
+        if key not in fn_map:
+            fn_map[key] = f"fn{len(fn_map)}"
+        return fn_map[key]
+
+    enqueue_fn = declare("enqueue", _ENQUEUE_SIG)
+    sched_read_fn = declare("sched_read", _SCHED_READ_SIG)
+
+    frame = "v0"  # block0 parameter: the frame pointer
+
+    def frame_ref(off: int) -> str:
+        return frame if off == 0 else f"{frame}+{off}"
+
+    def use(name: str, lines: List[str]) -> str:
+        if name not in slotmap:
+            raise _Unsupported(f"use of {name!r} with no storage")
+        v = fresh()
+        lines.append(f"    {v} = stack_load.i64 {slotmap[name]}")
+        return v
+
+    def setval(name: str, v: str, lines: List[str]) -> None:
+        lines.append(f"    stack_store {v}, {slotmap[name]}")
+
+    body: List[str] = []
+
+    def add_block(bid: int, lines: List[str], comment: str = "") -> None:
+        body.append(f"block{bid}:" + (f"  ; {comment}" if comment else ""))
+        body.extend(lines)
+
+    # -- dispatch -----------------------------------------------------------
+    fv = fresh()  # v0: the frame-pointer block argument
+    assert fv == frame
+    lines: List[str] = []
+    state = fresh()
+    lines.append(f"    {state} = load.i64 {frame_ref(STATE_OFFSET)}  ; state")
+    idx = fresh()
+    lines.append(f"    {idx} = ireduce.i32 {state}")
+    table = ", ".join(["block1"] + [f"block{resume_block(k)}" for k in range(1, m + 1)])
+    lines.append(f"    br_table {idx}, block{trap_block}, [{table}]")
+    body.append(f"block0({frame}: i64):  ; dispatch on frame.state")
+    body.extend(lines)
+
+    # -- state-0 prologue: params from frame -------------------------------
+    lines = []
+    for p, off in layout["params"].items():
+        v = fresh()
+        lines.append(f"    {v} = load.i64 {frame_ref(off)}  ; param {p}")
+        setval(p, v, lines)
+    lines.append(f"    jump block{mapped(0)}")
+    add_block(1, lines, "state 0: function entry")
+
+    # -- original blocks ----------------------------------------------------
+    for bi, b in enumerate(f.blocks):
+        lines = []
+        parked = False
+        for oi, op in enumerate(b.ops):
+            kind = op[0]
+            if kind == "params":
+                continue
+            if kind == "drop":
+                lines.append(f"    ; drop {op[1]}")
+                continue
+            if kind == "match_fail":
+                lines.append(f"    trap user0  ; match_fail: {op[1]}")
+                parked = True  # block is terminated
+                break
+            if kind == "perform":
+                point = point_at.get((bi, oi))
+                if point is None:
+                    raise _Unsupported("perform op missing from frame layout")
+                k = point["state"]
+                eff_desc = f"{point['effect']}.{point['op']}({', '.join(point['args'])})"
+                lines.append(f"    ; park: perform {eff_desc} -> suspend point {k}")
+                for lv in point["live"]:
+                    v = use(lv, lines)
+                    lines.append(f"    store {v}, {frame_ref(var_offset(layout, lv))}  ; save {lv}")
+                sv = fresh()
+                lines.append(f"    {sv} = iconst.i64 {k}")
+                lines.append(f"    store {sv}, {frame_ref(STATE_OFFSET)}  ; state = {k}")
+                if point["op"] == "read":
+                    # sched_read(fd, buf, len, k, frame): wire the perform's
+                    # args positionally (missing ones are 0) and pass the
+                    # resume shim as the continuation k.
+                    shim_fn = declare(f"resume_{sym}_{k}", ((I64, I64), I64))
+                    kv = fresh()
+                    lines.append(f"    {kv} = func_addr.i64 {shim_fn}")
+                    argv: List[str] = []
+                    for ai in range(3):
+                        if ai < len(point["args"]):
+                            argv.append(use(point["args"][ai], lines))
+                        else:
+                            z = fresh()
+                            lines.append(f"    {z} = iconst.i64 0")
+                            argv.append(z)
+                    lines.append(
+                        f"    call {sched_read_fn}({argv[0]}, {argv[1]}, {argv[2]}, {kv}, {frame})")
+                else:
+                    lines.append(f"    call {enqueue_fn}({frame})")
+                z = fresh()
+                lines.append(f"    {z} = iconst.i64 0")
+                lines.append(f"    return {z}  ; parked")
+                parked = True
+                break
+            # kind == "let" (analysis guarantees this)
+            _, dst, rhs, opargs = op
+            rk = rhs[0]
+            if rk in ("const", "const_ty"):
+                value = rhs[1] if rk == "const" else None
+                if value is None:
+                    iv = 0
+                elif isinstance(value, bool):
+                    iv = int(value)
+                else:
+                    iv = int(value)
+                v = fresh()
+                lines.append(f"    {v} = iconst.i64 {iv}")
+                setval(dst, v, lines)
+            elif rk == "copy":
+                v = use(opargs[0], lines)
+                setval(dst, v, lines)
+            elif rk == "binop":
+                o = rhs[1]
+                l = use(opargs[0], lines)
+                r = use(opargs[1], lines)
+                if o in _CMP_INT:
+                    c = fresh()
+                    lines.append(f"    {c} = icmp {_CMP_INT[o]} {l}, {r}")
+                    v = fresh()
+                    lines.append(f"    {v} = uextend.i64 {c}")
+                    setval(dst, v, lines)
+                elif o in _LOGIC:
+                    v = fresh()
+                    lines.append(f"    {v} = {_LOGIC[o]} {l}, {r}")
+                    setval(dst, v, lines)
+                else:
+                    mnem = _ARITH_INT.get(o)
+                    if mnem is None:
+                        raise _Unsupported(f"binop {o!r} in CPS function")
+                    v = fresh()
+                    lines.append(f"    {v} = {mnem} {l}, {r}")
+                    setval(dst, v, lines)
+            elif rk == "select":
+                c = use(opargs[0], lines)
+                t = use(opargs[1], lines)
+                e = use(opargs[2], lines)
+                v = fresh()
+                lines.append(f"    {v} = select {c}, {t}, {e}")
+                setval(dst, v, lines)
+            elif rk == "call":
+                callee = rhs[1]
+                csig = _callee_sig(callee, sigs)
+                sig: Tuple[Tuple[str, ...], Optional[str]]
+                if csig is None:
+                    sig = (tuple(I64 for _ in opargs), I64)
+                else:
+                    sig = csig
+                fnref = declare(callee, sig)
+                avals = [use(a, lines) for a in opargs]
+                v = fresh()
+                lines.append(f"    {v} = call {fnref}({', '.join(avals)})")
+                setval(dst, v, lines)
+            else:
+                raise _Unsupported(f"op {rk!r} in CPS function")
+
+        if not parked:
+            t = b.term
+            if t[0] == "br":
+                lines.append(f"    jump block{mapped(t[1])}")
+            elif t[0] == "br_if":
+                c = use(t[1], lines)
+                lines.append(f"    brif {c}, block{mapped(t[2])}, block{mapped(t[3])}")
+            elif t[0] == "ret":
+                rv = use(t[1], lines)
+                lines.append(f"    return {rv}")
+            else:
+                lines.append("    trap unreachable")
+        add_block(mapped(bi), lines, f"mir bb{bi}")
+
+    # -- resume prologues ---------------------------------------------------
+    for point in points:
+        k = point["state"]
+        lines = []
+        for lv in point["live"]:
+            v = fresh()
+            lines.append(f"    {v} = load.i64 {frame_ref(var_offset(layout, lv))}  ; restore {lv}")
+            setval(lv, v, lines)
+        v = fresh()
+        lines.append(f"    {v} = load.i64 {frame_ref(RESULT_OFFSET)}  ; resumed value")
+        setval(point["dst"], v, lines)
+        lines.append(f"    jump block{mapped(point['resume_block'])}")
+        add_block(resume_block(k),
+                  lines, f"state {k}: resume after {point['effect']}.{point['op']}")
+
+    # -- invalid-state trap -------------------------------------------------
+    add_block(trap_block, ["    trap user1  ; invalid frame state"])
+
+    # -- assemble %run_<f> --------------------------------------------------
+    out: List[str] = [_frame_comment(layout), f"function %{run_sym}(i64) -> i64 {{"]
+    for name in all_vars:
+        out.append(f"    {slotmap[name]} = explicit_slot 8  ; {name}")
+    for ((csym, csig), fnref) in fn_map.items():
+        kk = fnref[2:]
+        cptys, crty = csig
+        arrow = f" -> {crty}" if crty is not None else ""
+        out.append(f"    sig{kk} = ({', '.join(cptys)}){arrow}")
+        out.append(f"    {fnref} = %{csym} sig{kk}")
+    out.append("")
+    out.extend(body)
+    out.append("}")
+    chunks = ["\n".join(out)]
+
+    # -- %resume_<f>_<k> shims ---------------------------------------------
+    for point in points:
+        k = point["state"]
+        shim = [
+            f"function %resume_{sym}_{k}(i64, i64) -> i64 {{",
+            "    sig0 = (i64) -> i64",
+            f"    fn0 = %{run_sym} sig0",
+            "",
+            "block0(v0: i64, v1: i64):  ; (frame, resumed value)",
+            f"    store v1, v0+{RESULT_OFFSET}  ; frame.result = value",
+            f"    ; frame.state is already {k} (stored at the park site)",
+            "    return_call fn0(v0)",
+            "}",
+        ]
+        chunks.append("\n".join(shim))
+    return "\n\n".join(chunks)
+
+
+# ---------------------------------------------------------------------------
 # Module driver
 # ---------------------------------------------------------------------------
 
 def emit_clif(funcs: Sequence[MirFunc]) -> str:
     """Emit CLIF text for a MIR module.
 
-    Direct functions get full bodies; everything else gets a comment-only
-    placeholder with its reasons and an extern-style declaration.
+    Direct functions get full bodies; suspending functions in the CPS
+    subset get %run_/%resume_ state machines (see module docstring);
+    everything else gets a comment-only placeholder with its reasons and
+    an extern-style declaration.
     """
     module_names = {f.name for f in funcs}
+    layouts = compute_frame_layouts(funcs)
+    suspending_names = set(layouts)
     infos = [_analyze(f, module_names) for f in funcs]
 
     # Module-wide signature fixpoint: functions may call later functions whose
@@ -605,8 +977,8 @@ def emit_clif(funcs: Sequence[MirFunc]) -> str:
     for _round in range(6):
         changed = False
         for info in infos:
-            if info.reasons:
-                continue
+            if info.reasons or info.suspending:
+                continue  # suspending functions keep their i64 default sig
             f64s = _infer_f64(info, sigs)
             f64_sets[info.f.name] = f64s
             sig = _sig_of(info, f64s)
@@ -618,6 +990,23 @@ def emit_clif(funcs: Sequence[MirFunc]) -> str:
 
     chunks: List[str] = [_HEADER]
     for info in infos:
+        if info.suspending:
+            cps_reasons = list(info.reasons)
+            if not cps_reasons:
+                cps_reasons = _cps_blockers(info, suspending_names, sigs)
+            if not cps_reasons:
+                try:
+                    chunks.append(_emit_cps(info, layouts[info.f.name], sigs))
+                    continue
+                except _Unsupported as exc:
+                    cps_reasons = [exc.reason]
+                except Exception as exc:  # never crash the pipeline
+                    cps_reasons = [f"emission error: {type(exc).__name__}: {exc}"]
+            info.add_reason("suspending function outside the CPS-emittable subset")
+            for r in cps_reasons:
+                info.add_reason(r)
+            chunks.append(_emit_placeholder(info, sigs[info.f.name]))
+            continue
         if not info.reasons:
             f64s = f64_sets.get(info.f.name, set())
             probs = _check_consistency(info, f64s, sigs)
