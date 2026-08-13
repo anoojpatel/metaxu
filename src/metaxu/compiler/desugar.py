@@ -273,13 +273,20 @@ class TraitImplDesugarPass(DesugarPass):
             fn = self._method_to_function(m, trait_name, type_name)
             if fn is not None:
                 key = (trait_name, type_name, str(fn.name))
+                method = key[2].split(IMPL_SEP)[-1]
+                # Duplicate within THIS block (silent last-wins otherwise).
+                if any(str(prev.name) == str(fn.name) for prev in out):
+                    raise CoherenceError(
+                        f"Conflicting implementations: method {method!r} of "
+                        f"trait '{trait_name}' for type '{type_name}' is "
+                        f"defined twice in the same implement block")
+                # Duplicate across distinct blocks.
                 owner = self._seen_methods.setdefault(key, id(impl))
                 if owner != id(impl):
                     raise CoherenceError(
-                        f"Conflicting implementations: method "
-                        f"'{key[2].split(IMPL_SEP)[-1]}' of trait "
-                        f"'{trait_name}' for type '{type_name}' is defined "
-                        f"by more than one implement block")
+                        f"Conflicting implementations: method {method!r} of "
+                        f"trait '{trait_name}' for type '{type_name}' is "
+                        f"defined by more than one implement block")
                 out.append(fn)
         self._expanded[id(impl)] = out
         return out

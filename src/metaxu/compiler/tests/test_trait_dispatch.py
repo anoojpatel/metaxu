@@ -273,3 +273,24 @@ fn main() -> string {
 }
 """
     assert run_main(src) == "woofWOOF"
+
+
+def test_duplicate_method_within_one_impl_block_rejected():
+    from metaxu.compiler.desugar import CoherenceError
+    src = """
+struct Dog { name: string }
+
+trait Speak { fn speak(self) -> string }
+
+implement Speak for Dog {
+    fn speak(self) -> string { "woof" }
+    fn speak(self) -> string { "WOOF" }
+}
+
+fn main() -> string {
+    let d = Dog { name: "rex" };
+    d.speak()
+}
+"""
+    with pytest.raises(CoherenceError, match="same implement block"):
+        build_context_from_source(src)
