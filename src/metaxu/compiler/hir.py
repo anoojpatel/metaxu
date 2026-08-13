@@ -149,6 +149,9 @@ class HIRBuilder:
         # Type names with impl methods (targets of implement blocks), used to
         # recognize static calls `Type.method(args)`.
         self._impl_type_names: set[str] = set()
+        # All declared type names (structs, enums) plus runtime type
+        # constructors — used to tell `Type.method()` from `variable.method()`.
+        self._type_names: set[str] = {"Vec", "vector"}
 
     def build(self, root: mast.AstNode) -> list[HFun]:
         funcs: list[HFun] = []
@@ -170,7 +173,12 @@ class HIRBuilder:
                 for op in (getattr(orig, 'operations', []) or []):
                     if hasattr(op, 'name'):
                         self._effect_op_names.add(str(op.name))
+            if isinstance(orig, fast.StructDefinition):
+                sname = getattr(orig, 'name', None)
+                if sname is not None:
+                    self._type_names.add(str(sname))
             if isinstance(orig, fast.EnumDefinition):
+                self._type_names.add(str(getattr(orig, 'name', '') or ''))
                 ename = str(getattr(orig, 'name', '') or '')
                 for v in (getattr(orig, 'variants', []) or []):
                     vname = getattr(v, 'name', None)
@@ -601,11 +609,13 @@ class HIRBuilder:
                                       op='Call',
                                       callee=f"{STATIC_CALL_PREFIX}{parts[0]}{IMPL_SEP}{last}",
                                       operands=tuple(arg_exprs))
-            # A capitalized base that is not an impl target is a TYPE name
-            # (`Vec.new()`), not a runtime receiver: fall through to the
-            # plain dotted-callee path so runtime builtins keep working even
-            # when some unrelated impl defines a method with the same name.
-            base_is_foreign_type = (str(parts[0])[:1].isupper()
+            # A KNOWN type name without impls as the base (`Vec.new()`) is a
+            # static call on the type, not a runtime receiver: fall through
+            # to the plain dotted-callee path so runtime builtins keep
+            # working even when some unrelated impl defines a same-named
+            # method. Names not known as types (however capitalized) stay
+            # ordinary receivers.
+            base_is_foreign_type = (str(parts[0]) in self._type_names
                                     and str(parts[0]) not in self._impl_type_names)
             if (len(parts) >= 2 and not base_is_foreign_type
                     and (last in self._trait_method_names

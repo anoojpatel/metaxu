@@ -496,13 +496,53 @@ fn main() -> int {
 
 def test_redeclared_reference_holder_keeps_declared_mode():
     """Redeclaring a name that held a reference must record the NEW declared
-    mode, not the old reference's borrow mode."""
-    from metaxu.compiler.frozen_borrow_checker import FrozenBorrowChecker
-    bc = FrozenBorrowChecker()
-    bc.enter_scope()
-    bc.declare_variable("x", "shared", "global", 1)
-    bc.declare_variable("r", "shared", "global", 2)
-    bc.reference_graph["r"] = [("x", "shared")]
-    bc.referenced_by["x"] = [("r", "shared")]
-    bc.declare_variable("r", "unique", "global", 3)
-    assert bc.variables["r"].mode == "unique"
+    mode, not the old reference's borrow mode (the shadowing-loop bug made
+    `let @mut r = ...` after `let r = &x` behave as shared, rejecting
+    writes). Parsed-source end to end."""
+    src = """
+fn f() -> int {
+    let x = 1;
+    let r = &x;
+    let @mut r = 5;
+    r = 6;
+    r
+}
+"""
+    run_pipeline_from_source(src)  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# Fourth adversarial-review round regressions
+# ---------------------------------------------------------------------------
+
+def test_shadowed_global_container_gating_restored_after_block():
+    """An inner-block shadow of a @global container binding must not disable
+    deep-locality gating of the outer binding after the block exits."""
+    src = """
+struct S { f: int }
+
+fn a() -> int {
+    let @global g = S { f: 1 };
+    {
+        let g = S { f: 2 };
+        g.f
+    };
+    let @local t = 3;
+    g.f = t;
+    g.f
+}
+"""
+    with pytest.raises(BorrowCheckError, match="local"):
+        run_pipeline_from_source(src)
+
+
+def test_capitalized_local_variable_method_call():
+    """A capitalized local variable is not a type name: builtin methods on it
+    must keep dispatching."""
+    src = """
+fn main() -> string {
+    let Total = 42;
+    Total.to_string()
+}
+"""
+    assert call(src, "main", []) == "42"

@@ -341,13 +341,25 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
             return "Unit"
         return None
 
+    # Parallel to push_scope/pop_scope: per-scope saves of
+    # global_struct_bindings entries that declarations in the scope popped
+    # or overwrote, restored at scope exit (a shadow in an inner block must
+    # not disable gating of the outer @global container afterwards).
+    gsb_saves: list[dict[str, str | None]] = []
+
     def push_scope() -> None:
         scopes.append({})
+        gsb_saves.append({})
         borrow_checker.enter_scope()
 
     def pop_scope() -> None:
         scopes.pop()
         borrow_checker.exit_scope()
+        for name, prev in (gsb_saves.pop() if gsb_saves else {}).items():
+            if prev is None:
+                global_struct_bindings.pop(name, None)
+            else:
+                global_struct_bindings[name] = prev
 
     def walk(node: Any) -> None:
         node_ty = types.get(node.node_id)
@@ -645,6 +657,10 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
                 borrow_checker.declare_variable(var_name, uniqueness, locality, node.node_id)
                 # A rebinding of the name is a fresh binding: it must not
                 # inherit @global-container gating from an earlier binding.
+                # Save the outer entry so scope exit restores it.
+                if gsb_saves:
+                    gsb_saves[-1].setdefault(
+                        var_name, global_struct_bindings.get(var_name))
                 global_struct_bindings.pop(var_name, None)
                 # Deep ownership: an *explicitly* @global struct binding must
                 # not (transitively) contain @local fields nor store @local

@@ -106,6 +106,18 @@ class SimpleSubFacade:
     # both an Int and a String. Used for constraint-graph conflict detection.
     _LITERAL_CLASSES = frozenset({"Int", "String", "Bool", "Float"})
 
+    class TypeConflict:
+        """Structured hard type error from constraint-graph conflict
+        detection. Carries kind="type-conflict" so the pipeline can promote
+        it to TypeCheckError without string matching."""
+        kind = "type-conflict"
+
+        def __init__(self, message: str) -> None:
+            self.message = message
+
+        def __str__(self) -> str:
+            return self.message
+
     def _detect_class_conflicts(self) -> list[str]:
         """Union type vars along *unify* edges and flag components that carry
         contradictory literal classes (e.g. `1 + \"a\"` unifies an Int-classed
@@ -159,10 +171,10 @@ class SimpleSubFacade:
         for rep, cls_set in merged.items():
             if len(cls_set) > 1:
                 where = f" at node {rep_node[rep]}" if rep in rep_node else ""
-                errors.append(
+                errors.append(self.TypeConflict(
                     "type mismatch: one value is required to be "
                     + " and ".join(sorted(cls_set)) + where
-                )
+                ))
         return errors
 
     # --- Solving ---
