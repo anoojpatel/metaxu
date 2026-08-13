@@ -140,6 +140,348 @@ unsigned char *mx_vec_as_bytes(const mx_vec *v) {
 }
 
 /* ------------------------------------------------------------------------
+ * Fixed-size vectors: immutable length-prefixed word blocks (MxVector).
+ * See metaxu_rt.h for the full semantics contract; the interpreter
+ * (mir_interp.py MxVector + _vec_elementwise + _builtin_slice_get + ...)
+ * is the reference, including error message wording.
+ * ---------------------------------------------------------------------- */
+struct mx_fvec {
+    int64_t len;
+    int64_t elems[];  /* element words */
+};
+
+static void mx_fvec_check(const mx_fvec *v, const char *op) {
+    if (v == NULL) {
+        mx_rt_fail("%s: expected a vector receiver, got NULL", op);
+    }
+}
+
+mx_fvec *mx_fvec_new(int64_t len) {
+    if (len < 0) {
+        mx_rt_fail("vector: negative length %lld", (long long)len);
+    }
+    if ((uint64_t)len > (SIZE_MAX - sizeof(mx_fvec)) / sizeof(int64_t)) {
+        mx_rt_fail("vector: length overflow (%lld)", (long long)len);
+    }
+    size_t bytes = sizeof(mx_fvec) + (size_t)len * sizeof(int64_t);
+    mx_fvec *v = (mx_fvec *)calloc(1, bytes ? bytes : 1);
+    if (v == NULL) {
+        mx_rt_fail("out of memory (requested %zu bytes)", bytes);
+    }
+    v->len = len;
+    return v;
+}
+
+int64_t mx_fvec_len(const mx_fvec *v) {
+    mx_fvec_check(v, "len");
+    return v->len;
+}
+
+int64_t mx_fvec_get(const mx_fvec *v, int64_t idx) {
+    mx_fvec_check(v, "index");
+    if (idx < 0 || idx >= v->len) {
+        mx_rt_fail("index out of bounds: %lld (length %lld)",
+                   (long long)idx, (long long)v->len);
+    }
+    return v->elems[idx];
+}
+
+void mx_fvec_init(mx_fvec *v, int64_t idx, int64_t word) {
+    mx_fvec_check(v, "vector init");
+    if (idx < 0 || idx >= v->len) {
+        mx_rt_fail("index out of bounds: %lld (length %lld)",
+                   (long long)idx, (long long)v->len);
+    }
+    v->elems[idx] = word;
+}
+
+mx_fvec *mx_fvec_filled(int64_t len, int64_t word) {
+    mx_fvec *v = mx_fvec_new(len);
+    for (int64_t i = 0; i < len; i++) {
+        v->elems[i] = word;
+    }
+    return v;
+}
+
+mx_fvec *mx_fvec_range(int64_t start, int64_t end) {
+    int64_t n = end > start ? end - start : 0;
+    mx_fvec *v = mx_fvec_new(n);
+    for (int64_t i = 0; i < n; i++) {
+        v->elems[i] = start + i;
+    }
+    return v;
+}
+
+/* __vec_dim: dim 0 -> length; dim 1 -> 0 when empty, the first element's
+ * length when elements are vectors, else 1 (flat vector == column matrix).
+ * The compiler passes elems_are_vecs from the static element kind and
+ * demotes non-numeric non-vector element kinds, mirroring the
+ * interpreter's per-value checks exactly for every accepted program. */
+int64_t mx_fvec_dim(const mx_fvec *v, int64_t dim, int64_t elems_are_vecs) {
+    mx_fvec_check(v, "__vec_dim");
+    if (dim == 0) {
+        return v->len;
+    }
+    if (dim != 1) {
+        mx_rt_fail("__vec_dim: unsupported dimension %lld", (long long)dim);
+    }
+    if (v->len == 0) {
+        return 0;
+    }
+    if (elems_are_vecs) {
+        const mx_fvec *first = (const mx_fvec *)(intptr_t)v->elems[0];
+        mx_fvec_check(first, "__vec_dim");
+        return first->len;
+    }
+    return 1;
+}
+
+/* CPython slice.indices() over [0, len): negative wraps, clamps, and the
+ * omitted-part defaults depend on the step sign.  `mask` bits: 1 start
+ * given, 2 stop given, 4 step given. */
+mx_fvec *mx_fvec_slice(const mx_fvec *v, int64_t start, int64_t stop,
+                       int64_t step, int64_t mask) {
+    mx_fvec_check(v, "slice");
+    int64_t len = v->len;
+    if (!(mask & 4)) {
+        step = 1;
+    }
+    if (step == 0) {
+        mx_rt_fail("slice: step must be non-zero");
+    }
+    int64_t lo_clamp = step < 0 ? -1 : 0;
+    int64_t hi_clamp = step < 0 ? len - 1 : len;
+    if (mask & 1) {
+        if (start < 0) {
+            start += len;
+            if (start < 0) {
+                start = lo_clamp;
+            }
+        } else if (start >= len) {
+            start = hi_clamp;
+        }
+    } else {
+        start = step < 0 ? len - 1 : 0;
+    }
+    if (mask & 2) {
+        if (stop < 0) {
+            stop += len;
+            if (stop < 0) {
+                stop = lo_clamp;
+            }
+        } else if (stop >= len) {
+            stop = hi_clamp;
+        }
+    } else {
+        stop = step < 0 ? -1 : len;  /* -1 here means "past the front" */
+    }
+    int64_t count;
+    if (step > 0) {
+        count = stop > start ? (stop - start + step - 1) / step : 0;
+    } else {
+        count = start > stop ? (start - stop + (-step) - 1) / (-step) : 0;
+    }
+    mx_fvec *out = mx_fvec_new(count);
+    int64_t idx = start;
+    for (int64_t i = 0; i < count; i++, idx += step) {
+        out->elems[i] = v->elems[idx];
+    }
+    return out;
+}
+
+static const char *mx_fvec_op_name(int64_t op) {
+    switch (op) {
+    case 0: return "+";
+    case 1: return "-";
+    case 2: return "*";
+    case 3: return "/";
+    case 4: return "%";
+    default:
+        mx_rt_fail("vector binop: unknown opcode %lld", (long long)op);
+        return "?";  /* unreachable */
+    }
+}
+
+static int64_t mx_fvec_scalar_op(int64_t op, int64_t base, int64_t a,
+                                 int64_t b) {
+    if (base == 1) {
+        double x, y, r;
+        memcpy(&x, &a, sizeof x);
+        memcpy(&y, &b, sizeof y);
+        switch (op) {
+        case 0: r = x + y; break;
+        case 1: r = x - y; break;
+        case 2: r = x * y; break;
+        case 3: r = x / y; break;  /* IEEE; the interpreter REJECTS /0 */
+        default:
+            /* Float %% would need libm's fmod; the compiler demotes float
+             * vector %% instead (this runtime object stays libm-free). */
+            mx_rt_fail("vector binop: float %% has no native lowering");
+            r = 0.0;  /* unreachable */
+            break;
+        }
+        int64_t out;
+        memcpy(&out, &r, sizeof out);
+        return out;
+    }
+    switch (op) {
+    case 0: return a + b;
+    case 1: return a - b;
+    case 2: return a * b;
+    default:
+        if (b == 0) {
+            /* The interpreter raises ZeroDivisionError; scalar native sdiv
+             * is UB — the vector runtime aborts loudly instead. */
+            mx_rt_fail("vector binop: integer division by zero");
+        }
+        /* C truncating semantics, the backend's documented sdiv/srem
+         * convention (the interpreter floors; they agree for non-negative
+         * operands). */
+        return op == 3 ? a / b : a % b;
+    }
+}
+
+/* Element-wise arithmetic with scalar broadcasting, recursing through
+ * nested vectors — the interpreter's _vec_elementwise.  See the header
+ * for op/base/depth/mode. */
+mx_fvec *mx_fvec_binop(int64_t op, int64_t base, int64_t depth, int64_t mode,
+                       int64_t lhs, int64_t rhs) {
+    const mx_fvec *lv = NULL;
+    const mx_fvec *rv = NULL;
+    int64_t n;
+    if (mode == 0) {
+        lv = (const mx_fvec *)(intptr_t)lhs;
+        rv = (const mx_fvec *)(intptr_t)rhs;
+        mx_fvec_check(lv, "vector binop");
+        mx_fvec_check(rv, "vector binop");
+        if (lv->len != rv->len) {
+            mx_rt_fail("vector size mismatch for '%s': %lld vs %lld",
+                       mx_fvec_op_name(op), (long long)lv->len,
+                       (long long)rv->len);
+        }
+        n = lv->len;
+    } else if (mode == 1) {
+        lv = (const mx_fvec *)(intptr_t)lhs;
+        mx_fvec_check(lv, "vector binop");
+        n = lv->len;
+    } else {
+        rv = (const mx_fvec *)(intptr_t)rhs;
+        mx_fvec_check(rv, "vector binop");
+        n = rv->len;
+    }
+    mx_fvec *out = mx_fvec_new(n);
+    for (int64_t i = 0; i < n; i++) {
+        int64_t a = lv != NULL ? lv->elems[i] : lhs;
+        int64_t b = rv != NULL ? rv->elems[i] : rhs;
+        if (depth > 0) {
+            /* Elements are vectors: recurse; a scalar operand keeps
+             * broadcasting downward (the interpreter's recursion through
+             * _eval_binop). */
+            out->elems[i] = (int64_t)(intptr_t)mx_fvec_binop(
+                op, base, depth - 1, mode, a, b);
+        } else {
+            out->elems[i] = mx_fvec_scalar_op(op, base, a, b);
+        }
+    }
+    return out;
+}
+
+/* promote_matrix: wrap a flat vector's elements as one-element rows so a
+ * vector passed where a matrix is expected indexes as an Mx1 column. */
+mx_fvec *mx_fvec_promote(const mx_fvec *v) {
+    mx_fvec_check(v, "promote_matrix");
+    mx_fvec *out = mx_fvec_new(v->len);
+    for (int64_t i = 0; i < v->len; i++) {
+        mx_fvec *cell = mx_fvec_new(1);
+        cell->elems[0] = v->elems[i];
+        out->elems[i] = (int64_t)(intptr_t)cell;
+    }
+    return out;
+}
+
+mx_fvec *mx_fvec_map(const mx_fvec *v, mx_fvec_map_fn fn, void *env,
+                     int64_t expected_n) {
+    mx_fvec_check(v, "vector comprehension");
+    if (fn == NULL) {
+        mx_rt_fail("vector comprehension: NULL body function");
+    }
+    if (expected_n >= 0 && v->len != expected_n) {
+        mx_rt_fail("vector comprehension produced %lld elements for a "
+                   "vector of size %lld",
+                   (long long)v->len, (long long)expected_n);
+    }
+    mx_fvec *out = mx_fvec_new(v->len);
+    for (int64_t i = 0; i < v->len; i++) {
+        out->elems[i] = fn(env, v->elems[i]);
+    }
+    return out;
+}
+
+/* Append helper for mx_fvec_to_str: exact-size accounting is not worth the
+ * complexity; grow a buffer geometrically. */
+static void mx_buf_append(char **buf, size_t *len, size_t *cap,
+                          const char *piece) {
+    size_t pl = strlen(piece);
+    if (*len + pl + 1 > *cap) {
+        size_t ncap = *cap ? *cap * 2 : 64;
+        while (ncap < *len + pl + 1) {
+            ncap *= 2;
+        }
+        char *nb = (char *)realloc(*buf, ncap);
+        if (nb == NULL) {
+            mx_rt_fail("out of memory (requested %zu bytes)", ncap);
+        }
+        *buf = nb;
+        *cap = ncap;
+    }
+    memcpy(*buf + *len, piece, pl + 1);
+    *len += pl;
+}
+
+/* repr(MxVector): "vector[e0, e1, ...]" with Python-repr elements. */
+char *mx_fvec_to_str(const mx_fvec *v, int64_t base, int64_t depth) {
+    mx_fvec_check(v, "to_string");
+    char *buf = NULL;
+    size_t len = 0, cap = 0;
+    mx_buf_append(&buf, &len, &cap, "vector[");
+    for (int64_t i = 0; i < v->len; i++) {
+        if (i > 0) {
+            mx_buf_append(&buf, &len, &cap, ", ");
+        }
+        char *piece;
+        if (depth > 0) {
+            piece = mx_fvec_to_str(
+                (const mx_fvec *)(intptr_t)v->elems[i], base, depth - 1);
+        } else if (base == 1) {
+            double x;
+            memcpy(&x, &v->elems[i], sizeof x);
+            piece = mx_f64_to_str(x);
+        } else {
+            piece = mx_i64_to_str(v->elems[i]);
+        }
+        mx_buf_append(&buf, &len, &cap, piece);
+        free(piece);
+    }
+    mx_buf_append(&buf, &len, &cap, "]");
+    return buf;
+}
+
+/* `vector.as_ptr()`: fresh byte snapshot, mirroring mx_vec_as_bytes. */
+unsigned char *mx_fvec_as_bytes(const mx_fvec *v) {
+    mx_fvec_check(v, "as_ptr");
+    unsigned char *out = (unsigned char *)mx_rt_malloc((size_t)v->len);
+    for (int64_t i = 0; i < v->len; i++) {
+        int64_t e = v->elems[i];
+        if (e < 0 || e > 255) {
+            mx_rt_fail("as_ptr: element %lld is not a byte (0..255): %lld",
+                       (long long)i, (long long)e);
+        }
+        out[i] = (unsigned char)e;
+    }
+    return out;
+}
+
+/* ------------------------------------------------------------------------
  * Strings: NUL-terminated byte strings; results are fresh malloc'd buffers.
  * ---------------------------------------------------------------------- */
 static void mx_str_check(const char *s, const char *op, const char *which) {

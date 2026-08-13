@@ -156,8 +156,68 @@ runs natively):
     falsy i64 condition (message arguments are evaluated but not
     rendered natively; a failing assert aborts instead of raising).
 
-Everything else — try_scope,
-fixed-size vector comprehensions/slices/dims — is emitted as a
+Increment 10 makes the FIXED-VECTOR runtime native.  A `vector[T, N]`
+value is a new scalar-like kind family ``vector:ELEM`` — an opaque
+``mx_fvec*`` pointer to an IMMUTABLE length-prefixed word block
+``{ i64 len, [len x i64] }`` (metaxu_rt.c).  The interpreter's MxVector
+has VALUE semantics; since no operation ever mutates a filled block
+(construction fills it before the pointer is shared), shallow pointer
+copies are observationally identical to value copies — the write-once
+payload-box argument — and blocks LEAK BY DESIGN (shallow sharing makes
+ownership non-unique).  Push/pop on a fixed vector now demote by kind
+(the interpreter rejects them), retiring increment 9's mx_vec stand-in
+caveat:
+  * ``__vec_lit`` -> mx_fvec_new + mx_fvec_init fills; ``__vec_zeros`` ->
+    mx_fvec_new (calloc: 0 and 0.0 are the all-zero word; the base-name
+    argument must be a const 'float'/'int' string); ``__vec_filled`` ->
+    mx_fvec_filled; ``len``/``__index_get``/``as_ptr`` route by kind to
+    mx_fvec_len/mx_fvec_get/mx_fvec_as_bytes.
+  * element-wise arithmetic (+ - * / % with scalar broadcasting, nested
+    matrices included) -> mx_fvec_binop; vector operands and the result
+    share one vector kind, a broadcast scalar unifies with the LEAF
+    element kind.  Int elements use the backend's C-truncating sdiv/srem
+    convention (the interpreter floors; they agree for non-negative
+    operands); integer division by zero aborts.  ==/!= on vectors demote
+    (the interpreter compares structurally).
+  * ``__slice_get`` -> mx_fvec_slice, a FRESH COPY with CPython
+    slice.indices() semantics; a bound must be statically None (a
+    const-None variable) or an int — a sometimes-None bound demotes.
+  * ``__range`` -> mx_fvec_range (an int vector).  The interpreter's
+    range is a plain LIST whose repr differs from a vector's, so range
+    values are restricted to the iteration protocol (len / __index_get /
+    comprehension iterable / copies); any other use demotes.
+  * ``__vec_comprehension`` -> a per-site thunk (decode element word ->
+    call the statically-known body closure -> encode result) driven by
+    mx_fvec_map.  i64 elements/results may flow into f64 positions (the
+    thunk converts — the scalar int->float promotion contract); anything
+    else mismatched demotes.  Multi-parameter bodies (tuple unpacking)
+    and non-vector iterables demote.
+  * ``__cast`` with a const type-name target: numeric targets convert
+    (sitofp / fptosi — truncation toward zero, like Python's int());
+    every other target is the interpreter's identity reinterpretation.
+  * ``promote_matrix`` (matmul's vector -> Mx1 embedding): resolved
+    STATICALLY per parameter from the caller-side sig kind — a flat
+    numeric vector param is rebound to mx_fvec_promote(param) at entry
+    (its local kind is the promoted matrix kind; the driver skips the
+    local->sig join for such params), a matrix passes through, and mixed
+    flat/matrix callers demote via the sig join.  Supported shape:
+    entry block, parameters only, before any other use.
+  * ``print``/``to_string`` of a vector render the interpreter's repr
+    ("vector[1.0, 2.0]") via mx_fvec_to_str (int/float leaves only;
+    mx_f64_to_str already matches Python's float repr; bools are
+    kind-erased to ints, the standing caveat).  print frees the repr
+    string immediately; to_string results leak by design.
+  * EFFECT-OP DEFAULTS: a perform whose op name appears in NO
+    handle_scope of the module can never be intercepted by a scope, so
+    the interpreter's fallback is static — when the op declares an
+    `= expr` default (__effect_default$E$op) and no `with SYMBOL` runtime
+    mapping, the perform lowers to a DIRECT CALL of the default function
+    (ordinary conventions, aggregates and all, no effect boundary).  An
+    op with a default that also appears in some scope demotes (dynamic
+    default routing has no native lowering).
+
+Everything else — try_scope, `type_of` (no interpreter builtin exists),
+comprehensions over Vecs, string slicing/indexing — is emitted as a
 clearly marked, comment-only placeholder carrying the reasons, never as
 silently wrong code.  Functions that call a placeholder function are
 themselves demoted (the module must link), with an explicit reason.
@@ -492,6 +552,18 @@ _CLOSURE_PREFIX = "closure:"
 # copy aliases the one shared vector).  Elements are opaque 8-byte words in
 # the native runtime; the element kind decides the bitcast at push/pop/get.
 _VEC_PREFIX = "vec:"
+# A FIXED-SIZE vector value `vector[T, N]` (increment 10): an opaque
+# `mx_fvec*` pointer to an IMMUTABLE length-prefixed word block
+# { i64 len, [len x i64] } in the native runtime, parameterized by the
+# unified element kind ("vector:f64", "vector:vector:f64" for matrices...).
+# The interpreter's MxVector has VALUE semantics; since no operation ever
+# mutates a filled block (construction fills it before the pointer is
+# shared), shallow pointer copies are observationally identical to value
+# copies — the same write-once argument as boxed enum payloads.  Blocks
+# LEAK BY DESIGN (shallow sharing makes ownership non-unique).  Note
+# "vector:" does not collide with the "vec:" prefix test ("vector:f64"
+# does not start with "vec:").
+_FVEC_PREFIX = "vector:"
 
 _LLTY = {I64: "i64", F64: "double", STR: "ptr"}
 _SCALARS = (I64, F64, STR)
@@ -524,7 +596,11 @@ _INLINE_BUILTINS = {"neg", "not"}
 #   __index_get  -> mx_vec_get          __vec_lit -> mx_vec_new + pushes
 #   to_string / int_to_str -> mx_i64_to_str / mx_f64_to_str / identity(str)
 _NATIVE_RT_CALLS = {"Vec.new", "push", "pop", "len", "to_string",
-                    "int_to_str", "__index_get", "__vec_lit"}
+                    "int_to_str", "__index_get", "__vec_lit",
+                    # Fixed-vector builtins (increment 10) — mx_fvec_*:
+                    "__vec_dim", "__vec_zeros", "__vec_filled",
+                    "__vec_comprehension", "__range", "__slice_get",
+                    "__cast"}
 
 # Extern C symbols the interpreter shims over its simulated heap
 # (mir_interp._ffi_*): natively these are DIRECT calls to the real libc
@@ -558,6 +634,15 @@ _TRAIT_BUILTIN_FALLBACK = {"to_string", "int_to_str", "len", "push", "pop",
 _RUNTIME_PREFIXES = ("__vec_", "__index_", "__slice_", "__range")
 _RUNTIME_NAMES = {"type_of", "assert_eq"}
 
+# Element-wise vector arithmetic opcodes for mx_fvec_binop (metaxu_rt.h).
+_FVEC_BINOP_CODES = {"+": 0, "-": 1, "*": 2, "/": 3, "%": 4}
+
+# Effect-op fallback function name prefixes (mir_interp's resolution: an op
+# performed with no handler in scope first tries its `with SYMBOL` runtime
+# mapping, then its declared `= expr` default).
+_EFFECT_DEFAULT_PREFIX = "__effect_default$"
+_EFFECT_RUNTIME_PREFIX = "__effect_runtime$"
+
 # Native runtime symbol signatures (metaxu_rt.h ABI): name -> (ret, params).
 _RT_SIGS = {
     "mx_vec_new": ("ptr", ()),
@@ -574,6 +659,20 @@ _RT_SIGS = {
     "mx_str_eq": ("i64", ("ptr", "ptr")),
     "mx_str_free": ("void", ("ptr",)),
     "mx_vec_as_bytes": ("ptr", ("ptr",)),
+    # Fixed-size vectors (immutable mx_fvec blocks; increment 10).
+    "mx_fvec_new": ("ptr", ("i64",)),
+    "mx_fvec_len": ("i64", ("ptr",)),
+    "mx_fvec_get": ("i64", ("ptr", "i64")),
+    "mx_fvec_init": ("void", ("ptr", "i64", "i64")),
+    "mx_fvec_filled": ("ptr", ("i64", "i64")),
+    "mx_fvec_range": ("ptr", ("i64", "i64")),
+    "mx_fvec_dim": ("i64", ("ptr", "i64", "i64")),
+    "mx_fvec_slice": ("ptr", ("ptr", "i64", "i64", "i64", "i64")),
+    "mx_fvec_binop": ("ptr", ("i64", "i64", "i64", "i64", "i64", "i64")),
+    "mx_fvec_promote": ("ptr", ("ptr",)),
+    "mx_fvec_map": ("ptr", ("ptr", "ptr", "ptr", "i64")),
+    "mx_fvec_to_str": ("ptr", ("ptr", "i64", "i64")),
+    "mx_fvec_as_bytes": ("ptr", ("ptr",)),
     # Algebraic effects runtime (metaxu_effects.c).
     "mx_handle": ("i64", ("ptr", "ptr", "ptr", "ptr", "ptr", "ptr", "ptr",
                           "i64")),
@@ -670,22 +769,38 @@ _HEADER = (
     ";   program can tell); __static$Type$m calls resolve at compile time\n"
     ";   (impl fn -> dotted module fn -> dotted builtin, the\n"
     ";   interpreter's order); assert -> inline branch to @abort;\n"
+    ";   FIXED VECTORS (increment 10): vector[T,N] values -> opaque\n"
+    ";   mx_fvec* pointers to IMMUTABLE { i64 len, [len x i64] } word\n"
+    ";   blocks (write-once fill at construction; shallow sharing is\n"
+    ";   sound because nothing ever mutates a filled block; blocks leak\n"
+    ";   by design).  Literals/zeros/filled -> mx_fvec_new/_init/_filled;\n"
+    ";   element-wise + - * / % with scalar broadcast -> mx_fvec_binop\n"
+    ";   (C-truncating int div, like scalar sdiv); slices -> mx_fvec_slice\n"
+    ";   fresh copies (CPython slice.indices semantics); ranges ->\n"
+    ";   mx_fvec_range int vectors restricted to iteration uses;\n"
+    ";   comprehensions -> per-site word thunks driven by mx_fvec_map;\n"
+    ";   __cast -> sitofp/fptosi or identity; promote_matrix -> static\n"
+    ";   per-param mx_fvec_promote at entry; print/to_string render the\n"
+    ";   interpreter's vector repr via mx_fvec_to_str; performs of ops no\n"
+    ";   module scope handles lower to DIRECT CALLS of their declared\n"
+    ";   __effect_default fns;\n"
     "; functions outside the subset appear as comment-only placeholders."
 )
 
 
 def _llparam(kind: str) -> str:
     """The LLVM parameter/return-slot type for a value kind (aggregates -> ptr)."""
-    if _is_agg(kind) or _is_vec(kind) or kind in (KONT, PTR):
+    if _is_agg(kind) or _is_vec(kind) or _is_fvec(kind) or kind in (KONT, PTR):
         return "ptr"
     return _LLTY.get(kind, "i64")
 
 
 def _llscalar(kind: str) -> str:
     """The LLVM type of a non-aggregate (register-sized) value kind.
-    Vec values are opaque `mx_vec*` pointers; kont is an opaque `mx_k*`;
-    rawptr is a raw C `ptr`."""
-    if _is_vec(kind) or kind in (KONT, PTR):
+    Vec values are opaque `mx_vec*` pointers; fixed vectors are opaque
+    `mx_fvec*` pointers; kont is an opaque `mx_k*`; rawptr is a raw C
+    `ptr`."""
+    if _is_vec(kind) or _is_fvec(kind) or kind in (KONT, PTR):
         return "ptr"
     return _LLTY.get(kind, "i64")
 
@@ -783,9 +898,40 @@ def _vec_of(elem: str) -> str:
     return _VEC_PREFIX + elem
 
 
+def _is_fvec(kind: str) -> bool:
+    return kind.startswith(_FVEC_PREFIX)
+
+
+def _fvec_elem(kind: str) -> str:
+    """The element kind of a fixed-vector kind ('vector:f64' -> 'f64')."""
+    return kind[len(_FVEC_PREFIX):]
+
+
+def _fvec_of(elem: str) -> str:
+    return _FVEC_PREFIX + elem
+
+
+def _fvec_leaf(kind: str) -> Tuple[str, int]:
+    """(leaf scalar kind, nesting depth) of a fixed-vector kind: the depth
+    counts how many levels the ELEMENTS are still vectors ('vector:f64' ->
+    ('f64', 0); 'vector:vector:f64' -> ('f64', 1))."""
+    depth = -1
+    while _is_fvec(kind):
+        kind = _fvec_elem(kind)
+        depth += 1
+    return kind, depth
+
+
+def _fvec_with_leaf(kind: str, leaf: str) -> str:
+    """The fixed-vector kind with the same nesting but a new leaf kind."""
+    if _is_fvec(kind):
+        return _fvec_of(_fvec_with_leaf(_fvec_elem(kind), leaf))
+    return leaf
+
+
 def _is_word_kind(kind: str) -> bool:
     """Kinds storable as an opaque 8-byte word in a Vec element slot."""
-    return kind in (I64, F64, STR) or _is_vec(kind)
+    return kind in (I64, F64, STR) or _is_vec(kind) or _is_fvec(kind)
 
 
 def _is_agg(kind: str) -> bool:
@@ -834,6 +980,9 @@ def _join(a: str, b: str) -> str:
     if _is_vec(a) and _is_vec(b):
         e = _join(_vec_elem(a), _vec_elem(b))
         return CONFLICT if e == CONFLICT else _vec_of(e)
+    if _is_fvec(a) and _is_fvec(b):
+        e = _join(_fvec_elem(a), _fvec_elem(b))
+        return CONFLICT if e == CONFLICT else _fvec_of(e)
     if _is_enum(a) and _is_enum(b):
         ename = _enum_name(a)
         if ename != _enum_name(b):
@@ -915,11 +1064,28 @@ class _Info:
     is_scope_member: bool = False
     scope_site: Optional[str] = None
     scope_role: Optional[str] = None  # "body" | "case"
-    # Function contains perform ops (needs the [8 x i64] scratch alloca).
+    # Function contains perform ops routed through mx_perform (needs the
+    # [8 x i64] scratch alloca).  Performs statically resolved to a
+    # declared effect-op default (see default_performs) do not count.
     has_perform: bool = False
     # Results of copy/select ops that are provably never observed (see
     # _dead_results): excluded from kind unification, emitted as comments.
     dead_results: Set[str] = field(default_factory=set)
+    # Single-def constant facts (used by the fixed-vector builtins whose
+    # interpreter semantics depend on constant arguments).
+    const_strs: Dict[str, str] = field(default_factory=dict)
+    const_ints: Dict[str, int] = field(default_factory=dict)
+    const_nones: Set[str] = field(default_factory=set)
+    # Variables with ANY const-None def (a slice bound that is sometimes
+    # None and sometimes an int cannot be encoded statically -> demote).
+    none_def_vars: Set[str] = field(default_factory=set)
+    # promote_matrix'd parameters (matmul's vector -> Mx1 embedding).
+    promote_params: Tuple[str, ...] = ()
+    # (effect, op) -> __effect_default fn for performs statically resolved
+    # to their declared default (no handle site in the module lists the op,
+    # so no scope can ever intercept it -> a direct call, aggregates and
+    # all, exactly the interpreter's fallback).
+    default_performs: Dict[Tuple[str, str], str] = field(default_factory=dict)
 
     def add_reason(self, r: str) -> None:
         if r not in self.reasons:
@@ -1132,17 +1298,68 @@ def _analyze_inner(info: _Info, module_names: Set[str],
                 # runtime parks this call stack and returns the resumed
                 # value).  The op defines dst; the block then branches to
                 # the resume block.
+                #
+                # EXCEPTION (increment 10): an op that NO handle_scope in
+                # the module lists can never be intercepted by a scope, so
+                # the interpreter's fallback resolution is static.  When the
+                # op has a declared `= expr` default (and no `with SYMBOL`
+                # runtime mapping, which would win), the perform IS a direct
+                # call to __effect_default$E$op — normal call conventions,
+                # aggregates and all, no effect boundary.
                 if len(op) < 7:
                     info.add_reason("malformed perform op")
                     continue
-                if len(op[4]) > _MAX_EFFECT_ARGS:
-                    info.add_reason(
-                        f"perform with {len(op[4])} arguments (native limit "
-                        f"is {_MAX_EFFECT_ARGS})")
-                for a in op[4]:
+                peffect, pop_name, pargs = op[2], op[3], op[4]
+                for a in pargs:
                     add_use(a, bi)
                 add_def(op[1], bi)
+                scoped = any(
+                    pop_name == opn
+                    for rec in scopes.sites.values()
+                    for (opn, _p, _h) in rec.cases)
+                default_fn = f"{_EFFECT_DEFAULT_PREFIX}{peffect}${pop_name}"
+                runtime_fn = f"{_EFFECT_RUNTIME_PREFIX}{peffect}${pop_name}"
+                if not scoped and runtime_fn not in module_names \
+                        and default_fn in module_names:
+                    info.default_performs[(peffect, pop_name)] = default_fn
+                    continue
+                if scoped and default_fn in module_names:
+                    # A scope MAY intercept it dynamically; when none does,
+                    # the interpreter falls back to the default while
+                    # mx_perform would abort — demote, never guess.
+                    info.add_reason(
+                        f"effect op {pop_name!r} has a declared default and "
+                        "also appears in a handle scope (dynamic default "
+                        "routing has no native lowering)")
+                if len(pargs) > _MAX_EFFECT_ARGS:
+                    info.add_reason(
+                        f"perform with {len(pargs)} arguments (native limit "
+                        f"is {_MAX_EFFECT_ARGS})")
                 info.has_perform = True
+                continue
+            if kind == "promote_matrix":
+                # ("promote_matrix", (param names,)): the named parameters
+                # are declared as matrices; a flat numeric vector passed
+                # there is promoted to an Mx1 column of one-element rows
+                # (mir_interp).  Supported shape: entry block, parameters
+                # only, before any other use of the names — each variable
+                # has ONE kind (the post-promotion one), so a pre-promotion
+                # use would be typed wrongly.
+                names = tuple(op[1]) if len(op) > 1 else ()
+                if bi != 0:
+                    info.add_reason("promote_matrix outside the entry block")
+                for n in names:
+                    if n not in info.params:
+                        info.add_reason(
+                            f"promote_matrix of non-parameter {n!r}")
+                    elif n in info.use_blocks:
+                        info.add_reason(
+                            f"promote_matrix after a use of {n!r}")
+                for n in names:
+                    add_use(n, bi)
+                    add_def(n, bi)
+                info.promote_params = tuple(
+                    dict.fromkeys(info.promote_params + names))
                 continue
             if kind == "drop":
                 continue  # emitted as a comment
@@ -1343,6 +1560,26 @@ def _analyze_inner(info: _Info, module_names: Set[str],
         else:
             info.add_reason(f"unknown external callee {callee!r} (cannot link natively)")
     info.calls = direct_calls
+
+    # Single-def constant facts (the fixed-vector builtins depend on
+    # statically-known sizes / dims / casts / slice bounds / base names).
+    for b in f.blocks:
+        for op in b.ops:
+            if op[0] != "let" or len(op) != 4 or op[2][0] != "const":
+                continue
+            cdst, cval = op[1], op[2][1]
+            if cval is None:
+                info.none_def_vars.add(cdst)
+            if info.def_count.get(cdst, 0) != 1:
+                continue
+            if cval is None:
+                info.const_nones.add(cdst)
+            elif isinstance(cval, bool):
+                pass
+            elif isinstance(cval, int):
+                info.const_ints[cdst] = cval
+            elif isinstance(cval, str):
+                info.const_strs[cdst] = cval
 
     # Every used name must be defined somewhere in the function.
     for name in info.use_blocks:
@@ -1673,6 +1910,8 @@ def _fn_defs_uses_sites(f: MirFunc) -> Tuple[Set[str], Set[str], List[str]]:
             elif k == "perform" and len(op) >= 7:
                 uses.update(op[4])
                 defs.add(op[1])
+            elif k == "promote_matrix":
+                uses.update(op[1] if len(op) > 1 else ())
             elif k == "let" and len(op) == 4:
                 _, dst, rhs, args = op
                 defs.add(dst)
@@ -1941,6 +2180,26 @@ def _resolve_trait_call(method: str, recv_kind: str, traits: _TraitTable,
         return plain_fn_fallback(
             f"trait method {method!r} on a Vec receiver has no native lowering")
 
+    if _is_fvec(recv_kind):
+        # The interpreter reports "vector" for MxVector receivers (the head
+        # type constructor `implement ... for vector[T, N]` desugars to).
+        hit = from_impl("vector")
+        if hit is not None:
+            return hit
+        if method == "len":
+            return ("builtin", "len")
+        if method in ("to_string", "int_to_str"):
+            # str(MxVector) == "vector[...]" == mx_fvec_to_str; the
+            # element-kind restrictions are checked like any to_string.
+            return ("builtin", "to_string")
+        if method in ("push", "pop"):
+            return ("demote",
+                    f"trait method {method!r} on an immutable fixed vector "
+                    "(the interpreter rejects non-Vec receivers)")
+        return plain_fn_fallback(
+            f"trait method {method!r} on a fixed-vector receiver has no "
+            "native lowering")
+
     if recv_kind == STR:
         hit = from_impl("String")
         if hit is not None:
@@ -1985,6 +2244,17 @@ def _resolve_trait_call(method: str, recv_kind: str, traits: _TraitTable,
                 "(interpreter would reject a non-Vec receiver)")
     return plain_fn_fallback(
         f"trait method {method!r} on a receiver of kind i64 has no native lowering")
+
+
+def _promote_kind(k: str) -> str:
+    """promote_matrix's static effect on a parameter kind: a flat vector of
+    numbers becomes a matrix of one-element rows; everything else passes
+    through untouched (mir_interp promotes only MxVectors whose elements
+    are all numbers, which is exactly the flat-numeric KIND — including the
+    empty vector, whose promotion is observationally invisible)."""
+    if _is_fvec(k) and _fvec_elem(k) in (I64, F64):
+        return _fvec_of(k)
+    return k
 
 
 # ---------------------------------------------------------------------------
@@ -2049,6 +2319,7 @@ def _infer_kinds(info: _Info, sigs: Dict[str, _Sig], structs: _StructTable,
         calls (interpreter resolution: builtins first) receiver kinds are
         pinned eagerly; for trait-resolved calls the receiver is already
         known to be a vec/str (resolution is kind-driven)."""
+        nonlocal global_changed
         ch = False
         if name == "Vec.new":
             ch = mark(dst, _vec_of(I64)) or ch
@@ -2056,7 +2327,21 @@ def _infer_kinds(info: _Info, sigs: Dict[str, _Sig], structs: _StructTable,
             if not args:
                 return ch
             if plain_call:
-                ch = mark(args[0], _vec_of(I64)) or ch
+                if name in ("push", "pop"):
+                    # The interpreter rejects push/pop on anything but a
+                    # Vec, so the receiver of an accepted program IS one.
+                    # A receiver already known to be a FIXED vector is left
+                    # alone so the consistency check reports the clean
+                    # "fixed vectors are immutable" demotion instead of a
+                    # kind conflict.
+                    if not _is_fvec(get(args[0])):
+                        ch = mark(args[0], _vec_of(I64)) or ch
+                elif get(args[0]) == I64 and assume_final:
+                    # __index_get also accepts fixed vectors (and ranges),
+                    # so only a receiver nothing else could type is pinned
+                    # to the Vec bottom, and only once the fixpoint has
+                    # settled.
+                    ch = mark(args[0], _vec_of(I64)) or ch
             rk = get(args[0])
             if _is_vec(rk):
                 # Two-way element unification: pushed values and read
@@ -2072,24 +2357,101 @@ def _infer_kinds(info: _Info, sigs: Dict[str, _Sig], structs: _StructTable,
                         ch = mark(other, nk) or ch
                     else:
                         ch = mark(args[0], CONFLICT) or ch
+            elif _is_fvec(rk) and name == "__index_get":
+                nk = _join(_fvec_elem(rk), get(dst))
+                if nk != CONFLICT:
+                    ch = mark(args[0], _fvec_of(nk)) or ch
+                    ch = mark(dst, nk) or ch
+                else:
+                    ch = mark(args[0], CONFLICT) or ch
         elif name == "__vec_lit":
-            # ("__vec_lit", size, e0, e1, ...): the literal builds a fresh
-            # vector; elements unify two-way with the element kind exactly
-            # like push (the size argument stays i64).
-            ch = mark(dst, _vec_of(I64)) or ch
+            # ("__vec_lit", size, e0, e1, ...): a fixed-size vector literal
+            # builds an immutable mx_fvec block (increment 10); elements
+            # unify two-way with the element kind (the size argument stays
+            # i64).
+            ch = mark(dst, _fvec_of(I64)) or ch
             rk = get(dst)
-            if _is_vec(rk):
-                ek = _vec_elem(rk)
+            if _is_fvec(rk):
+                ek = _fvec_elem(rk)
                 for e in args[1:]:
                     ek = _join(ek, get(e))
                 if ek != CONFLICT:
-                    ch = mark(dst, _vec_of(ek)) or ch
+                    ch = mark(dst, _fvec_of(ek)) or ch
                     for e in args[1:]:
                         ch = mark(e, ek) or ch
                 else:
                     ch = mark(dst, CONFLICT) or ch
+        elif name == "__vec_zeros":
+            # ("__vec_zeros", n, base_name): the base-type name is a const
+            # string; float/int decide the element kind (anything else is
+            # an interpreter error -> the consistency check demotes).
+            if len(args) == 2:
+                base = info.const_strs.get(args[1], "").lower()
+                zk = {"float": F64, "int": I64}.get(base)
+                if zk is not None:
+                    ch = mark(dst, _fvec_of(zk)) or ch
+        elif name == "__vec_filled":
+            # ("__vec_filled", n, value): value unifies two-way with the
+            # element kind.
+            if len(args) == 2:
+                ch = mark(dst, _fvec_of(I64)) or ch
+                rk = get(dst)
+                if _is_fvec(rk):
+                    ek = _join(_fvec_elem(rk), get(args[1]))
+                    if ek != CONFLICT:
+                        ch = mark(dst, _fvec_of(ek)) or ch
+                        ch = mark(args[1], ek) or ch
+                    else:
+                        ch = mark(dst, CONFLICT) or ch
+        elif name == "__range":
+            # A range materializes as a fixed vector of ints; its uses are
+            # restricted to iteration shapes (see the consistency check —
+            # the interpreter's plain list has a different repr).
+            ch = mark(dst, _fvec_of(I64)) or ch
+        elif name == "__vec_dim":
+            pass  # receiver typed by its producer; dst stays i64
+        elif name == "__slice_get":
+            # A slice of a fixed vector is a fresh vector of the same kind
+            # (bounds stay i64 / None).
+            if args:
+                nk = _join(get(dst), get(args[0]))
+                if nk != CONFLICT and _is_fvec(nk):
+                    ch = mark(dst, nk) or ch
+                    ch = mark(args[0], nk) or ch
+        elif name == "__cast":
+            # `e as T`: numeric targets convert the representation; any
+            # other target is a static-level reinterpretation (identity).
+            if len(args) == 2:
+                t = info.const_strs.get(args[1], "")
+                if t in ("float", "f32", "f64"):
+                    ch = mark(dst, F64) or ch
+                elif t in ("int", "i8", "i16", "i32", "i64",
+                           "u8", "u16", "u32", "u64"):
+                    pass  # dst stays i64
+                else:
+                    ch = unify((dst, args[0])) or ch
+        elif name == "__vec_comprehension":
+            # ("__vec_comprehension", n, closure, iterable): element kinds
+            # flow one-way into the lambda's parameter, and the lambda's
+            # return kind one-way into the destination's element kind.
+            # (i64 values may flow into an f64 position: the per-element
+            # thunk converts, the same int->float promotion contract as
+            # scalar unification.)
+            if len(args) == 3:
+                fk = get(args[1])
+                lsig = sigs.get(_closure_lambda(fk)) if _is_closure(fk) \
+                    else None
+                if lsig is not None and len(lsig.params) == 1:
+                    itk = get(args[2])
+                    if _is_fvec(itk):
+                        nk = _join(lsig.params[0], _fvec_elem(itk))
+                        if nk != lsig.params[0]:
+                            lsig.params[0] = nk
+                            ch = True
+                            global_changed = True
+                    ch = mark(dst, _fvec_of(lsig.ret)) or ch
         elif name == "len":
-            pass  # receiver may be vec or str; dst stays i64
+            pass  # receiver may be vec/vector/str; dst stays i64
         elif name in ("to_string", "int_to_str"):
             ch = mark(dst, STR) or ch
         elif name in _MATH_EXTERNS:
@@ -2098,15 +2460,61 @@ def _infer_kinds(info: _Info, sigs: Dict[str, _Sig], structs: _StructTable,
             ch = mark(dst, F64) or ch
         return ch
 
+    def fvec_binop_unify(dst: str, a0: str, a1: str) -> bool:
+        """Element-wise vector arithmetic with scalar broadcasting: vector
+        operands and the destination share one vector kind; a scalar
+        operand unifies with the LEAF element kind (broadcast reaches the
+        innermost scalars of a nested vector).  A still-bottom scalar
+        operand is left alone until the final phase — it may yet turn out
+        to be a vector."""
+        ch2 = False
+        vecs = [n for n in (a0, a1) if _is_fvec(get(n))]
+        if not vecs:
+            return False  # dst promoted first: wait for the operands
+        vk = get(dst) if _is_fvec(get(dst)) else I64
+        for n in vecs:
+            vk = _join(vk, get(n))
+        if not _is_fvec(vk):  # CONFLICT (or joined into one)
+            for n in (dst, *vecs):
+                ch2 = mark(n, CONFLICT) or ch2
+            return ch2
+        leaf, _d = _fvec_leaf(vk)
+        scalars = [n for n in (a0, a1) if not _is_fvec(get(n))]
+        for n in scalars:
+            k = get(n)
+            if k != I64 or assume_final:
+                leaf = _join(leaf, k)
+        if leaf == CONFLICT:
+            for n in (dst, *vecs):
+                ch2 = mark(n, CONFLICT) or ch2
+            return ch2
+        vk = _fvec_with_leaf(vk, leaf)
+        ch2 = mark(dst, vk) or ch2
+        for n in vecs:
+            ch2 = mark(n, vk) or ch2
+        for n in scalars:
+            if get(n) != I64 or assume_final:
+                ch2 = mark(n, leaf) or ch2
+        return ch2
+
     fname = info.f.name
     own_sig = sigs.get(fname)
+    promoted_set = set(info.promote_params)
 
     changed = True
     while changed:
         changed = False
         if own_sig is not None and len(own_sig.params) == len(info.params):
             for p, pk in zip(info.params, own_sig.params):
-                changed = mark(p, pk) or changed
+                if p in promoted_set:
+                    # promote_matrix rebinds the parameter at entry: the
+                    # LOCAL kind is the promoted form of the incoming one
+                    # (flat numeric vector -> Mx1 matrix); the sig keeps
+                    # the caller-side kind (the driver skips the local ->
+                    # sig join for these).
+                    changed = mark(p, _promote_kind(pk)) or changed
+                else:
+                    changed = mark(p, pk) or changed
             for r in info.ret_vars:
                 changed = mark(r, own_sig.ret) or changed
         if len(info.ret_vars) > 1:
@@ -2148,6 +2556,26 @@ def _infer_kinds(info: _Info, sigs: Dict[str, _Sig], structs: _StructTable,
         for b in info.f.blocks:
             for op in b.ops:
                 if op[0] == "perform" and len(op) >= 7:
+                    dfn = info.default_performs.get((op[2], op[3]))
+                    if dfn is not None:
+                        # Statically resolved to the op's declared default:
+                        # an ordinary two-way call-signature join, no
+                        # boundary cells (see _analyze).
+                        dsig = sigs.get(dfn)
+                        if dsig is not None \
+                                and len(dsig.params) == len(op[4]):
+                            for i, a in enumerate(op[4]):
+                                nk = _join(dsig.params[i], get(a))
+                                if nk != dsig.params[i]:
+                                    dsig.params[i] = nk
+                                    changed = global_changed = True
+                                changed = mark(a, nk) or changed
+                            nk = _join(dsig.ret, get(op[1]))
+                            if nk != dsig.ret:
+                                dsig.ret = nk
+                                changed = global_changed = True
+                            changed = mark(op[1], nk) or changed
+                        continue
                     # Boundary-crossing values unify through the op-name
                     # cells (routing is dynamic; see _ScopeTable).
                     dst, opn, pargs = op[1], op[3], op[4]
@@ -2184,6 +2612,11 @@ def _infer_kinds(info: _Info, sigs: Dict[str, _Sig], structs: _StructTable,
                         changed = unify(args) or changed  # dst stays i64
                     elif o in _LOGIC:
                         pass  # i64-only
+                    elif len(args) == 2 and any(
+                            _is_fvec(get(x)) for x in (dst, *args)):
+                        # Element-wise vector arithmetic (with broadcast).
+                        changed = fvec_binop_unify(dst, args[0], args[1]) \
+                            or changed
                     else:
                         changed = unify((dst, *args)) or changed
                 elif rk == "select":
@@ -2432,7 +2865,8 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                 probs.append(f"push with {len(args)} arguments (expects 2)")
             elif not _is_vec(ty(args[0])):
                 probs.append(
-                    f"push receiver {args[0]!r} has kind {ty(args[0])}, not a Vec")
+                    f"push receiver {args[0]!r} has kind {ty(args[0])}, "
+                    "not a Vec (fixed vectors are immutable)")
             elif not _is_word_kind(_vec_elem(ty(args[0]))):
                 probs.append(
                     f"Vec of {_vec_elem(ty(args[0]))} elements (only 8-byte "
@@ -2441,58 +2875,267 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                 probs.append(
                     f"push of {ty(args[1])} into a Vec of "
                     f"{_vec_elem(ty(args[0]))}")
-        elif name in ("pop", "__index_get"):
-            want = 1 if name == "pop" else 2
-            if len(args) != want:
-                probs.append(f"{name} with {len(args)} arguments (expects {want})")
+        elif name == "pop":
+            if len(args) != 1:
+                probs.append(f"pop with {len(args)} arguments (expects 1)")
             elif not _is_vec(ty(args[0])):
                 probs.append(
-                    f"{name} receiver {args[0]!r} has kind {ty(args[0])}, "
-                    "not a Vec (string/vector indexing stays interpreted)")
-            elif name == "__index_get" and ty(args[1]) != I64:
-                probs.append(f"__index_get index {args[1]!r} is {ty(args[1])}")
+                    f"pop receiver {args[0]!r} has kind {ty(args[0])}, "
+                    "not a Vec (fixed vectors are immutable)")
             elif not _is_word_kind(_vec_elem(ty(args[0]))):
                 probs.append(
                     f"Vec of {_vec_elem(ty(args[0]))} elements (only 8-byte "
                     "word kinds fit native Vec slots)")
             elif ty(dst) != _vec_elem(ty(args[0])):
                 probs.append(
-                    f"{name} result {dst!r} is {ty(dst)}, Vec elements are "
+                    f"pop result {dst!r} is {ty(dst)}, Vec elements are "
                     f"{_vec_elem(ty(args[0]))}")
+        elif name == "__index_get":
+            rk0 = ty(args[0]) if args else I64
+            elem = (_vec_elem(rk0) if _is_vec(rk0)
+                    else _fvec_elem(rk0) if _is_fvec(rk0) else None)
+            if len(args) != 2:
+                probs.append(
+                    f"__index_get with {len(args)} arguments (expects 2)")
+            elif elem is None:
+                probs.append(
+                    f"__index_get receiver {args[0]!r} has kind {rk0}, "
+                    "not a Vec or fixed vector (string indexing stays "
+                    "interpreted)")
+            elif ty(args[1]) != I64:
+                probs.append(f"__index_get index {args[1]!r} is {ty(args[1])}")
+            elif not _is_word_kind(elem):
+                probs.append(
+                    f"vector of {elem} elements (only 8-byte word kinds fit "
+                    "native element slots)")
+            elif ty(dst) != elem:
+                probs.append(
+                    f"__index_get result {dst!r} is {ty(dst)}, elements are "
+                    f"{elem}")
         elif name == "__vec_lit":
             if not args:
                 probs.append("__vec_lit with no size argument")
-            elif not _is_vec(ty(dst)):
+            elif not _is_fvec(ty(dst)):
                 probs.append(
-                    f"__vec_lit result {dst!r} has kind {ty(dst)}, not a Vec")
+                    f"__vec_lit result {dst!r} has kind {ty(dst)}, not a "
+                    "fixed vector")
             elif ty(args[0]) != I64:
                 probs.append(f"__vec_lit size {args[0]!r} is {ty(args[0])}")
-            elif not _is_word_kind(_vec_elem(ty(dst))):
+            elif not _is_word_kind(_fvec_elem(ty(dst))):
                 probs.append(
-                    f"Vec of {_vec_elem(ty(dst))} elements (only 8-byte "
-                    "word kinds fit native Vec slots)")
+                    f"vector of {_fvec_elem(ty(dst))} elements (only 8-byte "
+                    "word kinds fit native element slots)")
             else:
                 for e in args[1:]:
-                    if ty(e) != _vec_elem(ty(dst)):
+                    if ty(e) != _fvec_elem(ty(dst)):
                         probs.append(
                             f"__vec_lit element {e!r} is {ty(e)} in a vector "
-                            f"of {_vec_elem(ty(dst))}")
+                            f"of {_fvec_elem(ty(dst))}")
+        elif name == "__vec_zeros":
+            base = info.const_strs.get(args[1], "").lower() \
+                if len(args) == 2 else ""
+            zk = {"float": F64, "int": I64}.get(base)
+            if len(args) != 2:
+                probs.append(
+                    f"__vec_zeros with {len(args)} arguments (expects 2)")
+            elif ty(args[0]) != I64:
+                probs.append(f"__vec_zeros size {args[0]!r} is {ty(args[0])}")
+            elif zk is None:
+                probs.append(
+                    "__vec_zeros base type is not a constant 'float'/'int' "
+                    "name (the interpreter cannot zero-initialize it either)")
+            elif ty(dst) != _fvec_of(zk):
+                probs.append(
+                    f"__vec_zeros result {dst!r} is {ty(dst)}, expected "
+                    f"{_fvec_of(zk)}")
+        elif name == "__vec_filled":
+            if len(args) != 2:
+                probs.append(
+                    f"__vec_filled with {len(args)} arguments (expects 2)")
+            elif ty(args[0]) != I64:
+                probs.append(f"__vec_filled size {args[0]!r} is {ty(args[0])}")
+            elif not _is_fvec(ty(dst)):
+                probs.append(
+                    f"__vec_filled result {dst!r} has kind {ty(dst)}, not a "
+                    "fixed vector")
+            elif not _is_word_kind(_fvec_elem(ty(dst))):
+                probs.append(
+                    f"vector of {_fvec_elem(ty(dst))} elements (only 8-byte "
+                    "word kinds fit native element slots)")
+            elif ty(args[1]) != _fvec_elem(ty(dst)):
+                probs.append(
+                    f"__vec_filled value {args[1]!r} is {ty(args[1])} in a "
+                    f"vector of {_fvec_elem(ty(dst))}")
+        elif name == "__range":
+            if len(args) != 2:
+                probs.append(f"__range with {len(args)} arguments (expects 2)")
+            elif any(ty(a) != I64 for a in args):
+                probs.append("__range bounds must be i64")
+            elif ty(dst) != _fvec_of(I64):
+                probs.append(
+                    f"__range result {dst!r} promoted to {ty(dst)} (ranges "
+                    "are int vectors)")
+        elif name == "__vec_dim":
+            dim = info.const_ints.get(args[1]) if len(args) == 2 else None
+            rk0 = ty(args[0]) if args else I64
+            if len(args) != 2:
+                probs.append(
+                    f"__vec_dim with {len(args)} arguments (expects 2)")
+            elif not _is_fvec(rk0):
+                probs.append(
+                    f"__vec_dim receiver {args[0]!r} has kind {rk0} (only "
+                    "fixed vectors lower natively)")
+            elif dim not in (0, 1):
+                probs.append(
+                    "__vec_dim dimension is not the constant 0 or 1")
+            elif dim == 1 and not (_is_fvec(_fvec_elem(rk0))
+                                   or _fvec_elem(rk0) in (I64, F64)):
+                probs.append(
+                    f"__vec_dim 1 of a vector of {_fvec_elem(rk0)} elements "
+                    "(no second dimension; the interpreter rejects it too)")
+            elif ty(dst) != I64:
+                probs.append(f"__vec_dim result {dst!r} promoted to {ty(dst)}")
+        elif name == "__slice_get":
+            rk0 = ty(args[0]) if args else I64
+            if len(args) != 4:
+                probs.append(
+                    f"__slice_get with {len(args)} arguments (expects 4)")
+            elif not _is_fvec(rk0):
+                probs.append(
+                    f"__slice_get receiver {args[0]!r} has kind {rk0} "
+                    "(Vec/string slicing stays interpreted)")
+            elif not _is_word_kind(_fvec_elem(rk0)):
+                probs.append(
+                    f"vector of {_fvec_elem(rk0)} elements (only 8-byte "
+                    "word kinds fit native element slots)")
+            elif ty(dst) != rk0:
+                probs.append(
+                    f"__slice_get result {dst!r} is {ty(dst)}, receiver is "
+                    f"{rk0}")
+            else:
+                for a in args[1:]:
+                    if a in info.const_nones:
+                        continue  # statically-omitted bound
+                    if a in info.none_def_vars:
+                        probs.append(
+                            f"__slice_get bound {a!r} is sometimes None and "
+                            "sometimes an int (no static encoding)")
+                    elif ty(a) != I64:
+                        probs.append(
+                            f"__slice_get bound {a!r} is {ty(a)}, not i64")
+        elif name == "__cast":
+            t = info.const_strs.get(args[1]) if len(args) == 2 else None
+            if len(args) != 2:
+                probs.append(f"__cast with {len(args)} arguments (expects 2)")
+            elif t is None:
+                probs.append("__cast target is not a constant type name")
+            elif t in ("float", "f32", "f64"):
+                if ty(args[0]) not in (I64, F64):
+                    probs.append(
+                        f"__cast of {ty(args[0])} to {t} (the interpreter "
+                        "only converts numbers)")
+                elif ty(dst) != F64:
+                    probs.append(f"__cast result {dst!r} is {ty(dst)}, not f64")
+            elif t in ("int", "i8", "i16", "i32", "i64",
+                       "u8", "u16", "u32", "u64"):
+                if ty(args[0]) not in (I64, F64):
+                    probs.append(
+                        f"__cast of {ty(args[0])} to {t} (the interpreter "
+                        "only converts numbers)")
+                elif ty(dst) != I64:
+                    probs.append(f"__cast result {dst!r} is {ty(dst)}, not i64")
+            else:
+                if ty(dst) != ty(args[0]):
+                    probs.append(
+                        f"__cast to {t!r} is an identity reinterpretation "
+                        f"but {dst!r} is {ty(dst)} and {args[0]!r} is "
+                        f"{ty(args[0])}")
+        elif name == "__vec_comprehension":
+            if len(args) != 3:
+                probs.append(
+                    f"__vec_comprehension with {len(args)} arguments "
+                    "(expects 3)")
+                return
+            nvar, fnvar, itvar = args
+            if nvar not in info.const_nones and nvar not in info.const_ints:
+                probs.append(
+                    "__vec_comprehension size is not a constant int or None")
+            fk = ty(fnvar)
+            if not _is_closure(fk):
+                probs.append(
+                    f"__vec_comprehension body {fnvar!r} is not a "
+                    "statically-known closure")
+                return
+            lname = _closure_lambda(fk)
+            lsig = sigs.get(lname)
+            if lsig is None or lname not in module_names:
+                probs.append(
+                    f"__vec_comprehension body lambda {lname!r} unknown")
+                return
+            if len(lsig.params) != 1:
+                probs.append(
+                    f"__vec_comprehension body lambda {lname!r} takes "
+                    f"{len(lsig.params)} parameters (tuple unpacking stays "
+                    "interpreted)")
+                return
+            itk = ty(itvar)
+            if not _is_fvec(itk):
+                probs.append(
+                    f"__vec_comprehension iterable {itvar!r} has kind {itk} "
+                    "(only fixed vectors and ranges lower natively)")
+                return
+            ek, pk_ = _fvec_elem(itk), lsig.params[0]
+            if not _is_word_kind(ek):
+                probs.append(
+                    f"vector of {ek} elements (only 8-byte word kinds fit "
+                    "native element slots)")
+            elif not (pk_ == ek or (ek == I64 and pk_ == F64)):
+                probs.append(
+                    f"__vec_comprehension element kind {ek} does not fit "
+                    f"the body lambda's parameter kind {pk_}")
+            dk = ty(dst)
+            if not _is_fvec(dk):
+                probs.append(
+                    f"__vec_comprehension result {dst!r} has kind {dk}, "
+                    "not a fixed vector")
+            else:
+                rk_, dek = lsig.ret, _fvec_elem(dk)
+                if not _is_word_kind(rk_):
+                    probs.append(
+                        f"__vec_comprehension body returns {rk_} (only "
+                        "8-byte word kinds fit native element slots)")
+                elif not (dek == rk_ or (rk_ == I64 and dek == F64)):
+                    probs.append(
+                        f"__vec_comprehension body returns {rk_} into a "
+                        f"vector of {dek}")
         elif name == "len":
             if len(args) != 1:
                 probs.append(f"len with {len(args)} arguments (expects 1)")
-            elif not (_is_vec(ty(args[0])) or ty(args[0]) == STR):
+            elif not (_is_vec(ty(args[0])) or _is_fvec(ty(args[0]))
+                      or ty(args[0]) == STR):
                 probs.append(
                     f"len receiver {args[0]!r} has kind {ty(args[0])} "
-                    "(only Vec and string lower natively)")
+                    "(only Vec, fixed vector and string lower natively)")
             elif ty(dst) != I64:
                 probs.append(f"len result {dst!r} promoted to {ty(dst)}")
         elif name in ("to_string", "int_to_str"):
+            ak = ty(args[0]) if len(args) == 1 else I64
             if len(args) != 1:
                 probs.append(f"{name} with {len(args)} arguments (expects 1)")
-            elif ty(args[0]) not in (I64, F64, STR):
+            elif _is_fvec(ak):
+                leaf, _d = _fvec_leaf(ak)
+                if leaf not in (I64, F64):
+                    probs.append(
+                        f"{name} of a vector of {leaf} leaves (only "
+                        "int/float vectors render natively)")
+                elif ty(dst) != STR:
+                    probs.append(
+                        f"{name} result {dst!r} is {ty(dst)}, not str")
+            elif ak not in (I64, F64, STR):
                 probs.append(
-                    f"{name} of kind {ty(args[0])} (only i64/f64/str lower "
-                    "to mx_i64_to_str/mx_f64_to_str/identity)")
+                    f"{name} of kind {ak} (only i64/f64/str/fixed-vector "
+                    "lower to mx_i64_to_str/mx_f64_to_str/identity/"
+                    "mx_fvec_to_str)")
             elif ty(dst) != STR:
                 probs.append(f"{name} result {dst!r} is {ty(dst)}, not str")
         elif name in _MATH_EXTERNS:
@@ -2508,6 +3151,32 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
     for b in info.f.blocks:
         for op in b.ops:
             if op[0] == "perform" and len(op) >= 7:
+                dfn = info.default_performs.get((op[2], op[3]))
+                if dfn is not None:
+                    # Direct call to the op's declared default: ordinary
+                    # call-signature checks, no boundary word restrictions.
+                    dsig = sigs.get(dfn)
+                    if dsig is None or dfn not in module_names:
+                        probs.append(
+                            f"effect-op default {dfn!r} missing from the "
+                            "module")
+                    elif len(dsig.params) != len(op[4]):
+                        probs.append(
+                            f"perform of {op[3]!r} with {len(op[4])} "
+                            f"arguments; its default declares "
+                            f"{len(dsig.params)} parameters")
+                    else:
+                        for a, pk_ in zip(op[4], dsig.params):
+                            if ty(a) != pk_:
+                                probs.append(
+                                    f"perform default call {dfn!r}: arg "
+                                    f"{a!r} is {ty(a)}, expects {pk_}")
+                        if ty(op[1]) != dsig.ret:
+                            probs.append(
+                                f"perform default call {dfn!r}: result "
+                                f"{op[1]!r} is {ty(op[1])}, returns "
+                                f"{dsig.ret}")
+                    continue
                 for a in op[4]:
                     check_boundary(ty(a), f"perform argument {a!r}")
                 check_boundary(ty(op[1]), f"perform result {op[1]!r}")
@@ -2554,12 +3223,13 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                     probs.append(
                         f"constant {dst!r} promoted to aggregate kind "
                         f"{ty(dst)} (no scalar-to-aggregate coercion)")
-                elif _is_vec(ty(dst)) and dst not in info.dead_results \
+                elif (_is_vec(ty(dst)) or _is_fvec(ty(dst))) \
+                        and dst not in info.dead_results \
                         and not (rk == "const" and rhs[1] is None) \
                         and rk != "const_ty":
                     probs.append(
-                        f"constant {dst!r} promoted to Vec kind {ty(dst)} "
-                        "(no literal Vec values)")
+                        f"constant {dst!r} promoted to vector kind {ty(dst)} "
+                        "(no scalar-to-vector coercion)")
                 elif ty(dst) == PTR and dst not in info.dead_results \
                         and not (rk == "const" and rhs[1] is None):
                     probs.append(
@@ -2567,7 +3237,46 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                         "(only `null` is a pointer literal)")
             elif rk == "binop":
                 o = rhs[1]
-                if any(_is_vec(ty(x)) for x in (dst, *args)):
+                if any(_is_fvec(ty(x)) for x in (dst, *args)):
+                    # Element-wise arithmetic (with scalar broadcasting) on
+                    # fixed vectors -> mx_fvec_binop.  Comparisons are
+                    # STRUCTURAL in the interpreter (dataclass equality);
+                    # native pointers cannot reproduce that -> demote.
+                    dk = ty(dst)
+                    if o not in _FVEC_BINOP_CODES:
+                        probs.append(
+                            f"binop {o!r} on fixed vectors (the interpreter "
+                            "compares structurally; only element-wise "
+                            "+ - * / % lower natively)")
+                    elif len(args) != 2 or not _is_fvec(dk):
+                        probs.append(
+                            f"vector binop {o!r} result {dst!r} has kind "
+                            f"{dk}, not a fixed vector")
+                    elif _fvec_leaf(dk)[0] not in (I64, F64):
+                        probs.append(
+                            f"vector binop {o!r} over {_fvec_leaf(dk)[0]} "
+                            "leaves (only numeric element-wise arithmetic)")
+                    elif o == "%" and _fvec_leaf(dk)[0] == F64:
+                        probs.append(
+                            "float vector % has no native lowering (the "
+                            "runtime object stays libm-free)")
+                    elif not any(_is_fvec(ty(a)) for a in args):
+                        probs.append(
+                            f"vector binop {o!r} with no vector operand")
+                    else:
+                        for a in args:
+                            ak = ty(a)
+                            if _is_fvec(ak):
+                                if ak != dk:
+                                    probs.append(
+                                        f"vector binop {o!r}: operand "
+                                        f"{a!r} is {ak}, result is {dk}")
+                            elif ak != _fvec_leaf(dk)[0]:
+                                probs.append(
+                                    f"vector binop {o!r}: broadcast scalar "
+                                    f"{a!r} is {ak}, leaf elements are "
+                                    f"{_fvec_leaf(dk)[0]}")
+                elif any(_is_vec(ty(x)) for x in (dst, *args)):
                     # Vec ==/!= is item-wise in the interpreter but would be
                     # pointer identity natively; no vec arithmetic exists.
                     probs.append(
@@ -2734,10 +3443,17 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                             probs.append(
                                 f"as_ptr of a Vec of {_vec_elem(ty(args[0]))} "
                                 "elements (byte snapshots need i64 elements)")
+                    elif _is_fvec(ty(args[0])):
+                        if _fvec_elem(ty(args[0])) != I64:
+                            probs.append(
+                                f"as_ptr of a vector of "
+                                f"{_fvec_elem(ty(args[0]))} elements (byte "
+                                "snapshots need i64 elements)")
                     else:
                         probs.append(
                             f"as_ptr receiver {args[0]!r} has kind "
-                            f"{ty(args[0])} (only str and Vec lower natively)")
+                            f"{ty(args[0])} (only str and vectors lower "
+                            "natively)")
                     if ty(dst) != PTR:
                         probs.append(
                             f"as_ptr result {dst!r} is {ty(dst)}, not rawptr")
@@ -2770,8 +3486,25 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                             "(native truthiness is i64-only)")
                 elif callee in _PRINT_BUILTINS:
                     for a in args:
-                        if ty(a) not in (I64, F64, STR):
-                            probs.append(f"print of unsupported kind {ty(a)}")
+                        ak = ty(a)
+                        if _is_fvec(ak):
+                            # print of a fixed vector renders via
+                            # mx_fvec_to_str (repr parity); non-numeric
+                            # leaves have no native repr.
+                            if _fvec_leaf(ak)[0] not in (I64, F64):
+                                probs.append(
+                                    f"print of a vector of "
+                                    f"{_fvec_leaf(ak)[0]} leaves")
+                        elif ak not in (I64, F64, STR):
+                            probs.append(f"print of unsupported kind {ak}")
+                elif callee == "neg":
+                    if len(args) == 1 and ty(dst) not in (I64, F64):
+                        probs.append(
+                            f"neg of kind {ty(dst)} (the interpreter only "
+                            "negates numbers)")
+                elif callee == "not":
+                    if len(args) == 1 and ty(dst) != I64:
+                        probs.append(f"not of kind {ty(dst)}")
                 elif callee in _MATH_EXTERNS or callee in _INLINE_BUILTINS:
                     pass  # kinds pinned during inference
                 elif callee in module_names:
@@ -3002,6 +3735,85 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                         f"enum {ename or 'anon'!r} variant {v!r} payload "
                         f"slot {i} boxes a value of {sk} whose layout is "
                         "infinite")
+    # RANGE VALUES: __range materializes a fixed int vector natively, but
+    # the interpreter's range is a plain Python list whose repr ("[0, 1]")
+    # differs from a vector's ("vector[0, 1]").  Restrict range values (and
+    # their copies) to the shapes where the two are observationally
+    # identical — the iteration protocol (len / __index_get receiver) and
+    # comprehension iterables — and demote every other use.
+    tainted: Set[str] = set()
+    tchanged = True
+    while tchanged:
+        tchanged = False
+        for b in info.f.blocks:
+            for op in b.ops:
+                if op[0] != "let" or len(op) != 4:
+                    continue
+                if op[2][0] == "call" and op[2][1] == "__range" \
+                        or (op[2][0] == "copy" and op[3]
+                            and op[3][0] in tainted):
+                    if op[1] not in tainted:
+                        tainted.add(op[1])
+                        tchanged = True
+    if tainted:
+        def bad_range_use(n: str) -> None:
+            probs.append(
+                f"range value {n!r} used outside the iteration protocol "
+                "(the interpreter's range is a list; its repr differs from "
+                "a vector's)")
+        for b in info.f.blocks:
+            for op in b.ops:
+                if op[0] == "drop" or op[0] == "params":
+                    continue
+                if op[0] == "perform" and len(op) >= 7:
+                    for a in op[4]:
+                        if a in tainted:
+                            bad_range_use(a)
+                    continue
+                if op[0] != "let" or len(op) != 4:
+                    continue
+                _, _dst2, rhs2, args2 = op
+                rk2 = rhs2[0]
+                if rk2 in ("alloc_struct", "make_closure", "handle_scope",
+                           "try_scope"):
+                    for pair in args2:
+                        if isinstance(pair, tuple) and len(pair) == 2 \
+                                and pair[1] in tainted:
+                            bad_range_use(pair[1])
+                    continue
+                ok_positions: Set[int] = set()
+                if rk2 == "copy":
+                    ok_positions = {0}
+                elif rk2 == "call" and rhs2[1] in ("len", "__index_get"):
+                    ok_positions = {0}
+                elif rk2 == "call" and rhs2[1] == "__vec_comprehension":
+                    ok_positions = {2}
+                for i, a in enumerate(args2):
+                    if isinstance(a, str) and a in tainted \
+                            and i not in ok_positions:
+                        bad_range_use(a)
+            t2 = b.term
+            if t2[0] in ("br_if", "ret") and t2[1] in tainted:
+                bad_range_use(t2[1])
+
+    # promote_matrix parameters: the local kind must be exactly the
+    # promoted form of the incoming (caller-side) kind.  A sig still at the
+    # i64 bottom with a promoted local kind means no caller ever passes a
+    # vector here — demote rather than emit code for a flow that cannot be
+    # typed.
+    if info.promote_params:
+        own2 = sigs.get(info.f.name)
+        if own2 is not None and len(own2.params) == len(info.params):
+            for i, p in enumerate(info.params):
+                if p not in info.promote_params:
+                    continue
+                sk = own2.params[i]
+                if ty(p) != _promote_kind(sk):
+                    probs.append(
+                        f"promote_matrix parameter {p!r}: local kind "
+                        f"{ty(p)} is not the promoted form of its incoming "
+                        f"kind {sk}")
+
     # Captures this function loads from its own env must be liftable too.
     if info.is_lambda:
         for cap in info.env_captures:
@@ -3529,6 +4341,11 @@ class _ModuleState:
         self.scope_tables: Dict[str, str] = {}
         # handle site -> body thunk + dispatcher define text
         self.scope_thunks: Dict[str, str] = {}
+        # owner fn -> per-site comprehension thunk defines (kept only when
+        # the owner emitted; each thunk calls its body lambda's symbol,
+        # which dep_names makes a dependency of the owner).
+        self.comp_thunks: Dict[str, List[str]] = {}
+        self.thunk_seq = 0
 
     def intern_string(self, content: str) -> str:
         if content not in self.strings:
@@ -3742,6 +4559,11 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
             if value is None:
                 return "null"  # an uninitialized Vec slot (const None)
             raise _Unsupported(f"non-None constant for Vec value {name!r}")
+        if _is_fvec(k):
+            if value is None:
+                return "null"  # an uninitialized vector slot (const None)
+            raise _Unsupported(
+                f"non-None constant for vector value {name!r}")
         if k == PTR:
             if value is None:
                 return "null"  # the `null` pointer literal
@@ -4081,35 +4903,199 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
             setval(dst, from_word(elem, w, lines), lines)
         elif name == "__index_get":
             recv = use(opargs[0], lines)
-            elem = _vec_elem(kind(opargs[0]))
+            rk0 = kind(opargs[0])
             idx = use(opargs[1], lines)
-            mod.runtime_syms.add("mx_vec_get")
             w = fresh()
-            lines.append(f"  {w} = call i64 @mx_vec_get(ptr {recv}, i64 {idx})")
+            if _is_fvec(rk0):
+                elem = _fvec_elem(rk0)
+                mod.runtime_syms.add("mx_fvec_get")
+                lines.append(
+                    f"  {w} = call i64 @mx_fvec_get(ptr {recv}, i64 {idx})")
+            else:
+                elem = _vec_elem(rk0)
+                mod.runtime_syms.add("mx_vec_get")
+                lines.append(
+                    f"  {w} = call i64 @mx_vec_get(ptr {recv}, i64 {idx})")
             setval(dst, from_word(elem, w, lines), lines)
         elif name == "__vec_lit":
-            # Fixed-size vector literal: a fresh native vector filled with
-            # one push per element (the size argument is implied by the
-            # element count; the front end already checked the arity).
-            # Identity semantics stand in for the interpreter's immutable
-            # MxVector — indistinguishable for every accepted program (see
-            # module docstring).
-            mod.runtime_syms.add("mx_vec_new")
+            # Fixed-size vector literal (increment 10): one immutable
+            # mx_fvec block, filled in place BEFORE the pointer is ever
+            # shared (write-once), then shallow-shared like the
+            # interpreter's value-semantics MxVector.  Leaks by design.
+            n = len(opargs) - 1
+            szc = info.const_ints.get(opargs[0])
+            if szc is not None and szc != n:
+                raise _Unsupported(
+                    f"vector literal has {n} elements for a declared size "
+                    f"of {szc} (the interpreter rejects it)")
+            mod.runtime_syms.add("mx_fvec_new")
             v = fresh()
-            note = ("freed on ret paths (provably non-escaping)"
-                    if dst in vec_free_set else "leaks by design (may escape)")
             lines.append(
-                f"  {v} = call ptr @mx_vec_new()  ; vector literal: {note}")
-            elem = _vec_elem(kind(dst))
-            if opargs[1:]:
-                mod.runtime_syms.add("mx_vec_push")
-            for e in opargs[1:]:
+                f"  {v} = call ptr @mx_fvec_new(i64 {n})"
+                "  ; vector literal (immutable block, leaks by design)")
+            elem = _fvec_elem(kind(dst))
+            if n:
+                mod.runtime_syms.add("mx_fvec_init")
+            for i, e in enumerate(opargs[1:]):
                 w = to_word(elem, use(e, lines), lines)
-                lines.append(f"  call void @mx_vec_push(ptr {v}, i64 {w})")
+                lines.append(
+                    f"  call void @mx_fvec_init(ptr {v}, i64 {i}, i64 {w})")
+            setval(dst, v, lines)
+        elif name == "__vec_zeros":
+            # mx_fvec_new zero-fills; the int 0 and float 0.0 words are
+            # both all-zero bits, so no fill loop is needed.
+            mod.runtime_syms.add("mx_fvec_new")
+            nv = use(opargs[0], lines)
+            v = fresh()
+            lines.append(
+                f"  {v} = call ptr @mx_fvec_new(i64 {nv})"
+                "  ; zero-filled vector (0 / 0.0 are the all-zero word)")
+            setval(dst, v, lines)
+        elif name == "__vec_filled":
+            elem = _fvec_elem(kind(dst))
+            nv = use(opargs[0], lines)
+            w = to_word(elem, use(opargs[1], lines), lines)
+            mod.runtime_syms.add("mx_fvec_filled")
+            v = fresh()
+            lines.append(
+                f"  {v} = call ptr @mx_fvec_filled(i64 {nv}, i64 {w})")
+            setval(dst, v, lines)
+        elif name == "__range":
+            mod.runtime_syms.add("mx_fvec_range")
+            s = use(opargs[0], lines)
+            e = use(opargs[1], lines)
+            v = fresh()
+            lines.append(
+                f"  {v} = call ptr @mx_fvec_range(i64 {s}, i64 {e})"
+                "  ; range as an int vector (uses restricted to iteration)")
+            setval(dst, v, lines)
+        elif name == "__vec_dim":
+            recv = use(opargs[0], lines)
+            v = fresh()
+            if info.const_ints.get(opargs[1]) == 0:
+                mod.runtime_syms.add("mx_fvec_len")
+                lines.append(f"  {v} = call i64 @mx_fvec_len(ptr {recv})")
+            else:  # dim 1 (the consistency check pinned 0 or 1)
+                isvec = 1 if _is_fvec(_fvec_elem(kind(opargs[0]))) else 0
+                mod.runtime_syms.add("mx_fvec_dim")
+                lines.append(
+                    f"  {v} = call i64 @mx_fvec_dim(ptr {recv}, i64 1, "
+                    f"i64 {isvec})")
+            setval(dst, v, lines)
+        elif name == "__slice_get":
+            recv = use(opargs[0], lines)
+            mask = 0
+            words: List[str] = []
+            for bit, a in zip((1, 2, 4), opargs[1:]):
+                if a in info.const_nones:
+                    words.append("0")  # statically-omitted bound
+                else:
+                    mask |= bit
+                    words.append(use(a, lines))
+            mod.runtime_syms.add("mx_fvec_slice")
+            v = fresh()
+            lines.append(
+                f"  {v} = call ptr @mx_fvec_slice(ptr {recv}, "
+                f"i64 {words[0]}, i64 {words[1]}, i64 {words[2]}, "
+                f"i64 {mask})  ; honest copy, never a view")
+            setval(dst, v, lines)
+        elif name == "__cast":
+            t = info.const_strs.get(opargs[1], "")
+            a = use(opargs[0], lines)
+            ak = kind(opargs[0])
+            if t in ("float", "f32", "f64"):
+                if ak == F64:
+                    setval(dst, a, lines)  # already a float
+                else:
+                    v = fresh()
+                    lines.append(
+                        f"  {v} = sitofp i64 {a} to double  ; `as float`")
+                    setval(dst, v, lines)
+            elif t in ("int", "i8", "i16", "i32", "i64",
+                       "u8", "u16", "u32", "u64"):
+                if ak == I64:
+                    setval(dst, a, lines)  # already an int
+                else:
+                    v = fresh()
+                    lines.append(
+                        f"  {v} = fptosi double {a} to i64"
+                        "  ; `as int` (truncates toward zero, like Python)")
+                    setval(dst, v, lines)
+            else:
+                lines.append(
+                    f"  ; __cast to {t!r}: static-level reinterpretation "
+                    "(identity, interpreter parity)")
+                setval(dst, a, lines)
+        elif name == "__vec_comprehension":
+            nvar, fnvar, itvar = opargs
+            lname = _closure_lambda(kind(fnvar))
+            if lname not in emitted_names:
+                raise _Unsupported(
+                    f"comprehension body lambda {lname!r} is not emitted")
+            lsig = sigs[lname]
+            ek = _fvec_elem(kind(itvar))
+            pk_, rk_ = lsig.params[0], lsig.ret
+            dek = _fvec_elem(kind(dst))
+            # Per-site thunk: decode the element word, adapt i64->f64 when
+            # the body expects floats (the scalar-promotion contract), call
+            # the lambda, encode its result as the destination's element
+            # word.
+            mod.thunk_seq += 1
+            tsym = f"mx.vcth.{mod.thunk_seq}"
+            tl: List[str] = [
+                f"define internal i64 @{tsym}(ptr %env, i64 %w) {{"
+                f"  ; comprehension thunk: {lname}",
+                "entry:"]
+            if pk_ == F64 and ek == I64:
+                tl.append("  %e = sitofp i64 %w to double")
+                ev = "%e"
+            elif ek == I64:
+                ev = "%w"
+            elif ek == F64:
+                tl.append("  %e = bitcast i64 %w to double")
+                ev = "%e"
+            else:
+                tl.append("  %e = inttoptr i64 %w to ptr")
+                ev = "%e"
+            tl.append(
+                f"  %r = call {_llscalar(rk_)} @{mangle(lname)}(ptr %env, "
+                f"{_llscalar(pk_)} {ev})")
+            rv = "%r"
+            if dek == F64 and rk_ == I64:
+                tl.append("  %rf = sitofp i64 %r to double")
+                rv = "%rf"
+            if dek == I64:
+                tl.append(f"  ret i64 {rv}")
+            elif dek == F64:
+                tl.append(f"  %rw = bitcast double {rv} to i64")
+                tl.append("  ret i64 %rw")
+            else:
+                tl.append(f"  %rw = ptrtoint ptr {rv} to i64")
+                tl.append("  ret i64 %rw")
+            tl.append("}")
+            mod.comp_thunks.setdefault(f.name, []).append("\n".join(tl))
+            base = use(fnvar, lines)
+            envpp = fresh()
+            lines.append(
+                f"  {envpp} = getelementptr inbounds {_CLOSURE_PAIR_TY}, "
+                f"ptr {base}, i32 0, i32 1")
+            envv = fresh()
+            lines.append(f"  {envv} = load ptr, ptr {envpp}")
+            nconst = info.const_ints.get(nvar)
+            nexp = -1 if nconst is None else nconst
+            src = use(itvar, lines)
+            mod.runtime_syms.add("mx_fvec_map")
+            v = fresh()
+            lines.append(
+                f"  {v} = call ptr @mx_fvec_map(ptr {src}, ptr @{tsym}, "
+                f"ptr {envv}, i64 {nexp})"
+                f"  ; comprehension via {lname}")
             setval(dst, v, lines)
         elif name == "len":
             recv = use(opargs[0], lines)
-            sym = "mx_vec_len" if _is_vec(kind(opargs[0])) else "mx_str_len"
+            rk0 = kind(opargs[0])
+            sym = ("mx_vec_len" if _is_vec(rk0)
+                   else "mx_fvec_len" if _is_fvec(rk0) else "mx_str_len")
             mod.runtime_syms.add(sym)
             v = fresh()
             lines.append(f"  {v} = call i64 @{sym}(ptr {recv})")
@@ -4119,6 +5105,15 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
             a = use(opargs[0], lines)
             if k == STR:
                 setval(dst, a, lines)  # to_string of a string is identity
+            elif _is_fvec(k):
+                leaf, depth = _fvec_leaf(k)
+                mod.runtime_syms.add("mx_fvec_to_str")
+                v = fresh()
+                lines.append(
+                    f"  {v} = call ptr @mx_fvec_to_str(ptr {a}, "
+                    f"i64 {1 if leaf == F64 else 0}, i64 {depth})"
+                    "  ; vector repr (fresh string, leaks by design)")
+                setval(dst, v, lines)
             else:
                 sym = "mx_f64_to_str" if k == F64 else "mx_i64_to_str"
                 mod.runtime_syms.add(sym)
@@ -4240,7 +5235,42 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                 lines.append("  unreachable")
                 terminated = True
                 break
+            if opk == "promote_matrix":
+                # Rebind each named parameter to its promoted form: a flat
+                # numeric vector becomes an Mx1 matrix (mx_fvec_promote);
+                # anything else passes through untouched (mir_interp's
+                # isinstance/all-numbers test, resolved statically from the
+                # incoming kind).
+                own_ps = sigs[f.name].params
+                for pname in (op[1] if len(op) > 1 else ()):
+                    pidx = info.params.index(pname)
+                    sk = own_ps[pidx] if pidx < len(own_ps) else I64
+                    if _is_fvec(sk) and _fvec_elem(sk) in (I64, F64):
+                        mod.runtime_syms.add("mx_fvec_promote")
+                        cur = use(pname, lines)
+                        pv = fresh()
+                        lines.append(
+                            f"  {pv} = call ptr @mx_fvec_promote(ptr {cur})"
+                            f"  ; promote_matrix: flat {sk} -> Mx1 matrix")
+                        setval(pname, pv, lines)
+                    else:
+                        lines.append(
+                            f"  ; promote_matrix {pname}: not a flat "
+                            "numeric vector (no-op)")
+                        setval(pname, use(pname, lines), lines)
+                continue
             if opk == "perform":
+                dfn = info.default_performs.get((op[2], op[3]))
+                if dfn is not None:
+                    # No handle_scope in the module lists this op, so no
+                    # scope can ever intercept it: the perform IS a direct
+                    # call to the declared default (mir_interp's fallback),
+                    # ordinary conventions, aggregates and all.
+                    lines.append(
+                        f"  ; perform {op[2] or '?'}.{op[3]} -> declared "
+                        "default (no handle scope in the module lists it)")
+                    emit_direct_call(op[1], dfn, tuple(op[4]), lines)
+                    continue
                 # ("perform", dst, effect, op, args, resume_bb, resume_slot):
                 # store the argument words into the scratch array and call
                 # mx_perform; the runtime parks this call stack at this
@@ -4307,7 +5337,30 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                 r = use(opargs[1], lines)
                 is_flt = kind(opargs[0]) == F64
                 is_str = kind(opargs[0]) == STR and kind(opargs[1]) == STR
-                if is_str and o == "+":
+                if any(_is_fvec(kind(x)) for x in (dst, *opargs)):
+                    # Element-wise vector arithmetic with scalar
+                    # broadcasting -> mx_fvec_binop (recursion handles
+                    # nested matrices); the consistency check pinned the
+                    # operand shapes and the numeric leaf kind.
+                    dk = kind(dst)
+                    leaf, depth = _fvec_leaf(dk)
+                    lk0, rk0 = kind(opargs[0]), kind(opargs[1])
+                    mode = (0 if _is_fvec(lk0) and _is_fvec(rk0)
+                            else 1 if _is_fvec(lk0) else 2)
+                    lw = to_word(lk0, l, lines)
+                    rw = to_word(rk0, r, lines)
+                    mod.runtime_syms.add("mx_fvec_binop")
+                    v = fresh()
+                    note = ("vector-vector" if mode == 0 else
+                            "scalar broadcast")
+                    lines.append(
+                        f"  {v} = call ptr @mx_fvec_binop("
+                        f"i64 {_FVEC_BINOP_CODES[o]}, "
+                        f"i64 {1 if leaf == F64 else 0}, i64 {depth}, "
+                        f"i64 {mode}, i64 {lw}, i64 {rw})"
+                        f"  ; element-wise {o} ({note})")
+                    setval(dst, v, lines)
+                elif is_str and o == "+":
                     # String concatenation -> fresh malloc'd string from the
                     # native runtime; freed when the ownership analysis
                     # proves the value non-retained, otherwise leaked by
@@ -4461,6 +5514,13 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                         lines.append(f"  ; as_ptr: identity on a native "
                                      "string (already NUL-terminated bytes)")
                         setval(dst, a, lines)
+                    elif _is_fvec(kind(opargs[0])):
+                        mod.runtime_syms.add("mx_fvec_as_bytes")
+                        v = fresh()
+                        lines.append(
+                            f"  {v} = call ptr @mx_fvec_as_bytes(ptr {a})"
+                            "  ; fresh byte snapshot (leaks by design)")
+                        setval(dst, v, lines)
                     else:  # vec receiver (consistency validated the kind)
                         mod.runtime_syms.add("mx_vec_as_bytes")
                         v = fresh()
@@ -4506,27 +5566,64 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                     lines.append(f"assert.ok.{n}:")
                     setval(dst, "0", lines)  # unit
                 elif callee in _PRINT_BUILTINS:
+                    def fvec_repr(a: str) -> str:
+                        """Render a fixed vector to its interpreter repr
+                        string ("vector[...]"); freed right after the print
+                        (printf never retains)."""
+                        leaf, depth = _fvec_leaf(kind(a))
+                        mod.runtime_syms.add("mx_fvec_to_str")
+                        sv = fresh()
+                        lines.append(
+                            f"  {sv} = call ptr @mx_fvec_to_str("
+                            f"ptr {use(a, lines)}, "
+                            f"i64 {1 if leaf == F64 else 0}, i64 {depth})"
+                            "  ; vector repr for print")
+                        return sv
+                    fvec_temps: List[str] = []
                     if len(opargs) == 1:
-                        a = use(opargs[0], lines)
                         k = kind(opargs[0])
-                        mod.print_helpers.add(k)
-                        hn = {I64: "metaxu_print_i64", F64: "metaxu_print_f64",
-                              STR: "metaxu_print_str"}[k]
-                        lines.append(f"  call void @{hn}({_LLTY[k]} {a})")
+                        if _is_fvec(k):
+                            sv = fvec_repr(opargs[0])
+                            fvec_temps.append(sv)
+                            mod.print_helpers.add(STR)
+                            lines.append(
+                                f"  call void @metaxu_print_str(ptr {sv})")
+                        else:
+                            a = use(opargs[0], lines)
+                            mod.print_helpers.add(k)
+                            hn = {I64: "metaxu_print_i64",
+                                  F64: "metaxu_print_f64",
+                                  STR: "metaxu_print_str"}[k]
+                            lines.append(
+                                f"  call void @{hn}({_LLTY[k]} {a})")
                     else:
                         # 0 or 2+ args: one printf with space-joined per-kind
                         # directives, matching the interpreter's print(*args).
-                        fmt = " ".join(
-                            {I64: "%lld", F64: "%g", STR: "%s"}[kind(a)]
-                            for a in opargs) + "\n"
-                        avals = [f"{_LLTY[kind(a)]} {use(a, lines)}"
-                                 for a in opargs]
+                        parts: List[str] = []
+                        avals: List[str] = []
+                        for a in opargs:
+                            k2 = kind(a)
+                            if _is_fvec(k2):
+                                sv = fvec_repr(a)
+                                fvec_temps.append(sv)
+                                parts.append("%s")
+                                avals.append(f"ptr {sv}")
+                            else:
+                                parts.append(
+                                    {I64: "%lld", F64: "%g", STR: "%s"}[k2])
+                                avals.append(f"{_LLTY[k2]} {use(a, lines)}")
+                        fmt = " ".join(parts) + "\n"
                         g = mod.intern_string(fmt)
                         mod.uses_printf = True
                         r = fresh()
                         call_args = ", ".join([f"ptr {g}"] + avals)
                         lines.append(
                             f"  {r} = call i32 (ptr, ...) @printf({call_args})")
+                    for sv in fvec_temps:
+                        mod.runtime_syms.add("mx_str_free")
+                        lines.append(
+                            f"  call void @mx_str_free(ptr {sv})"
+                            "  ; print never retains the repr")
                     setval(dst, "0", lines)  # unit
                 elif callee == "neg":
                     a = use(opargs[0], lines)
@@ -5162,6 +6259,15 @@ def emit_llvm(funcs: Sequence[MirFunc]) -> str:
                     deps.add(starget)
         deps |= {lname for (_d, lname, _c) in info.closure_defs
                  if lname in module_names}
+        # Statically default-resolved performs call the default fn directly.
+        deps |= {dfn for dfn in info.default_performs.values()
+                 if dfn in module_names}
+        # A comprehension site's per-element thunk calls the lambda symbol.
+        for (_d, callee, cargs) in info.calls:
+            if callee == "__vec_comprehension" and len(cargs) == 3:
+                ck = kinds.get(cargs[1], I64)
+                if _is_closure(ck) and _closure_lambda(ck) in module_names:
+                    deps.add(_closure_lambda(ck))
         # A handle site's owner cannot link without its body/case
         # subfunctions (the site's shims call them).
         for site in scopes.sites_of_owner.get(info.f.name, ()):
@@ -5215,6 +6321,11 @@ def emit_llvm(funcs: Sequence[MirFunc]) -> str:
                     changed = True
                 own = sigs[info.f.name]
                 for i, p in enumerate(info.params):
+                    if p in info.promote_params:
+                        # promote_matrix'd param: the local kind is the
+                        # PROMOTED form; the sig keeps the caller-side kind
+                        # (joined at call sites only).
+                        continue
                     nk = _join(own.params[i], kinds.get(p, I64))
                     if nk != own.params[i]:
                         own.params[i] = nk
@@ -5464,6 +6575,9 @@ def emit_llvm(funcs: Sequence[MirFunc]) -> str:
         chunk = emitted_chunks.get(info.f.name)
         if chunk is not None:
             chunks.append(chunk)
+            # Comprehension thunks of emitted owners (a demoted owner's
+            # thunks are dropped with it — they reference its lambdas).
+            chunks.extend(mod.comp_thunks.get(info.f.name, ()))
         else:
             chunks.append(_emit_placeholder(info, sigs[info.f.name]))
     return "\n\n".join(chunks)
