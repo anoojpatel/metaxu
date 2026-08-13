@@ -169,6 +169,10 @@ class IfDesugarPass(DesugarPass):
 # identifiers, so splitting on it is unambiguous even when trait/type/method
 # names themselves contain underscores.
 IMPL_SEP = "$"
+
+
+class CoherenceError(Exception):
+    """Two distinct implement blocks define the same (trait, type, method)."""
 IMPL_PREFIX = f"__impl{IMPL_SEP}"
 
 
@@ -234,6 +238,10 @@ class TraitImplDesugarPass(DesugarPass):
         # impl referenced from multiple lists (`statements` and `children`)
         # expands to the same FunctionDeclaration objects.
         self._expanded: dict[int, list[fast.Node]] = {}
+        # Coherence: (trait, type, method) -> id of the defining impl. A
+        # second DISTINCT impl for the same key silently overwriting the
+        # first would make dispatch order-dependent, so it is an error.
+        self._seen_methods: dict[tuple[str, str, str], int] = {}
 
     def apply(self, node: fast.Node, ctx: DesugarContext) -> fast.Node:
         # Splice Implementation items out of any list-valued field
@@ -264,6 +272,14 @@ class TraitImplDesugarPass(DesugarPass):
                 continue
             fn = self._method_to_function(m, trait_name, type_name)
             if fn is not None:
+                key = (trait_name, type_name, str(fn.name))
+                owner = self._seen_methods.setdefault(key, id(impl))
+                if owner != id(impl):
+                    raise CoherenceError(
+                        f"Conflicting implementations: method "
+                        f"'{key[2].split(IMPL_SEP)[-1]}' of trait "
+                        f"'{trait_name}' for type '{type_name}' is defined "
+                        f"by more than one implement block")
                 out.append(fn)
         self._expanded[id(impl)] = out
         return out
