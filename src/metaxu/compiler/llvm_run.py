@@ -75,6 +75,7 @@ _WRAPPERS = {
     "i64": (
         "define i32 @main() {{\n"
         "entry:\n"
+        "{init}"
         "  %r = call i64 @{sym}()\n"
         "  %t = trunc i64 %r to i32\n"
         "  ret i32 %t\n"
@@ -83,6 +84,7 @@ _WRAPPERS = {
     "double": (
         "define i32 @main() {{\n"
         "entry:\n"
+        "{init}"
         "  %r = call double @{sym}()\n"
         "  ret i32 0\n"
         "}}"
@@ -90,6 +92,7 @@ _WRAPPERS = {
     "ptr": (
         "define i32 @main() {{\n"
         "entry:\n"
+        "{init}"
         "  %r = call ptr @{sym}()\n"
         "  ret i32 0\n"
         "}}"
@@ -143,7 +146,31 @@ def compile_and_run(llvm_ir: str, entry: str = "main", *,
                        "cannot be an OS entry point)")
         raise LlvmRunError(f"entry {entry!r} (@{sym}) is not natively runnable: {detail}")
     rty = m.group(1)
-    full_ir = llvm_ir + "\n\n; native entry wrapper (llvm_run)\n" + _WRAPPERS[rty].format(sym=sym) + "\n"
+
+    # Module constants: when the module defines the synthesized
+    # @mx___module_init, the wrapper calls it BEFORE the entry point —
+    # the interpreter's _ensure_globals.  A module that HAS a
+    # __module_init but demoted it cannot run natively at all (globals
+    # would stay zero and any init side effects would be skipped).
+    init_sym = mangle("__module_init")
+    init_call = ""
+    if sym != init_sym:
+        mi = re.search(
+            rf"^define (i64|double|ptr) @{re.escape(init_sym)}\(\)",
+            llvm_ir, re.M)
+        if mi is not None:
+            init_call = (f"  %ginit = call {mi.group(1)} @{init_sym}()"
+                         "  ; module constants first\n")
+        elif f"; function @{init_sym}: placeholder" in llvm_ir:
+            reasons = _placeholder_reasons(llvm_ir, init_sym)
+            detail = "; ".join(reasons) if reasons else "no reasons recorded"
+            raise LlvmRunError(
+                "module constants initializer @"
+                f"{init_sym} is a placeholder, so no entry point can run "
+                f"natively: {detail}")
+
+    full_ir = (llvm_ir + "\n\n; native entry wrapper (llvm_run)\n"
+               + _WRAPPERS[rty].format(sym=sym, init=init_call) + "\n")
 
     if workdir is None:
         workdir = tempfile.mkdtemp(prefix="metaxu_llvm_")

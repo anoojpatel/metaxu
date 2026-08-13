@@ -267,6 +267,59 @@ actually vectorizes (`<N x double>` IS a SIMD register type):
     closure-kind conflicts that are not this backend's to fix; the
     helper is tested on synthetic modules so the wiring is proven.
 
+Increment 12 lifts the SILENT-SEAM constructs the last front-end round
+added (index assignment, mutable captures, module constants, zip):
+  * INDEX ASSIGNMENT: ``__index_store`` (the store-back form
+    `place = __index_store(place, i, x)`) lowers by receiver kind —
+    a Vec receiver calls mx_vec_set (in-place, bounds-checked abort;
+    the result IS the same pointer, so the place rebind is a no-op and
+    the dead-vec analysis treats the result as a group alias, keeping
+    provably-local vecs freeable) and a vector[T,N] receiver calls the
+    new mx_fvec_set_copy — the interpreter's FUNCTIONAL update made
+    native: fvec blocks are shallow-shared and write-once, so the update
+    COPIES the block, stores the element, and rebinds the place (other
+    shares never observe it; the fresh block leaks by design).
+    ``__index_set`` (in-place-only form, `m[i][j] = x`) is mx_vec_set on
+    Vec receivers; on a fixed vector (or any other receiver) it demotes
+    AT COMPILE TIME with the interpreter's immutability error.  A
+    functional fvec update propagates the receiver's static length.
+  * MUTABLE-CAPTURE CELLS: a ``cell_wrap`` op marks its variable
+    CELL-BACKED for the whole frame — storage is a malloc(8) one-word
+    heap box (leaked by design; an immortal cell cannot dangle): reads
+    load through %cellp.<n>, writes store through it, and closure/
+    handle-scope envs capture the CELL POINTER (marked ``cell:ELEM`` in
+    the env layout tables only — the kind lattice never sees cells), so
+    every frame shares one binding, exactly the interpreter's MxCell.
+    Cellness propagates through capture chains module-wide
+    (_CellTable); a capture NOT provably after the wrap (the
+    interpreter froze a value copy there) demotes, as do aggregate
+    cells, and per-function const/dead/static-length facts about
+    cell-backed names are dropped (another frame can write them).  This
+    un-demotes handler-frame counters (std.stream take/skip's `seen`,
+    for_'s `broke`) and every closure mutating a captured scalar.
+  * MODULE CONSTANTS: ``__module_init``'s declared names become
+    zero-initialized internal globals ``@mx_g_<name>`` (natural scalar
+    types: i64/double/ptr).  The initializer emits as a normal function
+    whose decl-name defs STORE to the globals; readers (uses with no
+    local def) LOAD from them — the interpreter's env-then-globals
+    lookup order, with parameter shadowing local and flow-sensitive
+    assignment shadowing demoted.  Kinds join through module-wide
+    per-name cells (_GlobalTable); aggregate globals demote.  llvm_run's
+    entry wrapper calls @mx___module_init before the entry point (the
+    interpreter's _ensure_globals) and REFUSES to run any entry when the
+    module has a demoted initializer.  Scope members and lambdas resolve
+    free global names without env captures (unless the env shadows
+    them).
+  * ZIP COMPREHENSIONS: ``__zip(xs, ys)`` is a VIRTUAL value — the
+    interpreter's list of tuples has no native representation, so its
+    only legal use is the iterable of a ``__vec_comprehension`` (every
+    other use demotes).  The comprehension site emits a two-word thunk
+    (decode each source's element word into the two-parameter body
+    lambda) driven by the new mx_fvec_zip_map, which ABORTS on a length
+    mismatch exactly like the interpreter's strict __zip (and on a
+    declared-size mismatch like mx_fvec_map).  Non-pair zips and Vec
+    sources demote.
+
 Everything else — try_scope, `type_of` (no interpreter builtin exists),
 comprehensions over Vecs, string slicing/indexing — is emitted as a
 clearly marked, comment-only placeholder carrying the reasons, never as
@@ -651,7 +704,17 @@ _NATIVE_RT_CALLS = {"Vec.new", "push", "pop", "len", "to_string",
                     # Fixed-vector builtins (increment 10) — mx_fvec_*:
                     "__vec_dim", "__vec_zeros", "__vec_filled",
                     "__vec_comprehension", "__range", "__slice_get",
-                    "__cast"}
+                    "__cast",
+                    # Index assignment + zip iteration (increment 12):
+                    # __index_store is the store-back form of `v[i] = x`
+                    # (mx_vec_set in place on a Vec; mx_fvec_set_copy
+                    # functional update on a vector[T,N] place),
+                    # __index_set the in-place-only form (Vec receivers
+                    # only — immutable receivers demote at compile time,
+                    # the interpreter's error made static), and __zip the
+                    # lockstep pair iterable of zip comprehensions
+                    # (mx_fvec_zip_map).
+                    "__index_store", "__index_set", "__zip"}
 
 # Extern C symbols the interpreter shims over its simulated heap
 # (mir_interp._ffi_*): natively these are DIRECT calls to the real libc
@@ -694,6 +757,17 @@ _FVEC_BINOP_CODES = {"+": 0, "-": 1, "*": 2, "/": 3, "%": 4}
 _EFFECT_DEFAULT_PREFIX = "__effect_default$"
 _EFFECT_RUNTIME_PREFIX = "__effect_runtime$"
 
+# The synthesized module-constant initializer (hir.py): its globals_decl
+# names become module-level LLVM globals `@mx_g_<name>`; the native entry
+# wrapper (llvm_run) calls it before the entry point, exactly the
+# interpreter's _ensure_globals.
+_MODULE_INIT = "__module_init"
+
+
+def _mx_global(name: str) -> str:
+    """The LLVM global symbol backing a module constant."""
+    return "@mx_g_" + _sanitize(name)
+
 # Native runtime symbol signatures (metaxu_rt.h ABI): name -> (ret, params).
 _RT_SIGS = {
     "mx_vec_new": ("ptr", ()),
@@ -722,6 +796,8 @@ _RT_SIGS = {
     "mx_fvec_binop": ("ptr", ("i64", "i64", "i64", "i64", "i64", "i64")),
     "mx_fvec_promote": ("ptr", ("ptr",)),
     "mx_fvec_map": ("ptr", ("ptr", "ptr", "ptr", "i64")),
+    "mx_fvec_set_copy": ("ptr", ("ptr", "i64", "i64")),
+    "mx_fvec_zip_map": ("ptr", ("ptr", "ptr", "ptr", "ptr", "i64")),
     "mx_fvec_to_str": ("ptr", ("ptr", "i64", "i64")),
     "mx_fvec_as_bytes": ("ptr", ("ptr",)),
     # Algebraic effects runtime (metaxu_effects.c).
@@ -843,6 +919,20 @@ _HEADER = (
     ";   every unproven shape (dynamic/mismatched lengths, matrices,\n"
     ";   N > 64) keep the mx_fvec_binop C loop -- the always-correct path\n"
     ";   with its division-by-zero and length-mismatch aborts;\n"
+    ";   SILENT-SEAM CONSTRUCTS (increment 12): index assignment --\n"
+    ";   __index_store on a Vec -> mx_vec_set in place (result aliases\n"
+    ";   the receiver), on a vector[T,N] -> mx_fvec_set_copy (the\n"
+    ";   functional update: copy the write-once block, set, rebind);\n"
+    ";   __index_set is Vec-only (immutable receivers demote at compile\n"
+    ";   time with the interpreter's error); mutable captures\n"
+    ";   (cell_wrap) -> one-word malloc'd cells (leak by design), reads/\n"
+    ";   writes through %cellp.<n>, envs capture the CELL POINTER so\n"
+    ";   frames share one binding; module constants -> @mx_g_<name>\n"
+    ";   internal globals stored by @mx___module_init (called first by\n"
+    ";   the entry wrapper) and loaded by readers; zip comprehensions ->\n"
+    ";   two-word thunks over mx_fvec_zip_map (aborts on length\n"
+    ";   mismatch, the interpreter's strict __zip); zip results are\n"
+    ";   virtual and restricted to comprehension iterables;\n"
     "; functions outside the subset appear as comment-only placeholders."
 )
 
@@ -1015,8 +1105,37 @@ def _agg_ty(kind: str) -> str:
 def _llcell(kind: str) -> str:
     """The LLVM type of an INLINE storage cell for a kind: scalars map via
     _llscalar (vec -> ptr), aggregates inline their named type (struct
-    fields, env fields)."""
+    fields, env fields).  A ``cell:ELEM`` env-field marker (mutable
+    capture, increment 12) stores the CELL POINTER — aliasing is the whole
+    point."""
+    if _is_cell_marker(kind):
+        return "ptr"
     return _agg_ty(kind) if _is_agg(kind) else _llscalar(kind)
+
+
+# MUTABLE-CAPTURE CELLS (increment 12): a variable some sub-function
+# assigns is backed by a heap box holding one 8-byte word (`malloc(8)`,
+# leaked by design — an immortal cell can never dangle), mirroring the
+# interpreter's MxCell exactly: reads load through the cell pointer,
+# writes store through it, and closure/handle-scope envs capture the CELL
+# POINTER so every frame shares one binding.  The variable's KIND stays
+# its element kind everywhere (the kind lattice never sees cells); the
+# ``cell:ELEM`` marker below appears ONLY in env-field layout tables
+# (mod.env_types / mod.scope_env_types) to say "this field holds the cell
+# pointer, not the value".
+_CELL_MARK_PREFIX = "cell:"
+
+
+def _is_cell_marker(kind: str) -> bool:
+    return kind.startswith(_CELL_MARK_PREFIX)
+
+
+def _cell_marked(kind: str) -> str:
+    return _CELL_MARK_PREFIX + kind
+
+
+def _cell_elem(kind: str) -> str:
+    return kind[len(_CELL_MARK_PREFIX):]
 
 
 def _join(a: str, b: str) -> str:
@@ -1145,6 +1264,18 @@ class _Info:
     # so no scope can ever intercept it -> a direct call, aggregates and
     # all, exactly the interpreter's fallback).
     default_performs: Dict[Tuple[str, str], str] = field(default_factory=dict)
+    # Module-constant names this function READS (used with no local def and
+    # declared by __module_init): they load from @mx_g_<name> globals.
+    global_reads: Set[str] = field(default_factory=set)
+    # __module_init only: the declared module-constant names — their defs
+    # store straight into the @mx_g_<name> globals (their storage class).
+    init_globals: Tuple[str, ...] = ()
+    # __zip call results: dst -> the zipped sequence variables.  A zip
+    # result is a virtual value (the interpreter's list of tuples has no
+    # native representation): its ONLY legal use is as the iterable of a
+    # __vec_comprehension, which reads the SOURCES directly and drives
+    # mx_fvec_zip_map.  Every other use demotes (consistency check).
+    zip_defs: Dict[str, Tuple[str, ...]] = field(default_factory=dict)
 
     def add_reason(self, r: str) -> None:
         if r not in self.reasons:
@@ -1281,10 +1412,12 @@ def _blocks_in_cycles(f: MirFunc) -> Set[int]:
 
 
 def _analyze(f: MirFunc, module_names: Set[str], closures: "_ClosureTable",
-             scopes: "_ScopeTable", traits: "_TraitTable") -> _Info:
+             scopes: "_ScopeTable", traits: "_TraitTable",
+             cells: "_CellTable", gtable: "_GlobalTable") -> _Info:
     info = _Info(f=f)
     try:
-        _analyze_inner(info, module_names, closures, scopes, traits)
+        _analyze_inner(info, module_names, closures, scopes, traits,
+                       cells, gtable)
     except Exception as exc:  # defensive: malformed MIR must never crash codegen
         info.add_reason(f"analysis error: {type(exc).__name__}: {exc}")
     return info
@@ -1292,7 +1425,8 @@ def _analyze(f: MirFunc, module_names: Set[str], closures: "_ClosureTable",
 
 def _analyze_inner(info: _Info, module_names: Set[str],
                    closures: "_ClosureTable", scopes: "_ScopeTable",
-                   traits: "_TraitTable") -> None:
+                   traits: "_TraitTable", cells: "_CellTable",
+                   gtable: "_GlobalTable") -> None:
     f = info.f
     if not f.blocks:
         info.add_reason("function has no blocks")
@@ -1306,6 +1440,21 @@ def _analyze_inner(info: _Info, module_names: Set[str],
     info.tag_consts = _find_tag_consts(f)
     info.dead_results = _dead_results(f)
     cycle_blocks = _blocks_in_cycles(f)
+
+    # Mutable-capture cells (increment 12): prescan problems demote here;
+    # writes to a cell-backed variable are observable through the shared
+    # cell even when the owner never reads them again, so they are never
+    # dead results.
+    cell_backed = cells.backed.get(f.name, set())
+    for r in cells.bad.get(f.name, ()):
+        info.add_reason(r)
+    info.dead_results -= cell_backed
+
+    if f.name == _MODULE_INIT:
+        info.init_globals = tuple(f.globals_decl)
+        # A declared name's def PUBLISHES the global — observable by every
+        # reader even when the initializer itself never reads it again.
+        info.dead_results -= set(f.globals_decl)
 
     # A make_closure target receives its captures through the env struct:
     # they are entry-defined names, exactly like parameters.
@@ -1422,6 +1571,13 @@ def _analyze_inner(info: _Info, module_names: Set[str],
                 continue
             if kind == "drop":
                 continue  # emitted as a comment
+            if kind == "cell_wrap":
+                # ("cell_wrap", slot): the slot is cell-backed for the
+                # whole frame (see _CellTable), so the op itself is a
+                # comment; the wrap position already fed the prescan's
+                # post-wrap capture check.
+                add_use(op[1], bi)
+                continue
             if kind == "match_fail":
                 continue  # emitted as @abort + unreachable
             if kind != "let" or len(op) != 4:
@@ -1461,6 +1617,15 @@ def _analyze_inner(info: _Info, module_names: Set[str],
             elif rk == "call":
                 callee = rhs[1]
                 info.calls.append((dst, callee, tuple(args)))
+                if callee == "__zip" and callee not in info.def_count:
+                    # Lockstep zip iterable: the result is virtual (its only
+                    # legal use is a comprehension iterable — consistency
+                    # enforces); native support is pair iteration.
+                    info.zip_defs[dst] = tuple(args)
+                    if len(args) != 2:
+                        info.add_reason(
+                            f"__zip of {len(args)} sequences (only pair "
+                            "iteration lowers natively)")
                 for a in args:
                     add_use(a, bi)
                 add_def(dst, bi)
@@ -1640,11 +1805,48 @@ def _analyze_inner(info: _Info, module_names: Set[str],
             elif isinstance(cval, str):
                 info.const_strs[cdst] = cval
 
-    # Every used name must be defined somewhere in the function.
+    # A cell-backed variable can be reassigned from ANOTHER function
+    # through the shared cell, so per-function single-def constant facts
+    # about it are unsound: drop them.
+    for n in cell_backed:
+        info.const_strs.pop(n, None)
+        info.const_ints.pop(n, None)
+        info.const_nones.discard(n)
+
+    # Every used name must be defined somewhere in the function — except
+    # module constants (declared by __module_init), which resolve as
+    # global reads, exactly the interpreter's _lookup fallback order
+    # (frame bindings first, then globals).
     for name in info.use_blocks:
         if name not in info.def_count:
-            info.add_reason(
-                f"references {name!r} with no local definition (captured environment)")
+            if name in gtable.names:
+                info.global_reads.add(name)
+            else:
+                info.add_reason(
+                    f"references {name!r} with no local definition (captured environment)")
+
+    # A local (non-parameter) DEF of a module-constant name shadows the
+    # global flow-sensitively in the interpreter (reads before the first
+    # assignment see the global, later reads the local): no static storage
+    # class reproduces that, so demote.  Parameters shadow from entry on
+    # (a plain local) and __module_init's declared names ARE the globals.
+    if f.name != _MODULE_INIT:
+        for n in sorted(gtable.names):
+            if n in info.def_count and n not in info.params \
+                    and n not in info.env_captures:
+                info.add_reason(
+                    f"local assignment to module-constant name {n!r} "
+                    "shadows the global flow-sensitively")
+    else:
+        for n in info.init_globals:
+            if n in cell_backed:
+                info.add_reason(
+                    f"module constant {n!r} is cell-wrapped (mutable "
+                    "module state stays interpreted)")
+            if n not in info.def_count:
+                info.add_reason(
+                    f"module constant {n!r} declared but never bound "
+                    "(bad lowering)")
 
 
 # ---------------------------------------------------------------------------
@@ -1866,6 +2068,202 @@ def _build_closure_table(funcs: Sequence[MirFunc]) -> _ClosureTable:
 
 
 # ---------------------------------------------------------------------------
+# Module-wide mutable-capture cell table (increment 12)
+# ---------------------------------------------------------------------------
+#
+# A `cell_wrap` op boxes a binding into a shared one-word heap cell so the
+# sub-functions capturing it can WRITE BACK (mir_interp.MxCell).  Natively a
+# cell-backed variable's storage is a malloc(8) block (leaked by design —
+# an immortal cell can never dangle): every read loads through the cell
+# pointer, every write stores through it, and closure / handle-scope envs
+# capture the POINTER (aliasing is the whole point).  The variable's KIND
+# stays its element kind everywhere; only the storage class changes.
+#
+# Soundness rule (interpreter parity): the interpreter's cell springs into
+# existence AT the cell_wrap op — a closure created BEFORE the wrap
+# captured a frozen VALUE copy, and a delayed call of it must keep seeing
+# the frozen value.  Whole-function cell backing would show it live
+# updates instead, so any capture of a cell-backed variable that is not
+# PROVABLY after a wrap (same block earlier, an entry-block wrap, or the
+# variable itself arriving as a cell capture) demotes the function.  For
+# every use that is not a capture, cell-from-entry is observationally
+# identical (the cell always holds the binding's current value).
+
+@dataclass
+class _CellTable:
+    # function name -> variable names backed by a heap cell in that frame.
+    backed: Dict[str, Set[str]] = field(default_factory=dict)
+    # lambda / scope-member name -> capture names that arrive as CELL
+    # POINTERS through the env struct (subset of backed[fn]).
+    cap_cells: Dict[str, Set[str]] = field(default_factory=dict)
+    # handle site -> env field names holding cell pointers.
+    scope_cells: Dict[str, Set[str]] = field(default_factory=dict)
+    # function name -> demotion reasons found by the prescan.
+    bad: Dict[str, List[str]] = field(default_factory=dict)
+
+    def add_bad(self, fname: str, reason: str) -> None:
+        rs = self.bad.setdefault(fname, [])
+        if reason not in rs:
+            rs.append(reason)
+
+
+def _build_cell_table(funcs: Sequence[MirFunc],
+                      scopes: _ScopeTable) -> _CellTable:
+    table = _CellTable()
+    by_name = {f.name: f for f in funcs}
+
+    # 1. Own wraps: variables named by cell_wrap ops, with their positions
+    # (block index, op index) for the post-wrap provability check.
+    wrap_pos: Dict[str, Dict[str, List[Tuple[int, int]]]] = {}
+    for f in funcs:
+        own = table.backed.setdefault(f.name, set())
+        wp = wrap_pos.setdefault(f.name, {})
+        for bi, b in enumerate(f.blocks):
+            for oi, op in enumerate(b.ops):
+                if op[0] == "cell_wrap":
+                    own.add(op[1])
+                    wp.setdefault(op[1], []).append((bi, oi))
+
+    # 2. Propagate cellness through captures to a fixpoint: a cell-backed
+    # value captured into a lambda env or a handle-site env makes the
+    # target's capture a cell pointer (and the name cell-backed there, so
+    # nested captures chain).
+    changed = True
+    while changed:
+        changed = False
+        for f in funcs:
+            backed = table.backed.setdefault(f.name, set())
+            for b in f.blocks:
+                for op in b.ops:
+                    if op[0] != "let" or len(op) != 4:
+                        continue
+                    rk = op[2][0]
+                    if rk == "make_closure":
+                        lname = op[2][1]
+                        for (cn, vn) in op[3]:
+                            if isinstance(vn, str) and vn in backed:
+                                cc = table.cap_cells.setdefault(lname, set())
+                                lb = table.backed.setdefault(lname, set())
+                                if cn not in cc or cn not in lb:
+                                    cc.add(cn)
+                                    lb.add(cn)
+                                    changed = True
+                    elif rk == "handle_scope":
+                        site = op[2][1]
+                        rec = scopes.sites.get(site)
+                        if rec is None:
+                            continue
+                        for n in scopes.env_fields.get(site, ()):
+                            vn = rec.cap_vals.get(n, n)
+                            if vn not in backed:
+                                continue
+                            sc = table.scope_cells.setdefault(site, set())
+                            if n not in sc:
+                                sc.add(n)
+                                changed = True
+                            for m in rec.member_fns():
+                                if n not in scopes.free_names.get(m, ()):
+                                    continue
+                                cc = table.cap_cells.setdefault(m, set())
+                                mb = table.backed.setdefault(m, set())
+                                if n not in cc or n not in mb:
+                                    cc.add(n)
+                                    mb.add(n)
+                                    changed = True
+
+    # 3. Post-wrap provability + mixed-capture validation per site.
+    def provably_wrapped(fname: str, vn: str, bi: int, oi: int) -> bool:
+        if vn in table.cap_cells.get(fname, ()):
+            return True  # arrived as a cell: cell-backed from entry for real
+        for (wbi, woi) in wrap_pos.get(fname, {}).get(vn, ()):
+            if wbi == bi and woi < oi:
+                return True  # same block, earlier op
+            if wbi == 0 and bi != 0:
+                return True  # entry block dominates every other block
+        return False
+
+    for f in funcs:
+        backed = table.backed.get(f.name, set())
+        if not backed:
+            continue
+        for bi, b in enumerate(f.blocks):
+            for oi, op in enumerate(b.ops):
+                if op[0] != "let" or len(op) != 4:
+                    continue
+                rk = op[2][0]
+                if rk == "make_closure":
+                    lname = op[2][1]
+                    for (cn, vn) in op[3]:
+                        if not isinstance(vn, str) or vn not in backed:
+                            # Value capture at this site, but the lambda may
+                            # expect a cell (marked from another site).
+                            if cn in table.cap_cells.get(lname, ()):
+                                table.add_bad(
+                                    f.name,
+                                    f"capture {cn!r} of lambda {lname!r} is a "
+                                    "cell at another site but a value here")
+                                table.add_bad(
+                                    lname,
+                                    f"capture {cn!r} is a cell at one "
+                                    "make_closure site and a value at another")
+                            continue
+                        if not provably_wrapped(f.name, vn, bi, oi):
+                            table.add_bad(
+                                f.name,
+                                f"closure capture of {vn!r} is not provably "
+                                "after its cell_wrap (a pre-wrap capture "
+                                "freezes a VALUE copy in the interpreter)")
+                elif rk == "handle_scope":
+                    site = op[2][1]
+                    rec = scopes.sites.get(site)
+                    if rec is None:
+                        continue
+                    for n in table.scope_cells.get(site, ()):
+                        vn = rec.cap_vals.get(n, n)
+                        if vn in backed and not provably_wrapped(
+                                f.name, vn, bi, oi):
+                            table.add_bad(
+                                f.name,
+                                f"handle-scope capture of {vn!r} is not "
+                                "provably after its cell_wrap")
+    # Cell-backed variables in functions the module does not know cannot
+    # happen (wraps come from the functions themselves); nothing to prune.
+    _ = by_name
+    return table
+
+
+# ---------------------------------------------------------------------------
+# Module-constant (global) kind table (increment 12)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _GlobalTable:
+    """Module constants declared by __module_init: one module-wide kind
+    cell per name, joined across the initializer's stores and every
+    reader (exactly the sig/struct-field discipline)."""
+    names: Set[str] = field(default_factory=set)
+    kinds: Dict[str, str] = field(default_factory=dict)
+
+    def kind(self, n: str) -> str:
+        return self.kinds.get(n, I64)
+
+    def mark(self, n: str, kind: str) -> bool:
+        cur = self.kinds.get(n, I64)
+        nk = _join(cur, kind)
+        if nk != cur:
+            self.kinds[n] = nk
+            return True
+        return False
+
+
+def _build_global_table(funcs: Sequence[MirFunc]) -> _GlobalTable:
+    table = _GlobalTable()
+    for f in funcs:
+        table.names.update(f.globals_decl)
+    return table
+
+
+# ---------------------------------------------------------------------------
 # Module-wide handle-scope table (effects: sites, members, kind cells)
 # ---------------------------------------------------------------------------
 #
@@ -1971,6 +2369,8 @@ def _fn_defs_uses_sites(f: MirFunc) -> Tuple[Set[str], Set[str], List[str]]:
                 defs.add(op[1])
             elif k == "promote_matrix":
                 uses.update(op[1] if len(op) > 1 else ())
+            elif k == "cell_wrap":
+                uses.add(op[1])
             elif k == "let" and len(op) == 4:
                 _, dst, rhs, args = op
                 defs.add(dst)
@@ -2058,6 +2458,19 @@ def _build_scope_table(funcs: Sequence[MirFunc]) -> _ScopeTable:
                 need.add(rec2.cap_vals.get(n, n))
         return need
 
+    # Module constants (declared by __module_init) resolve as GLOBAL reads
+    # unless the site's captures shadow them (interpreter order: env first,
+    # then globals) — so a member's free global names do not force env
+    # captures the owner cannot provide.
+    global_names = {n for f in funcs for n in f.globals_decl}
+
+    # Cell-wrapped names (mutable captures): a member that both READS and
+    # ASSIGNS such a name still needs it from the env — the binding lives
+    # in the shared cell, and `uses - defs` alone would drop it (its local
+    # def is a write THROUGH the capture, not a fresh binding).
+    wrapped_names = {op[1] for f2 in funcs for b2 in f2.blocks
+                     for op in b2.ops if op[0] == "cell_wrap"}
+
     changed = True
     while changed:
         changed = False
@@ -2068,7 +2481,10 @@ def _build_scope_table(funcs: Sequence[MirFunc]) -> _ScopeTable:
             need = set(uses)
             for s2 in inner_sites:
                 need |= site_needs(s2)
-            nf = need - defs
+            nf = (need - defs) | (need & defs & wrapped_names)
+            site_caps = table.sites[table.member_site[m]].cap_vals
+            nf -= {n for n in nf
+                   if n in global_names and n not in site_caps}
             if nf != free[m]:
                 free[m] = nf
                 changed = True
@@ -2329,7 +2745,7 @@ class _Sig:
 def _infer_kinds(info: _Info, sigs: Dict[str, _Sig], structs: _StructTable,
                  variants: _VariantTable, closures: _ClosureTable,
                  traits: _TraitTable, scopes: _ScopeTable,
-                 module_names: Set[str],
+                 module_names: Set[str], gtable: "_GlobalTable",
                  assume_final: bool = False,
                  ) -> Tuple[Dict[str, str], bool]:
     """One inner fixpoint over a function.  Returns (kinds, global_changed)
@@ -2509,6 +2925,72 @@ def _infer_kinds(info: _Info, sigs: Dict[str, _Sig], structs: _StructTable,
                             ch = True
                             global_changed = True
                     ch = mark(dst, _fvec_of(lsig.ret)) or ch
+                elif lsig is not None \
+                        and args[2] in info.zip_defs \
+                        and len(lsig.params) == len(info.zip_defs[args[2]]):
+                    # Zip comprehension: each zipped SOURCE's element kind
+                    # flows one-way into its lambda parameter (same
+                    # int->float promotion contract as the single form);
+                    # the lambda's return decides the result element kind.
+                    for i, s in enumerate(info.zip_defs[args[2]]):
+                        sk = get(s)
+                        if _is_fvec(sk):
+                            nk = _join(lsig.params[i], _fvec_elem(sk))
+                            if nk != lsig.params[i]:
+                                lsig.params[i] = nk
+                                ch = True
+                                global_changed = True
+                    ch = mark(dst, _fvec_of(lsig.ret)) or ch
+        elif name == "__index_store":
+            # ("__index_store", recv, idx, val): store-back index
+            # assignment — `place = __index_store(place, i, x)`.  The
+            # result IS the receiver (same Vec pointer / functionally
+            # updated vector), so dst and receiver unify; the value
+            # unifies two-way with the element kind.
+            if len(args) == 3:
+                rk = get(args[0])
+                if plain_call and rk == I64 and assume_final:
+                    # A receiver nothing else could type: the interpreter
+                    # only accepts Vec (in place) or vector[T,N]
+                    # (functional update); pin the Vec bottom.
+                    ch = mark(args[0], _vec_of(I64)) or ch
+                    rk = get(args[0])
+                if _is_vec(rk) or _is_fvec(rk):
+                    elem = _vec_elem(rk) if _is_vec(rk) else _fvec_elem(rk)
+                    of = _vec_of if _is_vec(rk) else _fvec_of
+                    nk = _join(elem, get(args[2]))
+                    if nk != CONFLICT:
+                        ch = mark(args[0], of(nk)) or ch
+                        ch = mark(args[2], nk) or ch
+                    else:
+                        ch = mark(args[0], CONFLICT) or ch
+                    ch = unify((dst, args[0])) or ch
+        elif name == "__index_set":
+            # ("__index_set", recv, idx, val): in-place element store.
+            # Only Vec receivers support it (the interpreter errors on
+            # everything else — a fixed vector stays untouched here so the
+            # consistency check reports the clean immutability demotion).
+            if len(args) == 3:
+                if plain_call and not _is_fvec(get(args[0])):
+                    ch = mark(args[0], _vec_of(I64)) or ch
+                rk = get(args[0])
+                if _is_vec(rk):
+                    nk = _join(_vec_elem(rk), get(args[2]))
+                    if nk != CONFLICT:
+                        ch = mark(args[0], _vec_of(nk)) or ch
+                        ch = mark(args[2], nk) or ch
+                    else:
+                        ch = mark(args[0], CONFLICT) or ch
+                # dst is unit -> stays i64
+        elif name == "__zip":
+            # The zip result stays at the i64 bottom deliberately: it is a
+            # VIRTUAL value whose only legal use is a comprehension
+            # iterable (the emission reads the sources directly).  The
+            # sources are fixed vectors; one still at the bottom when the
+            # fixpoint settles can only be a vector (ranges included).
+            for a in args:
+                if get(a) == I64 and assume_final:
+                    ch = mark(a, _fvec_of(I64)) or ch
         elif name == "len":
             pass  # receiver may be vec/vector/str; dst stays i64
         elif name in ("to_string", "int_to_str"):
@@ -2578,6 +3060,17 @@ def _infer_kinds(info: _Info, sigs: Dict[str, _Sig], structs: _StructTable,
                 changed = mark(r, own_sig.ret) or changed
         if len(info.ret_vars) > 1:
             changed = unify(info.ret_vars) or changed
+        # Module constants: two-way join between the module-wide global
+        # cell and this function's local view (reads everywhere; the
+        # initializer's declared names are its stores).
+        gnames = set(info.global_reads)
+        if info.f.name == _MODULE_INIT:
+            gnames |= set(info.init_globals)
+        for n in sorted(gnames):
+            nk = _join(gtable.kind(n), get(n))
+            if gtable.mark(n, nk):
+                changed = global_changed = True
+            changed = mark(n, nk) or changed
         # Lambda captures behave like parameters: two-way join between the
         # creator-side cell and the local uses.
         if info.is_lambda:
@@ -2884,6 +3377,7 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                        structs: _StructTable, variants: _VariantTable,
                        closures: _ClosureTable, traits: _TraitTable,
                        scopes: _ScopeTable, module_names: Set[str],
+                       cells: "_CellTable", gtable: "_GlobalTable",
                        ) -> List[str]:
     probs: List[str] = []
 
@@ -2971,6 +3465,97 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                 probs.append(
                     f"__index_get result {dst!r} is {ty(dst)}, elements are "
                     f"{elem}")
+        elif name == "__index_store":
+            # Store-back index assignment: mx_vec_set in place on a Vec
+            # (result = the same pointer), mx_fvec_set_copy functional
+            # update on a vector[T,N] (result = a fresh block).  Immutable
+            # or unindexable receivers are interpreter errors — demoted
+            # here at compile time rather than aborting at runtime.
+            rk0 = ty(args[0]) if args else I64
+            elem = (_vec_elem(rk0) if _is_vec(rk0)
+                    else _fvec_elem(rk0) if _is_fvec(rk0) else None)
+            if len(args) != 3:
+                probs.append(
+                    f"__index_store with {len(args)} arguments (expects 3)")
+            elif elem is None:
+                probs.append(
+                    f"index assignment into a {rk0} receiver (the "
+                    "interpreter rejects it: only Vec mutates in place and "
+                    "vector[T,N] updates functionally — strings and "
+                    "everything else are immutable)")
+            elif ty(args[1]) != I64:
+                probs.append(
+                    f"__index_store index {args[1]!r} is {ty(args[1])}")
+            elif not _is_word_kind(elem):
+                probs.append(
+                    f"vector of {elem} elements (only 8-byte word kinds fit "
+                    "native element slots)")
+            elif ty(args[2]) != elem:
+                probs.append(
+                    f"__index_store of {ty(args[2])} into elements of {elem}")
+            elif ty(dst) != rk0:
+                probs.append(
+                    f"__index_store result {dst!r} is {ty(dst)}, receiver "
+                    f"is {rk0} (the result IS the updated receiver)")
+        elif name == "__index_set":
+            # In-place element store: Vec receivers only (identity
+            # semantics).  The interpreter rejects stores into immutable
+            # receivers loudly; statically-known-immutable receivers
+            # demote at compile time with the same message.
+            rk0 = ty(args[0]) if args else I64
+            if len(args) != 3:
+                probs.append(
+                    f"__index_set with {len(args)} arguments (expects 3)")
+            elif _is_fvec(rk0):
+                probs.append(
+                    "cannot assign into an immutable vector: vector[T, N] "
+                    "values have value semantics (interpreter parity — "
+                    "build a new vector, or use Vec for mutable data)")
+            elif not _is_vec(rk0):
+                probs.append(
+                    f"index assignment into a {rk0} receiver (the "
+                    "interpreter rejects in-place stores on anything but "
+                    "a Vec)")
+            elif ty(args[1]) != I64:
+                probs.append(
+                    f"__index_set index {args[1]!r} is {ty(args[1])}")
+            elif not _is_word_kind(_vec_elem(rk0)):
+                probs.append(
+                    f"Vec of {_vec_elem(rk0)} elements (only 8-byte word "
+                    "kinds fit native Vec slots)")
+            elif ty(args[2]) != _vec_elem(rk0):
+                probs.append(
+                    f"__index_set of {ty(args[2])} into a Vec of "
+                    f"{_vec_elem(rk0)}")
+            elif ty(dst) != I64:
+                probs.append(
+                    f"__index_set result {dst!r} promoted to {ty(dst)} "
+                    "(the store returns unit)")
+        elif name == "__zip":
+            # Pair-lockstep iterable for zip comprehensions.  The result is
+            # virtual (mx_fvec_zip_map reads the sources directly); a
+            # separate use-restriction scan below demotes any use outside
+            # a comprehension iterable position.
+            if len(args) != 2:
+                probs.append(
+                    f"__zip of {len(args)} sequences (only pair iteration "
+                    "lowers natively)")
+            else:
+                for a in args:
+                    ak = ty(a)
+                    if not _is_fvec(ak):
+                        probs.append(
+                            f"__zip operand {a!r} has kind {ak} (only fixed "
+                            "vectors and ranges zip natively; Vec iteration "
+                            "stays interpreted)")
+                    elif not _is_word_kind(_fvec_elem(ak)):
+                        probs.append(
+                            f"vector of {_fvec_elem(ak)} elements (only "
+                            "8-byte word kinds fit native element slots)")
+                if ty(dst) != I64:
+                    probs.append(
+                        f"__zip result {dst!r} promoted to {ty(dst)} (zip "
+                        "results only feed comprehension iterables)")
         elif name == "__vec_lit":
             if not args:
                 probs.append("__vec_lit with no size argument")
@@ -3131,27 +3716,54 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                 probs.append(
                     f"__vec_comprehension body lambda {lname!r} unknown")
                 return
-            if len(lsig.params) != 1:
-                probs.append(
-                    f"__vec_comprehension body lambda {lname!r} takes "
-                    f"{len(lsig.params)} parameters (tuple unpacking stays "
-                    "interpreted)")
-                return
-            itk = ty(itvar)
-            if not _is_fvec(itk):
-                probs.append(
-                    f"__vec_comprehension iterable {itvar!r} has kind {itk} "
-                    "(only fixed vectors and ranges lower natively)")
-                return
-            ek, pk_ = _fvec_elem(itk), lsig.params[0]
-            if not _is_word_kind(ek):
-                probs.append(
-                    f"vector of {ek} elements (only 8-byte word kinds fit "
-                    "native element slots)")
-            elif not (pk_ == ek or (ek == I64 and pk_ == F64)):
-                probs.append(
-                    f"__vec_comprehension element kind {ek} does not fit "
-                    f"the body lambda's parameter kind {pk_}")
+            zsrcs = info.zip_defs.get(itvar)
+            if zsrcs is not None:
+                # Zip comprehension: lockstep over the zip SOURCES via
+                # mx_fvec_zip_map (the body lambda unpacks one parameter
+                # per zipped sequence).
+                if len(lsig.params) != len(zsrcs):
+                    probs.append(
+                        f"zip comprehension body lambda {lname!r} takes "
+                        f"{len(lsig.params)} parameters for {len(zsrcs)} "
+                        "zipped sequences")
+                else:
+                    for i, s in enumerate(zsrcs):
+                        sk_ = ty(s)
+                        if not _is_fvec(sk_):
+                            continue  # the __zip check reported it already
+                        ek_, pk2 = _fvec_elem(sk_), lsig.params[i]
+                        if not _is_word_kind(ek_):
+                            probs.append(
+                                f"vector of {ek_} elements (only 8-byte "
+                                "word kinds fit native element slots)")
+                        elif not (pk2 == ek_ or (ek_ == I64 and pk2 == F64)):
+                            probs.append(
+                                f"zip comprehension element kind {ek_} does "
+                                f"not fit the body lambda's parameter "
+                                f"{i} kind {pk2}")
+            else:
+                if len(lsig.params) != 1:
+                    probs.append(
+                        f"__vec_comprehension body lambda {lname!r} takes "
+                        f"{len(lsig.params)} parameters (tuple unpacking "
+                        "stays interpreted)")
+                    return
+                itk = ty(itvar)
+                if not _is_fvec(itk):
+                    probs.append(
+                        f"__vec_comprehension iterable {itvar!r} has kind "
+                        f"{itk} (only fixed vectors and ranges lower "
+                        "natively)")
+                    return
+                ek, pk_ = _fvec_elem(itk), lsig.params[0]
+                if not _is_word_kind(ek):
+                    probs.append(
+                        f"vector of {ek} elements (only 8-byte word kinds "
+                        "fit native element slots)")
+                elif not (pk_ == ek or (ek == I64 and pk_ == F64)):
+                    probs.append(
+                        f"__vec_comprehension element kind {ek} does not "
+                        f"fit the body lambda's parameter kind {pk_}")
             dk = ty(dst)
             if not _is_fvec(dk):
                 probs.append(
@@ -3855,6 +4467,81 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
             if t2[0] in ("br_if", "ret") and t2[1] in tainted:
                 bad_range_use(t2[1])
 
+    # ZIP RESULTS: a __zip result is virtual (the interpreter's list of
+    # tuples has no native representation; mx_fvec_zip_map reads the
+    # SOURCES).  Its ONLY legal use is the iterable position of a
+    # __vec_comprehension — even copies demote (they would need value
+    # forwarding for a value that does not exist).
+    if info.zip_defs:
+        zt = set(info.zip_defs)
+
+        def bad_zip_use(n: str) -> None:
+            probs.append(
+                f"zip result {n!r} used outside a comprehension iterable "
+                "(zip values are virtual: the native lowering reads the "
+                "zipped sequences directly)")
+
+        for b in info.f.blocks:
+            for op in b.ops:
+                if op[0] in ("drop", "params", "cell_wrap"):
+                    continue
+                if op[0] == "perform" and len(op) >= 7:
+                    for a in op[4]:
+                        if a in zt:
+                            bad_zip_use(a)
+                    continue
+                if op[0] != "let" or len(op) != 4:
+                    continue
+                _, _dz, rhsz, argsz = op
+                if rhsz[0] in ("alloc_struct", "make_closure",
+                               "handle_scope", "try_scope"):
+                    for pair in argsz:
+                        if isinstance(pair, tuple) and len(pair) == 2 \
+                                and pair[1] in zt:
+                            bad_zip_use(pair[1])
+                    continue
+                okz: Set[int] = set()
+                if rhsz[0] == "call" and rhsz[1] == "__vec_comprehension":
+                    okz = {2}
+                for i, a in enumerate(argsz):
+                    if isinstance(a, str) and a in zt and i not in okz:
+                        bad_zip_use(a)
+            tz = b.term
+            if tz[0] in ("br_if", "ret") and tz[1] in zt:
+                bad_zip_use(tz[1])
+
+    # MUTABLE-CAPTURE CELLS: a cell boxes exactly one 8-byte word, so a
+    # cell-backed variable's kind must be a word-sized scalar (aggregates
+    # and continuations stay interpreted).
+    for n in sorted(cells.backed.get(info.f.name, ())):
+        ck2 = ty(n)
+        if _is_agg(ck2):
+            probs.append(
+                f"mutable capture {n!r} holds {ck2} (cells box one 8-byte "
+                "word; aggregate cells stay interpreted)")
+        elif ck2 == KONT:
+            probs.append(
+                f"mutable capture {n!r} holds an effect continuation")
+
+    # MODULE CONSTANTS: globals are one 8-byte scalar slot each; the local
+    # view must agree with the module-wide joined kind (like call sigs).
+    gnames2 = set(info.global_reads)
+    if info.f.name == _MODULE_INIT:
+        gnames2 |= set(info.init_globals)
+    for n in sorted(gnames2):
+        gk2 = gtable.kind(n)
+        if _is_agg(gk2):
+            probs.append(
+                f"module constant {n!r} holds {gk2} (only 8-byte scalar "
+                "and pointer kinds fit native globals)")
+        elif gk2 in (KONT, CONFLICT):
+            probs.append(
+                f"module constant {n!r} has kind {gk2} across the module")
+        elif ty(n) != gk2:
+            probs.append(
+                f"module constant {n!r} is {gk2} module-wide but {ty(n)} "
+                "in this function")
+
     # promote_matrix parameters: the local kind must be exactly the
     # promoted form of the incoming (caller-side) kind.  A sig still at the
     # i64 bottom with a promoted local kind means no caller ever passes a
@@ -3935,7 +4622,8 @@ _VEC_SAFE_RECEIVER_BUILTINS = {"push", "pop", "len", "__index_get", "as_ptr"}
 
 
 def _provably_dead_vecs(f: MirFunc, kinds: Dict[str, str],
-                        builtin_of) -> List[str]:
+                        builtin_of, retained: Optional[Set[str]] = None
+                        ) -> List[str]:
     """Vec.new result variables whose vector provably never escapes the
     frame, so `mx_vec_free` at every ret path is sound.
 
@@ -3977,21 +4665,28 @@ def _provably_dead_vecs(f: MirFunc, kinds: Dict[str, str],
 
     freed: List[str] = []
     for site in candidates:
-        # Alias group closure over plain copies.
+        # Alias group closure over plain copies AND __index_store results
+        # (`v2 = __index_store(v, i, x)` on a Vec returns the SAME pointer:
+        # v2 aliases v exactly like a copy would).
         group: Set[str] = {site}
         changed = True
         while changed:
             changed = False
             for b in f.blocks:
                 for op in b.ops:
-                    if op[0] == "let" and len(op) == 4 and op[2][0] == "copy" \
-                            and op[3] and op[3][0] in group \
-                            and op[1] not in group:
+                    if op[0] != "let" or len(op) != 4 or op[1] in group:
+                        continue
+                    if op[2][0] == "copy" and op[3] and op[3][0] in group:
+                        group.add(op[1])
+                        changed = True
+                    elif op[2][0] == "call" and op[2][1] == "__index_store" \
+                            and len(op[3]) == 3 and op[3][0] in group:
                         group.add(op[1])
                         changed = True
         # Every group member's every def must be the site's producing call
-        # (Vec.new / __vec_lit, for the site itself, exactly once) or a copy
-        # from within the group.
+        # (Vec.new / __vec_lit, for the site itself, exactly once), a copy
+        # from within the group, or an aliasing __index_store of a group
+        # member.
         ok = True
         for m in group:
             for (rhs, dargs) in defs.get(m, []):
@@ -4000,7 +4695,14 @@ def _provably_dead_vecs(f: MirFunc, kinds: Dict[str, str],
                     continue
                 if rhs[0] == "copy" and dargs and dargs[0] in group:
                     continue
+                if rhs[0] == "call" and rhs[1] == "__index_store" \
+                        and len(dargs) == 3 and dargs[0] in group:
+                    continue
                 ok = False
+        # Any group member the caller declared RETAINED (cell-backed
+        # storage, module-constant slots) outlives the frame: never free.
+        if retained and group & retained:
+            ok = False
         if len([1 for (rhs, _a) in defs.get(site, [])
                 if rhs[0] == "call"
                 and rhs[1] in ("Vec.new", "__vec_lit")]) != 1:
@@ -4033,9 +4735,13 @@ def _provably_dead_vecs(f: MirFunc, kinds: Dict[str, str],
                     if rk == "call":
                         callee = rhs[1]
                         bname = builtin_of(callee, oargs)
-                        if bname in _VEC_SAFE_RECEIVER_BUILTINS:
-                            # receiver-only use is safe; a group member in
-                            # any VALUE position escapes (stored in the vec)
+                        if bname in _VEC_SAFE_RECEIVER_BUILTINS \
+                                or bname in ("__index_store", "__index_set"):
+                            # receiver-only use is safe (index stores
+                            # mutate elements without retaining the
+                            # pointer; __index_store's aliasing RESULT is
+                            # already in the group); a group member in any
+                            # VALUE position escapes (stored in a vec)
                             if any(a in group for a in oargs[1:]):
                                 ok = False
                             continue
@@ -4405,6 +5111,11 @@ class _ModuleState:
         # which dep_names makes a dependency of the owner).
         self.comp_thunks: Dict[str, List[str]] = {}
         self.thunk_seq = 0
+        # Module constants touched by emitted functions: name -> kind.
+        # Emitted as @mx_g_<name> internal globals, zero-initialized and
+        # filled by @mx___module_init (called by llvm_run's entry wrapper
+        # before the entry point — the interpreter's _ensure_globals).
+        self.globals_used: Dict[str, str] = {}
 
     def intern_string(self, content: str) -> str:
         if content not in self.strings:
@@ -4551,6 +5262,12 @@ def _fvec_static_lens(f: MirFunc, kinds: Dict[str, str],
                             if s is not None and e is not None else _FLEN_DYN
                     elif callee == "__slice_get" and len(args) == 4:
                         v = slice_len(args[0], args[1:])
+                    elif callee == "__index_store" and len(args) == 3:
+                        # A functional element update preserves the length
+                        # (mx_fvec_set_copy copies the whole block); a
+                        # still-bottom receiver refines on later rounds,
+                        # like the copy rule.
+                        v = lens.get(args[0])
                     elif callee == "__vec_comprehension" and len(args) == 3:
                         v = lens.get(args[2])
                         if v is None or v == _FLEN_DYN:
@@ -4737,7 +5454,8 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                    closures: _ClosureTable, traits: _TraitTable,
                    scopes: _ScopeTable, module_names: Set[str],
                    mod: _ModuleState, emitted_names: Set[str],
-                   writeback_map: Dict[str, frozenset]) -> str:
+                   writeback_map: Dict[str, frozenset],
+                   cells: "_CellTable", gtable: "_GlobalTable") -> str:
     f = info.f
     sig = sigs[f.name]
 
@@ -4747,12 +5465,42 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
     def llty(n: str) -> str:
         return _llscalar(kind(n))
 
+    # MUTABLE-CAPTURE CELLS (increment 12): cell-backed variables read and
+    # write through a one-word heap cell pointer (%cellp.<n>, defined in
+    # the entry block: malloc'd here, or loaded from the env for cell
+    # captures) instead of a slot/register; envs capture the POINTER.
+    cellset = set(cells.backed.get(f.name, ()))
+    cap_cellset = set(cells.cap_cells.get(f.name, ()))
+
+    # MODULE CONSTANTS (increment 12): reads of __module_init-declared
+    # names with no local binding load from @mx_g_<name>; inside
+    # __module_init itself the declared names' defs STORE there (the
+    # global is their storage class).
+    global_reads = set(info.global_reads)
+    init_globals = set(info.init_globals) if f.name == _MODULE_INIT else set()
+
+    def global_slot(n: str) -> str:
+        mod.globals_used[n] = gtable.kind(n)
+        return _mx_global(n)
+
     def env_fields(lname: str) -> Tuple[Tuple[str, str], ...]:
-        """The env struct layout of a lambda: (capture, kind) in list order."""
-        return tuple((cn, closures.cell_kind(lname, cn))
+        """The env struct layout of a lambda: (capture, kind) in list
+        order; mutable captures carry the cell:ELEM marker (the field
+        holds the cell POINTER)."""
+        ccs = cells.cap_cells.get(lname, set())
+        return tuple((cn, _cell_marked(closures.cell_kind(lname, cn))
+                      if cn in ccs else closures.cell_kind(lname, cn))
                      for cn in closures.targets.get(lname, ()))
 
-    slots = _compute_slots(info, kinds)
+    def scope_fields(site: str) -> Tuple[Tuple[str, str], ...]:
+        """The env struct layout of a handle site, cell markers included."""
+        scs = cells.scope_cells.get(site, set())
+        return tuple((n, _cell_marked(scopes.cell_kind(site, n))
+                      if n in scs else scopes.cell_kind(site, n))
+                     for n in scopes.env_fields.get(site, ()))
+
+    slots = [n for n in _compute_slots(info, kinds)
+             if n not in cellset and n not in init_globals]
     slotset = set(slots)
     # Aggregate variables (struct / enum / closure kinds): each owns storage.
     agg_vars = sorted(n for n in info.def_count if _is_agg(kind(n)))
@@ -4776,6 +5524,9 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
     def slot_ref(n: str) -> str:
         return f"%slot.{_sanitize(n)}"
 
+    def cellp_ref(n: str) -> str:
+        return f"%cellp.{_sanitize(n)}"
+
     def strown_ref(n: str) -> str:
         return f"%strown.{_sanitize(n)}"
 
@@ -4797,6 +5548,19 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
         return f"%sv.{_sanitize(n)}"
 
     def use(name: str, lines: List[str]) -> str:
+        if name in cellset:
+            # Mutable capture: load through the shared cell (auto-deref,
+            # exactly mir_interp._lookup on an MxCell slot).
+            v = fresh()
+            lines.append(f"  {v} = load {llty(name)}, ptr {cellp_ref(name)}"
+                         f"  ; cell read: {name}")
+            return v
+        if name in init_globals:
+            v = fresh()
+            lines.append(
+                f"  {v} = load {llty(name)}, ptr {global_slot(name)}"
+                f"  ; module constant {name}")
+            return v
         if name in boxview:
             v = fresh()
             lines.append(f"  {v} = load ptr, ptr {bp_ref(name)}")
@@ -4807,12 +5571,29 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
             v = fresh()
             lines.append(f"  {v} = load {llty(name)}, ptr {slot_ref(name)}")
             return v
+        if name in global_reads and name not in info.def_count:
+            v = fresh()
+            lines.append(
+                f"  {v} = load {llty(name)}, ptr {global_slot(name)}"
+                f"  ; module constant {name}")
+            return v
         try:
             return valmap[name]
         except KeyError:
             raise _Unsupported(f"use of {name!r} before its definition")
 
     def setval(name: str, v: str, lines: List[str]) -> None:
+        if name in cellset:
+            # Write THROUGH the shared cell: every frame that captured the
+            # cell observes the new value (mir_interp's "let" on a cell).
+            lines.append(f"  store {llty(name)} {v}, ptr {cellp_ref(name)}"
+                         f"  ; cell write: {name}")
+            return
+        if name in init_globals:
+            lines.append(
+                f"  store {llty(name)} {v}, ptr {global_slot(name)}"
+                f"  ; module constant {name}: published")
+            return
         if name in aggset:
             raise _Unsupported(f"scalar assignment to aggregate variable {name!r}")
         if name in slotset:
@@ -4905,13 +5686,21 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
     # every ret path.  All other Vec.new results LEAK BY DESIGN — identity
     # semantics means the pointer may be shared anywhere it escaped to, so
     # no free can be proven unique (same contract as boxes/heap envs).
-    vec_free_vars = _provably_dead_vecs(f, kinds, builtin_of)
+    vec_free_vars = _provably_dead_vecs(
+        f, kinds, builtin_of,
+        retained=cellset | init_globals | global_reads)
     vec_free_set = set(vec_free_vars)
 
     # Fixed-vector static lengths (increment 11): var -> element count when
     # every def is provably that long, _FLEN_DYN otherwise.  Drives the
     # inline `<N x double>` / `<N x i64>` fast path for element-wise binops.
     fvec_lens = _fvec_static_lens(f, kinds, info)
+    # A cell-backed vector can be REASSIGNED from another function through
+    # the shared cell (and a module-constant one read here has its defs in
+    # __module_init), so local static-length facts about them are unsound.
+    for n in cellset | global_reads:
+        if _is_fvec(kind(n)):
+            fvec_lens[n] = _FLEN_DYN
 
     def fvec_len_of(n: str) -> Optional[int]:
         """The usable static length of a vector variable: an int in
@@ -4927,6 +5716,12 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
     # produced pointers.
     owned_strs, str_lit_temps, str_prod_temps = _owned_strings(
         f, kinds, info, builtin_of)
+    # Cell-backed and module-constant strings are shared beyond this
+    # frame's view: never freeable here (leak by design).
+    _str_retained = cellset | init_globals | global_reads
+    owned_strs = [n for n in owned_strs if n not in _str_retained]
+    str_lit_temps -= _str_retained
+    str_prod_temps -= _str_retained
     owned_str_set = set(owned_strs)
 
     # UNIQUE BOXES (increment 8): entry-block make_variant sites whose
@@ -5195,6 +5990,55 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                 lines.append(
                     f"  {w} = call i64 @mx_vec_get(ptr {recv}, i64 {idx})")
             setval(dst, from_word(elem, w, lines), lines)
+        elif name == "__index_store":
+            # Store-back index assignment `place = __index_store(place, i,
+            # x)`.  Vec receiver: mx_vec_set mutates the one shared vector
+            # in place (bounds-checked abort, interpreter parity) and the
+            # result IS the same pointer, so the rebind is a no-op copy.
+            # Fixed-vector receiver: mx_fvec_set_copy performs the
+            # interpreter's FUNCTIONAL update — blocks are shallow-shared
+            # and write-once, so the update copies the block and returns a
+            # fresh one for the place rebind (other shares never observe
+            # the write); the fresh block leaks by design like every fvec.
+            recv = use(opargs[0], lines)
+            rk0 = kind(opargs[0])
+            idx = use(opargs[1], lines)
+            if _is_fvec(rk0):
+                w = to_word(_fvec_elem(rk0), use(opargs[2], lines), lines)
+                mod.runtime_syms.add("mx_fvec_set_copy")
+                v = fresh()
+                lines.append(
+                    f"  {v} = call ptr @mx_fvec_set_copy(ptr {recv}, "
+                    f"i64 {idx}, i64 {w})"
+                    "  ; functional update: fresh block, write-once "
+                    "sharing preserved")
+                setval(dst, v, lines)
+            else:
+                w = to_word(_vec_elem(rk0), use(opargs[2], lines), lines)
+                mod.runtime_syms.add("mx_vec_set")
+                lines.append(
+                    f"  call void @mx_vec_set(ptr {recv}, i64 {idx}, "
+                    f"i64 {w})  ; in-place element store (identity "
+                    "semantics)")
+                setval(dst, recv, lines)
+        elif name == "__index_set":
+            # In-place element store (Vec receivers only; immutable
+            # receivers were demoted at compile time).
+            recv = use(opargs[0], lines)
+            idx = use(opargs[1], lines)
+            w = to_word(_vec_elem(kind(opargs[0])), use(opargs[2], lines),
+                        lines)
+            mod.runtime_syms.add("mx_vec_set")
+            lines.append(
+                f"  call void @mx_vec_set(ptr {recv}, i64 {idx}, i64 {w})")
+            setval(dst, "0", lines)  # unit
+        elif name == "__zip":
+            # Virtual value: the comprehension site reads the zipped
+            # SOURCES directly and drives mx_fvec_zip_map (the consistency
+            # check restricted every use to that shape).
+            lines.append(
+                f"  ; __zip {', '.join(opargs)} -> {dst}: virtual pair "
+                "iterable (materialized by the comprehension site)")
         elif name == "__vec_lit":
             # Fixed-size vector literal (increment 10): one immutable
             # mx_fvec block, filled in place BEFORE the pointer is ever
@@ -5311,64 +6155,118 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                 raise _Unsupported(
                     f"comprehension body lambda {lname!r} is not emitted")
             lsig = sigs[lname]
-            ek = _fvec_elem(kind(itvar))
-            pk_, rk_ = lsig.params[0], lsig.ret
             dek = _fvec_elem(kind(dst))
-            # Per-site thunk: decode the element word, adapt i64->f64 when
-            # the body expects floats (the scalar-promotion contract), call
-            # the lambda, encode its result as the destination's element
-            # word.
-            mod.thunk_seq += 1
-            tsym = f"mx.vcth.{mod.thunk_seq}"
-            tl: List[str] = [
-                f"define internal i64 @{tsym}(ptr %env, i64 %w) {{"
-                f"  ; comprehension thunk: {lname}",
-                "entry:"]
-            if pk_ == F64 and ek == I64:
-                tl.append("  %e = sitofp i64 %w to double")
-                ev = "%e"
-            elif ek == I64:
-                ev = "%w"
-            elif ek == F64:
-                tl.append("  %e = bitcast i64 %w to double")
-                ev = "%e"
-            else:
-                tl.append("  %e = inttoptr i64 %w to ptr")
-                ev = "%e"
-            tl.append(
-                f"  %r = call {_llscalar(rk_)} @{mangle(lname)}(ptr %env, "
-                f"{_llscalar(pk_)} {ev})")
-            rv = "%r"
-            if dek == F64 and rk_ == I64:
-                tl.append("  %rf = sitofp i64 %r to double")
-                rv = "%rf"
-            if dek == I64:
-                tl.append(f"  ret i64 {rv}")
-            elif dek == F64:
-                tl.append(f"  %rw = bitcast double {rv} to i64")
-                tl.append("  ret i64 %rw")
-            else:
-                tl.append(f"  %rw = ptrtoint ptr {rv} to i64")
-                tl.append("  ret i64 %rw")
-            tl.append("}")
-            mod.comp_thunks.setdefault(f.name, []).append("\n".join(tl))
-            base = use(fnvar, lines)
-            envpp = fresh()
-            lines.append(
-                f"  {envpp} = getelementptr inbounds {_CLOSURE_PAIR_TY}, "
-                f"ptr {base}, i32 0, i32 1")
-            envv = fresh()
-            lines.append(f"  {envv} = load ptr, ptr {envpp}")
+
+            def decode_word(tl: List[str], w: str, ek: str, pk_: str,
+                            tag: str) -> str:
+                """Thunk-side element decode: word -> the lambda's
+                parameter type (i64->f64 is the scalar promotion
+                contract)."""
+                if pk_ == F64 and ek == I64:
+                    tl.append(f"  %e{tag} = sitofp i64 {w} to double")
+                    return f"%e{tag}"
+                if ek == I64:
+                    return w
+                if ek == F64:
+                    tl.append(f"  %e{tag} = bitcast i64 {w} to double")
+                    return f"%e{tag}"
+                tl.append(f"  %e{tag} = inttoptr i64 {w} to ptr")
+                return f"%e{tag}"
+
+            def encode_result(tl: List[str], rk_: str) -> None:
+                """Thunk-side result encode: lambda return -> element
+                word of the destination vector."""
+                rv = "%r"
+                if dek == F64 and rk_ == I64:
+                    tl.append("  %rf = sitofp i64 %r to double")
+                    rv = "%rf"
+                if dek == I64:
+                    tl.append(f"  ret i64 {rv}")
+                elif dek == F64:
+                    tl.append(f"  %rw = bitcast double {rv} to i64")
+                    tl.append("  ret i64 %rw")
+                else:
+                    tl.append(f"  %rw = ptrtoint ptr {rv} to i64")
+                    tl.append("  ret i64 %rw")
+
+            def closure_env_of(fv: str) -> str:
+                base = use(fv, lines)
+                envpp = fresh()
+                lines.append(
+                    f"  {envpp} = getelementptr inbounds "
+                    f"{_CLOSURE_PAIR_TY}, ptr {base}, i32 0, i32 1")
+                envv = fresh()
+                lines.append(f"  {envv} = load ptr, ptr {envpp}")
+                return envv
+
             nconst = info.const_ints.get(nvar)
             nexp = -1 if nconst is None else nconst
-            src = use(itvar, lines)
-            mod.runtime_syms.add("mx_fvec_map")
-            v = fresh()
-            lines.append(
-                f"  {v} = call ptr @mx_fvec_map(ptr {src}, ptr @{tsym}, "
-                f"ptr {envv}, i64 {nexp})"
-                f"  ; comprehension via {lname}")
-            setval(dst, v, lines)
+            zsrcs = info.zip_defs.get(itvar)
+            if zsrcs is not None:
+                # ZIP COMPREHENSION (increment 12): lockstep over the two
+                # zip sources via mx_fvec_zip_map, which ABORTS on a
+                # length mismatch exactly like the interpreter's strict
+                # __zip.  The two-word thunk decodes one element word per
+                # source into the lambda's two parameters.
+                if len(zsrcs) != 2 or len(lsig.params) != 2:
+                    raise _Unsupported(
+                        "zip comprehension outside the pair shape")
+                eks = [_fvec_elem(kind(s)) for s in zsrcs]
+                mod.thunk_seq += 1
+                tsym = f"mx.vzth.{mod.thunk_seq}"
+                tl = [
+                    f"define internal i64 @{tsym}(ptr %env, i64 %wa, "
+                    f"i64 %wb) {{  ; zip comprehension thunk: {lname}",
+                    "entry:"]
+                ea = decode_word(tl, "%wa", eks[0], lsig.params[0], "a")
+                eb = decode_word(tl, "%wb", eks[1], lsig.params[1], "b")
+                tl.append(
+                    f"  %r = call {_llscalar(lsig.ret)} @{mangle(lname)}"
+                    f"(ptr %env, {_llscalar(lsig.params[0])} {ea}, "
+                    f"{_llscalar(lsig.params[1])} {eb})")
+                encode_result(tl, lsig.ret)
+                tl.append("}")
+                mod.comp_thunks.setdefault(f.name, []).append("\n".join(tl))
+                envv = closure_env_of(fnvar)
+                a = use(zsrcs[0], lines)
+                b2 = use(zsrcs[1], lines)
+                mod.runtime_syms.add("mx_fvec_zip_map")
+                v = fresh()
+                lines.append(
+                    f"  {v} = call ptr @mx_fvec_zip_map(ptr {a}, "
+                    f"ptr {b2}, ptr @{tsym}, ptr {envv}, i64 {nexp})"
+                    f"  ; zip comprehension via {lname} (aborts on "
+                    "length mismatch)")
+                setval(dst, v, lines)
+            else:
+                ek = _fvec_elem(kind(itvar))
+                pk_, rk_ = lsig.params[0], lsig.ret
+                # Per-site thunk: decode the element word, adapt i64->f64
+                # when the body expects floats (the scalar-promotion
+                # contract), call the lambda, encode its result as the
+                # destination's element word.
+                mod.thunk_seq += 1
+                tsym = f"mx.vcth.{mod.thunk_seq}"
+                tl = [
+                    f"define internal i64 @{tsym}(ptr %env, i64 %w) {{"
+                    f"  ; comprehension thunk: {lname}",
+                    "entry:"]
+                ev = decode_word(tl, "%w", ek, pk_, "")
+                tl.append(
+                    f"  %r = call {_llscalar(rk_)} @{mangle(lname)}"
+                    f"(ptr %env, {_llscalar(pk_)} {ev})")
+                encode_result(tl, rk_)
+                tl.append("}")
+                mod.comp_thunks.setdefault(f.name, []).append("\n".join(tl))
+                envv = closure_env_of(fnvar)
+                src = use(itvar, lines)
+                mod.runtime_syms.add("mx_fvec_map")
+                v = fresh()
+                lines.append(
+                    f"  {v} = call ptr @mx_fvec_map(ptr {src}, "
+                    f"ptr @{tsym}, ptr {envv}, i64 {nexp})"
+                    f"  ; comprehension via {lname}")
+                setval(dst, v, lines)
         elif name == "len":
             recv = use(opargs[0], lines)
             rk0 = kind(opargs[0])
@@ -5449,11 +6347,11 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
     # captures load into %cap.* registers (or their slot), aggregate captures
     # copy into their own storage.
     for p in info.params:
-        if p not in slotset and p not in aggset:
+        if p not in slotset and p not in aggset and p not in cellset:
             valmap[p] = f"%a.{_sanitize(p)}"
     if info.is_lambda or info.is_scope_member:
         for c in info.env_captures:
-            if c not in slotset and c not in aggset:
+            if c not in slotset and c not in aggset and c not in cellset:
                 valmap[c] = f"%cap.{_sanitize(c)}"
 
     # One env alloca per stack-env make_closure site, named and created in
@@ -5506,6 +6404,13 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                     lines.append(f"  ; drop {op[1]} (@global struct: freed on ret paths)")
                 else:
                     lines.append(f"  ; drop {op[1]} (scalar/local: frame-owned, no-op)")
+                continue
+            if opk == "cell_wrap":
+                # The slot is cell-backed for the whole frame (entry-block
+                # cell), so the wrap itself is a no-op — idempotent, like
+                # the interpreter's re-wrap of an existing MxCell.
+                lines.append(f"  ; cell_wrap {op[1]}: cell-backed from "
+                             "entry (shared one-word heap cell)")
                 continue
             if opk == "match_fail":
                 mod.uses_abort = True
@@ -6217,7 +7122,17 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                     lines.append(
                         f"  {p} = getelementptr inbounds {ety}, ptr {envp}, "
                         f"i32 0, i32 {i}")
-                    if _is_agg(ck):
+                    if _is_cell_marker(ck):
+                        # Mutable capture: store the CELL POINTER, never
+                        # the value — the closure aliases the binding.
+                        if vn not in cellset:
+                            raise _Unsupported(
+                                f"cell capture {cn!r} of non-cell "
+                                f"variable {vn!r}")
+                        lines.append(
+                            f"  store ptr {cellp_ref(vn)}, ptr {p}"
+                            f"  ; mutable capture: cell pointer for {cn}")
+                    elif _is_agg(ck):
                         # aggregate capture: copy the whole value into the env
                         agg_copy(_agg_ty(ck), use(vn, lines), p, lines)
                     else:
@@ -6264,8 +7179,7 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                         raise _Unsupported(
                             f"handler case {hfn!r} has an unexpected "
                             "signature")
-                fields = [(n, scopes.cell_kind(site, n))
-                          for n in scopes.env_fields.get(site, ())]
+                fields = list(scope_fields(site))
                 mod.scope_env_types[site] = tuple(fields)
                 envp = env_allocas.get(id(op))
                 if envp is None:  # unreachable: prescan covers every site
@@ -6277,7 +7191,17 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                     lines.append(
                         f"  {p} = getelementptr inbounds {ety}, ptr {envp}, "
                         f"i32 0, i32 {i}")
-                    if _is_agg(ck):
+                    if _is_cell_marker(ck):
+                        # Mutable capture: the scope members share the
+                        # binding through the cell pointer.
+                        if vn not in cellset:
+                            raise _Unsupported(
+                                f"cell capture {cn!r} of non-cell "
+                                f"variable {vn!r}")
+                        lines.append(
+                            f"  store ptr {cellp_ref(vn)}, ptr {p}"
+                            f"  ; mutable capture: cell pointer for {cn}")
+                    elif _is_agg(ck):
                         agg_copy(_agg_ty(ck), use(vn, lines), p, lines)
                     else:
                         lines.append(
@@ -6382,6 +7306,15 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
             f"  {strown_ref(n)} = alloca ptr  ; owned string shadow: {n}")
         entry.append(f"  store ptr null, ptr {strown_ref(n)}")
     entry.extend(env_entry)
+    # Mutable-capture cells owned by this frame: one malloc(8) word box
+    # each, NEVER freed (leak by design: the cell may be aliased by any
+    # env that captured its pointer, and an immortal cell cannot dangle).
+    # Cell CAPTURES (cap_cellset) load their pointer from the env below.
+    for n in sorted(cellset - cap_cellset):
+        mod.uses_malloc = True
+        entry.append(
+            f"  {cellp_ref(n)} = call ptr @malloc(i64 8)"
+            f"  ; mutable-capture cell for {n} (leaks by design)")
     for n in heap_vars:
         sname = _struct_name(kind(n))
         # Recursive layout size: leaf cells are 8 bytes, nested aggregates
@@ -6406,6 +7339,12 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
             # semantics (rebound params also copy back OUT on ret paths).
             agg_copy(_agg_ty(kind(p)), f"%a.{_sanitize(p)}",
                      struct_ref(p), entry)
+        elif p in cellset:
+            # A cell-backed parameter: seed the fresh cell with the
+            # incoming value (the caller passed by value, as always).
+            entry.append(
+                f"  store {llty(p)} %a.{_sanitize(p)}, ptr {cellp_ref(p)}"
+                f"  ; cell-backed parameter {p}")
         elif p in slotset:
             entry.append(f"  store {llty(p)} %a.{_sanitize(p)}, ptr {slot_ref(p)}")
     if info.is_lambda or info.is_scope_member:
@@ -6418,9 +7357,7 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
             mod.env_types[f.name] = fields
             ety = f"%env.{_sanitize(f.name)}"
         else:
-            fields = tuple(
-                (n, scopes.cell_kind(info.scope_site, n))
-                for n in scopes.env_fields.get(info.scope_site, ()))
+            fields = scope_fields(info.scope_site)
             mod.scope_env_types[info.scope_site] = fields
             ety = f"%henv.{_sanitize(info.scope_site)}"
         wanted = set(info.env_captures)
@@ -6431,7 +7368,22 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
             entry.append(
                 f"  {p} = getelementptr inbounds {ety}, ptr %cl.env, "
                 f"i32 0, i32 {i}")
-            if cn in aggset:
+            if _is_cell_marker(ck):
+                # Mutable capture: the env field holds the shared cell's
+                # POINTER — load it, and all reads/writes go through it.
+                entry.append(
+                    f"  {cellp_ref(cn)} = load ptr, ptr {p}"
+                    f"  ; mutable capture: shared cell pointer for {cn}")
+            elif cn in cellset:
+                # Value capture that THIS function wraps into its own
+                # fresh cell (a sub-function of ours assigns it): seed the
+                # cell with the captured value.
+                v = f"%capv.{_sanitize(cn)}"
+                entry.append(f"  {v} = load {_llscalar(ck)}, ptr {p}")
+                entry.append(
+                    f"  store {_llscalar(ck)} {v}, ptr {cellp_ref(cn)}"
+                    f"  ; cell-backed capture {cn}: seeded from the env")
+            elif cn in aggset:
                 agg_copy(_agg_ty(ck), p, struct_ref(cn), entry)
             elif cn in slotset:
                 v = f"%capv.{_sanitize(cn)}"
@@ -6592,7 +7544,10 @@ def emit_llvm(funcs: Sequence[MirFunc]) -> str:
     closures = _build_closure_table(funcs)
     traits = _build_trait_table(module_names)
     scopes = _build_scope_table(funcs)
-    infos = [_analyze(f, module_names, closures, scopes, traits)
+    cells = _build_cell_table(funcs, scopes)
+    gtable = _build_global_table(funcs)
+    infos = [_analyze(f, module_names, closures, scopes, traits,
+                      cells, gtable)
              for f in funcs]
     variants = _build_variant_table(funcs, infos)
 
@@ -6632,6 +7587,11 @@ def emit_llvm(funcs: Sequence[MirFunc]) -> str:
             ck = kinds.get(cvar, I64)
             if _is_closure(ck) and _closure_lambda(ck) in module_names:
                 deps.add(_closure_lambda(ck))
+        # Reading a module constant is meaningless unless its initializer
+        # emitted (the entry wrapper must be able to run it first): a
+        # demoted __module_init cascades onto every global reader.
+        if info.global_reads and _MODULE_INIT in module_names:
+            deps.add(_MODULE_INIT)
         for (_d, method, targs) in info.trait_calls:
             if not targs:
                 continue
@@ -6669,7 +7629,7 @@ def emit_llvm(funcs: Sequence[MirFunc]) -> str:
             for info in candidates:
                 kinds, cell_changed = _infer_kinds(
                     info, sigs, structs, variants, closures, traits, scopes,
-                    module_names, assume_final=assume_final)
+                    module_names, gtable, assume_final=assume_final)
                 changed = changed or cell_changed
                 if kind_sets.get(info.f.name) != kinds:
                     kind_sets[info.f.name] = kinds
@@ -6762,7 +7722,8 @@ def emit_llvm(funcs: Sequence[MirFunc]) -> str:
     for info in candidates:
         kinds = kind_sets.get(info.f.name, {})
         for p in _check_consistency(info, kinds, sigs, structs, variants,
-                                    closures, traits, scopes, module_names):
+                                    closures, traits, scopes, module_names,
+                                    cells, gtable):
             info.add_reason(p)
 
     # WRITE-BACK MAP (increment 8, for copy elision): per function, the
@@ -6816,7 +7777,7 @@ def emit_llvm(funcs: Sequence[MirFunc]) -> str:
                 chunk = _emit_function(info, kinds, sigs, structs, variants,
                                        closures, traits, scopes,
                                        module_names, mod, emitted,
-                                       writeback_map)
+                                       writeback_map, cells, gtable)
             except _Unsupported as exc:
                 info.add_reason(exc.reason)
             except Exception as exc:  # never crash the pipeline
@@ -6922,6 +7883,17 @@ def emit_llvm(funcs: Sequence[MirFunc]) -> str:
         henv_lines[-1] += f"  ; handle-site env: {desc or '(none)'}"
     if henv_lines:
         chunks.append("\n".join(henv_lines))
+    if mod.globals_used:
+        glines = ["; module constants (declared by __module_init; the",
+                  "; native entry wrapper calls @mx___module_init first --",
+                  "; the interpreter's _ensure_globals)"]
+        zero = {"i64": "0", "double": _fmt_f64(0.0), "ptr": "null"}
+        for n in sorted(mod.globals_used):
+            lty = _llscalar(mod.globals_used[n])
+            glines.append(
+                f"{_mx_global(n)} = internal global {lty} {zero[lty]}"
+                f"  ; {n}: {mod.globals_used[n]}")
+        chunks.append("\n".join(glines))
     chunks.extend(_emit_runtime(mod))
     for site in sorted(live_scope_shims):
         chunks.append(mod.scope_tables[site])

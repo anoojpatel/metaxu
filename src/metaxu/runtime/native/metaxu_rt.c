@@ -417,6 +417,52 @@ mx_fvec *mx_fvec_map(const mx_fvec *v, mx_fvec_map_fn fn, void *env,
     return out;
 }
 
+/* Functional update behind `v[i] = x` on an immutable vector[T,N] place:
+ * blocks are shallow-shared and write-once, so the update must COPY the
+ * block, store the element, and hand the fresh block back for the
+ * compiler to rebind — a mutation in place would be observed by every
+ * other share (exactly the silent bug the interpreter's value semantics
+ * forbid). */
+mx_fvec *mx_fvec_set_copy(const mx_fvec *v, int64_t idx, int64_t word) {
+    mx_fvec_check(v, "index assignment");
+    if (idx < 0 || idx >= v->len) {
+        mx_rt_fail("index assignment out of bounds: %lld (length %lld)",
+                   (long long)idx, (long long)v->len);
+    }
+    mx_fvec *out = mx_fvec_new(v->len);
+    memcpy(out->elems, v->elems, (size_t)v->len * sizeof(int64_t));
+    out->elems[idx] = word;
+    return out;
+}
+
+/* Lockstep pair comprehension: `f(a, b) for (a, b) in (xs, ys)`.  The
+ * interpreter's __zip is strict about lengths, so a mismatch aborts
+ * loudly; expected_n mirrors mx_fvec_map's declared-size check. */
+mx_fvec *mx_fvec_zip_map(const mx_fvec *a, const mx_fvec *b,
+                         mx_fvec_zip_fn fn, void *env, int64_t expected_n) {
+    mx_fvec_check(a, "zip");
+    mx_fvec_check(b, "zip");
+    if (fn == NULL) {
+        mx_rt_fail("zip comprehension: NULL body function");
+    }
+    if (a->len != b->len) {
+        int64_t lo = a->len < b->len ? a->len : b->len;
+        int64_t hi = a->len < b->len ? b->len : a->len;
+        mx_rt_fail("zip: sequences have different lengths [%lld, %lld]",
+                   (long long)lo, (long long)hi);
+    }
+    if (expected_n >= 0 && a->len != expected_n) {
+        mx_rt_fail("vector comprehension produced %lld elements for a "
+                   "vector of size %lld",
+                   (long long)a->len, (long long)expected_n);
+    }
+    mx_fvec *out = mx_fvec_new(a->len);
+    for (int64_t i = 0; i < a->len; i++) {
+        out->elems[i] = fn(env, a->elems[i], b->elems[i]);
+    }
+    return out;
+}
+
 /* Append helper for mx_fvec_to_str: exact-size accounting is not worth the
  * complexity; grow a buffer geometrically. */
 static void mx_buf_append(char **buf, size_t *len, size_t *cap,

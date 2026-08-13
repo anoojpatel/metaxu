@@ -136,6 +136,29 @@ leak-checked (real allocator, program-managed frees), while vec snapshots
 and example 05's Ok-arm File box keep the detect_leaks=0 leak-by-design
 contract.  05_unsafe_and_ffi.mx emits with ZERO placeholders and runs
 natively end-to-end with the cwd pinned (both fopen outcomes).
+
+Increment 12 (silent-seam constructs) adds: index assignment
+(`__index_store` -> mx_vec_set in place on Vecs — the aliasing result
+keeps provably-local vecs freeable — and the new mx_fvec_set_copy
+FUNCTIONAL update on vector[T,N] places, copying the write-once block so
+other shares never observe the write; `__index_set` is Vec-only, with
+immutable receivers demoted at compile time carrying the interpreter's
+error), mutable-capture cells (`cell_wrap` -> one-word malloc'd cells,
+reads/writes through the cell pointer, closure AND handle-scope envs
+capture the POINTER — closure counters, escaping-counter state retention
+and handler-frame counters like std.stream take/skip's `seen` all run
+natively; captures not provably after the wrap demote, since the
+interpreter froze a value copy there), module constants (`__module_init`
+-> @mx_g_<name> internal globals stored by the emitted initializer,
+which llvm_run's entry wrapper calls first; readers load with no local
+binding, parameter shadowing stays local, flow-sensitive assignment
+shadowing demotes, and a module whose initializer demoted refuses to run
+natively at all), and zip comprehensions (`__zip` results are VIRTUAL —
+restricted to comprehension-iterable uses — and the site drives the new
+mx_fvec_zip_map through a two-word thunk; length mismatches abort with
+the interpreter's message).  Cells and fvec blocks leak by design
+(detect_leaks=0); index-stored local Vecs and scalar-global programs run
+FULLY leak-checked.
 """
 from __future__ import annotations
 
@@ -2802,13 +2825,19 @@ def test_examples_define_census_does_not_regress():
     # parameter joins conflicting closure kinds), landing at 70.  06's
     # remaining demotions are all higher-order: map/reduce/zip receive
     # DIFFERENT lambdas at one call site (indirect closure calls are not
-    # a feature yet), never vector builtins.
+    # a feature yet), never vector builtins.  (The parser-sharing round
+    # later landed at a 77 baseline.)  Increment 12 (silent-seam
+    # constructs) lifts ownership.mx entirely (process + main: the fvec
+    # functional index update through a struct-field place), landing at
+    # 79; collections.mx's push now demotes on its List<T> field-table
+    # gap instead of __index_store, and 06's zip demotions are all
+    # closure-kind conflicts, never __zip itself.
     total_defines = 0
     for path in _example_files():
         ir = llvm_from_source(path.read_text())
         total_defines += len(re.findall(
             r"^define (?:i64|double|ptr|void) @mx_\w+\(", ir, re.M))
-    assert total_defines >= 70
+    assert total_defines >= 79
 
 
 # ---------------------------------------------------------------------------
@@ -3872,3 +3901,473 @@ def test_reduce_helper_int_runs_and_matches_python_sum(tmp_path):
     exit_code, out = compile_and_run(ir, "main", workdir=str(tmp_path))
     assert exit_code == 0
     assert out == f"{sum(vals)}\n"
+
+
+# ---------------------------------------------------------------------------
+# Increment 12: silent-seam constructs — index assignment, mutable-capture
+# cells, module constants, zip comprehensions
+# ---------------------------------------------------------------------------
+
+_VEC_INDEX_STORE_SRC = """
+fn main() -> int {
+    let v = Vec.new();
+    v.push(1);
+    v.push(2);
+    v[0] = 10;
+    print(v[0] + v[1]);
+    0
+}
+"""
+
+
+def test_index_store_on_vec_lowers_to_mx_vec_set_and_stays_freeable():
+    ir = llvm_from_source(_VEC_INDEX_STORE_SRC)
+    assert count_placeholders(ir) == 0
+    assert re.search(r"call void @mx_vec_set\(ptr %t\d+, i64 %?\w+, "
+                     r"i64 %?\w+\)", ir)
+    # The __index_store result aliases the receiver (same pointer), so the
+    # dead-vec analysis still proves the vec frame-local and frees it.
+    assert "call void @mx_vec_free" in ir
+
+
+_FVEC_INDEX_STORE_SRC = """
+fn main() -> int {
+    let mut v = vector[int, 3](1, 2, 3);
+    let w = v;
+    v[1] = 20;
+    print(v[0] + v[1] + v[2]);
+    print(w[1]);
+    0
+}
+"""
+
+
+def test_index_store_on_fixed_vector_is_functional_copy():
+    ir = llvm_from_source(_FVEC_INDEX_STORE_SRC)
+    assert count_placeholders(ir) == 0
+    # Never a mutation in place: the write-once block is COPIED, the
+    # element set in the fresh block, and the place rebound.
+    assert "call ptr @mx_fvec_set_copy(ptr" in ir
+    assert "functional update" in ir
+    assert "mx_fvec_init" in ir  # the literal still fills in place
+
+
+def test_index_store_immutable_receiver_demotes_at_compile_time():
+    ir = llvm_from_source("""
+fn main() -> int {
+    let s = "abc";
+    s[0] = "x";
+    1
+}
+""")
+    assert count_placeholders(ir) == 1
+    assert "index assignment into a str receiver" in ir
+    assert "the interpreter rejects it" in ir
+
+
+def test_index_set_on_immutable_vector_demotes_with_interpreter_error():
+    # `m[0][1] = x` reaches the in-place __index_set form; a fixed-vector
+    # inner row is immutable, so it demotes at compile time with the
+    # interpreter's own message (never a silent store, never an abort the
+    # compiler could have predicted).
+    ir = llvm_from_source("""
+fn main() -> int {
+    let m = vector[vector[int,2],2](vector[int,2](1,2), vector[int,2](3,4));
+    m[0][1] = 9;
+    0
+}
+""")
+    assert count_placeholders(ir) == 1
+    assert "cannot assign into an immutable vector" in ir
+
+
+def test_mutable_capture_lowers_to_shared_cell():
+    ir = llvm_from_source("""
+fn main() -> int {
+    let mut count = 0;
+    let bump = fn() { count = count + 1; };
+    bump();
+    bump();
+    print(count);
+    0
+}
+""")
+    assert count_placeholders(ir) == 0
+    # One-word heap cell, reads/writes through the pointer, env captures
+    # the POINTER (aliasing is the point).
+    assert re.search(r"%cellp\.count_\d+ = call ptr @malloc\(i64 8\)", ir)
+    assert "; cell write: count_" in ir
+    assert "; cell read: count_" in ir
+    assert "mutable capture: cell pointer for count_" in ir
+
+
+def test_pre_wrap_capture_demotes_honestly():
+    # `r` captures count BEFORE the wrap (the interpreter freezes a VALUE
+    # copy there: r() sees 0 even after w() runs); whole-frame cell
+    # backing would show r the live value — demote, never diverge.
+    ir = llvm_from_source("""
+fn main() -> int {
+    let mut count = 0;
+    let r = fn() -> int { count };
+    let w = fn() { count = count + 1; };
+    w();
+    print(r());
+    0
+}
+""")
+    assert "not provably after its cell_wrap" in ir
+
+
+def test_module_constants_emit_globals_and_init_stores():
+    ir = llvm_from_source("""
+let BASE = 40;
+let SCALE = 2.5;
+let NAME = "metaxu";
+fn get() -> int { BASE + 1 }
+fn main() -> int {
+    print(BASE + get());
+    print(NAME);
+    if SCALE > 2.0 { print(1) } else { print(0) };
+    0
+}
+""")
+    assert count_placeholders(ir) == 0
+    assert "@mx_g_BASE = internal global i64 0" in ir
+    assert "@mx_g_SCALE = internal global double" in ir
+    assert "@mx_g_NAME = internal global ptr null" in ir
+    # init is a normal function storing into the globals; readers load.
+    assert re.search(r"^define (?:i64|double|ptr) @mx___module_init\(\)",
+                     ir, re.M)
+    assert "store i64 40, ptr @mx_g_BASE" in ir
+    # get() reads the global with no local binding (interpreter fallback).
+    assert re.search(r"load i64, ptr @mx_g_BASE", ir)
+
+
+def test_local_shadow_of_module_constant_demotes():
+    # Assignment creates a flow-sensitive local shadow in the interpreter
+    # (reads before it see the global): no static storage class matches.
+    ir = llvm_from_source("""
+let BASE = 7;
+fn f() -> int { BASE = 2; BASE }
+fn main() -> int { print(f()); print(BASE); 0 }
+""")
+    assert "shadows the global flow-sensitively" in ir
+
+
+def test_zip_comprehension_emits_two_word_thunk_and_zip_map():
+    ir = llvm_from_source("""
+fn main() -> int {
+    let xs = vector[int, 3](1, 2, 3);
+    let ys = vector[int, 3](10, 20, 30);
+    let zs = vector[int, 3](a + b for (a, b) in (xs, ys));
+    print(zs[0] + zs[1] + zs[2]);
+    0
+}
+""")
+    assert count_placeholders(ir) == 0
+    assert re.search(
+        r"define internal i64 @mx\.vzth\.\d+\(ptr %env, i64 %wa, i64 %wb\)",
+        ir)
+    assert re.search(
+        r"call ptr @mx_fvec_zip_map\(ptr %t\d+, ptr %t\d+, "
+        r"ptr @mx\.vzth\.\d+, ptr %t\d+, i64 3\)", ir)
+    # The zip result itself is virtual: no materialized list of tuples.
+    assert "virtual pair iterable" in ir
+
+
+# --- native differentials --------------------------------------------------
+
+@needs_clang
+def test_native_index_store_vec_differential(tmp_path):
+    assert_native_matches_interp(_VEC_INDEX_STORE_SRC, tmp_path)
+
+
+@needs_asan
+def test_native_index_store_vec_fully_leak_checked_under_asan(tmp_path):
+    # The index-stored local vec is still provably frame-local (the store
+    # result aliases the receiver) and freed: FULL leak check.
+    assert_native_matches_interp_asan(_VEC_INDEX_STORE_SRC, tmp_path)
+
+
+@needs_clang
+def test_native_index_store_fvec_differential_preserves_shares(tmp_path):
+    # `w = v` snapshots the pre-update value: the functional update must
+    # COPY the block, never mutate it in place (w[1] stays 2).
+    assert_native_matches_interp(_FVEC_INDEX_STORE_SRC, tmp_path)
+
+
+@needs_asan
+def test_native_index_store_fvec_asan_no_uaf(tmp_path):
+    # fvec blocks (original + functional-update copy) leak by design.
+    result, expected_out = interp_run(_FVEC_INDEX_STORE_SRC)
+    ir = llvm_from_source(_FVEC_INDEX_STORE_SRC)
+    exit_code, stdout = compile_and_run(
+        ir, "main", workdir=str(tmp_path),
+        clang_args=("-fsanitize=address",),
+        run_env={"ASAN_OPTIONS": "detect_leaks=0"})
+    assert stdout == expected_out
+    assert exit_code == 0
+
+
+@needs_clang
+def test_native_index_store_struct_field_place_differential(tmp_path):
+    # ownership.mx's shape: `buf.data[i] = x` through a @mut struct param
+    # — the functional fvec update flows through field write-back.
+    assert_native_matches_interp("""
+struct Buffer { data: vector[int,3] }
+fn process(buf: @mut Buffer) {
+    buf.data[0] = 42
+}
+fn main() -> int {
+    let buf = Buffer { data: vector[int,3](1, 2, 3) };
+    process(buf);
+    print(buf.data[0]);
+    print(buf.data[1]);
+    0
+}
+""", tmp_path)
+
+
+@needs_clang
+def test_native_nested_vec_index_set_differential(tmp_path):
+    # `m[0][1] = x` on a Vec of Vecs: in-place store on the shared inner
+    # row (identity semantics observable through the original binding).
+    assert_native_matches_interp("""
+fn main() -> int {
+    let row = Vec.new();
+    row.push(1);
+    row.push(2);
+    let m = Vec.new();
+    m.push(row);
+    m[0][1] = 9;
+    print(row[1]);
+    0
+}
+""", tmp_path)
+
+
+_COUNTER_SRC = """
+fn main() -> int {
+    let mut count = 0;
+    let bump = fn() { count = count + 1; };
+    bump();
+    bump();
+    bump();
+    print(count);
+    0
+}
+"""
+
+
+@needs_clang
+def test_native_mutable_capture_counter_differential(tmp_path):
+    assert_native_matches_interp(_COUNTER_SRC, tmp_path)
+
+
+@needs_asan
+def test_native_mutable_capture_counter_asan_no_uaf(tmp_path):
+    # Cells leak by design (malloc'd one-word boxes, never freed).
+    result, expected_out = interp_run(_COUNTER_SRC)
+    ir = llvm_from_source(_COUNTER_SRC)
+    exit_code, stdout = compile_and_run(
+        ir, "main", workdir=str(tmp_path),
+        clang_args=("-fsanitize=address",),
+        run_env={"ASAN_OPTIONS": "detect_leaks=0"})
+    assert stdout == expected_out
+    assert exit_code == 0
+
+
+@needs_clang
+def test_native_escaping_closure_retains_cell_state(tmp_path):
+    # The counter closure ESCAPES its creating frame: the cell (like the
+    # heap env holding its pointer) must outlive make_counter, and two
+    # counters must not share state.
+    assert_native_matches_interp("""
+fn make_counter() -> fn() -> int {
+    let mut n = 0;
+    fn() -> int {
+        n = n + 1;
+        n
+    }
+}
+fn main() -> int {
+    let c = make_counter();
+    c();
+    c();
+    print(c());
+    let d = make_counter();
+    print(d());
+    0
+}
+""", tmp_path)
+
+
+@needs_clang
+def test_native_handler_cell_counter_differential(tmp_path):
+    # The std.stream take/skip shape: a handler case mutating a captured
+    # scalar across resumes (the scope env carries the cell pointer).
+    assert_native_matches_interp("""
+effect Emit { emit(x) -> Unit }
+fn main() -> int {
+    let mut total = 0;
+    handle Emit with {
+        emit(x) -> { total = total + x; resume(()) }
+    } in {
+        perform Emit.emit(4);
+        perform Emit.emit(5);
+        ()
+    };
+    print(total);
+    0
+}
+""", tmp_path)
+
+
+_GLOBALS_SRC = """
+let BASE = 40;
+let SCALE = 2.5;
+let NAME = "metaxu";
+fn get() -> int { BASE + 1 }
+fn main() -> int {
+    print(BASE + get());
+    print(NAME);
+    if SCALE > 2.0 { print(1) } else { print(0) };
+    0
+}
+"""
+
+
+@needs_clang
+def test_native_module_constants_differential(tmp_path):
+    # Reads from main AND from another function; the entry wrapper calls
+    # @mx___module_init first (the interpreter's _ensure_globals).
+    ir = assert_native_matches_interp(_GLOBALS_SRC, tmp_path)
+    wrapper = (tmp_path / "prog.ll").read_text()
+    assert "call ptr @mx___module_init()" in wrapper
+
+
+@needs_asan
+def test_native_module_constants_fully_leak_checked_under_asan(tmp_path):
+    # Scalar globals allocate nothing: FULL leak check.
+    assert_native_matches_interp_asan(_GLOBALS_SRC, tmp_path)
+
+
+@needs_clang
+def test_native_module_constant_from_lambda_differential(tmp_path):
+    # A lambda's free global name resolves as a global read (no env
+    # capture), the interpreter's lookup-fallback order.
+    assert_native_matches_interp("""
+let K = 5;
+fn main() -> int {
+    let f = fn() -> int { K * 2 };
+    print(f());
+    0
+}
+""", tmp_path)
+
+
+_ZIP_SRC = """
+fn main() -> int {
+    let xs = vector[int, 3](1, 2, 3);
+    let ys = vector[int, 3](10, 20, 30);
+    let zs = vector[int, 3](a + b for (a, b) in (xs, ys));
+    print(zs[0] + zs[1] + zs[2]);
+    0
+}
+"""
+
+
+@needs_clang
+def test_native_zip_comprehension_differential(tmp_path):
+    assert_native_matches_interp(_ZIP_SRC, tmp_path)
+
+
+@needs_asan
+def test_native_zip_comprehension_asan_no_uaf(tmp_path):
+    # fvec blocks (sources + zip_map result) leak by design.
+    result, expected_out = interp_run(_ZIP_SRC)
+    ir = llvm_from_source(_ZIP_SRC)
+    exit_code, stdout = compile_and_run(
+        ir, "main", workdir=str(tmp_path),
+        clang_args=("-fsanitize=address",),
+        run_env={"ASAN_OPTIONS": "detect_leaks=0"})
+    assert stdout == expected_out
+    assert exit_code == 0
+
+
+@needs_clang
+def test_native_zip_length_mismatch_aborts_loudly(tmp_path):
+    # The interpreter raises "zip: sequences have different lengths";
+    # mx_fvec_zip_map aborts — loud on both sides, never a short zip.
+    src = """
+fn main() -> int {
+    let xs = vector[int, 2](1, 2);
+    let ys = vector[int, 3](10, 20, 30);
+    let zs = vector[int, 2](a + b for (a, b) in (xs, ys));
+    print(zs[0]);
+    0
+}
+"""
+    with pytest.raises(Exception, match="zip"):
+        interp_run(src)
+    ir = llvm_from_source(src)
+    assert count_placeholders(ir) == 0
+    exit_code, stdout = compile_and_run(ir, "main", workdir=str(tmp_path))
+    assert exit_code != 0  # SIGABRT, no output
+    assert stdout == ""
+
+
+def test_std_stream_import_emits_cell_counter_handlers():
+    # A program importing std.stream: the cell constructs are LIFTED —
+    # no `cell_wrap` demotion reason survives anywhere, and the counter
+    # handler cases (take/skip's `seen` — the exact shapes the stdlib
+    # documents as relying on shared cells) emit as real defines.  The
+    # consumers themselves (iter/fold/sum/take) still demote HONESTLY on
+    # higher-order shapes (calls through function-valued parameters,
+    # conflicting closure kinds) — a later increment's feature, not a
+    # silent seam.
+    ir = llvm_from_source("""
+from std.stream import Emit, iota, iter, fold, sum, count, take;
+
+fn main() -> int {
+    let s = take(iota(10), 3);
+    let total = sum(s);
+    let n = count(iota(5));
+    print(total);
+    print(n);
+    total + n
+}
+""")
+    # the seam construct itself never demotes anything anymore
+    assert "unsupported op 'cell_wrap'" not in ir
+    assert not re.search(r"reason:.*cell_wrap", ir)
+    assert re.search(
+        r"^define i64 @mx___handler_Emit_emit_std_stream_take_hs\d+\(",
+        ir, re.M)
+    assert re.search(
+        r"^define i64 @mx___handler_Emit_emit_std_stream_skip_hs\d+\(",
+        ir, re.M)
+    assert re.search(
+        r"^define i64 @mx___handler_Loop_break__std_stream_for__hs\d+\(",
+        ir, re.M)
+    # The remaining demotions are all higher-order, honestly named.
+    assert re.search(r"reason: (unknown external callee 'producer'|"
+                     r"irreconcilable value kinds)", ir)
+
+
+def test_ownership_example_now_emits_fully_native():
+    # ownership.mx (both fns) was fully demoted on __index_store before
+    # increment 12; the fvec functional update lifts it end to end.
+    ir = llvm_from_source(
+        (REPO_ROOT / "examples" / "ownership.mx").read_text())
+    assert count_placeholders(ir) == 0
+    assert "call ptr @mx_fvec_set_copy(ptr" in ir
+
+
+@needs_clang
+def test_native_ownership_example_differential(tmp_path):
+    src = (REPO_ROOT / "examples" / "ownership.mx").read_text()
+    result, expected_out = interp_run(src)
+    ir = llvm_from_source(src)
+    exit_code, stdout = compile_and_run(ir, "main", workdir=str(tmp_path))
+    assert stdout == expected_out
