@@ -41,6 +41,15 @@ TRAIT_CALL_PREFIX = f"__trait{IMPL_SEP}"
 # loaded __impl$Trait$Type$m functions for that type name.
 STATIC_CALL_PREFIX = f"__static{IMPL_SEP}"
 
+# Callee-name prefix for an effect op mapped onto a named runtime primitive
+# via a `with SYMBOL` clause in its effect declaration (e.g.
+# `fn lock(m: Mutex) -> () with EFFECT_MUTEX_LOCK`). Each mapped op compiles
+# to a thunk `__effect_runtime$Effect$op` whose body is
+# Call(callee="__mx_effect_runtime$SYMBOL", operands=(op params...)); the
+# interpreter dispatches that callee to its runtime shim table (loudly
+# erroring on symbols it has no shim for).
+EFFECT_RUNTIME_CALL_PREFIX = f"__mx_effect_runtime{IMPL_SEP}"
+
 
 @dataclass(slots=True)
 class ModeInfo:
@@ -298,6 +307,33 @@ class HIRBuilder:
             frozen = self._orig_to_frozen.get(id(orig), root)
             for op in (getattr(orig, 'operations', []) or []):
                 dexpr = getattr(op, '_default_expr', None)
+                dparams: list[tuple[Any, Ty]] = []
+                for p in (getattr(op, 'params', []) or []):
+                    pname = getattr(p, 'name', None)
+                    pty = getattr(p, 'type_annotation', None) or "Unknown"
+                    dparams.append((pname, pty))
+                # Runtime mapping: `op(params) -> T with SYMBOL` binds the op
+                # to a named runtime primitive (effect_mapping.mx: Mutex and
+                # Thread ops map onto EFFECT_MUTEX_* / EFFECT_SPAWN / ...).
+                # Compile a thunk __effect_runtime$Effect$op whose body calls
+                # __mx_effect_runtime$SYMBOL(params); the interpreter resolves
+                # that callee against its runtime shim table and fails loudly
+                # for symbols it cannot honor.
+                csym = getattr(op, 'c_effect', None)
+                if csym:
+                    operands = tuple(
+                        self._mk_hexpr(frozen.node_id, "Expr", "Unknown",
+                                       frozen.span, op="Var", var_name=pn)
+                        for (pn, _pty) in dparams)
+                    rt_body = self._mk_hexpr(
+                        frozen.node_id, "Expr", "Unknown", frozen.span,
+                        op="Call",
+                        callee=f"{EFFECT_RUNTIME_CALL_PREFIX}{csym}",
+                        operands=operands)
+                    funcs.append(HFun(
+                        sym=f"__effect_runtime{IMPL_SEP}{eff_name}{IMPL_SEP}{op.name}",
+                        params=list(dparams), dict_params=[], ret_ty="Unknown",
+                        where_cls=[], body=rt_body))
                 if dexpr is None:
                     continue
                 body_he = self._from_orig_expr(dexpr, frozen)
@@ -305,11 +341,6 @@ class HIRBuilder:
                     raise NotImplementedError(
                         f"effect {eff_name}.{op.name}: could not lower the "
                         "declared default expression — refusing to drop it")
-                dparams: list[tuple[Any, Ty]] = []
-                for p in (getattr(op, 'params', []) or []):
-                    pname = getattr(p, 'name', None)
-                    pty = getattr(p, 'type_annotation', None) or "Unknown"
-                    dparams.append((pname, pty))
                 funcs.append(HFun(
                     sym=f"__effect_default{IMPL_SEP}{eff_name}{IMPL_SEP}{op.name}",
                     params=dparams, dict_params=[], ret_ty="Unknown",
