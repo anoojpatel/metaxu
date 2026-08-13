@@ -38,12 +38,13 @@ Known remaining gaps (documented, not v1-blocking):
 - Struct-literal field type checking covers literal fields against known
   primitives (incl. substituted type params); full inference-driven field
   checking is future work.
-- Multi-argument effect ops bind only the first argument to the handler
-  case parameter (the surface grammar has single-param handler cases).
-- A handler case performing its own scope's effect deadlocks rather than
-  routing to an outer handler of the same effect.
 - Traits/impls dictionary desugaring and deep field-mode validation remain
   at their pre-branch level.
+
+Closed since first writing: multi-argument effect ops bind all handler-case
+parameters, and a handler case performing its own effect routes to the next
+enclosing handler (handler bodies evaluate outside their own delimitation)
+instead of deadlocking.
 
 ## Headline findings
 
