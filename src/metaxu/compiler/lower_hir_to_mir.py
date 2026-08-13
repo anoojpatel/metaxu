@@ -368,7 +368,12 @@ class _FuncLowerer:
             return dst
         # Lambda / closure
         if e.op == "Lambda" and e.lambda_params is not None:
-            lname = self.state.fresh("lambda")
+            # Qualify with the enclosing function's name: the fresh counter
+            # is per-function, so bare "lambdaN" names collided ACROSS
+            # functions (e.g. sum's (a,b)->a+b and prod's (a,b)->a*b both
+            # lowered to "lambda1"; whichever loaded last won and sum
+            # silently multiplied). MirFuncs live in one flat namespace.
+            lname = f"{self.f.sym}${self.state.fresh('lambda')}"
             # Capture current env values. The lambda body is compiled against
             # the enclosing env's SLOT names (source `x` may live in slot
             # `x_2`), so the runtime closure env must be keyed by the slot
@@ -503,6 +508,28 @@ class _FuncLowerer:
         return res_var
 
 
+def _is_matrix_annotation(pty: Any) -> bool:
+    """True when a parameter's type annotation is a vector of vectors."""
+
+    def vector_elem(t: Any) -> Any:
+        # Returns the element type when t is a vector type, else a sentinel.
+        ctor = getattr(t, "type_constructor", None)
+        if ctor == "vector":
+            args = list(getattr(t, "type_args", None) or [])
+            return args[0] if args else None
+        if type(t).__name__ == "VectorTypeExpression":
+            return getattr(t, "base_type", None)
+        return _NOT_VECTOR
+
+    elem = vector_elem(pty)
+    if elem is _NOT_VECTOR or elem is None:
+        return False
+    return vector_elem(elem) is not _NOT_VECTOR
+
+
+_NOT_VECTOR = object()
+
+
 def lower_hir_to_mir(funcs: Sequence[HFun], borrow_errors: List[Any] | None = None) -> list[MirFunc]:
     """Lower HIR to MIR (ANF direct vs CPS later).
 
@@ -521,6 +548,18 @@ def lower_hir_to_mir(funcs: Sequence[HFun], borrow_errors: List[Any] | None = No
         # Parameters
         param_names = [str(pname) for (pname, _pty) in f.params]
         fl.emit(("params", tuple(param_names)))
+        # Parameters declared as matrices (vector[vector[T,N],M]) accept a
+        # flat vector as an Mx1 column: the interpreter promotes such an
+        # argument to a real nested vector at entry, so generic matrix code
+        # (transpose's self[j][i]) runs strictly instead of indexing
+        # scalars. This is the boundary where `mat.matmul(vec)` — the
+        # example's "matrix-vector multiplication" — becomes well-shaped.
+        matrix_params = tuple(
+            str(pname) for (pname, pty) in f.params
+            if _is_matrix_annotation(pty)
+        )
+        if matrix_params:
+            fl.emit(("promote_matrix", matrix_params))
         for pn in param_names:
             fl.state.env[pn] = pn
         res = fl.lower_expr(f.body)
