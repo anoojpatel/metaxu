@@ -10,9 +10,21 @@ What the type system promises (docs/type_system.md):
   ones ("inferred from usage");
 - bounds/constraints on type parameters (`where T: Trait` / `fn f<T: Trait>`).
 
+Also covered (previously documented caveats, now closed — see
+docs/v1_gap_analysis.md):
+- substitution inside type applications (`Vec[T]`, nested `Pair[Pair[T]]`)
+  for values whose element/argument types are known, base-name checking
+  when they are not;
+- bracket-form explicit instantiations (`Full[Int](x)`, `identity[Int](x)`)
+  routed through the same checking (and lowering) as the angle form;
+- impl-block where clauses, enforced at coherence-load time where decidable
+  (constraints over concrete types); conditional impls
+  (`implement Show for Pair[T] where T: Show`) stay permissive;
+- module-qualified generic calls (`mod.f<Int>(x)`) checked and
+  monomorphized like plain ones.
+
 What is deliberately NOT covered here (see docs/v1_gap_analysis.md): variance
-annotations, higher-kinded type parameters, associated types, substitution
-inside type applications (`Vec[T]`), and coherence checking of impls.
+annotations, higher-kinded type parameters, and associated types.
 """
 from __future__ import annotations
 
@@ -305,6 +317,366 @@ fn main() -> int {
     return s + 1
 }
 """, "Int and String")
+
+
+# ---------------------------------------------------------------------------
+# Substitution inside type applications (Vec[T], Pair[T], nested)
+# ---------------------------------------------------------------------------
+
+NESTED_APP = """
+struct Pair<T> { x: T, y: T }
+struct Holder<T> { inner: Pair[T] }
+"""
+
+
+def test_type_application_field_wrong_instantiation_rejected():
+    # Field declared Pair[T] in Holder<Int> checks against Pair[Int]:
+    # a Pair<String> value is a structural mismatch.
+    reject(NESTED_APP + """
+fn main() -> int {
+    let h = Holder<Int> { inner: Pair<String> { x: "a", y: "b" } }
+    return 0
+}
+""", "field 'inner' of Holder: expected Pair[Int], got Pair[String]")
+
+
+def test_type_application_field_right_instantiation_ok():
+    assert run_main(NESTED_APP + """
+fn main() -> int {
+    let h = Holder<Int> { inner: Pair<Int> { x: 40, y: 2 } }
+    return h.inner.x + h.inner.y
+}
+""") == 42
+
+
+def test_type_application_field_base_name_mismatch_rejected():
+    # Base constructors must match even when the value carries no type args.
+    reject(NESTED_APP + """
+fn main() -> int {
+    let h = Holder<Int> { inner: 3 }
+    return 0
+}
+""", "field 'inner' of Holder: expected Pair[Int], got Int")
+
+
+def test_type_application_field_unknown_value_permissive():
+    # A value whose type is not statically known stays unchecked
+    # (no false positives; inference/runtime still applies).
+    compile_ok(NESTED_APP + """
+fn mk<U>(v: U) -> U { return v }
+fn main() -> int {
+    let p = mk(1)
+    let h = Holder<Int> { inner: p }
+    return 0
+}
+""")
+
+
+def test_type_application_field_args_unknown_base_checked():
+    # Value of known base but unknown args (`Pair {...}` inferred):
+    # base-name check passes, argument positions stay permissive.
+    compile_ok(NESTED_APP + """
+fn main() -> int {
+    let h = Holder<Int> { inner: Pair { x: 1, y: 2 } }
+    return 0
+}
+""")
+
+
+def test_type_application_vec_field_wrong_value_rejected():
+    reject("""
+struct H<T> { items: Vec[T] }
+fn main() -> int {
+    let h = H<Int> { items: 3 }
+    return 0
+}
+""", "field 'items' of H: expected Vec[Int], got Int")
+
+
+def test_type_application_vec_field_unknown_stays_permissive():
+    # Vec.new() has no statically known element type: base-name-only
+    # checking, current permissive behavior preserved.
+    compile_ok("""
+struct H<T> { items: Vec[T] }
+fn main() -> int {
+    let v = Vec.new()
+    v.push(1)
+    let h = H<Int> { items: v }
+    return 0
+}
+""")
+
+
+def test_type_application_param_wrong_rejected():
+    reject("""
+struct Pair<T> { x: T, y: T }
+fn f<T>(p: Pair[T]) -> int { return 0 }
+fn main() -> int {
+    return f<Int>(Pair<String> { x: "a", y: "b" })
+}
+""", "call of f: argument has type Pair[String], expected Pair[Int]")
+
+
+def test_type_application_param_right_ok():
+    compile_ok("""
+struct Pair<T> { x: T, y: T }
+fn f<T>(p: Pair[T]) -> int { return 0 }
+fn main() -> int {
+    return f<Int>(Pair<Int> { x: 1, y: 2 })
+}
+""")
+
+
+def test_type_application_deep_nesting_checked():
+    # Two levels down: Wrap<Int> declares p: Pair[Pair[T]]; the value's
+    # explicit Pair<Pair[String]> instantiation conflicts at depth 2.
+    reject("""
+struct Pair<T> { x: T, y: T }
+struct Wrap<T> { p: Pair[Pair[T]] }
+fn main() -> int {
+    let w = Wrap<Int> { p: Pair<Pair[String]> {
+        x: Pair<String> { x: "a", y: "b" },
+        y: Pair<String> { x: "c", y: "d" } } }
+    return 0
+}
+""", "field 'p' of Wrap: expected Pair[Pair[Int]], got Pair[Pair[String]]")
+
+
+def test_type_application_enum_payload_checked():
+    # Variant payload declared as a type application substitutes too.
+    reject("""
+struct Pair<T> { x: T, y: T }
+enum Carton<T> {
+    Boxed(Pair[T]),
+    Missing
+}
+fn main() -> int {
+    let c = Boxed<Int>(Pair<String> { x: "a", y: "b" })
+    return 0
+}
+""", "Carton.Boxed: payload has type Pair[String], expected Pair[Int]")
+
+
+# ---------------------------------------------------------------------------
+# Bracket-form explicit instantiations: Full[Int](x) == Full<Int>(x)
+# ---------------------------------------------------------------------------
+
+def test_bracket_enum_ctor_runs():
+    assert run_main(GENERIC_ENUM + """
+fn main() -> int {
+    let b = Full[Int](3)
+    return match b { Full(v) => v, Empty => 0 }
+}
+""") == 3
+
+
+def test_bracket_enum_ctor_wrong_payload_rejected():
+    reject(GENERIC_ENUM + """
+fn main() -> int {
+    let b = Full[Int]("nope")
+    return 0
+}
+""", "Box.Full")
+
+
+def test_bracket_enum_ctor_known_var_rejected():
+    reject(GENERIC_ENUM + """
+fn main() -> int {
+    let s = "hello"
+    let b = Full[Int](s)
+    return 0
+}
+""", "Int and String")
+
+
+def test_bracket_fn_call_runs():
+    assert run_main(IDENTITY + """
+fn main() -> int {
+    let i = identity[Int](41)
+    return i + 1
+}
+""") == 42
+
+
+def test_bracket_fn_call_wrong_arg_rejected():
+    reject(IDENTITY + """
+fn main() -> int {
+    let i = identity[Int]("s")
+    return 0
+}
+""", "call of identity")
+
+
+def test_bracket_fn_call_monomorphizes():
+    txt = mir_text(IDENTITY + """
+fn main() -> int {
+    let i = identity[Int](41)
+    return i + 1
+}
+""", monomorphize=True)
+    assert "identity$Int" in txt
+
+
+def test_bracket_non_type_index_left_alone():
+    # `identity[n](1)` with n a plain local is NOT an instantiation: the
+    # shape stays an ordinary indexed call (unknown stays permissive; no
+    # rewrite, no false instantiation checking).
+    compile_ok(IDENTITY + """
+fn main() -> int {
+    let n = 0
+    let i = identity[n](1)
+    return 0
+}
+""")
+
+
+# ---------------------------------------------------------------------------
+# Impl-block where clauses (coherence-load time, where decidable)
+# ---------------------------------------------------------------------------
+
+IMPL_WHERE = """
+trait Show { fn show(self) -> String }
+trait Eq2 { fn eq2(self) -> Bool }
+struct P { v: int }
+struct Q { w: int }
+"""
+
+
+def test_impl_where_concrete_violation_rejected():
+    # `where Q: Eq2` with no `implement Eq2 for Q` anywhere is decidable
+    # as soon as all impls are loaded: rejected, naming the missing impl.
+    reject(IMPL_WHERE + """
+implement Show for P where Q: Eq2 {
+    fn show(self) -> String { return "p" }
+}
+fn main() -> int { return 0 }
+""", "missing `implement Eq2 for Q`")
+
+
+def test_impl_where_concrete_satisfied_ok():
+    compile_ok(IMPL_WHERE + """
+implement Eq2 for Q { fn eq2(self) -> Bool { return true } }
+implement Show for P where Q: Eq2 {
+    fn show(self) -> String { return "p" }
+}
+fn main() -> int { return 0 }
+""")
+
+
+def test_impl_where_self_constraint_checked():
+    # The impl's own target type in its where clause is concrete too.
+    reject(IMPL_WHERE + """
+implement Show for P where P: Eq2 {
+    fn show(self) -> String { return "p" }
+}
+fn main() -> int { return 0 }
+""", "missing `implement Eq2 for P`")
+
+
+def test_impl_where_conditional_stays_permissive():
+    # `implement Show for Pair[T] where T: Show` depends on each
+    # instantiation's type arguments, which the base-name registry cannot
+    # decide: stays permissive (runtime dispatch enforces).
+    compile_ok(IMPL_WHERE + """
+struct Pair<T> { x: T, y: T }
+implement Show for Pair[T] where T: Show {
+    fn show(self) -> String { return "pair" }
+}
+fn main() -> int { return 0 }
+""")
+
+
+# ---------------------------------------------------------------------------
+# Module-qualified generic calls: mod.f<Int>(x)
+# ---------------------------------------------------------------------------
+
+QUAL_LIB = "fn ident<T>(x: T) -> T { return x }\n"
+
+
+def _write_tree(tmp_path, files: dict[str, str]) -> str:
+    for rel, src in files.items():
+        (tmp_path / rel).write_text(src)
+    return str(tmp_path / "main.mx")
+
+
+def test_module_qualified_generic_call_wrong_rejected(tmp_path):
+    root = _write_tree(tmp_path, {
+        "mathmod.mx": QUAL_LIB,
+        "main.mx": """
+import mathmod;
+fn main() -> int {
+    let a = mathmod.ident<Int>("s")
+    return 0
+}
+""",
+    })
+    with pytest.raises(TypeCheckError) as exc:
+        run_pipeline_from_source((tmp_path / "main.mx").read_text(),
+                                 file_path=root)
+    assert "call of mathmod.ident" in str(exc.value)
+
+
+def test_module_qualified_generic_call_right_runs(tmp_path):
+    root = _write_tree(tmp_path, {
+        "mathmod.mx": QUAL_LIB,
+        "main.mx": """
+import mathmod;
+fn main() -> int {
+    let a = mathmod.ident<Int>(41)
+    return a + 1
+}
+""",
+    })
+    ctx = build_context_from_source((tmp_path / "main.mx").read_text(),
+                                    file_path=root)
+    hir = HIRBuilder(ctx.tables, id_map=ctx.id_map).build(ctx.frozen_root)
+    interp = MirInterpreter()
+    interp.load(lower_hir_to_mir(hir))
+    assert interp.call("main", []) == 42
+
+
+def test_module_qualified_generic_call_monomorphizes(tmp_path):
+    root = _write_tree(tmp_path, {
+        "mathmod.mx": QUAL_LIB,
+        "main.mx": """
+import mathmod;
+fn main() -> int {
+    let a = mathmod.ident<Int>(41)
+    return a + 1
+}
+""",
+    })
+    ctx = build_context_from_source((tmp_path / "main.mx").read_text(),
+                                    file_path=root)
+    hir = HIRBuilder(ctx.tables, id_map=ctx.id_map).build(ctx.frozen_root)
+    hir = monomorphize_hir(hir, collect_signatures(ctx.id_map))
+    txt = dump_mir(lower_hir_to_mir(hir))
+    assert "mathmod.ident$Int" in txt
+    interp = MirInterpreter()
+    interp.load(lower_hir_to_mir(hir))
+    assert interp.call("main", []) == 42
+
+
+def test_module_qualified_where_clause_checked(tmp_path):
+    # Trait bounds on a module function are enforced across the module
+    # boundary, exactly like plain calls.
+    root = _write_tree(tmp_path, {
+        "showlib.mx": """
+trait Show { fn show(self) -> String }
+fn describe<T>(x: T) -> T where T: Show { return x }
+""",
+        "main.mx": """
+import showlib;
+fn main() -> int {
+    let x = showlib.describe<Int>(1)
+    return 0
+}
+""",
+    })
+    with pytest.raises(TypeCheckError) as exc:
+        run_pipeline_from_source((tmp_path / "main.mx").read_text(),
+                                 file_path=root)
+    assert "implement Show for Int" in str(exc.value)
 
 
 # ---------------------------------------------------------------------------
