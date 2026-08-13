@@ -203,6 +203,108 @@ fn main() -> int {
     assert prints == ["hello", "world"]
 
 
+def test_resume_returns_whole_body_value_across_function_call():
+    """resume() returns the value of the WHOLE handle body, not just the rest
+    of the innermost performing frame: helper() must return 1 (the resumed
+    value), the body computes 1 + 2 = 3, so rest = 3 and the handler yields
+    300 as the handle result. (Regression: this used to evaluate to 102 —
+    resume returned only helper's remainder and the body's `+ 2` ran after
+    the handler completed.)"""
+    result, _ = run_main("""
+effect Ask {
+    ask() -> int
+}
+
+fn helper() performs Ask -> int {
+    perform Ask.ask()
+}
+
+fn main() -> int {
+    handle Ask with {
+        ask() -> {
+            let rest = resume(1);
+            rest * 100
+        }
+    } in {
+        helper() + 2
+    }
+}
+""")
+    assert result == 300
+
+
+def test_nested_handles_post_resume_with_called_function():
+    """Nested handle scopes with post-resume handler code and the performs in
+    a called function: each resume() sees the completion value of its OWN
+    delimited body, with the inner handle's transformed result flowing into
+    the outer one."""
+    result, _ = run_main("""
+effect State {
+    get() -> int
+}
+
+effect Logger {
+    log(message: string) -> Unit
+}
+
+fn body() performs State, Logger -> int {
+    let v = perform State.get();
+    perform Logger.log("hi");
+    v + 1
+}
+
+fn main() -> int {
+    handle State with {
+        get() -> {
+            let rest = resume(10);
+            rest * 2
+        }
+    } in {
+        handle Logger with {
+            log(message) -> {
+                let r = resume(());
+                r + 1
+            }
+        } in {
+            body() + 100
+        }
+    }
+}
+""")
+    # body(): v = 10 -> returns 11; inner handle body = 11 + 100 = 111;
+    # Logger handler: r = 111 -> inner handle result 112;
+    # State handler: rest = 112 -> outer handle result 224.
+    assert result == 224
+
+
+def test_abort_inside_called_function_skips_caller_remainder():
+    """A non-resuming handler aborts the whole delimited body: neither the
+    rest of the called function nor the rest of the handle body runs."""
+    result, prints = run_main("""
+effect Fail {
+    fail() -> int
+}
+
+fn helper() performs Fail -> int {
+    let x = perform Fail.fail();
+    print("unreachable-helper");
+    x
+}
+
+fn main() -> int {
+    handle Fail with {
+        fail() -> 7
+    } in {
+        let y = helper();
+        print("unreachable-main");
+        y
+    }
+}
+""")
+    assert result == 7
+    assert prints == []
+
+
 def test_single_shot_double_resume_raises():
     """Resuming the same continuation twice violates single-shot semantics."""
     with pytest.raises(Exception, match="[Ss]ingle-shot|already consumed"):
