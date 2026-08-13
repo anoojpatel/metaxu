@@ -16,6 +16,7 @@ def run_pipeline(
     tables: InferSideTables,
     id_map: dict[int, object] | None = None,
     strict: bool = True,
+    monomorphize: bool = False,
 ) -> tuple[str, str, str]:
     """Run the minimal pipeline and return (hir_txt, mir_txt, clif_txt).
 
@@ -23,6 +24,11 @@ def run_pipeline(
     errors, a BorrowCheckError carrying the structured error list is raised
     instead of silently compiling the broken program. Pass strict=False to
     lower anyway (e.g. for diagnostics tooling).
+
+    When `monomorphize` is True, generic functions are cloned per concrete
+    instantiation after HIR construction (see compiler/monomorphize.py);
+    default off — behavior is identical either way, the specialized names
+    are groundwork for native codegen.
     """
     # Structured diagnostics from the frozen checker are stored under key -2.
     # Type errors (kind "type-*") surface as TypeCheckError; the rest are
@@ -40,6 +46,9 @@ def run_pipeline(
     if strict and borrow_errors:
         raise BorrowCheckError(borrow_errors)
     hir_funcs = HIRBuilder(tables, id_map=id_map).build(ast_root)
+    if monomorphize:
+        from .monomorphize import monomorphize_hir, collect_signatures
+        hir_funcs = monomorphize_hir(hir_funcs, collect_signatures(id_map or {}))
     hir_txt = dump_hir(hir_funcs)
     mir_funcs = lower_hir_to_mir(hir_funcs, borrow_errors)
     mir_txt = dump_mir(mir_funcs)
@@ -118,14 +127,17 @@ def build_context_from_source(source: str, file_path: str = "<mem>") -> PhaseCon
     )
 
 
-def run_pipeline_ctx(ctx: PhaseContext, strict: bool = True) -> tuple[str, str, str, str]:
+def run_pipeline_ctx(ctx: PhaseContext, strict: bool = True,
+                     monomorphize: bool = False) -> tuple[str, str, str, str]:
     """Run the pipeline using a prebuilt PhaseContext.
 
     Returns (ast_json, hir_txt, mir_txt, clif_txt). Raises BorrowCheckError
     when strict (default) and the program failed borrow checking.
     """
     ast_json = dump_ast_json(ctx.frozen_root)
-    hir_txt, mir_txt, clif_txt = run_pipeline(ctx.frozen_root, ctx.tables, id_map=ctx.id_map, strict=strict)
+    hir_txt, mir_txt, clif_txt = run_pipeline(
+        ctx.frozen_root, ctx.tables, id_map=ctx.id_map, strict=strict,
+        monomorphize=monomorphize)
     return ast_json, hir_txt, mir_txt, clif_txt
 
 
@@ -146,7 +158,8 @@ def emit_llvm_from_source(source: str, strict: bool = True) -> str:
 
 
 def run_pipeline_from_source(source: str, strict: bool = True,
-                             file_path: str = "<mem>") -> tuple[str, str, str, str]:
+                             file_path: str = "<mem>",
+                             monomorphize: bool = False) -> tuple[str, str, str, str]:
     """Parse, desugar, type/borrow check, and run the pipeline from source.
 
     Thin wrapper over build_context_from_source + run_pipeline_ctx so that
@@ -158,4 +171,4 @@ def run_pipeline_from_source(source: str, strict: bool = True,
     when strict (default) and the program failed borrow checking.
     """
     ctx = build_context_from_source(source, file_path=file_path)
-    return run_pipeline_ctx(ctx, strict=strict)
+    return run_pipeline_ctx(ctx, strict=strict, monomorphize=monomorphize)
