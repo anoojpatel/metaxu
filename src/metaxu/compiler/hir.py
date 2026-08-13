@@ -272,6 +272,29 @@ class HIRBuilder:
                 current = self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span, op="FieldGet", base=current, field_name=str(field))
             return current
 
+        # PrintStatement: `print(args)` — lower to a builtin call
+        if isinstance(orig, fast.PrintStatement):
+            arg_exprs = []
+            for a in getattr(orig, 'arguments', []) or []:
+                he = self._from_orig_expr(a, ctx_for(a))
+                if he is not None:
+                    arg_exprs.append(he)
+            ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, 'Unit'))
+            return self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span,
+                                  op="Call", callee="print", operands=tuple(arg_exprs))
+
+        # Dedicated Resume node: `resume(v)` inside a handle case
+        if isinstance(orig, fast.Resume):
+            val_node = getattr(orig, 'value', None)
+            val_exprs: tuple = ()
+            if val_node is not None and hasattr(val_node, '__class__') and isinstance(val_node, fast.Node):
+                he = self._from_orig_expr(val_node, ctx_for(val_node))
+                if he is not None:
+                    val_exprs = (he,)
+            ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, 'Unknown'))
+            return self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span,
+                                  op="Resume", perform_args=val_exprs)
+
         # Function calls (including perform-as-bare-call and resume)
         if isinstance(orig, fast.FunctionCall):
             callee = str(getattr(orig, 'name', None) or '')
@@ -500,7 +523,7 @@ class HIRBuilder:
             for c in cases_raw:
                 if isinstance(c, fast.HandleCase):
                     op_name = str(c.op_name)
-                    param_name = str(c.param_name)
+                    param_name = str(c.param_name) if c.param_name is not None else "_"
                     case_body = self._from_orig_expr(c.body, ctx_for(c.body) if c.body is not None else frozen_ctx)
                     if case_body is not None:
                         case_triples.append((op_name, param_name, case_body))

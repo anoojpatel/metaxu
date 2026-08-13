@@ -134,6 +134,29 @@ class InterpError(Exception):
     pass
 
 
+@dataclass
+class _EffectReturn:
+    """Control sentinel: a perform op consumed this frame.
+
+    The handler (and, via resume, the rest of this frame) already ran; the
+    frame's overall result is `value`. _run_blocks unwraps this instead of
+    continuing into the resume block a second time.
+    """
+    value: Any
+
+
+class _EffectAbort(Exception):
+    """Control exception: a handler case returned WITHOUT calling resume.
+
+    Unwinds to the handle_scope that installed the handler frame; the handle
+    expression's value becomes `value` (abort semantics).
+    """
+    def __init__(self, frame_id: int, value: Any) -> None:
+        super().__init__(f"effect abort -> frame {frame_id}")
+        self.frame_id = frame_id
+        self.value = value
+
+
 class MirInterpreter:
     def __init__(self) -> None:
         self._funcs: Dict[str, MirFunc] = {}
@@ -141,6 +164,10 @@ class MirInterpreter:
         self._builtins: Dict[str, Callable[..., Any]] = {}
         # Dynamic handler stack: list of {op_name -> (param_name, handler_func_name)}
         self._handler_stack: List[Dict[str, tuple]] = []
+        # Delimited MIR-level handler frames installed by handle_scope ops:
+        # each is {"id", "effect", "cases": {op: (param, fn_name)}, "captured"}
+        self._mir_handler_frames: List[Dict[str, Any]] = []
+        self._next_frame_id: int = 1
         self._register_builtins()
 
     # ------------------------------------------------------------------
@@ -193,6 +220,10 @@ class MirInterpreter:
                 raise InterpError(f"Block index {bi} out of range in {f.name!r}")
             block = f.blocks[bi]
             result = self._run_ops(block.ops, env, f)
+            if isinstance(result, _EffectReturn):
+                # A perform op consumed this frame (handler resumed and the
+                # rest of the frame already ran, or is aborting via its value).
+                return result.value
             # Process terminator
             term = block.term
             if term[0] == "ret":
@@ -213,6 +244,16 @@ class MirInterpreter:
                 raise InterpError(f"Reached unreachable block bb{bi} in {f.name!r}")
             else:
                 raise InterpError(f"Unknown terminator: {term!r}")
+
+    def _find_mir_frame(self, effect_name: str, op_name: str) -> Optional[Dict[str, Any]]:
+        """Innermost MIR handler frame handling op_name (and effect, if named)."""
+        for frame in reversed(self._mir_handler_frames):
+            if op_name not in frame["cases"]:
+                continue
+            if effect_name and frame["effect"] and frame["effect"] != effect_name:
+                continue
+            return frame
+        return None
 
     def _lookup(self, a: Any, env: Dict[str, Any], f: MirFunc) -> Any:
         """Resolve an operand: strings are variable names (must be bound);
@@ -248,19 +289,35 @@ class MirInterpreter:
                 op_name = op[3]
                 arg_names: tuple = op[4]
                 arg_vals = [self._lookup(a, env, f) for a in arg_names]
-                handler = self._effect_handlers.get(effect_name)
-                if handler is None:
-                    raise InterpError(f"No handler for effect {effect_name!r}")
-                # Build single-shot continuation.
-                # When resumed with value v, execution continues from resume_block with
-                # resume_slot bound to v in the env.  The result returned from resume()
-                # becomes the overall call result for suspend effects.
                 resume_block: int = op[5]
                 resume_slot: str = op[6]
                 # The continuation captures the CURRENT env so that after the handler
                 # stores it and later calls k.resume(v), the env is correctly seeded.
                 k = MxContinuation(func=f, block_idx=resume_block, env=dict(env),
                                     result_slot=resume_slot)
+                # MIR-level handler frames first (innermost handle wins).
+                frame = self._find_mir_frame(effect_name, op_name)
+                if frame is not None:
+                    param_name, handler_fn_name = frame["cases"][op_name]
+                    target = self._funcs.get(handler_fn_name)
+                    if target is None:
+                        raise InterpError(f"Missing handler function {handler_fn_name!r}")
+                    handler_env = dict(frame["captured"])
+                    handler_arg = arg_vals[0] if arg_vals else UNIT
+                    handler_result = self._call_func(target, [handler_arg, k], handler_env)
+                    if k.used:
+                        # The handler resumed: the rest of this frame already ran
+                        # inside k.resume() and handler_result is the final value
+                        # of this frame. Do NOT fall through into resume_block.
+                        return _EffectReturn(handler_result)
+                    # The handler returned without resuming: abort the handle
+                    # scope with the handler's value.
+                    raise _EffectAbort(frame["id"], handler_result)
+                # Host-registered handlers (tests/embedding): legacy semantics —
+                # bind dst to the handler's return and keep running this block.
+                handler = self._effect_handlers.get(effect_name)
+                if handler is None:
+                    raise InterpError(f"No handler for effect {effect_name!r}")
                 handler_result = handler.fn(op_name, arg_vals, k)
                 # For stack effects the handler called k.resume() inline and returned
                 # the final value.  For suspend effects the handler returns a placeholder
@@ -323,6 +380,49 @@ class MirInterpreter:
             if idx >= len(v.fields):
                 raise InterpError(f"variant_field: index {idx} out of range for {v!r}")
             return v.fields[idx]
+        elif kind == "handle_scope":
+            # ("handle_scope", body_fn, effect_name, ((op, param, handler_fn), ...)),
+            # args = ((name, val_name), ...) captured environment
+            body_fn_name: str = rhs[1]
+            scope_effect: str = rhs[2]
+            case_encodings = rhs[3]
+            captured: Dict[str, Any] = {}
+            for (cname, cval) in args:
+                # Non-strict: the lowering conservatively captures every name
+                # in its symbol table; some may not be live at runtime.
+                if isinstance(cval, str):
+                    if cval in env:
+                        captured[cname] = env[cval]
+                else:
+                    captured[cname] = cval
+            frame_id = self._next_frame_id
+            self._next_frame_id += 1
+            frame = {
+                "id": frame_id,
+                "effect": scope_effect,
+                "cases": {op_name: (param, hfn) for (op_name, param, hfn) in case_encodings},
+                "captured": captured,
+            }
+            body_func = self._funcs.get(body_fn_name)
+            if body_func is None:
+                raise InterpError(f"Missing handle body function {body_fn_name!r}")
+            self._mir_handler_frames.append(frame)
+            try:
+                return self._call_func(body_func, [], dict(captured))
+            except _EffectAbort as abort:
+                if abort.frame_id != frame_id:
+                    raise
+                return abort.value
+            finally:
+                self._mir_handler_frames.pop()
+        elif kind == "resume":
+            # ("resume",), (k_name, value_name) — consume the single-shot
+            # continuation: run the suspended frame from its resume block.
+            k = self._lookup(args[0], env, f)
+            value = self._lookup(args[1], env, f)
+            if not isinstance(k, MxContinuation):
+                raise InterpError(f"resume: expected continuation, got {type(k).__name__!r}")
+            return k.resume(value, self)
         elif kind == "push_handler":
             # ("push_handler", effect_name), ((op, param_name), ...)
             # Register handler cases on the dynamic stack
