@@ -146,7 +146,7 @@ from pathlib import Path
 
 import pytest
 
-from metaxu.compiler.codegen_llvm import emit_llvm, mangle
+from metaxu.compiler.codegen_llvm import emit_fvec_reduce, emit_llvm, mangle
 from metaxu.compiler.hir import HIRBuilder
 from metaxu.compiler.llvm_run import LlvmRunError, compile_and_run
 from metaxu.compiler.lower_hir_to_mir import lower_hir_to_mir
@@ -3250,12 +3250,14 @@ fn main() -> int {
 """
 
 
-def test_elementwise_binop_lowers_to_mx_fvec_binop():
+def test_elementwise_binop_lowers_to_simd_or_mx_fvec_binop():
+    # Increment 11: the float shapes in this program all have statically
+    # known lengths, so they emit INLINE vector IR; the int division keeps
+    # the mx_fvec_binop C loop (division-by-zero abort semantics).
     ir = llvm_from_source(_ELEMENTWISE_SRC)
     assert count_placeholders(ir) == 0
-    # vector-vector and broadcast modes, float and int bases
-    assert re.search(r"@mx_fvec_binop\(i64 0, i64 1, i64 0, i64 0,", ir)
-    assert "; element-wise * (scalar broadcast)" in ir
+    assert "fadd <4 x double>" in ir
+    assert "; scalar broadcast splat" in ir
     assert re.search(r"@mx_fvec_binop\(i64 3, i64 0, i64 0, i64 1,", ir)
     # vectors print through the runtime repr, freed right after
     assert "call ptr @mx_fvec_to_str" in ir
@@ -3499,3 +3501,374 @@ def test_native_slice_and_comprehension_asan_no_uaf(tmp_path):
     # copies are independent allocations (no aliasing UAF) under ASan.
     assert_native_matches_interp_asan_boxes(_SLICES_SRC, tmp_path)
     assert_native_matches_interp_asan_boxes(_COMPREHENSION_SRC, tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Increment 11: vector arithmetic emits real LLVM SIMD IR
+# ---------------------------------------------------------------------------
+# Static-length tracking (_fvec_static_lens) + the inline `<N x double>` /
+# `<N x i64>` fast path for flat vector binops.  The contract under test:
+# NEVER WRONG, ONLY FASTER — every proven shape emits one vector arithmetic
+# instruction over loads off the block's word array; every unproven shape
+# (dynamic/mismatched lengths, matrices, int division, N > 64) falls back
+# to the increment 10 mx_fvec_binop C loop with its abort semantics.
+# Differentials prove result equality with the interpreter for every
+# emitted shape (clang always compiles at -O2, so each differential below
+# is also an -O2 equivalence witness).
+#
+# PERFORMANCE NOTE (deliberately not a timing assert — wall-clock tests
+# flake in CI): the structural asserts pin that static-length float/int
+# binops are single vector instructions on `<N x double>` / `<N x i64>`,
+# which IS the SIMD register width story; the dynamic-length fallback
+# remains a C loop that LLVM may still auto-vectorize with a runtime trip
+# count.  Expected behavior: the inline path removes the call + per-element
+# loop overhead entirely for small fixed N.
+
+_SIMD_FLOAT_SRC = """
+fn main() -> int {
+    let a = vector[float,4](1.5, -2.0, 3.25, 4.0);
+    let b = vector[float,4](10.0, 20.5, -30.0, 0.5);
+    print((a + b).to_string());
+    print((a - b).to_string());
+    print((a * b).to_string());
+    print((b / a).to_string());
+    print((a * -2.5).to_string());
+    print((100.0 + a).to_string());
+    0
+}
+"""
+
+_SIMD_INT_SRC = """
+fn main() -> int {
+    let a = vector[int,3](7, -8, 9);
+    let b = vector[int,3](-1, 2, 40);
+    print((a + b).to_string());
+    print((a - b).to_string());
+    print((a * b).to_string());
+    print((a * -3).to_string());
+    print((10 + a).to_string());
+    let p = vector[int,3](7, 8, 9);
+    print((p / 2).to_string());
+    0
+}
+"""
+# NOTE: p (all non-negative) is deliberate for /: the backend's
+# C-truncating division convention diverges from the interpreter's floor
+# on negative operands (the standing documented divergence, unchanged by
+# this increment — / stays on the runtime call anyway; the language has
+# no source-level % operator).
+
+_SIMD_PROPAGATION_SRC = """
+fn main() -> int {
+    let v = vector[float,5](1.0, 2.0, 3.0, 4.0, 5.0);
+    let s = v[1:3];
+    print((s + s).to_string());
+    let z = vector[float,4]();
+    let f = vector[float,4].filled(2.5);
+    print((z + f).to_string());
+    let c = vector[float,4](x * 2.0 for x in 0..4);
+    print((c * c).to_string());
+    let sum = (c + f) * 2.0;
+    print(sum.to_string());
+    0
+}
+"""
+
+_SIMD_JOIN_SRC = """
+fn main() -> int {
+    let mut v = vector[float,2](1.0, 2.0);
+    if 1 == 1 {
+        v = vector[float,3](1.0, 2.0, 3.0);
+    }
+    print((v + v).to_string());
+    0
+}
+"""
+
+
+def test_static_length_float_binop_emits_vector_ir():
+    # THE POINT of increment 11: static-length float vector arithmetic is
+    # real SIMD IR — `<4 x double>` loads off the block words (offset 8,
+    # the block's actual 8-byte alignment), one vector instruction per op,
+    # a store into a fresh result block, and NO runtime binop call left
+    # anywhere in the module.
+    ir = llvm_from_source(_SIMD_FLOAT_SRC)
+    assert count_placeholders(ir) == 0
+    for mnem in ("fadd", "fsub", "fmul", "fdiv"):
+        assert f"{mnem} <4 x double>" in ir, mnem
+    assert re.search(
+        r"getelementptr inbounds i8, ptr %t\d+, i64 8", ir)
+    assert "load <4 x double>, ptr" in ir and ", align 8" in ir
+    assert "store <4 x double>" in ir
+    assert "call ptr @mx_fvec_new(i64 4)" in ir
+    assert "@mx_fvec_binop(" not in ir
+
+
+def test_scalar_broadcast_emits_splat_both_orientations():
+    # vector*scalar and scalar+vector both splat via insertelement +
+    # shufflevector; the vector operand's static length drives the width.
+    ir = llvm_from_source(_SIMD_FLOAT_SRC)
+    assert "insertelement <4 x double> poison, double" in ir
+    assert ("shufflevector <4 x double> %t" in ir
+            and "<4 x i32> zeroinitializer" in ir)
+    assert ir.count("; scalar broadcast splat") == 2
+
+
+def test_int_vector_add_sub_mul_inline_div_keeps_runtime_call():
+    # Int + - * vectorize; / keeps the mx_fvec_binop C loop even with
+    # known lengths — DOCUMENTED CHOICE: the runtime aborts loudly on
+    # division by zero where vector sdiv would be UB.
+    ir = llvm_from_source(_SIMD_INT_SRC)
+    assert count_placeholders(ir) == 0
+    for mnem in ("add", "sub", "mul"):
+        assert f"{mnem} <3 x i64>" in ir, mnem
+    assert "insertelement <3 x i64> poison, i64" in ir
+    assert "sdiv <" not in ir and "srem <" not in ir
+    # op 3 = /, base 0 = int, mode 1 = vector-scalar
+    assert re.search(r"@mx_fvec_binop\(i64 3, i64 0, i64 0, i64 1,", ir)
+
+
+def test_static_lengths_propagate_through_slices_zeros_filled_comprehensions():
+    # const-bounds slice of a known-length vector -> <2 x double>; zeros /
+    # filled with const counts -> <4 x double>; comprehension output takes
+    # its iterable's length; binop RESULTS keep their operands' length so
+    # chains stay on the fast path.
+    ir = llvm_from_source(_SIMD_PROPAGATION_SRC)
+    assert count_placeholders(ir) == 0
+    assert "fadd <2 x double>" in ir     # slice v[1:3]
+    assert "fadd <4 x double>" in ir     # zeros + filled
+    assert "fmul <4 x double>" in ir     # comprehension result, and chain
+    assert "@mx_fvec_binop(" not in ir
+
+
+def test_dynamic_length_falls_back_to_runtime_call():
+    # Parameters have no static length (lengths are per-function facts, not
+    # part of the kind that flows through sigs): the always-correct C loop
+    # remains the lowering, and no vector-arithmetic IR is emitted.
+    ir = llvm_from_source("""
+fn add(a: vector[float,4], b: vector[float,4]) -> vector[float,4] {
+    a + b
+}
+
+fn main() -> int {
+    let v = vector[float,4](1.0, 2.0, 3.0, 4.0);
+    print(add(v, v).to_string());
+    0
+}
+""")
+    assert count_placeholders(ir) == 0
+    assert re.search(r"@mx_fvec_binop\(i64 0, i64 1, i64 0, i64 0,", ir)
+    assert "fadd <" not in ir
+
+
+def test_mismatched_static_lengths_fall_back_to_aborting_runtime_call():
+    # Both lengths are KNOWN but unequal: the inline path must never be
+    # taken (it would skip the length-mismatch abort); the runtime call
+    # keeps the interpreter's error semantics (mx_rt_fail at run time).
+    ir = llvm_from_source("""
+fn main() -> int {
+    let a = vector[float,2](1.0, 2.0);
+    let b = vector[float,3](1.0, 2.0, 3.0);
+    print((a + b).to_string());
+    0
+}
+""")
+    assert re.search(r"@mx_fvec_binop\(i64 0, i64 1, i64 0, i64 0,", ir)
+    assert "fadd <" not in ir
+
+
+def test_length_join_across_branch_defs_degrades_to_dynamic():
+    # One variable, two defs with different lengths: the per-name join is
+    # dynamic, so the binop falls back (a sound join can never pick 2 OR 3).
+    ir = llvm_from_source(_SIMD_JOIN_SRC)
+    assert count_placeholders(ir) == 0
+    assert re.search(r"@mx_fvec_binop\(i64 0, i64 1, i64 0, i64 0,", ir)
+    assert "fadd <" not in ir
+
+
+def test_length_above_cap_falls_back():
+    # N = 100 > 64: correct via the C loop (which LLVM can still
+    # auto-vectorize), no giant IR vectors.
+    ir = llvm_from_source("""
+fn main() -> int {
+    let a = vector[float,100].filled(1.5);
+    let b = a + a;
+    print(b.len());
+    0
+}
+""")
+    assert count_placeholders(ir) == 0
+    assert re.search(r"@mx_fvec_binop\(i64 0, i64 1, i64 0, i64 0,", ir)
+    assert "fadd <" not in ir
+
+
+def test_matrix_binops_keep_runtime_recursion():
+    # Nested vectors (depth > 0) stay on mx_fvec_binop: elements are row
+    # POINTERS, not lanes — a vector instruction over them would be wrong.
+    ir = llvm_from_source(_MATRIX_SRC)
+    assert count_placeholders(ir) == 0
+    assert re.search(r"@mx_fvec_binop\(i64 0, i64 1, i64 1, i64 0,", ir)
+    assert "fadd <" not in ir
+
+
+def test_vector_ir_module_passes_llvm_verifier(tmp_path):
+    if shutil.which("opt") is None:
+        pytest.skip("LLVM opt not installed")
+    for src in (_SIMD_FLOAT_SRC, _SIMD_INT_SRC, _SIMD_PROPAGATION_SRC):
+        ll = tmp_path / "simd.ll"
+        ll.write_text(llvm_from_source(src))
+        proc = subprocess.run(
+            ["opt", "-passes=verify", "-disable-output", str(ll)],
+            capture_output=True, text=True)
+        assert proc.returncode == 0, proc.stderr
+
+
+@needs_clang
+def test_native_simd_float_differential(tmp_path):
+    # Differential at -O2 (compile_and_run always passes clang -O2): the
+    # inline vector IR must produce the interpreter's exact reprs for
+    # + - * / and both broadcast orientations, negatives included.
+    ir = assert_native_matches_interp(_SIMD_FLOAT_SRC, tmp_path)
+    assert "fadd <4 x double>" in ir  # the fast path was actually on trial
+
+
+@needs_clang
+def test_native_simd_int_differential(tmp_path):
+    ir = assert_native_matches_interp(_SIMD_INT_SRC, tmp_path)
+    assert "mul <3 x i64>" in ir
+
+
+@needs_clang
+def test_native_simd_propagation_differential(tmp_path):
+    ir = assert_native_matches_interp(_SIMD_PROPAGATION_SRC, tmp_path)
+    assert "@mx_fvec_binop(" not in ir
+
+
+@needs_clang
+def test_native_simd_length_join_differential(tmp_path):
+    assert_native_matches_interp(_SIMD_JOIN_SRC, tmp_path)
+
+
+@needs_clang
+def test_native_simd_inf_nan_differential(tmp_path):
+    # inf via overflow and nan via inf - inf — both produced INSIDE the
+    # vector fast path (float division by zero can't be the vehicle: the
+    # interpreter rejects it, the documented IEEE divergence).  The runtime
+    # repr renders "inf"/"-inf"/"nan" exactly like Python's str().
+    ir = assert_native_matches_interp("""
+fn main() -> int {
+    let mut v = vector[float,2](10.0, -10.0);
+    let mut i = 0;
+    while i < 400 {
+        v = v * 10.0;
+        i = i + 1;
+    }
+    let nans = v - v;
+    print(v.to_string());
+    print(nans.to_string());
+    0
+}
+""", tmp_path)
+    assert "fmul <2 x double>" in ir and "fsub <2 x double>" in ir
+
+
+@needs_asan
+def test_native_simd_asan_no_oob_store(tmp_path):
+    # The inline path stores `<N x double>` into a fresh mx_fvec_new block
+    # of exactly 8 + 8N bytes: ASan proves the vector store stays inside
+    # the allocation (blocks leak by design -> detect_leaks=0 contract).
+    assert_native_matches_interp_asan_boxes(_SIMD_FLOAT_SRC, tmp_path)
+    assert_native_matches_interp_asan_boxes(_SIMD_PROPAGATION_SRC, tmp_path)
+
+
+# --- Reductions: the emission helper (no MIR shape reaches it yet) --------
+
+def test_reduce_helper_emits_ordered_fadd_reduction():
+    decl, body, res = emit_fvec_reduce("%v", 4, "f64", "rd")
+    assert decl == ("declare double @llvm.vector.reduce.fadd.v4f64"
+                    "(double, <4 x double>)")
+    text = "\n".join(body)
+    assert "getelementptr inbounds i8, ptr %v, i64 8" in text
+    assert "load <4 x double>" in text and "align 8" in text
+    # ORDERED reduction (no reassoc), seeded with -0.0 (exact fadd
+    # identity) == the interpreter's left-to-right fold, bit for bit.
+    assert ("call double @llvm.vector.reduce.fadd.v4f64"
+            "(double -0.000000e+00, <4 x double> %rd.v)") in text
+    assert res == "%rd.sum"
+
+
+def test_reduce_helper_int_form_and_bad_inputs():
+    decl, body, res = emit_fvec_reduce("%v", 8, "i64", "rd")
+    assert decl == "declare i64 @llvm.vector.reduce.add.v8i64(<8 x i64>)"
+    assert any("call i64 @llvm.vector.reduce.add.v8i64" in ln
+               for ln in body)
+    with pytest.raises(ValueError):
+        emit_fvec_reduce("%v", 0, "f64", "rd")
+    with pytest.raises(ValueError):
+        emit_fvec_reduce("%v", 4, "str", "rd")
+
+
+def _reduce_module(vals, leaf: str) -> str:
+    """A synthetic module exercising emit_fvec_reduce end to end: build the
+    block with the real runtime (mx_fvec_new/_init), reduce, print."""
+    import struct
+    n = len(vals)
+    if leaf == "f64":
+        words = [struct.unpack("<q", struct.pack("<d", float(v)))[0]
+                 for v in vals]
+    else:
+        words = [int(v) for v in vals]
+    decl, body, res = emit_fvec_reduce("%v", n, leaf, "rd")
+    fmt = "%.17g\\0A\\00" if leaf == "f64" else "%lld\\0A\\00"
+    fmtlen = 7 if leaf == "f64" else 6  # strlen + \n + NUL
+    lines = [
+        "declare ptr @mx_fvec_new(i64)",
+        "declare void @mx_fvec_init(ptr, i64, i64)",
+        "declare i32 @printf(ptr, ...)",
+        decl,
+        f'@.fmt = private unnamed_addr constant [{fmtlen} x i8] c"{fmt}"',
+        f"define i64 @{mangle('main')}() {{",
+        "entry:",
+        f"  %v = call ptr @mx_fvec_new(i64 {n})",
+    ]
+    lines += [f"  call void @mx_fvec_init(ptr %v, i64 {i}, i64 {w})"
+              for i, w in enumerate(words)]
+    lines += body
+    ty = "double" if leaf == "f64" else "i64"
+    lines += [
+        f"  %p = call i32 (ptr, ...) @printf(ptr @.fmt, {ty} {res})",
+        "  ret i64 0",
+        "}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+@needs_clang
+def test_reduce_helper_float_runs_and_matches_python_fold(tmp_path):
+    # Values chosen so ORDER MATTERS: a reassociating reduction (or a tree
+    # reduction) would round differently — equality with Python's
+    # left-to-right fold proves the ordered semantics, not just the sum.
+    vals = [1.0, 1e16, -1e16, 3.5, 0.1, -0.25]
+    expected = 0.0
+    for v in vals:
+        expected = expected + v
+    ir = _reduce_module(vals, "f64")
+    if shutil.which("opt") is not None:
+        ll = tmp_path / "reduce.ll"
+        ll.write_text(ir)
+        proc = subprocess.run(
+            ["opt", "-passes=verify", "-disable-output", str(ll)],
+            capture_output=True, text=True)
+        assert proc.returncode == 0, proc.stderr
+    exit_code, out = compile_and_run(ir, "main", workdir=str(tmp_path))
+    assert exit_code == 0
+    assert out == f"{expected:.17g}\n"
+
+
+@needs_clang
+def test_reduce_helper_int_runs_and_matches_python_sum(tmp_path):
+    vals = [5, -7, 40, 3, -1, 2**40]
+    ir = _reduce_module(vals, "i64")
+    exit_code, out = compile_and_run(ir, "main", workdir=str(tmp_path))
+    assert exit_code == 0
+    assert out == f"{sum(vals)}\n"
