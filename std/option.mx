@@ -1,0 +1,108 @@
+# std.option — combinators over Metaxu's builtin Option (Some/None).
+#
+# Design follows the Maybe surface used throughout Ante's stdlib
+# (stdlib/src/Prelude.an and friends, jfecher/ante), adapted to Metaxu:
+# Option/Some/None are compiler builtins here, so this module only adds
+# the combinator functions. All functions are total; none perform
+# effects. Combinators that need a callable take it as a closure
+# argument (`fn(x) -> ...` at the call site).
+
+export {
+    map,
+    and_then,
+    filter,
+    or_else,
+    unwrap_or,
+    unwrap_or_else,
+    is_some,
+    is_none,
+    contains,
+    ok_or,
+    flatten
+}
+
+# Some(f(v)) if `o` is Some(v), else None.
+fn map(o, f) {
+    match o {
+        Some(v) => Some(f(v)),
+        None => None
+    }
+}
+
+# f(v) if `o` is Some(v) (f returns an Option), else None.
+fn and_then(o, f) {
+    match o {
+        Some(v) => f(v),
+        None => None
+    }
+}
+
+# Keep Some(v) only when pred(v) is true.
+fn filter(o, pred) {
+    match o {
+        Some(v) => if pred(v) { Some(v) } else { None },
+        None => None
+    }
+}
+
+# `o` itself if Some, else `alt` (an Option).
+fn or_else(o, alt) {
+    match o {
+        Some(v) => Some(v),
+        None => alt
+    }
+}
+
+# The contained value, or `default` when None.
+fn unwrap_or(o, default) {
+    match o {
+        Some(v) => v,
+        None => default
+    }
+}
+
+# The contained value, or `default()` when None (lazy default).
+fn unwrap_or_else(o, default) {
+    match o {
+        Some(v) => v,
+        None => default()
+    }
+}
+
+fn is_some(o) -> bool {
+    match o {
+        Some(v) => true,
+        None => false
+    }
+}
+
+fn is_none(o) -> bool {
+    match o {
+        Some(v) => false,
+        None => true
+    }
+}
+
+# True when `o` is Some(x).
+fn contains(o, x) -> bool {
+    match o {
+        Some(v) => v == x,
+        None => false
+    }
+}
+
+# Ok(v) if Some(v), else Err(e) — Option into Result.
+fn ok_or(o, e) {
+    match o {
+        Some(v) => Ok(v),
+        None => Err(e)
+    }
+}
+
+# Collapse Some(Some(v)) to Some(v); anything else to the inner value/None.
+fn flatten(o) {
+    match o {
+        Some(inner) => inner,
+        None => None
+    }
+}

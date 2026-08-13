@@ -1,0 +1,101 @@
+# std.throw — the Throw effect: failure carrying an error value.
+#
+# Design ported from Ante's stdlib (stdlib/src/Throw.an, jfecher/ante):
+# `throw e` aborts the computation with an error payload; `catch` turns a
+# throwing computation into a Result. Adaptations for Metaxu:
+# - Ante's effect is generic (`Throw t`). Metaxu effect declarations
+#   parse a type parameter but the op payload here is left unannotated,
+#   which the checker treats permissively: one program can throw ints and
+#   strings through the same effect. A future generic-effects pass can
+#   tighten this.
+# - Ante's `catch` is `catch_` here (`catch` is a reserved word in
+#   Metaxu, kept for the deferred try/catch statement).
+# - `unwrap_err` composes with std.fail exactly like Ante's version.
+# - Result is Metaxu's builtin (Ok/Err constructors), so unlike Ante we
+#   do not declare it here.
+
+export {
+    Throw,
+    catch_,
+    catch_or,
+    catch_or_else,
+    map_err,
+    unwrap_err,
+    throw_if
+}
+
+from std.fail import Fail, ok_if;
+
+effect Throw {
+    throw(e) -> Unit
+}
+
+# Run `f`, answering Err(e) if it throws e and Ok(result) otherwise.
+#
+#     let r = catch_(fn() -> int { perform Throw.throw("boom"); 1 });
+#     match r { Ok(v) => v, Err(e) => 0 }
+fn catch_(f) {
+    handle Throw with {
+        throw(e) -> Err(e)
+    } in {
+        Ok(f())
+    }
+}
+
+# Run `f`, answering `default` if it throws (the error is discarded).
+fn catch_or(f, default) {
+    handle Throw with {
+        throw(e) -> default
+    } in {
+        f()
+    }
+}
+
+# Run `f`, answering `on_err(e)` if it throws e.
+fn catch_or_else(f, on_err) {
+    handle Throw with {
+        throw(e) -> on_err(e)
+    } in {
+        f()
+    }
+}
+
+# Run `f`; if it throws e, re-throw `g(e)` to the enclosing handler.
+# (A handler case evaluates outside its own delimitation, so the perform
+# in the case routes to the next enclosing Throw handler — Ante's
+# map_err idiom, verbatim.)
+fn map_err(f, g) performs Throw {
+    handle Throw with {
+        throw(e) -> perform Throw.throw(g(e))
+    } in {
+        f()
+    }
+}
+
+# Return the error `f` throws; fail (std.fail) if it finishes cleanly.
+fn unwrap_err(f) performs Fail {
+    let r = handle Throw with {
+        throw(e) -> Some(e)
+    } in {
+        f();
+        None
+    };
+    ok_if(is_some_priv(r));
+    match r {
+        Some(e) => e,
+        None => r
+    }
+}
+
+# Throw `e` if `cond` is true.
+fn throw_if(cond: bool, e) performs Throw {
+    if cond { perform Throw.throw(e) } else { () }
+}
+
+# private helper (not exported): Option check without importing std.option
+fn is_some_priv(o) -> bool {
+    match o {
+        Some(v) => true,
+        None => false
+    }
+}

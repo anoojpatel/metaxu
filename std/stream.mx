@@ -1,0 +1,292 @@
+# std.stream — streams as the Emit effect; loops as the Loop effect.
+#
+# Design ported from Ante's stdlib (stdlib/src/Stream.an, jfecher/ante):
+# a stream is a thunk that performs Emit once per element; consumers are
+# handlers around calling the thunk; transformers (map/filter/take/skip)
+# are handlers that re-emit, returned as new thunks so streams chain:
+#
+#     let s = filter(map(iota(10), fn(x: int) -> x * 2), fn(x: int) -> x > 5);
+#     let total = sum(s);
+#
+# `for_` is Ante's for_: each element is delivered under a fresh Loop
+# handler, so the body can perform break_ (stop the whole loop) or
+# continue_ (skip to the next element) — both are ABORT-style handler
+# cases (they return without resuming, tearing down just that
+# iteration's delimited body).
+#
+# Adaptations for Metaxu:
+# - No trait-based Stream dispatch (Ante's `Stream t a` trait + implicit
+#   thunk impl): producers here are explicitly thunks; `emit_vec`/`iota`/
+#   `emit_range` build thunk-shaped sources from data.
+# - `fold` is Ante's foldr (handler cases chain through resume(), whose
+#   value is the completion value of the whole delimited body). Ante's
+#   tail-resumptive foldl needs mutable capture of scalars, which Metaxu
+#   closures do not have (captures are by value); Vec captures ARE
+#   shared, which `collect` exploits instead.
+# - `enumerate`/`zip` are deferred: they emit tuples, and tuple
+#   destructuring (`let (a, b) = p`) is not in the parser yet.
+
+export {
+    Emit,
+    Loop,
+    emit_range,
+    iota,
+    emit_vec,
+    iter,
+    for_,
+    fold,
+    sum,
+    product,
+    count,
+    collect,
+    all_of,
+    any_of,
+    find,
+    map,
+    filter,
+    take,
+    skip,
+    chain
+}
+
+# ---------------------------------------------------------------------
+# Effects
+# ---------------------------------------------------------------------
+
+# Emit one element. A stream is any fn() -> Unit that performs this.
+effect Emit {
+    emit(x) -> Unit
+}
+
+# Loop control for `for_` bodies: both ops abort the current iteration's
+# handler scope (break_ additionally stops the iteration).
+effect Loop {
+    break_() -> Unit
+    continue_() -> Unit
+}
+
+# ---------------------------------------------------------------------
+# Producers
+# ---------------------------------------------------------------------
+
+# Emit a, a+1, .., b-1 (end-exclusive).
+fn emit_range(a: int, b: int) performs Emit {
+    let @mut i = a;
+    while i < b {
+        perform Emit.emit(i);
+        i = i + 1
+    }
+}
+
+# Ante's iota: a thunk emitting 0, 1, .., n-1.
+fn iota(n: int) -> fn() -> Unit {
+    fn() {
+        emit_range(0, n)
+    }
+}
+
+# A thunk emitting each element of the Vec in order.
+fn emit_vec(v: Vec) -> fn() -> Unit {
+    fn() {
+        let @mut i = 0;
+        while i < len(v) {
+            perform Emit.emit(v[i]);
+            i = i + 1
+        }
+    }
+}
+
+# ---------------------------------------------------------------------
+# Consumers
+# ---------------------------------------------------------------------
+
+# Consume the stream, applying `f` to each element (Ante's iter).
+fn iter(producer, f) {
+    handle Emit with {
+        emit(x) -> {
+            f(x);
+            resume(())
+        }
+    } in {
+        producer();
+        ()
+    }
+}
+
+# Consume the stream, applying `f` to each element under a Loop handler:
+# `perform Loop.break_()` in the body ends the loop, and
+# `perform Loop.continue_()` skips to the next element (Ante's for_).
+#
+#     for_(iota(10), fn(x: int) {
+#         if x > 2 { perform Loop.break_() } else { () };
+#         v.push(x)
+#     });
+fn for_(producer, f) {
+    let @mut broke = Vec.new();
+    handle Emit with {
+        emit(x) -> {
+            handle Loop with {
+                break_() -> { broke.push(1); () }
+                continue_() -> { () }
+            } in {
+                f(x);
+                ()
+            };
+            if len(broke) == 0 { resume(()) } else { () }
+        }
+    } in {
+        producer();
+        ()
+    }
+}
+
+# Right fold: given emissions x1, x2, .., xN, computes
+# f(x1, f(x2, .. f(xN, init))). Each handler case chains through
+# resume(()), whose value is the fold of the REST of the stream —
+# Ante's foldr, and the way to accumulate without mutable state.
+fn fold(producer, init, f) {
+    handle Emit with {
+        emit(x) -> f(x, resume(()))
+    } in {
+        producer();
+        init
+    }
+}
+
+# Sum of all emitted elements (0 when empty).
+fn sum(producer) {
+    fold(producer, 0, fn(x, acc) -> x + acc)
+}
+
+# Product of all emitted elements (1 when empty).
+fn product(producer) {
+    fold(producer, 1, fn(x, acc) -> x * acc)
+}
+
+# Number of emitted elements.
+fn count(producer) -> int {
+    fold(producer, 0, fn(x, acc) -> acc + 1)
+}
+
+# Collect all emitted elements into a fresh Vec. (Vec captures are
+# shared references, so the handler's pushes are visible here.)
+fn collect(producer) -> Vec {
+    let @mut out = Vec.new();
+    iter(producer, fn(x) { out.push(x) });
+    out
+}
+
+# True when pred holds for every element; stops at the first false
+# (the handler case simply declines to resume — Ante's all).
+fn all_of(producer, pred) -> bool {
+    handle Emit with {
+        emit(x) -> {
+            if pred(x) { resume(()) } else { false }
+        }
+    } in {
+        producer();
+        true
+    }
+}
+
+# True when pred holds for any element; stops at the first true.
+fn any_of(producer, pred) -> bool {
+    handle Emit with {
+        emit(x) -> {
+            if pred(x) { true } else { resume(()) }
+        }
+    } in {
+        producer();
+        false
+    }
+}
+
+# Some(first element satisfying pred), else None (Ante's find, with
+# Option instead of the Fail effect).
+fn find(producer, pred) {
+    handle Emit with {
+        emit(x) -> {
+            if pred(x) { Some(x) } else { resume(()) }
+        }
+    } in {
+        producer();
+        None
+    }
+}
+
+# ---------------------------------------------------------------------
+# Transformers (return new thunks; streams chain lazily)
+# ---------------------------------------------------------------------
+
+# Re-emit f(x) for each x.
+fn map(producer, f) -> fn() -> Unit {
+    fn() {
+        handle Emit with {
+            emit(x) -> {
+                perform Emit.emit(f(x));
+                resume(())
+            }
+        } in {
+            producer();
+            ()
+        }
+    }
+}
+
+# Re-emit only elements with pred(x) true.
+fn filter(producer, pred) -> fn() -> Unit {
+    fn() {
+        handle Emit with {
+            emit(x) -> {
+                if pred(x) { perform Emit.emit(x) } else { () };
+                resume(())
+            }
+        } in {
+            producer();
+            ()
+        }
+    }
+}
+
+# Re-emit only the first n elements, then stop pulling the source.
+# (The counter is a Vec because closure captures of scalars are by
+# value; a Vec capture aliases the same runtime vector.)
+fn take(producer, n: int) -> fn() -> Unit {
+    fn() {
+        let @mut seen = Vec.new();
+        handle Emit with {
+            emit(x) -> {
+                seen.push(x);
+                perform Emit.emit(x);
+                if len(seen) < n { resume(()) } else { () }
+            }
+        } in {
+            if n > 0 { producer() } else { () };
+            ()
+        }
+    }
+}
+
+# Skip the first n elements, re-emitting the rest.
+fn skip(producer, n: int) -> fn() -> Unit {
+    fn() {
+        let @mut seen = Vec.new();
+        handle Emit with {
+            emit(x) -> {
+                if len(seen) < n { seen.push(x) } else { perform Emit.emit(x) };
+                resume(())
+            }
+        } in {
+            producer();
+            ()
+        }
+    }
+}
+
+# All elements of `first`, then all elements of `second` (Ante's chain).
+fn chain(first, second) -> fn() -> Unit {
+    fn() {
+        first();
+        second()
+    }
+}

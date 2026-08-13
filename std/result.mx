@@ -1,0 +1,88 @@
+# std.result — combinators over Metaxu's builtin Result (Ok/Err).
+#
+# Design follows Ante's Result surface (declared in stdlib/src/Throw.an,
+# jfecher/ante), adapted to Metaxu: Result/Ok/Err are compiler builtins
+# here, so this module only adds the combinators. See std.throw for the
+# effectful way to produce Results (`catch_`).
+
+export {
+    map,
+    map_err,
+    and_then,
+    unwrap_or,
+    unwrap_or_else,
+    is_ok,
+    is_err,
+    ok,
+    err
+}
+
+# Ok(f(v)) if `r` is Ok(v); Err passes through.
+fn map(r, f) {
+    match r {
+        Ok(v) => Ok(f(v)),
+        Err(e) => Err(e)
+    }
+}
+
+# Err(f(e)) if `r` is Err(e); Ok passes through.
+fn map_err(r, f) {
+    match r {
+        Ok(v) => Ok(v),
+        Err(e) => Err(f(e))
+    }
+}
+
+# f(v) if `r` is Ok(v) (f returns a Result), else the original Err.
+fn and_then(r, f) {
+    match r {
+        Ok(v) => f(v),
+        Err(e) => Err(e)
+    }
+}
+
+# The Ok value, or `default` when Err.
+fn unwrap_or(r, default) {
+    match r {
+        Ok(v) => v,
+        Err(e) => default
+    }
+}
+
+# The Ok value, or `default(e)` when Err(e).
+fn unwrap_or_else(r, default) {
+    match r {
+        Ok(v) => v,
+        Err(e) => default(e)
+    }
+}
+
+fn is_ok(r) -> bool {
+    match r {
+        Ok(v) => true,
+        Err(e) => false
+    }
+}
+
+fn is_err(r) -> bool {
+    match r {
+        Ok(v) => false,
+        Err(e) => true
+    }
+}
+
+# Some(v) if Ok(v), else None — the success side as an Option.
+fn ok(r) {
+    match r {
+        Ok(v) => Some(v),
+        Err(e) => None
+    }
+}
+
+# Some(e) if Err(e), else None — the error side as an Option.
+fn err(r) {
+    match r {
+        Ok(v) => None,
+        Err(e) => Some(e)
+    }
+}

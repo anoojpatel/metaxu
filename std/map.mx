@@ -1,0 +1,147 @@
+# std.map — an association-list Map: the HashMap stand-in.
+#
+# API design ported from Ante's stdlib (stdlib/src/HashMap.an,
+# jfecher/ante), with an honest downgrade: Metaxu has no Hash trait and
+# no fixed-capacity generic buckets yet, so this Map is a pair of
+# parallel vectors scanned linearly. Every operation is O(n). It is a
+# correctness placeholder to program against — the API is shaped so a
+# real hash map can replace the representation without changing callers.
+#
+# Keys can be any type with `==` (ints and strings are the tested ones).
+# Map values are shared references (their Vecs are), so `put`/`remove`
+# mutate the map in place; `get`/`keys`/`values` never mutate.
+#
+# `remove` rebuilds the vectors through pop/push because Vec has no
+# element-removal builtin and `v[i] = x` index assignment does not store
+# yet (silent no-op) — see std/README.md.
+
+export {
+    Map,
+    empty,
+    size,
+    is_empty,
+    contains_key,
+    get,
+    get_or,
+    put,
+    remove,
+    keys,
+    values
+}
+
+struct Map {
+    ks: Vec,
+    vs: Vec
+}
+
+# A fresh empty map.
+fn empty() -> Map {
+    Map { ks: Vec.new(), vs: Vec.new() }
+}
+
+# Number of entries.
+fn size(m: Map) -> int {
+    len(m.ks)
+}
+
+fn is_empty(m: Map) -> bool {
+    len(m.ks) == 0
+}
+
+fn contains_key(m: Map, k) -> bool {
+    let @mut i = 0;
+    let @mut found = false;
+    let ks = m.ks;
+    while i < len(ks) {
+        if ks[i] == k { found = true } else { () };
+        i = i + 1
+    }
+    found
+}
+
+# Some(value for k), else None. The LAST binding wins, so a plain push
+# in `put` acts as an overwrite.
+fn get(m: Map, k) {
+    let @mut i = 0;
+    let @mut found = None;
+    let ks = m.ks;
+    let vs = m.vs;
+    while i < len(ks) {
+        if ks[i] == k { found = Some(vs[i]) } else { () };
+        i = i + 1
+    }
+    found
+}
+
+# The value for k, or `default` when absent.
+fn get_or(m: Map, k, default) {
+    let @mut i = 0;
+    let @mut found = default;
+    let ks = m.ks;
+    let vs = m.vs;
+    while i < len(ks) {
+        if ks[i] == k { found = vs[i] } else { () };
+        i = i + 1
+    }
+    found
+}
+
+# Bind k to v (in place). Overwrites any previous binding for k:
+# stale pairs are dropped first so size() stays one-per-key.
+fn put(m: Map, k, v) {
+    remove(m, k);
+    let @mut ks = m.ks;
+    let @mut vs = m.vs;
+    ks.push(k);
+    vs.push(v)
+}
+
+# Remove k's binding (in place); Some(removed value), else None.
+fn remove(m: Map, k) {
+    let @mut ks = m.ks;
+    let @mut vs = m.vs;
+    let @mut tk = Vec.new();
+    let @mut tv = Vec.new();
+    let @mut removed = None;
+    # drain into temporaries (pop reverses; reversed again below)
+    while len(ks) > 0 {
+        tk.push(ks.pop());
+        tv.push(vs.pop())
+    }
+    # push back everything except k, restoring the original order
+    let @mut i = len(tk);
+    while i > 0 {
+        if tk[i - 1] == k {
+            removed = Some(tv[i - 1])
+        } else {
+            ks.push(tk[i - 1]);
+            vs.push(tv[i - 1])
+        };
+        i = i - 1
+    }
+    removed
+}
+
+# Fresh Vec of the keys, in insertion order.
+fn keys(m: Map) -> Vec {
+    let @mut out = Vec.new();
+    let ks = m.ks;
+    let @mut i = 0;
+    while i < len(ks) {
+        out.push(ks[i]);
+        i = i + 1
+    }
+    out
+}
+
+# Fresh Vec of the values, in key insertion order.
+fn values(m: Map) -> Vec {
+    let @mut out = Vec.new();
+    let vs = m.vs;
+    let @mut i = 0;
+    while i < len(vs) {
+        out.push(vs[i]);
+        i = i + 1
+    }
+    out
+}
