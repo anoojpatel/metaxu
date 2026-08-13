@@ -22,6 +22,20 @@ to_string/len). The remaining non-executing examples need real FFI/threads
 (05, effect_mapping), a SimdOp handler + const-generic N at runtime (06),
 and try/catch lowering (04).
 
+Update (2026-08-13): all of those now execute — the run gate is 19/19.
+effect_mapping.mx was the last: its `with EFFECT_*` clauses (effect ops
+mapped onto named runtime primitives) now compile to
+`__effect_runtime$Effect$op` thunks, and the interpreter carries shims for
+EFFECT_MUTEX_CREATE/LOCK/UNLOCK and EFFECT_SPAWN/JOIN under a documented
+single-threaded execution model: spawn runs the child closure to
+completion at spawn time (one legal schedule of real thread semantics),
+join returns its stored result once, and mutexes are exact — locking a
+locked mutex is a deadlock and errors loudly, as do unlock-of-unlocked,
+double join, and any mapped symbol without a shim. In-scope handlers
+still override runtime mappings (effects stay virtualizable). Real OS
+threads remain out of scope for the interpreter; the LLVM backend still
+has no effect-op runtime (see below).
+
 Direction update (2026-08-13): the project targets LLVM for AOT native
 compilation (near-C, no GC; modes decide memory). Increment 1 is on this
 branch: codegen_llvm.py emits a verifier-clean LLVM module for the direct

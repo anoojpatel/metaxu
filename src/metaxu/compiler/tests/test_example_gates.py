@@ -40,6 +40,7 @@ MUST_RUN = [
     "examples/05_unsafe_and_ffi.mx",
     "examples/06_vector_operations.mx",
     "examples/10_traits_and_structs.mx",
+    "examples/effect_mapping.mx",
     "examples/effects.mx",
     "examples/hello.mx",
     "examples/linked_list.mx",
