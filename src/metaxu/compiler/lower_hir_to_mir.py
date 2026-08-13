@@ -33,6 +33,11 @@ class _FuncLowerer:
         self.cur: int = 0
         self.state = _ANFState()
         self._pending_lambdas: List[MirFunc] = []
+        # Early-return plumbing: allocated lazily by the first "Return" op.
+        # All returns copy into ret_var and branch to ret_bb; the function's
+        # epilogue (drops + the actual ret) lives in ret_bb.
+        self.ret_bb: int | None = None
+        self.ret_var: str | None = None
 
     # ------------------------------------------------------------------
     # Block plumbing
@@ -58,6 +63,27 @@ class _FuncLowerer:
         self.emit(("let", dst, ("const_ty", "Unit"), ()))
         return dst
 
+    def finish_body(self, res: str, drop_names: Sequence[str] = ()) -> None:
+        """Terminate the function body whose result value is ``res``.
+
+        Without early returns this is the classic ``drops; ret res`` in the
+        current block. When any "Return" op fired, the epilogue instead lives
+        in the shared ret_bb: the fall-off-the-end path copies its result
+        into ret_var and joins the early returns there.
+        """
+        if self.ret_bb is None:
+            for name in drop_names:
+                self.emit(("drop", name))
+            self.terminate(("ret", res))
+            return
+        assert self.ret_var is not None
+        self.emit(("let", self.ret_var, ("copy",), (res,)))
+        self.terminate(("br", self.ret_bb))
+        self.switch_to(self.ret_bb)
+        for name in drop_names:
+            self.emit(("drop", name))
+        self.terminate(("ret", self.ret_var))
+
     # ------------------------------------------------------------------
     # Sub-function compilation (lambdas, effect handler cases)
     # ------------------------------------------------------------------
@@ -71,15 +97,18 @@ class _FuncLowerer:
         """
         saved_blocks, saved_cur = self.blocks, self.cur
         saved_env = dict(self.state.env)
+        saved_ret_bb, saved_ret_var = self.ret_bb, self.ret_var
         self.blocks = [MirBlock(ops=[("params", tuple(params))], term=("unreachable",))]
         self.cur = 0
+        self.ret_bb, self.ret_var = None, None
         for pn in params:
             self.state.env[pn] = pn
         result = self.lower_expr(body)
-        self.terminate(("ret", result))
+        self.finish_body(result)
         sub_blocks = self.blocks
         self.blocks, self.cur = saved_blocks, saved_cur
         self.state.env = saved_env
+        self.ret_bb, self.ret_var = saved_ret_bb, saved_ret_var
         self._pending_lambdas.append(
             MirFunc(name=name, ty_sig=ty_sig, blocks=sub_blocks, suspending=suspending)
         )
@@ -263,6 +292,42 @@ class _FuncLowerer:
             # Exit: a while loop evaluates to unit
             self.switch_to(exit_bb)
             return self.unit_value()
+        # While-let loop: `while let PAT = expr { body }`. The header
+        # re-evaluates expr each iteration and pattern-matches it; a match
+        # binds the pattern variables and runs the body, a mismatch exits.
+        if e.op == "WhileLet" and e.scrutinee is not None and e.loop_pattern is not None:
+            header_bb = self.new_block()
+            body_bb = self.new_block()
+            exit_bb = self.new_block()
+            self.terminate(("br", header_bb))
+            self.switch_to(header_bb)
+            saved_env = dict(self.state.env)
+            scrut_val = self.lower_expr(e.scrutinee)
+            # On mismatch compile_pattern jumps to exit_bb; on fall-through
+            # all pattern variables are bound for the body.
+            self.compile_pattern(e.loop_pattern, scrut_val, exit_bb)
+            self.terminate(("br", body_bb))
+            self.switch_to(body_bb)
+            for sub in (e.loop_body or ()):
+                self.lower_expr(sub)
+            self.terminate(("br", header_bb))
+            self.state.env = saved_env
+            # Exit: a while-let loop evaluates to unit
+            self.switch_to(exit_bb)
+            return self.unit_value()
+        # Early return: copy the value into the shared return slot and jump
+        # to the (lazily created) epilogue block. Subsequent code in the
+        # current arm lowers into a fresh unreachable block and is dead.
+        if e.op == "Return":
+            val = self.lower_expr(e.operands[0]) if e.operands else self.unit_value()
+            if self.ret_bb is None:
+                self.ret_bb = self.new_block()
+                self.ret_var = self.state.fresh("retv")
+            assert self.ret_var is not None
+            self.emit(("let", self.ret_var, ("copy",), (val,)))
+            self.terminate(("br", self.ret_bb))
+            self.switch_to(self.new_block())
+            return val
         # Enum variant construction
         if e.op == "MakeVariant" and e.variant_name is not None:
             payload = [self.lower_expr(a) for a in (e.operands or ())]
@@ -449,13 +514,9 @@ def lower_hir_to_mir(funcs: Sequence[HFun], borrow_errors: List[Any] | None = No
         for pn in param_names:
             fl.state.env[pn] = pn
         res = fl.lower_expr(f.body)
-        # Insert drops before ret
+        # Epilogue: drops + ret (joined with any early returns via ret_bb)
         plan = drops.get(str(f.sym))
-        if plan:
-            for name in plan.drop_at_end:
-                fl.emit(("drop", name))
-        # Terminate the current (final) block with the return
-        fl.terminate(("ret", res))
+        fl.finish_body(res, plan.drop_at_end if plan else ())
         out.append(MirFunc(name=str(f.sym), ty_sig=f.ret_ty, blocks=fl.blocks, suspending=bool(f.body.suspends)))
         # Emit any lambdas that were compiled during lowering
         out.extend(fl._pending_lambdas)

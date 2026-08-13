@@ -94,6 +94,9 @@ class HExpr:
     match_arms: tuple[tuple[HPattern, 'HExpr'], ...] | None = None  # (pattern, body) pairs
     # While loop: op="While" (cond field reused for the loop condition)
     loop_body: tuple['HExpr', ...] | None = None
+    # While-let loop: op="WhileLet" (scrutinee reused for the matched value;
+    # the loop runs while loop_pattern matches, binding its variables in the body)
+    loop_pattern: HPattern | None = None
     # Assignment: op="Assign" (var_name reused for the target)
     assign_value: 'HExpr | None' = None
     # Enum variant construction: op="MakeVariant" (operands reused for payload exprs)
@@ -353,6 +356,14 @@ class HIRBuilder:
                 return self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span,
                                       op="Var", var_name=inner)
             return self._from_orig_expr(inner, ctx_for(inner)) if inner is not None else None
+        # Mode-annotated expression (`@const node.data`, `@mut x.f`): like the
+        # borrow forms above, at runtime it evaluates to the underlying value.
+        # (Previously unhandled: it lowered to None and e.g. the payload of
+        # `Some(@const node.data)` was silently dropped, leaving a nullary
+        # Some that blew up at pattern-match time.)
+        if isinstance(orig, fast.ModeExpression):
+            inner = getattr(orig, 'expression', None)
+            return self._from_orig_expr(inner, ctx_for(inner)) if inner is not None else None
 
         # Option constructors in expression position: Some(x) / None.
         # (In pattern position these are handled by _convert_pattern.)
@@ -457,6 +468,68 @@ class HIRBuilder:
             ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, "Unit"))
             return self._mk_hexpr(frozen_ctx.node_id, "Stmt", ty, frozen_ctx.span, op="If", cond=c, then_ops=as_ops(tb), else_ops=as_ops(eb) if eb else tuple())
 
+        # IfLetExpression: `if let PAT = expr { then } else { else }`.
+        # Desugared to a two-arm Match (PAT => then, _ => else) so the
+        # pattern binding and both branches survive lowering. This node
+        # used to fall through to the None fallback and be silently
+        # dropped — whole function bodies degraded to unit.
+        if isinstance(orig, fast.IfLetExpression):
+            val_node = getattr(orig, 'value', None)
+            scrut = self._from_orig_expr(val_node, ctx_for(val_node))
+            if scrut is None:
+                raise NotImplementedError(
+                    "if let: could not lower the matched expression "
+                    f"({type(val_node).__name__})")
+            pat_node = getattr(orig, 'pattern', None)
+            pat = self._checked_refutable_pattern(pat_node, construct="if let")
+            then_node = getattr(orig, 'then_branch', None)
+            then_he = self._from_orig_expr(then_node, ctx_for(then_node))
+            if then_he is None:
+                raise NotImplementedError(
+                    "if let: could not lower the then-branch "
+                    f"({type(then_node).__name__})")
+            ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, "Unit"))
+            else_node = getattr(orig, 'else_branch', None)
+            if else_node is not None:
+                else_he = self._from_orig_expr(else_node, ctx_for(else_node))
+                if else_he is None:
+                    raise NotImplementedError(
+                        "if let: could not lower the else-branch "
+                        f"({type(else_node).__name__})")
+            else:
+                # No else: the non-matching arm evaluates to unit.
+                else_he = self._mk_hexpr(frozen_ctx.node_id, "Block", ty,
+                                         frozen_ctx.span, op="Block", operands=())
+            arms = ((pat, then_he), (HPattern(kind="wildcard"), else_he))
+            return self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span,
+                                  op="Match", scrutinee=scrut,
+                                  cases=(then_he, else_he), match_arms=arms)
+
+        # WhileLetStatement: `while let PAT = expr { body }` — loop while
+        # PAT matches the (re-evaluated) expr, binding pattern variables in
+        # the body. Previously silently dropped like IfLetExpression.
+        if isinstance(orig, fast.WhileLetStatement):
+            val_node = getattr(orig, 'value', None)
+            scrut = self._from_orig_expr(val_node, ctx_for(val_node))
+            if scrut is None:
+                raise NotImplementedError(
+                    "while let: could not lower the matched expression "
+                    f"({type(val_node).__name__})")
+            pat = self._checked_refutable_pattern(getattr(orig, 'pattern', None),
+                                                  construct="while let")
+            body_node = getattr(orig, 'body', None)
+            body_he = self._from_orig_expr(body_node, ctx_for(body_node))
+            if body_he is not None and body_he.op == "Block" and body_he.operands is not None:
+                body_ops = body_he.operands
+            elif body_he is not None:
+                body_ops = (body_he,)
+            else:
+                body_ops = tuple()
+            ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, "Unit"))
+            return self._mk_hexpr(frozen_ctx.node_id, "Stmt", ty, frozen_ctx.span,
+                                  op="WhileLet", scrutinee=scrut,
+                                  loop_pattern=pat, loop_body=body_ops)
+
         # MatchExpression: carry (pattern, body) pairs into HIR.
         # TODO(pattern-typing): pattern variable types are not yet threaded through
         # the constraint emitter; typing of bindings currently falls back to the
@@ -532,10 +605,18 @@ class HIRBuilder:
                                   op="Assign", var_name=str(target) if target is not None else None,
                                   assign_value=val_he)
 
-        # ReturnStatement: lower its expression if present
+        # ReturnStatement: an explicit Return op so early returns (inside
+        # loops, match arms, if branches) actually exit the function. The
+        # old lowering reduced `return e` to just `e`, which is only correct
+        # in tail position — everywhere else the value was silently discarded
+        # and execution continued.
         if isinstance(orig, fast.ReturnStatement):
             expr = getattr(orig, 'expression', None)
-            return self._from_orig_expr(expr, frozen_ctx)
+            val_he = self._from_orig_expr(expr, frozen_ctx) if expr is not None else None
+            ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, "Unit"))
+            return self._mk_hexpr(frozen_ctx.node_id, "Stmt", ty, frozen_ctx.span,
+                                  op="Return",
+                                  operands=(val_he,) if val_he is not None else ())
 
         # LetStatement
         if isinstance(orig, fast.LetStatement):
@@ -844,9 +925,22 @@ class HIRBuilder:
             param_names = tuple(str(getattr(p, 'name', p)) for p in params)
             body_nodes = getattr(orig, 'body', None)
             body_he = self._from_orig_expr(body_nodes, frozen_ctx)
-            captured_vars = getattr(orig, 'captured_vars', set()) or set()
+            captured_vars = {str(v) for v in (getattr(orig, 'captured_vars', set()) or set())}
             capture_modes = getattr(orig, 'capture_modes', {}) or {}
-            captures = tuple((str(v), str(capture_modes.get(v, 'borrow'))) for v in sorted(captured_vars))
+            # The parser's scope-based capture analysis only sees scopes it
+            # links and populates (function/lambda scopes); variables bound
+            # in enclosing loop or block scopes are invisible to it, which
+            # used to yield silently-empty capture lists ("Unbound variable"
+            # at run time). Supplement it with a free-variable analysis of
+            # the body: free names that are not parameters are captured with
+            # mode 'auto' — the MIR lowering captures only the ones actually
+            # bound in the enclosing scope (the rest are globals/builtins
+            # that resolve by name at call time).
+            free = self._free_names(body_nodes) - set(param_names)
+            captures = tuple(
+                (name, str(capture_modes.get(name, 'auto')))
+                for name in sorted(captured_vars | free)
+            )
             ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, "Unknown"))
             return self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span,
                                   op="Lambda",
@@ -983,6 +1077,28 @@ class HIRBuilder:
                 continue
             out |= self._free_names(value, _seen)
         return out
+
+    def _checked_refutable_pattern(self, pat_node: Any, construct: str) -> HPattern:
+        """Convert an `if let` / `while let` pattern, failing loudly when the
+        pattern shape is not understood.
+
+        _convert_pattern falls back to a wildcard for unknown nodes (fine for
+        the last match arm); for `if let`/`while let` a silent wildcard would
+        make the branch unconditionally taken, so reject it instead.
+        """
+        pat = self._convert_pattern(pat_node)
+        is_source_wildcard = (
+            pat_node is None
+            or type(pat_node).__name__ == "WildcardPattern"
+            or (isinstance(pat_node, fast.Variable)
+                and getattr(pat_node, 'name', None) == "_")
+        )
+        if pat.kind == "wildcard" and not is_source_wildcard:
+            raise NotImplementedError(
+                f"{construct}: unsupported pattern shape "
+                f"{type(pat_node).__name__} — refusing to degrade it to a "
+                "match-anything wildcard")
+        return pat
 
     def _convert_pattern(self, p: Any) -> HPattern:
         """Convert a frozen-AST pattern node into an HPattern.
