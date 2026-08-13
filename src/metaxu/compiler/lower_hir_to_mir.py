@@ -423,7 +423,10 @@ class _FuncLowerer:
         # handler frame, runs the body under it, and catches handler aborts
         # (a case returning without calling resume).
         if e.op == "Try" and e.handle_body is not None and e.handle_cases:
-            scope_tag = self.state.fresh("tc")
+            # Qualify with the enclosing function's name: the fresh counter is
+            # per-function, so bare "__catch_tcN" names collided ACROSS
+            # functions (same defect the lambda naming fix documents above).
+            scope_tag = f"{self.f.sym}${self.state.fresh('tc')}"
             (_, catch_params, catch_he) = e.handle_cases[0]
             if isinstance(catch_params, str):
                 catch_params = (catch_params,)
@@ -442,7 +445,11 @@ class _FuncLowerer:
             effect = str(e.handle_effect or "")
             if "<" in effect:  # strip generic args: State<int> -> State
                 effect = effect.split("<", 1)[0]
-            scope_tag = self.state.fresh("hs")
+            # Qualified like lambda names: two functions handling the same
+            # effect+op each lower handler cases to sub-functions, and the
+            # per-function fresh counter alone made those names collide
+            # across functions (whichever loaded last silently won).
+            scope_tag = f"{self.f.sym}${self.state.fresh('hs')}"
             cases_encoded: List[tuple] = []
             for (op_name, case_params, body_he) in (e.handle_cases or ()):
                 # case_params is a tuple of parameter names (multi-arg ops);

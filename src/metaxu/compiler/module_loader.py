@@ -30,12 +30,33 @@ import metaxu.metaxu_ast as fast
 from metaxu.errors import CompileError
 
 
-# The reserved namespace for the (not yet implemented) standard library.
-# Imports under `std.*` resolve to an external placeholder module: the
-# import itself succeeds (so documented examples importing std keep
-# compiling), no names are rewritten, and calls into it fall through to
-# interpreter builtins or fail loudly at run time.
+# The reserved namespace for the standard library. Imports under `std.*`
+# first resolve to real files under the stdlib root (see _stdlib_dir):
+# `import std.fail` loads `<stdlib>/fail.mx` exactly like any other module
+# file. Names with no file under the stdlib root (std.simd, std.matrix,
+# std.geometry, ...) fall back to the historical external-placeholder
+# behavior: the import succeeds, no names are rewritten, and calls into
+# the placeholder fall through to interpreter builtins or fail loudly at
+# run time — documented examples importing those keep compiling.
 STD_ROOT = "std"
+
+
+def _stdlib_dir() -> str | None:
+    """Directory holding the standard library sources (`std/*.mx`).
+
+    Resolution order:
+    1. the METAXU_STD_PATH environment variable, when set and a directory;
+    2. the repo-layout default: the `std/` directory at the repository
+       root, located relative to this file (src/metaxu/compiler/ -> ../../../std).
+    Returns None when neither exists (std.* imports then all resolve to
+    the external placeholder, the pre-stdlib behavior).
+    """
+    env = os.environ.get("METAXU_STD_PATH")
+    if env:
+        return env if os.path.isdir(env) else None
+    here = os.path.dirname(os.path.abspath(__file__))
+    cand = os.path.normpath(os.path.join(here, "..", "..", "..", "std"))
+    return cand if os.path.isdir(cand) else None
 
 
 def _module_error(message: str, notes: list[str] | None = None) -> CompileError:
@@ -97,6 +118,10 @@ class ModuleResolver:
         self.entry_path: str | None = None
         self.import_edges: list[tuple[str, str]] = []
         self.loaded_files: dict[str, str] = {}   # abs file path -> module path
+        # from-import checks deferred until every module (and its own
+        # imports, which populate re-export tables) has been processed:
+        # [(target_path, symbol_name, importer_path)]
+        self.pending_import_checks: list[tuple[str, str, str]] = []
 
     # ------------------------------------------------------------------
     # Registration
@@ -186,6 +211,14 @@ class ModuleResolver:
             return info
         root = path.split(".", 1)[0]
         if root == STD_ROOT:
+            # Real stdlib file first (std.fail -> <stdlib>/fail.mx), then
+            # the external placeholder for unresolved std.* names.
+            std_dir = _stdlib_dir()
+            rel_parts = path.split(".")[1:]
+            if std_dir is not None and rel_parts:
+                candidate = os.path.join(std_dir, *rel_parts) + ".mx"
+                if os.path.isfile(candidate):
+                    return self._load_module_file(os.path.abspath(candidate), path)
             info = self._info(path)
             info.external = True
             return info
@@ -203,7 +236,10 @@ class ModuleResolver:
                 notes=[f"looked for {candidate}",
                        f"module paths resolve relative to the root file's "
                        f"directory: {self.root_dir}"])
-        candidate = os.path.abspath(candidate)
+        return self._load_module_file(os.path.abspath(candidate), path)
+
+    def _load_module_file(self, candidate: str, path: str) -> ModuleInfo:
+        """Parse the module file at `candidate` and register it under `path`."""
         if candidate in self.loaded_files:
             # Same file already loaded under another module path: alias it.
             return self._info(self.loaded_files[candidate])
@@ -251,7 +287,13 @@ class ModuleResolver:
                         name = str(name)
                         local = str(alias) if alias else name
                         if not target.external:
-                            self._check_importable(target, name, info)
+                            # Deferred: the target's own imports may not have
+                            # been processed yet, so its re-export table
+                            # (public import / public from-import) can still
+                            # be empty here. Checking after the worklist
+                            # drains sees the complete picture.
+                            self.pending_import_checks.append(
+                                (target.path, name, info.path))
                         binding = ("symbol", target.path, name)
                         info.bindings[local] = binding
                         if getattr(imp, "is_public", False):
@@ -259,6 +301,31 @@ class ModuleResolver:
                 # newly loaded modules need their own imports processed
                 for new_path in set(self.registry) - before:
                     worklist.append(self.registry[new_path])
+        for (target_path, name, importer_path) in self.pending_import_checks:
+            self._check_importable(self.registry[target_path], name,
+                                   self.registry[importer_path])
+
+    def _chase_symbol(self, target: ModuleInfo, name: str,
+                      _seen: set[tuple[str, str]] | None = None):
+        """Follow `name` through `target`'s re-export chain to the module
+        that actually declares it.
+
+        Returns (final_info, final_name) — final_info.external is True when
+        the chain ends in a std.* placeholder — or None when the name is
+        neither declared nor re-exported anywhere along the chain."""
+        seen = _seen or set()
+        if (target.path, name) in seen:
+            return None
+        seen.add((target.path, name))
+        if target.external or target.declares(name):
+            return target, name
+        b = target.reexports.get(name)
+        if b is None or b[0] != "symbol":
+            return None
+        nxt = self.registry.get(b[1])
+        if nxt is None:
+            return None
+        return self._chase_symbol(nxt, b[2], seen)
 
     def _check_importable(self, target: ModuleInfo, name: str,
                           importer: ModuleInfo) -> None:
@@ -269,8 +336,11 @@ class ModuleResolver:
                     f"'{target.path}' (imported by module '{importer.path}')",
                     notes=[f"'{name}' is not exported by '{target.path}'"])
             return
-        # re-exported names (public import / public from-import)
-        if name in target.reexports:
+        # re-exported names (public import / public from-import), possibly
+        # through a chain of re-exporting modules (e.g. std.prelude)
+        if name in target.reexports and (
+                target.reexports[name][0] != "symbol"
+                or self._chase_symbol(target, name) is not None):
             return
         raise _module_error(
             f"module '{target.path}' has no symbol '{name}' "
@@ -379,10 +449,16 @@ class ModuleResolver:
             b = info.bindings.get(name)
             if b is not None and b[0] == "symbol":
                 target = self.registry.get(b[1])
-                if target is None or target.external:
+                if target is None:
+                    return
+                resolved = self._chase_symbol(target, b[2])
+                if resolved is None:
+                    return
+                final, fname = resolved
+                if final.external:
                     return          # std.* placeholder: leave for builtins
-                if b[2] in target.functions:
-                    node.name = self._final_name(target.path, b[2])
+                if fname in final.functions:
+                    node.name = self._final_name(final.path, fname)
             return
 
         if isinstance(node, fast.QualifiedFunctionCall):
@@ -399,10 +475,21 @@ class ModuleResolver:
                 return
             head = rest[0]
             if not target.declares(head):
-                raise _module_error(
-                    f"module '{target.path}' has no symbol '{head}' "
-                    f"(referenced from module '{info.path}' as "
-                    f"'{'.'.join(parts)}')")
+                # A re-exported symbol referenced through the re-exporting
+                # module (`prelude.try_opt(...)`): chase to the declarer.
+                chased = (self._chase_symbol(target, head)
+                          if head in target.reexports else None)
+                if chased is not None:
+                    final, fname = chased
+                    if final.external:
+                        return      # re-export of a std.* placeholder name
+                    target, head = final, fname
+                    rest = [head] + rest[1:]
+                else:
+                    raise _module_error(
+                        f"module '{target.path}' has no symbol '{head}' "
+                        f"(referenced from module '{info.path}' as "
+                        f"'{'.'.join(parts)}')")
             if target.path != info.path and not target.is_public(head):
                 raise _module_error(
                     f"symbol '{head}' of module '{target.path}' is private "
