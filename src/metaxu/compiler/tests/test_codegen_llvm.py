@@ -59,6 +59,17 @@ results) leak by design, so their ASan tests use detect_leaks=0 and prove
 no-UAF/no-double-free only.  Known kind-erasure caveat (same as print):
 bools/unit erase to i64, so to_string of a bool natively yields "1"/"0",
 not "True"/"False" — differential sources stringify ints/floats/strings.
+
+Increment 6 (per-variant payload slot typing) adds: enum payload slots are
+typed per VARIANT and per VALUE — each enum value's kind carries a
+refinement of its constructible variants' slot representations, so
+Leaf(int) | Fork(Tree, Tree) and generic instantiation mixes like Some(3)
+vs Some(node) in one module (linked_list.mx's reality) now emit; the MIR
+variant_field op carries its pattern's ctor name so reads know which
+variant's slot they touch.  Still demoted honestly: ONE value merging two
+representations of the same variant (heterogeneous ... no coercion),
+nested enums extracted through a boxing boundary when their slots are
+instantiation-dependent, and legacy two-element variant_field ops.
 """
 from __future__ import annotations
 
@@ -978,10 +989,10 @@ fn main() -> int {
     assert "call void @free" not in ir
 
 
-def test_heterogeneous_payload_slot_demotes_instead_of_coercing():
-    # Two variants of one enum may legally store different types in the same
-    # slot; the tagged union must not silently coerce the int store to the
-    # unified slot kind (str here), so the function demotes.
+def test_per_variant_payload_slots_emit_mixed_variant_kinds():
+    # Increment 6: payload slot kinds are PER VARIANT — A(int) and B(str)
+    # sharing slot 0 no longer demotes (each variant knows its own slot
+    # representation), and the IR documents the per-variant kinds.
     ir = llvm_from_source("""
 enum Mix { A(int), B(str) }
 fn main() -> int {
@@ -990,9 +1001,54 @@ fn main() -> int {
     0
 }
 """)
-    assert count_placeholders(ir) == 1
-    assert "heterogeneous payload slot 0 of enum 'Mix'" in ir
+    assert count_placeholders(ir) == 0
+    assert ";   variant A(i64)" in ir
+    assert ";   variant B(str)" in ir
+
+
+def test_merged_same_variant_mixed_instantiation_still_demotes():
+    # PER-VALUE limits: ONE value (pick's merged result) holding both
+    # Some(int) and Some(str) has no single native slot representation, so
+    # the writer demotes instead of coercing — the honest boundary of the
+    # per-variant model.
+    ir = llvm_from_source("""
+enum Opt { Some(int), None }
+fn pick(n: int) -> Opt { if n > 0 { Some(1) } else { Some("s") } }
+fn main() -> int { let x = pick(1); 0 }
+""")
+    assert count_placeholders(ir) >= 1
+    assert "; function @mx_pick: placeholder" in ir
+    assert re.search(
+        r"heterogeneous payload slot 0 of enum 'Opt': variant 'Some' stores "
+        r"(i64|str) where merged flows require (str|i64)", ir)
     assert "no coercion through tagged-union storage" in ir
+
+
+def test_nested_mixed_enum_extraction_demotes():
+    # An enum whose slot representation is instantiation-dependent (W holds
+    # i64 in one use, str in another) loses its per-value refinement when
+    # boxed inside ANOTHER enum's payload: extraction would have to guess a
+    # representation, so the reader demotes with the boxing-boundary reason.
+    ir = llvm_from_source("""
+enum Inner { W(int), Z }
+enum Outer { O(Inner), E }
+fn use_int() -> Inner { W(1) }
+fn use_str() -> Inner { W("s") }
+fn peel(o: Outer) -> int {
+    match o { O(x) -> match x { W(y) -> 0, Z -> 1 }, E -> 2 }
+}
+fn main() -> int {
+    let a = O(use_int());
+    let b = O(use_str());
+    peel(a)
+}
+""")
+    assert "; function @mx_peel: placeholder" in ir
+    assert "extracts nested enum 'Inner'" in ir
+    assert "instantiation-dependent" in ir
+    # the writers themselves stay native: each value knows its own kinds
+    for fname in ("use_int", "use_str"):
+        assert re.search(rf"^define \S+ @mx_{fname}\(", ir, re.M)
 
 
 def test_dead_statement_position_match_result_does_not_poison_kinds():
@@ -1153,9 +1209,9 @@ fn main() -> int {
 @needs_clang
 def test_native_enum_returned_and_str_payload(tmp_path):
     # Enums crossing frames both ways (param + sret return) and a string
-    # payload slot.  NB: slot 0 must be kind-homogeneous across variants
-    # (an int-payload variant here would demote by the no-coercion rule, see
-    # test_heterogeneous_payload_slot_demotes_instead_of_coercing).
+    # payload slot.  (Since increment 6 slot kinds are per-variant, so an
+    # int-payload variant sharing slot 0 would also be fine — see
+    # test_native_mixed_variant_tree_sum.)
     assert_native_matches_interp("""
 enum Msg { Text(str), Shout(str, int), Empty }
 fn pick(n: int) -> Msg {
@@ -1347,24 +1403,26 @@ def test_struct_enum_mutual_recursion_boxes_at_the_enum_slot():
     assert "call void @free" not in ir  # boxes leak by design
 
 
-def test_linked_list_example_emits_honestly():
-    # HONEST POST-FRONT-END-FIX CENSUS: pop_front/remove_next/get/get_mut
-    # previously lowered to empty unit bodies (an if-let front-end bug), so
-    # increment 4's "fully native 8/8" was partly vacuous.  Their REAL
-    # bodies put both ints (Some(node.data)) and Nodes (Some(next_node))
-    # into Option's payload slot 0, which this backend refuses to coerce
-    # through tagged-union storage — those four demote with the
-    # heterogeneous-payload reason, and main demotes on a unit/Node merge.
-    # The structural builders still emit.
+def test_linked_list_example_emits_all_real_bodies():
+    # Increment 6: per-value payload refinements let pop_front/remove_next/
+    # get/get_mut — whose REAL bodies put both ints (Some(node.data)) and
+    # Nodes (Some(next_node)) into Option's slot 0 — emit natively: each
+    # Option VALUE knows its own instantiation's representation.  Only main
+    # still demotes, on a pre-existing front-end seam unrelated to enums:
+    # its trailing statement-position `if let` merges a unit constant with
+    # a struct:Node into the function's return value (the interpreter
+    # really does return either), which has no scalar native encoding.
     ir = llvm_from_source(
         (REPO_ROOT / "examples" / "linked_list.mx").read_text())
-    for fname in ("new_list", "push_front", "take_node"):
+    for fname in ("new_list", "push_front", "pop_front", "remove_next",
+                  "get", "get_mut", "take_node"):
         assert re.search(rf"^define (?:i64|double|ptr|void) @mx_{fname}\(",
                          ir, re.M), f"{fname} did not emit"
-    for fname in ("pop_front", "remove_next", "get", "get_mut"):
-        assert f"; function @mx_{fname}: placeholder" in ir, (
-            f"{fname} expected to demote on the heterogeneous Option slot")
-    assert "heterogeneous payload slot 0 of enum 'Option'" in ir
+    assert count_placeholders(ir) == 1
+    assert "; function @mx_main: placeholder" in ir
+    assert "promoted to aggregate kind struct:Node" in ir
+    # the IR documents the per-value nature of the shared Some slot
+    assert ";   variant Some(boxed struct:Node (mixed per value))" in ir
 
 
 def test_struct_in_struct_cycle_demotes():
@@ -1386,6 +1444,24 @@ def test_struct_in_struct_cycle_demotes():
     assert "%struct.A = type" not in ir
 
 
+def test_legacy_variant_field_without_ctor_name_demotes():
+    # Hand-built MIR using the pre-increment-6 two-element variant_field op
+    # (no ctor name): payload slot kinds are per-variant now, so the read
+    # cannot be attributed to a variant and demotes honestly instead of
+    # guessing (the interpreter still accepts the legacy shape).
+    fs = [
+        make_func("f", [block([
+            ("params", ()),
+            ("let", "c", ("const", 1), ()),
+            ("let", "v", ("make_variant", "E", "Only"), ("c",)),
+            ("let", "x", ("variant_field", 0), ("v",)),
+        ], ("ret", "x"))]),
+    ]
+    ir = emit_llvm(fs)
+    assert count_placeholders(ir) == 1
+    assert "carries no variant name (legacy MIR shape" in ir
+
+
 def test_closure_in_enum_payload_still_demotes():
     # A closure pair stored in a boxed payload could outlive its stack env
     # (and env-escape analysis does not chase payload flow): demote honestly.
@@ -1402,10 +1478,11 @@ fn main() -> int {
     assert "payload slot 0 holds a closure" in ir
 
 
-def test_heterogeneous_aggregate_payload_slot_demotes():
-    # Leaf(int) | Fork(Tree, Tree) puts i64 and a boxed aggregate in the SAME
-    # slot; per-slot cells are flow-insensitive, so this demotes rather than
-    # guessing which representation a read expects.
+def test_mixed_scalar_aggregate_variants_emit_per_variant():
+    # Increment 6 lifts the old per-slot caveat: Leaf(int) | Fork(Tree,
+    # Tree) puts i64 and a boxed aggregate in the SAME slot index, but each
+    # variant's slots are typed separately, so this now emits — with the
+    # per-variant kinds documented on the enum type.
     ir = llvm_from_source("""
 enum Tree { Leaf(int), Fork(Tree, Tree) }
 fn main() -> int {
@@ -1413,8 +1490,10 @@ fn main() -> int {
     0
 }
 """)
-    assert count_placeholders(ir) >= 1
-    assert "heterogeneous payload slot 0 of enum 'Tree'" in ir
+    assert count_placeholders(ir) == 0
+    assert "%enum.Tree = type { i64, [2 x i64] }" in ir
+    assert ";   variant Leaf(i64)" in ir
+    assert ";   variant Fork(boxed enum:Tree, boxed enum:Tree)" in ir
 
 
 # ---------------------------------------------------------------------------
@@ -1459,6 +1538,103 @@ fn main() -> int {
     total(t)
 }
 """, tmp_path)
+
+
+# The increment-6 target shapes: per-variant slot typing (Leaf/Fork) and
+# per-value instantiation typing (one Some holding ints AND nodes).
+
+_MIXED_TREE_SUM_SRC = """
+enum Tree { Leaf(int), Fork(Tree, Tree) }
+fn total(t: Tree) -> int {
+    match t { Leaf(n) -> n, Fork(l, r) -> total(l) + total(r) }
+}
+fn main() -> int {
+    let t = Fork(Fork(Leaf(1), Leaf(2)), Fork(Leaf(3), Fork(Leaf(4), Leaf(5))));
+    print(total(t));
+    total(t)
+}
+"""
+
+_POP_FRONT_SUM_SRC = """
+struct Node { data: int, next: Option }
+struct List { head: Option }
+fn push_front(list: @mut List, value: int) {
+    let new_node = Node { data: value, next: list.head };
+    list.head = Some(new_node);
+}
+fn pop_front(list: @mut List) -> Option {
+    if let Some(head) = list.head {
+        list.head = head.next;
+        return Some(head.data)
+    } else {
+        return None
+    }
+}
+fn sum(list: List) -> int {
+    let mut cur = list.head;
+    let mut acc = 0;
+    let mut going = 1;
+    while going == 1 {
+        if let Some(node) = cur {
+            acc = acc + node.data;
+            cur = node.next;
+        } else {
+            going = 0;
+        }
+    }
+    acc
+}
+fn main() -> int {
+    let @mut l = List { head: None };
+    push_front(l, 3);
+    push_front(l, 2);
+    push_front(l, 1);
+    let popped = pop_front(l);
+    if let Some(v) = popped {
+        print(v);
+    } else {
+        print(0 - 1);
+    }
+    print(sum(l));
+    sum(l)
+}
+"""
+
+
+@needs_clang
+def test_native_mixed_variant_tree_sum(tmp_path):
+    # Leaf(int) | Fork(Tree, Tree): slot 0 is i64 for Leaf and a boxed Tree
+    # for Fork — the previous increments' caveat, now summed natively.
+    ir = assert_native_matches_interp(_MIXED_TREE_SUM_SRC, tmp_path)
+    assert ";   variant Fork(boxed enum:Tree, boxed enum:Tree)" in ir
+
+
+@needs_clang
+def test_native_pop_front_mixed_instantiation_list(tmp_path):
+    # linked_list.mx's exact reality end-to-end: ONE generic Some variant
+    # holds Node inside the list and int out of pop_front.  Build a list,
+    # pop the head, sum the rest — natively, matching the interpreter.
+    ir = assert_native_matches_interp(_POP_FRONT_SUM_SRC, tmp_path)
+    assert ";   variant Some(boxed struct:Node (mixed per value))" in ir
+
+
+@needs_clang
+@needs_asan
+def test_native_mixed_variant_tree_sum_no_uaf_under_asan(tmp_path):
+    # ASan (leaks off: boxes leak BY DESIGN) proves the per-variant boxing
+    # traffic has no use-after-free / double-free.
+    src = _MIXED_TREE_SUM_SRC.replace("total(t)\n}", "total(t) - 15\n}", 1)
+    assert_native_matches_interp_asan_boxes(src, tmp_path)
+
+
+@needs_clang
+@needs_asan
+def test_native_pop_front_mixed_instantiation_no_uaf_under_asan(tmp_path):
+    # Same contract-scoped ASan proof for the per-value mixed Some slot:
+    # raw i64 stores and boxed Node stores share the slot index without a
+    # single stray free or out-of-bounds box access.
+    src = _POP_FRONT_SUM_SRC.replace("sum(l)\n}", "sum(l) - 5\n}", 1)
+    assert_native_matches_interp_asan_boxes(src, tmp_path)
 
 
 @needs_clang
@@ -1872,16 +2048,19 @@ fn main() -> int {
 
 def test_examples_define_census_does_not_regress():
     # Aggregate emission census across all accepted examples: the number of
-    # real defines must not regress below the increment-5 level (increment 3
+    # real defines must not regress below the increment-6 level (increment 3
     # emitted 18; increment 4's boxing/inlining reached 30; the native
     # vec/string runtime + static trait dispatch lifted 01/03/06/10/
     # collections to 45 — then the front-end if-let/early-return fixes gave
     # linked_list.mx its REAL pop_front/remove_next/get/get_mut bodies
     # (heterogeneous Option slots: 4 honest demotions + main) and
-    # test_operations.mx a real `assert` call (1 more), landing at 39).
+    # test_operations.mx a real `assert` call (1 more), landing at 39;
+    # increment 6's per-variant/per-value payload typing un-demoted those
+    # four linked_list bodies, landing at 43 — only linked_list's main still
+    # demotes there, on its trailing unit/Node statement-position merge).
     total_defines = 0
     for path in _example_files():
         ir = llvm_from_source(path.read_text())
         total_defines += len(re.findall(
             r"^define (?:i64|double|ptr|void) @mx_\w+\(", ir, re.M))
-    assert total_defines >= 39
+    assert total_defines >= 43

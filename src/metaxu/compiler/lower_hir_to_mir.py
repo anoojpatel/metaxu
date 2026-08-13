@@ -152,7 +152,13 @@ class _FuncLowerer:
             self.switch_to(ok_bb)
             for i, sub in enumerate(pat.subpatterns):
                 fv = self.state.fresh("pf")
-                self.emit(("let", fv, ("variant_field", i), (val_name,)))
+                # The op carries the pattern's ctor name as a third element so
+                # backends know WHICH variant's slot is being read (the read
+                # sits under this ctor's tag test).  Consumers that don't need
+                # it (interpreter, CLIF) read only rhs[1]; legacy two-element
+                # shapes remain valid MIR.
+                self.emit(("let", fv,
+                           ("variant_field", i, str(pat.name)), (val_name,)))
                 self.compile_pattern(sub, fv, fail_bb)
             return
         raise ValueError(f"Unknown pattern kind: {pat.kind!r}")
