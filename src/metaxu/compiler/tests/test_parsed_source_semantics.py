@@ -177,3 +177,63 @@ fn main() -> int {
 """
     with pytest.raises(BorrowCheckError):
         run_pipeline_from_source(src)
+
+
+# ---------------------------------------------------------------------------
+# Runtime semantics of modes example constructs (example 01 regressions)
+# ---------------------------------------------------------------------------
+
+def test_borrow_argument_passes_value():
+    """`f(&mut x)` passes x's value; it must not be silently dropped from the
+    argument list (which previously shifted every later argument left)."""
+    src = """
+struct Counter { value: int }
+
+fn bump(@mut c: Counter, delta: int) -> int {
+    c.value + delta
+}
+
+fn main() -> int {
+    let counter = Counter { value: 40 };
+    bump(&mut counter, 2)
+}
+"""
+    assert call(src, "main", []) == 42
+
+
+def test_field_assignment_writes_through():
+    """`c.value = expr` updates the struct in the variable's slot, instead of
+    creating a phantom local named 'c.value'."""
+    src = """
+struct Counter { value: int }
+
+fn main() -> int {
+    let @mut c = Counter { value: 1 };
+    c.value = c.value + 10;
+    c.value
+}
+"""
+    assert call(src, "main", []) == 11
+
+
+def test_to_string_builtin_method():
+    src = """
+fn main() -> string {
+    let x = 7;
+    "v=" + x.to_string()
+}
+"""
+    assert call(src, "main", []) == "v=7"
+
+
+def test_field_access_with_string_base():
+    """The parser stores `c.name`'s base as a raw string; it must still read."""
+    src = """
+struct P { name: string }
+
+fn main() -> string {
+    let p = P { name: "ok" };
+    p.name
+}
+"""
+    assert call(src, "main", []) == "ok"

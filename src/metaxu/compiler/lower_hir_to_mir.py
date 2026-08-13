@@ -178,6 +178,25 @@ class _FuncLowerer:
         # the updated value on the next iteration.
         if e.op == "Assign" and e.var_name is not None:
             val = self.unit_value() if e.assign_value is None else self.lower_expr(e.assign_value)
+            # Field assignment: `x.f = v` (target arrives as a dotted string).
+            # Structs have value semantics in MIR, so read the intermediate
+            # structs, set the innermost field, and write the updated structs
+            # back out to the base slot.
+            if "." in e.var_name:
+                base, *fields = e.var_name.split(".")
+                base_slot = self.state.env.get(base, base)
+                chain = [base_slot]
+                for fname in fields[:-1]:
+                    nxt = self.state.fresh("fg")
+                    self.emit(("let", nxt, ("field_get", fname), (chain[-1],)))
+                    chain.append(nxt)
+                updated = val
+                for fname, holder in zip(reversed(fields), reversed(chain)):
+                    nxt = self.state.fresh("fs")
+                    self.emit(("let", nxt, ("field_set", fname), (holder, updated)))
+                    updated = nxt
+                self.emit(("let", base_slot, ("copy",), (updated,)))
+                return base_slot
             slot = self.state.env.get(e.var_name)
             if slot is None:
                 # First assignment introduces the slot (named after the variable)
