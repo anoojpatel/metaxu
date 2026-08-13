@@ -19,10 +19,10 @@
 #   thunk impl): producers here are explicitly thunks; `emit_vec`/`iota`/
 #   `emit_range` build thunk-shaped sources from data.
 # - `fold` is Ante's foldr (handler cases chain through resume(), whose
-#   value is the completion value of the whole delimited body). Ante's
-#   tail-resumptive foldl needs mutable capture of scalars, which Metaxu
-#   closures do not have (captures are by value); Vec captures ARE
-#   shared, which `collect` exploits instead.
+#   value is the completion value of the whole delimited body). Scalar
+#   captures that a closure or handler arm assigns to are shared cells
+#   (take/skip's counters, for_'s broke flag rely on this); Vec captures
+#   alias the shared runtime vector, which `collect` exploits.
 # - `enumerate`/`zip` are deferred: they emit tuples, and tuple
 #   destructuring (`let (a, b) = p`) is not in the parser yet.
 
@@ -122,17 +122,17 @@ fn iter(producer, f) {
 #         v.push(x)
 #     });
 fn for_(producer, f) {
-    let @mut broke = Vec.new();
+    let @mut broke = false;
     handle Emit with {
         emit(x) -> {
             handle Loop with {
-                break_() -> { broke.push(1); () }
+                break_() -> { broke = true; () }
                 continue_() -> { () }
             } in {
                 f(x);
                 ()
             };
-            if len(broke) == 0 { resume(()) } else { () }
+            if broke { () } else { resume(()) }
         }
     } in {
         producer();
@@ -249,16 +249,16 @@ fn filter(producer, pred) -> fn() -> Unit {
 }
 
 # Re-emit only the first n elements, then stop pulling the source.
-# (The counter is a Vec because closure captures of scalars are by
-# value; a Vec capture aliases the same runtime vector.)
+# (Mutating the captured counter writes back to the enclosing binding —
+# handler-frame captures of assigned scalars are shared cells.)
 fn take(producer, n: int) -> fn() -> Unit {
     fn() {
-        let @mut seen = Vec.new();
+        let @mut seen = 0;
         handle Emit with {
             emit(x) -> {
-                seen.push(x);
+                seen = seen + 1;
                 perform Emit.emit(x);
-                if len(seen) < n { resume(()) } else { () }
+                if seen < n { resume(()) } else { () }
             }
         } in {
             if n > 0 { producer() } else { () };
@@ -270,10 +270,10 @@ fn take(producer, n: int) -> fn() -> Unit {
 # Skip the first n elements, re-emitting the rest.
 fn skip(producer, n: int) -> fn() -> Unit {
     fn() {
-        let @mut seen = Vec.new();
+        let @mut seen = 0;
         handle Emit with {
             emit(x) -> {
-                if len(seen) < n { seen.push(x) } else { perform Emit.emit(x) };
+                if seen < n { seen = seen + 1 } else { perform Emit.emit(x) };
                 resume(())
             }
         } in {

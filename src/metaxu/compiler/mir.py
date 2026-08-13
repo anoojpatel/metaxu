@@ -16,6 +16,10 @@ class MirFunc:
     ty_sig: Any
     blocks: list[MirBlock]
     suspending: bool
+    # Module-level constant names initialized by this function (only set on
+    # the synthesized __module_init): the interpreter runs it before the
+    # entry point and publishes exactly these bindings as globals.
+    globals_decl: tuple = ()
 
     def param_names(self) -> tuple:
         """Parameter names from the entry block's params op (empty if none)."""
