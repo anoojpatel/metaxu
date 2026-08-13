@@ -354,8 +354,11 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
 
             # Function body is a fresh scope *and* a fresh region: locals
             # (and @local params) belong to the function's region and may not
-            # escape to the caller's region except through exclave.
+            # escape to the caller's region except through exclave. Borrow
+            # state is per-function: moves in one function must not poison
+            # same-named bindings in another.
             push_scope()
+            fn_state = borrow_checker.enter_function_state()
             borrow_checker.enter_region()
             function_region_stack.append(borrow_checker.current_region())
 
@@ -391,6 +394,7 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
             return_types.pop()
             function_region_stack.pop()
             borrow_checker.exit_region()
+            borrow_checker.exit_function_state(fn_state)
             pop_scope()
             return None
         if kind == "LambdaExpression" and node_ty is not None:
@@ -573,7 +577,7 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
                         simplesub.add_class_constraint("Eq", [left_ty], node.node_id)
                 if kind == "BinaryOperation" and payload_operator(node) in {"+", "-", "*", "/"}:
                     simplesub.add_class_constraint("Number", [node_ty], node.node_id)
-        if kind == "IfStatement" and node_ty is not None and children:
+        if kind in {"IfStatement", "IfExpression"} and node_ty is not None and children:
             cond_ty = types.get(children[0].node_id)
             if cond_ty is not None:
                 simplesub.add_class_constraint("Bool", [cond_ty], children[0].node_id)
@@ -707,14 +711,15 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
         if kind == "FunctionCall":
             # Borrows taken directly in argument position (`f(&mut x)`) live
             # only for the duration of the call; release them so `x` is
-            # borrowable again afterwards. Named references (`let r = &mut x`)
-            # are not affected — their borrow is tracked via the Assignment
-            # binding, and this release is keyed off the call's own children.
+            # borrowable again afterwards. release_call_borrow keeps the state
+            # when a live named reference (`let r = &mut x`) still holds a
+            # borrow of the same variable.
             for child in children:
-                if child.kind in _BORROW_NODE_MODES:
+                mode = _BORROW_NODE_MODES.get(child.kind)
+                if mode is not None:
                     arg_var = payload_dict(child).get("variable")
                     if isinstance(arg_var, str):
-                        borrow_checker.release_borrows(arg_var)
+                        borrow_checker.release_call_borrow(arg_var, mode)
 
     walk(frozen_root)
     # Publish declared effect classes so the constraint checker can

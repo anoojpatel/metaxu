@@ -111,6 +111,26 @@ class FrozenBorrowChecker:
         for var_name in scope:
             self.release_borrows(var_name)
     
+    def enter_function_state(self) -> tuple:
+        """Snapshot per-function borrow/alias state on function entry.
+
+        Each function body is checked against its own state: locals, moves,
+        and borrows in one function must not leak into (or poison) another
+        function's identically-named bindings.
+        """
+        snapshot = (self.borrow_state, self.variables,
+                    self.reference_graph, self.referenced_by)
+        self.borrow_state = BorrowState()
+        self.variables = dict(self.variables)
+        self.reference_graph = {}
+        self.referenced_by = {}
+        return snapshot
+
+    def exit_function_state(self, snapshot: tuple) -> None:
+        """Restore the enclosing scope's borrow/alias state on function exit."""
+        (self.borrow_state, self.variables,
+         self.reference_graph, self.referenced_by) = snapshot
+
     def enter_region(self):
         """Enter a new region for locality tracking."""
         self.region_stack.append(len(self.region_stack))
@@ -156,6 +176,25 @@ class FrozenBorrowChecker:
         self.borrow_state.exclusive_borrows.discard(var_name)
         self.borrow_state.mutable_borrows.discard(var_name)
     
+    def release_call_borrow(self, var_name: str, mode: str):
+        """Release a call-argument temporary borrow (`f(&mut x)` ended).
+
+        If a live *named* reference (`let r = &mut x`) still holds a borrow of
+        the variable, keep the state: only the call-site temporary ends here.
+        Named references register in referenced_by; temporaries do not.
+        """
+        holders = self.referenced_by.get(var_name, [])
+        if mode == "shared":
+            if any(m == "shared" for _, m in holders):
+                return
+            self.borrow_state.shared_borrows.pop(var_name, None)
+        else:
+            if any(m in ("unique", "exclusive") for _, m in holders):
+                return
+            self.borrow_state.unique_borrows.discard(var_name)
+            self.borrow_state.exclusive_borrows.discard(var_name)
+            self.borrow_state.mutable_borrows.discard(var_name)
+
     def invalidate_variable(self, var_name: str):
         """Invalidate a variable (after a move)."""
         self.borrow_state.invalidated.add(var_name)
@@ -279,6 +318,10 @@ class FrozenBorrowChecker:
             locality: "local" or "global"
             node_id: Node ID for error reporting
         """
+        # A (re)declaration is a fresh binding: clear any stale move/borrow
+        # state a same-named earlier binding (shadowing, other scope) left.
+        self.borrow_state.invalidated.discard(var_name)
+        self.release_borrows(var_name)
         self.variables[var_name] = VariableInfo(
             name=var_name,
             mode=mode,
