@@ -1,6 +1,10 @@
-; function main
-function %main() {
-  block0:
-    ; ...
-    return
+; CLIF emitted by metaxu codegen_clif (direct subset)
+; conventions: ints/bools/unit -> i64 (unit = 0); floats -> f64;
+;   icmp/fcmp results are uextend-ed to i64; brif takes the i64 condition.
+; functions outside the direct subset appear as comment-only placeholders.
+
+function %main() -> i64 {
+block0:
+    v0 = iconst.i64 0
+    return v0
 }
