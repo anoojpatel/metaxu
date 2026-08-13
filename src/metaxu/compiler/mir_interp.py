@@ -161,6 +161,45 @@ class MxVector:
         return f"vector[{', '.join(repr(e) for e in self.elements)}]"
 
 
+@dataclass(frozen=True)
+class MxPtr:
+    """A raw pointer into the interpreter's simulated C heap.
+
+    FFI runtime model (strict): `malloc` returns a fresh MxPtr handle backed
+    by a Python bytearray owned by the interpreter; every read/write is
+    bounds-checked and freed allocations are poisoned, so a buffer overrun,
+    use-after-free or double free is a hard InterpError instead of UB.
+    The null pointer is represented as Python None (the `null` literal), so
+    `ptr == null` comparisons work structurally.
+
+    readonly=True marks pointers produced by `as_ptr` on immutable data
+    (string/vector byte snapshots): writing through them is an InterpError
+    rather than a silent write into a snapshot nobody can observe.
+    """
+    alloc_id: int
+    offset: int = 0
+    readonly: bool = False
+
+    def __repr__(self) -> str:
+        ro = " const" if self.readonly else ""
+        off = f"+{self.offset}" if self.offset else ""
+        return f"<*heap#{self.alloc_id}{off}{ro}>"
+
+
+class MxFile:
+    """An opaque FILE* handle returned by the fopen shim (real OS file)."""
+    __slots__ = ("fp", "path", "closed")
+
+    def __init__(self, fp: Any, path: str) -> None:
+        self.fp = fp
+        self.path = path
+        self.closed = False
+
+    def __repr__(self) -> str:
+        state = "closed" if self.closed else "open"
+        return f"<*FILE {self.path!r} {state}>"
+
+
 # ---------------------------------------------------------------------------
 # Effect handler registry
 # ---------------------------------------------------------------------------
@@ -275,6 +314,12 @@ class MirInterpreter:
         # scalar type names) — the documented v1 choice: no static receiver
         # types needed, generics dispatch on the head type constructor.
         self._impl_index: Dict[str, Dict[str, Dict[str, str]]] = {}
+        # Simulated C heap for the FFI shims: alloc_id -> backing bytes.
+        # Freed ids are remembered so use-after-free / double free give a
+        # precise diagnostic instead of a generic "wild pointer".
+        self._c_heap: Dict[int, bytearray] = {}
+        self._c_freed: set[int] = set()
+        self._next_alloc_id: int = 1
         self._register_builtins()
 
     # ------------------------------------------------------------------
@@ -928,6 +973,201 @@ class MirInterpreter:
         self._builtins["__vec_filled"] = _builtin_vec_filled
         # Comprehension needs to call back into the interpreter for closures.
         self._builtins["__vec_comprehension"] = self._builtin_vec_comprehension
+        # --- FFI shims over a simulated, bounds-checked C heap --------------
+        # Extern fns lower to plain calls; these builtins are their runtime.
+        # (Builtins are checked before user functions, but the only functions
+        # with these bare names come from `extern` declarations — impl methods
+        # are mangled to __impl$... and dispatch via __trait$/__static$.)
+        self._builtins["malloc"] = self._ffi_malloc
+        self._builtins["free"] = self._ffi_free
+        self._builtins["memcpy"] = self._ffi_memcpy
+        self._builtins["realloc"] = self._ffi_realloc
+        self._builtins["ptr_read"] = self._ffi_ptr_read
+        self._builtins["ptr_write"] = self._ffi_ptr_write
+        self._builtins["as_ptr"] = self._ffi_as_ptr
+        self._builtins["fopen"] = self._ffi_fopen
+        self._builtins["fclose"] = self._ffi_fclose
+
+    # ------------------------------------------------------------------
+    # FFI shims (simulated C heap; strict bounds/lifetime checking)
+    # ------------------------------------------------------------------
+
+    def _heap_buf(self, ptr: Any, what: str, *, write: bool = False) -> bytearray:
+        """Resolve an MxPtr to its live backing buffer, or raise InterpError."""
+        if ptr is None:
+            raise InterpError(f"{what}: null pointer dereference")
+        if not isinstance(ptr, MxPtr):
+            raise InterpError(
+                f"{what}: expected a pointer, got {_runtime_type_name(ptr)!r}")
+        if ptr.alloc_id in self._c_freed:
+            raise InterpError(f"{what}: use after free ({ptr!r})")
+        buf = self._c_heap.get(ptr.alloc_id)
+        if buf is None:
+            raise InterpError(f"{what}: wild pointer ({ptr!r})")
+        if write and ptr.readonly:
+            raise InterpError(f"{what}: write through read-only pointer ({ptr!r})")
+        return buf
+
+    def _heap_range(self, ptr: MxPtr, n: int, what: str, *, write: bool = False) -> tuple[bytearray, int]:
+        """Bounds-check [ptr.offset, ptr.offset + n) and return (buf, start)."""
+        buf = self._heap_buf(ptr, what, write=write)
+        start = ptr.offset
+        if start < 0 or n < 0 or start + n > len(buf):
+            raise InterpError(
+                f"{what}: out of bounds — [{start}, {start + n}) outside "
+                f"allocation of {len(buf)} bytes ({ptr!r})")
+        return buf, start
+
+    def _c_alloc(self, data: bytearray, readonly: bool = False) -> MxPtr:
+        aid = self._next_alloc_id
+        self._next_alloc_id += 1
+        self._c_heap[aid] = data
+        return MxPtr(alloc_id=aid, offset=0, readonly=readonly)
+
+    def _ffi_malloc(self, size: Any) -> MxPtr:
+        if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+            raise InterpError(
+                f"malloc: size must be a non-negative integer, got {size!r}")
+        return self._c_alloc(bytearray(size))
+
+    def _ffi_free(self, ptr: Any) -> Any:
+        if ptr is None:
+            return UNIT  # free(NULL) is a documented no-op in C
+        if not isinstance(ptr, MxPtr):
+            raise InterpError(
+                f"free: expected a pointer, got {_runtime_type_name(ptr)!r}")
+        if ptr.alloc_id in self._c_freed:
+            raise InterpError(f"free: double free ({ptr!r})")
+        if ptr.alloc_id not in self._c_heap:
+            raise InterpError(f"free: wild pointer ({ptr!r})")
+        if ptr.offset != 0:
+            raise InterpError(
+                f"free: pointer does not point to the start of an allocation ({ptr!r})")
+        del self._c_heap[ptr.alloc_id]
+        self._c_freed.add(ptr.alloc_id)
+        return UNIT
+
+    def _src_bytes(self, src: Any, n: int, what: str) -> bytes:
+        """Read n bytes from a memcpy-style source (pointer or string)."""
+        if isinstance(src, str):
+            data = src.encode("utf-8")
+            if n > len(data):
+                raise InterpError(
+                    f"{what}: out of bounds — reading {n} bytes from a "
+                    f"{len(data)}-byte string source")
+            return bytes(data[:n])
+        buf, start = self._heap_range(src, n, what)
+        return bytes(buf[start:start + n])
+
+    def _ffi_memcpy(self, dest: Any, src: Any, n: Any) -> Any:
+        if not isinstance(n, int) or isinstance(n, bool) or n < 0:
+            raise InterpError(
+                f"memcpy: byte count must be a non-negative integer, got {n!r}")
+        data = self._src_bytes(src, n, "memcpy")
+        dbuf, dstart = self._heap_range(dest, n, "memcpy", write=True)
+        dbuf[dstart:dstart + n] = data
+        return dest
+
+    def _ffi_realloc(self, ptr: Any, size: Any) -> MxPtr:
+        if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+            raise InterpError(
+                f"realloc: size must be a non-negative integer, got {size!r}")
+        if ptr is None:
+            return self._ffi_malloc(size)  # realloc(NULL, n) == malloc(n)
+        buf = self._heap_buf(ptr, "realloc", write=True)
+        if ptr.offset != 0:
+            raise InterpError(
+                f"realloc: pointer does not point to the start of an allocation ({ptr!r})")
+        new = bytearray(size)
+        keep = min(size, len(buf))
+        new[:keep] = buf[:keep]
+        # The old allocation is invalidated (strict: stale pointers poison).
+        del self._c_heap[ptr.alloc_id]
+        self._c_freed.add(ptr.alloc_id)
+        return self._c_alloc(new)
+
+    def _ffi_ptr_read(self, ptr: Any, offset: Any) -> int:
+        if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+            raise InterpError(
+                f"ptr_read: offset must be a non-negative integer, got {offset!r}")
+        buf, start = self._heap_range(
+            MxPtr(alloc_id=ptr.alloc_id, offset=ptr.offset + offset,
+                  readonly=ptr.readonly) if isinstance(ptr, MxPtr) else ptr,
+            1, "ptr_read")
+        return buf[start]
+
+    def _ffi_ptr_write(self, ptr: Any, offset: Any, value: Any) -> Any:
+        if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+            raise InterpError(
+                f"ptr_write: offset must be a non-negative integer, got {offset!r}")
+        if not isinstance(value, int) or isinstance(value, bool) or not (0 <= value <= 255):
+            raise InterpError(
+                f"ptr_write: value must be a byte (0..255), got {value!r}")
+        buf, start = self._heap_range(
+            MxPtr(alloc_id=ptr.alloc_id, offset=ptr.offset + offset,
+                  readonly=ptr.readonly) if isinstance(ptr, MxPtr) else ptr,
+            1, "ptr_write", write=True)
+        buf[start] = value
+        return UNIT
+
+    def _ffi_as_ptr(self, recv: Any) -> MxPtr:
+        """`x.as_ptr()` — a read-only byte snapshot of a string or vector.
+
+        Strings become NUL-terminated UTF-8 (C-string convention, so the
+        result feeds fopen/strlen-style consumers); vectors of bytes become
+        their raw bytes. Elements outside 0..255 are an error: the source
+        surface types these as &[u8].
+        """
+        if isinstance(recv, str):
+            return self._c_alloc(bytearray(recv.encode("utf-8") + b"\x00"),
+                                 readonly=True)
+        if isinstance(recv, (MxVector, MxVec)):
+            items = recv.elements if isinstance(recv, MxVector) else recv.items
+            out = bytearray()
+            for i, e in enumerate(items):
+                if not isinstance(e, int) or isinstance(e, bool) or not (0 <= e <= 255):
+                    raise InterpError(
+                        f"as_ptr: element {i} is not a byte (0..255): {e!r}")
+                out.append(e)
+            return self._c_alloc(out, readonly=True)
+        raise InterpError(
+            f"as_ptr: unsupported receiver type {_runtime_type_name(recv)!r}")
+
+    def _c_string_at(self, ptr: Any, what: str) -> str:
+        """Decode a NUL-terminated C string from a pointer (or pass a str)."""
+        if isinstance(ptr, str):
+            return ptr
+        buf = self._heap_buf(ptr, what)
+        end = buf.find(b"\x00", ptr.offset)
+        if end < 0:
+            raise InterpError(
+                f"{what}: unterminated C string — no NUL byte before the end "
+                f"of the allocation ({ptr!r})")
+        return bytes(buf[ptr.offset:end]).decode("utf-8")
+
+    def _ffi_fopen(self, path: Any, mode: Any) -> Any:
+        """fopen shim over the real filesystem: returns null on failure."""
+        path_s = self._c_string_at(path, "fopen")
+        mode_s = self._c_string_at(mode, "fopen")
+        if not mode_s or any(ch not in "rwa+bx" for ch in mode_s):
+            raise InterpError(f"fopen: unsupported mode {mode_s!r}")
+        try:
+            fp = open(path_s, mode_s if "b" in mode_s else mode_s + "b")
+        except OSError:
+            return None  # C fopen returns NULL on failure
+        return MxFile(fp, path_s)
+
+    def _ffi_fclose(self, handle: Any) -> int:
+        if handle is None:
+            raise InterpError("fclose: null FILE handle")
+        if not isinstance(handle, MxFile):
+            raise InterpError(
+                f"fclose: expected a FILE handle, got {_runtime_type_name(handle)!r}")
+        if handle.closed:
+            raise InterpError(f"fclose: FILE already closed ({handle!r})")
+        handle.fp.close()
+        handle.closed = True
+        return 0
 
     def _builtin_vec_comprehension(self, n: Any, fn: Any, iterable: Any) -> Any:
         """Evaluate `vector[T, N](expr for targets in iterable)` at runtime."""
@@ -994,6 +1234,12 @@ def _runtime_type_name(v: Any) -> str:
         # Matches the head type constructor name that `implement ... for
         # vector[T, N]` desugars to, so user impls on vectors dispatch.
         return "vector"
+    if isinstance(v, MxPtr):
+        return "Ptr"
+    if isinstance(v, MxFile):
+        return "FILE"
+    if v is None:
+        return "Null"
     return type(v).__name__
 
 
