@@ -966,10 +966,16 @@ class HIRBuilder:
                 return self._mk_hexpr(frozen_ctx.node_id, 'Expr', ty, frozen_ctx.span,
                                       op='Call', callee=callee,
                                       operands=(recv, *arg_exprs))
-            # Treat as a plain call with dotted callee name
+            # Treat as a plain call with dotted callee name. Explicit
+            # instantiation type args (`mod.f<Int>(x)`) are preserved so the
+            # monomorphization pass can specialize qualified generic calls.
             callee = '.'.join(str(p) for p in parts)
+            raw_targs = getattr(orig, 'type_args', None) or ()
+            targs = tuple(t for t in (mast._type_display(a) for a in raw_targs)
+                          if isinstance(t, str))
             return self._mk_hexpr(frozen_ctx.node_id, 'Expr', ty, frozen_ctx.span,
-                                  op='Call', callee=callee, operands=tuple(arg_exprs))
+                                  op='Call', callee=callee, operands=tuple(arg_exprs),
+                                  type_args=targs or None)
 
         # MethodCall on a computed receiver: `expr.method(args)`
         if isinstance(orig, fast.MethodCall):
