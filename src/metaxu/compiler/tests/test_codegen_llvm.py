@@ -682,20 +682,20 @@ def test_unknown_external_and_runtime_builtin_are_placeholders():
         ], ("ret", "r"))]),
         make_func("b", [block([
             ("params", ()),
-            ("let", "r", ("call", "__vec_comprehension"), ()),
+            ("let", "r", ("call", "type_of"), ()),
         ], ("ret", "r"))]),
     ]
     ir = emit_llvm(fs)
     assert count_placeholders(ir) == 2
     assert "unknown external callee 'mystery_ffi'" in ir
-    assert "calls runtime builtin '__vec_comprehension'" in ir
+    assert "calls runtime builtin 'type_of'" in ir
 
 
 def test_caller_of_placeholder_is_demoted_for_linkability():
     fs = [
         make_func("bad", [block([
             ("params", ()),
-            ("let", "r", ("call", "__vec_comprehension"), ()),
+            ("let", "r", ("call", "type_of"), ()),
         ], ("ret", "r"))]),
         make_func("good_but_calls_bad", [block([
             ("params", ()),
@@ -711,7 +711,7 @@ def test_llvm_run_refuses_placeholder_entry():
     f = make_func("main", [
         block([
             ("params", ()),
-            ("let", "r", ("call", "__vec_comprehension"), ()),
+            ("let", "r", ("call", "type_of"), ()),
         ], ("ret", "r")),
     ])
     ir = emit_llvm([f])
@@ -2755,9 +2755,9 @@ def test_ffi_example_emits_fully_native():
     assert re.search(r"sext i32 %t\d+ to i64", ir)  # fclose result widened
     # null pointer literal + pointer identity comparison
     assert re.search(r"icmp (eq|ne) ptr %t\d+, null", ir)
-    assert "call ptr @mx_vec_as_bytes(ptr" in ir  # vec.as_ptr() snapshot
-    assert "; vector literal" in ir               # __vec_lit -> pushes
-    assert ir.count("call void @mx_vec_push") == 5
+    assert "call ptr @mx_fvec_as_bytes(ptr" in ir  # vector.as_ptr() snapshot
+    assert "; vector literal" in ir  # __vec_lit -> immutable mx_fvec block
+    assert ir.count("call void @mx_fvec_init") == 5
     # __static$ calls resolved at compile time: no call instruction or
     # demotion reason references a __static symbol (the module header
     # comment legitimately documents the mechanism).
@@ -2795,12 +2795,20 @@ def test_examples_define_census_does_not_regress():
     # assert lifts test_locality_heap.mx / test_operations.mx mains —
     # landing at 69 (04_advanced_types' main stays demoted: its next
     # blocker behind __vec_lit is the try/catch-shaped Result flow).
+    # Increment 10 (native fixed-vector runtime) lifts 06's transpose,
+    # transpose$lambda8 and static_assert; its two __effect_default fns —
+    # previously dead trivial defines — now demote honestly (they are
+    # actually CALLED via default-resolved performs, and their `f`
+    # parameter joins conflicting closure kinds), landing at 70.  06's
+    # remaining demotions are all higher-order: map/reduce/zip receive
+    # DIFFERENT lambdas at one call site (indirect closure calls are not
+    # a feature yet), never vector builtins.
     total_defines = 0
     for path in _example_files():
         ir = llvm_from_source(path.read_text())
         total_defines += len(re.findall(
             r"^define (?:i64|double|ptr|void) @mx_\w+\(", ir, re.M))
-    assert total_defines >= 69
+    assert total_defines >= 70
 
 
 # ---------------------------------------------------------------------------
@@ -2895,21 +2903,25 @@ fn main() -> int {
 
 
 def test_vector_literal_lowers_to_native_vec():
+    # Increment 10: a fixed-vector literal is an immutable mx_fvec block,
+    # filled in place before the pointer is ever shared (write-once).
     ir = llvm_from_source(
         "fn main() -> int { let v = vector[int,3](7, 8, 9); v[0] + v[2] }")
     assert count_placeholders(ir) == 0
-    assert "call ptr @mx_vec_new()  ; vector literal" in ir
-    assert ir.count("call void @mx_vec_push") == 3
-    assert "call i64 @mx_vec_get" in ir
+    assert "call ptr @mx_fvec_new(i64 3)  ; vector literal" in ir
+    assert ir.count("call void @mx_fvec_init") == 3
+    assert "call i64 @mx_fvec_get" in ir
+    assert "call void @mx_vec_push" not in ir  # no growable-Vec stand-in
 
 
-def test_vector_literal_confined_to_frame_is_freed():
-    # A vector literal that never escapes joins the provably-dead-vec
-    # analysis: freed on ret paths like a confined Vec.new.
+def test_vector_literal_leaks_by_design_never_freed():
+    # Fixed-vector blocks are shallow-shared (immutability makes that
+    # sound) so ownership is never unique: no block is ever freed.
     ir = llvm_from_source(
         "fn main() -> int { let v = vector[int,2](4, 5); v[0] + v[1] }")
-    assert "freed on ret paths (provably non-escaping)" in ir
-    assert "call void @mx_vec_free" in ir
+    assert "immutable block, leaks by design" in ir
+    assert "call void @mx_vec_free" not in ir
+    assert "mx_fvec_free" not in ir  # no such symbol exists
 
 
 def test_static_method_call_resolves_at_compile_time():
@@ -3039,7 +3051,7 @@ def test_native_vec_as_ptr_snapshot_asan_no_uaf(tmp_path):
     result, expected_out = interp_run(_VEC_SNAPSHOT_SRC)
     assert result in (UNIT, 0)
     ir = llvm_from_source(_VEC_SNAPSHOT_SRC)
-    assert "call ptr @mx_vec_as_bytes(ptr" in ir
+    assert "call ptr @mx_fvec_as_bytes(ptr" in ir
     exit_code, stdout = compile_and_run(
         ir, "main", workdir=str(tmp_path),
         clang_args=("-fsanitize=address",),
@@ -3049,17 +3061,27 @@ def test_native_vec_as_ptr_snapshot_asan_no_uaf(tmp_path):
 
 
 @needs_asan
-def test_native_vector_literal_differential_asan_full(tmp_path):
-    # A confined vector literal is freed at frame exit (see the structural
-    # test above), so this runs under FULL leak checking.
-    assert_native_matches_interp_asan("""
+def test_native_vector_literal_differential_asan(tmp_path):
+    # Fixed-vector blocks leak BY DESIGN (immutable, shallow-shared), so
+    # ASan proves no UAF/double-free only: detect_leaks=0 (the sharing
+    # contract, same as boxes/heap envs).
+    src = """
 fn main() -> int {
     let v = vector[int,4](3, 5, 7, 11);
     print(v[0] + v[3]);
     print(v.len());
     0
 }
-""", tmp_path)
+"""
+    result, expected_out = interp_run(src)
+    assert result in (UNIT, 0)
+    ir = llvm_from_source(src)
+    exit_code, stdout = compile_and_run(
+        ir, "main", workdir=str(tmp_path),
+        clang_args=("-fsanitize=address",),
+        run_env={"ASAN_OPTIONS": "detect_leaks=0"})
+    assert exit_code == 0
+    assert stdout == expected_out
 
 
 @needs_asan
@@ -3126,3 +3148,354 @@ fn main() -> int {
     c.n + 1
 }
 """, tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Increment 10: fixed-vector runtime natively — immutable mx_fvec blocks,
+# element-wise arithmetic w/ broadcast, zeros/filled/dim, slices, ranges,
+# comprehensions, __cast, promote_matrix, vector printing, effect-op
+# defaults as direct calls
+# ---------------------------------------------------------------------------
+
+_ELEMENTWISE_SRC = """
+fn main() -> int {
+    let a = vector[float,4](1.0, 2.0, 3.0, 4.0);
+    let b = vector[float,4](10.0, 20.0, 30.0, 40.0);
+    print(a);
+    print((a + b).to_string());
+    print((a * b).to_string());
+    print((b - a).to_string());
+    print((b / a).to_string());
+    print((a * 2.0).to_string());
+    print((1.0 + a).to_string());
+    let iv = vector[int,3](7, 8, 9);
+    print((iv / 2).to_string());
+    0
+}
+"""
+
+_ZEROS_FILLED_DIM_SRC = """
+implement<T, const N: int> vector[T,N] {
+    fn size(self) -> int { N }
+}
+
+fn main() -> int {
+    let z = vector[float,4]();
+    let o = vector[float,3].filled(2.5);
+    print(z.to_string());
+    print(o.to_string());
+    print(z.size());
+    print(o.len());
+    0
+}
+"""
+
+_SLICES_SRC = """
+fn main() -> int {
+    let v = vector[int,5](10, 20, 30, 40, 50);
+    print(v[1:3].to_string());
+    print(v[::-1].to_string());
+    print(v[::2].to_string());
+    print(v.to_string());
+    0
+}
+"""
+
+_COMPREHENSION_SRC = """
+fn main() -> int {
+    let k = 2.5;
+    let v = vector[float,4](x * k for x in 0..4);
+    let w = vector[float,4](e + 1.0 for e in v);
+    print(v.to_string());
+    print(w.to_string());
+    0
+}
+"""
+
+_MATRIX_SRC = """
+fn main() -> int {
+    let m = vector[vector[float,2],2](
+        vector[float,2](1.0, 2.0),
+        vector[float,2](3.0, 4.0)
+    );
+    print(m[1].to_string());
+    print(m[0][1].to_string());
+    print((m + m).to_string());
+    print((m * 2.0).to_string());
+    print(m.to_string());
+    0
+}
+"""
+
+_PROMOTE_SRC = """
+fn pick(m: vector[vector[float,1],2]) -> float {
+    m[1][0]
+}
+
+fn main() -> int {
+    print(pick(vector[float,2](5.0, 6.0)).to_string());
+    0
+}
+"""
+
+_EFFECT_DEFAULT_SRC = """
+effect Cap {
+    ask(x: int) -> int = 7;
+}
+
+fn main() -> int {
+    print(perform Cap.ask(41));
+    0
+}
+"""
+
+
+def test_elementwise_binop_lowers_to_mx_fvec_binop():
+    ir = llvm_from_source(_ELEMENTWISE_SRC)
+    assert count_placeholders(ir) == 0
+    # vector-vector and broadcast modes, float and int bases
+    assert re.search(r"@mx_fvec_binop\(i64 0, i64 1, i64 0, i64 0,", ir)
+    assert "; element-wise * (scalar broadcast)" in ir
+    assert re.search(r"@mx_fvec_binop\(i64 3, i64 0, i64 0, i64 1,", ir)
+    # vectors print through the runtime repr, freed right after
+    assert "call ptr @mx_fvec_to_str" in ir
+    assert "; print never retains the repr" in ir
+
+
+def test_zeros_filled_and_dim_lower_natively():
+    ir = llvm_from_source(_ZEROS_FILLED_DIM_SRC)
+    assert count_placeholders(ir) == 0
+    assert "; zero-filled vector" in ir
+    assert "call ptr @mx_fvec_filled(i64" in ir
+    # `size` binds const N via __vec_dim 0 -> mx_fvec_len
+    assert "define i64 @mx___impl__vector_size(" in ir
+    assert "call i64 @mx_fvec_len(ptr" in ir
+
+
+def test_slice_lowers_to_fresh_copy_with_static_none_mask():
+    ir = llvm_from_source(_SLICES_SRC)
+    assert count_placeholders(ir) == 0
+    # v[1:3]: start+stop given, step omitted -> mask 3
+    assert re.search(r"@mx_fvec_slice\(ptr %t\d+, i64 %?t?\d+, "
+                     r"i64 %?t?\d+, i64 0, i64 3\)", ir)
+    # v[::-1] / v[::2]: only step given -> mask 4
+    assert len(re.findall(r"i64 4\)  ; honest copy", ir)) == 2
+
+
+def test_comprehension_emits_per_site_thunk_and_mx_fvec_map():
+    ir = llvm_from_source(_COMPREHENSION_SRC)
+    assert count_placeholders(ir) == 0
+    assert ir.count("call ptr @mx_fvec_map(ptr") == 2
+    assert re.search(
+        r"define internal i64 @mx\.vcth\.\d+\(ptr %env, i64 %w\)", ir)
+    # the range comprehension's int elements convert to the f64 parameter
+    assert "sitofp i64 %w to double" in ir
+    # ranges stay confined to iteration shapes
+    assert "; range as an int vector" in ir
+
+
+def test_cast_lowers_to_sitofp_fptosi():
+    ir = llvm_from_source("""
+fn main() -> int {
+    let f = 3 as float;
+    let i = (f * 1.5) as int;
+    print(i);
+    0
+}
+""")
+    assert count_placeholders(ir) == 0
+    assert "sitofp i64" in ir and "; `as float`" in ir
+    assert "fptosi double" in ir and "; `as int`" in ir
+
+
+def test_matrix_literals_and_nested_binops_emit():
+    ir = llvm_from_source(_MATRIX_SRC)
+    assert count_placeholders(ir) == 0
+    # nested element-wise ops carry depth 1
+    assert re.search(r"@mx_fvec_binop\(i64 0, i64 1, i64 1, i64 0,", ir)
+    assert re.search(r"@mx_fvec_binop\(i64 2, i64 1, i64 1, i64 1,", ir)
+    # matrix repr recurses (depth 1 in mx_fvec_to_str)
+    assert re.search(r"@mx_fvec_to_str\(ptr %t\d+, i64 1, i64 1\)", ir)
+
+
+def test_promote_matrix_rebinds_flat_vector_param_at_entry():
+    ir = llvm_from_source(_PROMOTE_SRC)
+    assert count_placeholders(ir) == 0
+    assert "call ptr @mx_fvec_promote(ptr" in ir
+    assert "; promote_matrix: flat vector:f64 -> Mx1 matrix" in ir
+
+
+def test_push_on_fixed_vector_demotes_honestly():
+    # The interpreter rejects push on an MxVector; the immutable native
+    # block must never be mutated either — demote, never emit a push.
+    ir = llvm_from_source("""
+fn main() -> int {
+    let v = vector[int,2](1, 2);
+    v.push(3);
+    0
+}
+""")
+    assert count_placeholders(ir) == 1
+    assert "not a Vec (fixed vectors are immutable)" in ir
+
+
+def test_effect_default_perform_lowers_to_direct_call():
+    # No handle_scope in the module lists `ask`, so no scope can ever
+    # intercept it: the perform IS a direct call of the declared default.
+    ir = llvm_from_source(_EFFECT_DEFAULT_SRC)
+    assert count_placeholders(ir) == 0
+    assert "-> declared default" in ir
+    assert "call i64 @mx___effect_default_Cap_ask(i64" in ir
+    assert "call i64 @mx_perform" not in ir
+
+
+def test_effect_default_with_handle_scope_demotes_honestly():
+    # `ask` has a default AND appears in a handle scope: whether the scope
+    # intercepts a given perform is dynamic, and mx_perform aborts where
+    # the interpreter would fall back to the default — demote.
+    ir = llvm_from_source("""
+effect Cap {
+    ask(x: int) -> int = 7;
+}
+
+fn inner() -> int performs Cap {
+    perform Cap.ask(1)
+}
+
+fn main() -> int {
+    let handled = handle Cap with { ask(x) -> resume(x + 1) } in { inner() };
+    let bare = inner();
+    print(handled);
+    print(bare);
+    0
+}
+""")
+    assert ("effect op 'ask' has a declared default and also appears in a "
+            "handle scope") in ir
+
+
+def test_range_value_outside_iteration_demotes():
+    # Hand-built MIR: a __range result reaching ret would expose the
+    # list-vs-vector repr divergence, so the function demotes.
+    fs = [
+        make_func("main", [block([
+            ("params", ()),
+            ("let", "a", ("const", 0), ()),
+            ("let", "b", ("const", 3), ()),
+            ("let", "r", ("call", "__range"), ("a", "b")),
+        ], ("ret", "r"))]),
+    ]
+    ir = emit_llvm(fs)
+    assert count_placeholders(ir) == 1
+    assert "used outside the iteration protocol" in ir
+
+
+def test_vector_operations_example_lifts_transpose_and_static_assert():
+    # 06_vector_operations.mx after increment 10: the pure-vector functions
+    # (transpose + its comprehension lambdas, static_assert) emit; the
+    # higher-order SIMD plumbing stays honestly demoted — map/reduce take
+    # DIFFERENT lambdas at one call site (closure-kind conflicts), zip's
+    # lambda references an undefined name, fold's generic type_of code has
+    # free type variables.
+    ir = llvm_from_source(
+        (REPO_ROOT / "examples" / "06_vector_operations.mx").read_text())
+    assert "define ptr @mx___impl__vector_transpose(ptr" in ir
+    assert "define ptr @mx___impl__vector_transpose_lambda8(" in ir
+    assert "define ptr @mx_static_assert()" in ir
+    assert ir.count("call ptr @mx_fvec_map(ptr") >= 2
+    # the honest residue: higher-order conflicts, not vector builtins
+    assert "; function @mx_main: placeholder" in ir
+    assert "irreconcilable value kinds" in ir
+    for lifted_builtin in ("__vec_dim", "__vec_zeros", "__vec_filled",
+                           "__vec_comprehension", "__slice_get", "__range",
+                           "__cast"):
+        assert f"calls runtime builtin '{lifted_builtin}'" not in ir
+
+
+@needs_clang
+def test_native_elementwise_differential(tmp_path):
+    assert_native_matches_interp(_ELEMENTWISE_SRC, tmp_path)
+
+
+@needs_clang
+def test_native_zeros_filled_dim_differential(tmp_path):
+    assert_native_matches_interp(_ZEROS_FILLED_DIM_SRC, tmp_path)
+
+
+@needs_clang
+def test_native_slice_differential(tmp_path):
+    assert_native_matches_interp(_SLICES_SRC, tmp_path)
+
+
+@needs_clang
+def test_native_comprehension_with_capture_differential(tmp_path):
+    assert_native_matches_interp(_COMPREHENSION_SRC, tmp_path)
+
+
+@needs_clang
+def test_native_cast_roundtrip_differential(tmp_path):
+    assert_native_matches_interp("""
+fn main() -> int {
+    let f = 3 as float;
+    let g = f * 1.5;
+    let i = g as int;
+    print(f.to_string());
+    print(g.to_string());
+    print(i);
+    0
+}
+""", tmp_path)
+
+
+@needs_clang
+def test_native_matrix_differential(tmp_path):
+    assert_native_matches_interp(_MATRIX_SRC, tmp_path)
+
+
+@needs_clang
+def test_native_promote_matrix_differential(tmp_path):
+    assert_native_matches_interp(_PROMOTE_SRC, tmp_path)
+
+
+@needs_clang
+def test_native_for_range_differential(tmp_path):
+    assert_native_matches_interp("""
+fn main() -> int {
+    let mut s = 0;
+    for i in 2..7 {
+        s = s + i;
+    }
+    print(s);
+    0
+}
+""", tmp_path)
+
+
+@needs_clang
+def test_native_effect_default_differential(tmp_path):
+    assert_native_matches_interp(_EFFECT_DEFAULT_SRC, tmp_path)
+
+
+@needs_asan
+def test_native_elementwise_asan_no_uaf(tmp_path):
+    # Fixed-vector blocks (and the repr strings to_string produces) LEAK
+    # BY DESIGN: detect_leaks=0 proves no UAF/double-free — in particular
+    # that printing frees each repr exactly once and that shallow-shared
+    # blocks are never freed at all.
+    assert_native_matches_interp_asan_boxes(_ELEMENTWISE_SRC, tmp_path)
+
+
+@needs_asan
+def test_native_matrix_asan_no_uaf(tmp_path):
+    # Nested matrices shallow-share row blocks across literals, binop
+    # results and __index_get reads; ASan (leaks excused by contract)
+    # proves no row is ever freed or read after free.
+    assert_native_matches_interp_asan_boxes(_MATRIX_SRC, tmp_path)
+
+
+@needs_asan
+def test_native_slice_and_comprehension_asan_no_uaf(tmp_path):
+    # Slices are fresh copies and comprehensions fresh blocks: prove the
+    # copies are independent allocations (no aliasing UAF) under ASan.
+    assert_native_matches_interp_asan_boxes(_SLICES_SRC, tmp_path)
+    assert_native_matches_interp_asan_boxes(_COMPREHENSION_SRC, tmp_path)
