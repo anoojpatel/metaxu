@@ -6,9 +6,14 @@ Covers:
 - a regex-based structural validator run over the CLIF emitted for ALL
   example programs (we cannot run cranelift here, so the validator checks
   def-before-use, block references, one-terminator-per-block, and that every
-  reachable exit is a return/trap)
-- effectful/struct/closure functions must become comment-only placeholders,
-  never bogus bodies
+  reachable exit is a return/return_call/trap).  The validator also covers
+  the CPS functions (%run_*/%resume_*): br_table and return_call count as
+  terminators and every fn reference (call/return_call/func_addr) must be
+  declared.
+- suspending functions inside the i64 direct subset emit the CPS state
+  machine (see test_cps_lowering.py for the full shape); suspending
+  functions outside it, and struct/closure/string functions, must become
+  comment-only placeholders, never bogus bodies
 """
 from __future__ import annotations
 
@@ -44,7 +49,8 @@ _BLOCK_HEADER_RE = re.compile(r"^block(\d+)(?:\(([^)]*)\))?:$")
 _RESULT_RE = re.compile(r"^(v\d+) = ")
 _VALUE_RE = re.compile(r"\bv\d+\b")
 _BLOCK_REF_RE = re.compile(r"\bblock(\d+)\b")
-_TERMINATORS = ("jump", "brif", "return", "trap")
+_TERMINATORS = ("jump", "brif", "br_table", "return", "return_call", "trap")
+_EXIT_OPCODES = ("return", "return_call", "trap")
 
 
 def split_functions(clif: str) -> list[list[str]]:
@@ -122,12 +128,12 @@ def validate_function(lines: list[str]) -> None:
         if rm:
             assert rm.group(1) not in defined, f"redefinition of {rm.group(1)}"
             defined.add(rm.group(1))
-        # referenced stack slots / fn refs must be declared
+        # referenced stack slots / fn refs must be declared (fn refs appear in
+        # call, return_call and func_addr instructions)
         for ss in re.findall(r"\bss\d+\b", inst):
             assert ss in declared_slots, f"undeclared stack slot {ss} in {inst!r}"
-        if inst.startswith("call ") or " = call " in inst:
-            fnref = re.search(r"\bfn\d+\b", inst)
-            assert fnref and fnref.group(0) in declared_fns, f"undeclared fn in {inst!r}"
+        for fnref in re.findall(r"\bfn\d+\b", inst):
+            assert fnref in declared_fns, f"undeclared fn {fnref} in {inst!r}"
         blocks[cur_block].append(inst)
 
     assert blocks, "function has no blocks"
@@ -159,7 +165,7 @@ def validate_function(lines: list[str]) -> None:
         stack.extend(succs[bi])
     reachable_exits = [exits[bi] for bi in seen if not succs[bi]]
     assert reachable_exits, "no reachable exit block"
-    assert all(e in ("return", "trap") for e in reachable_exits)
+    assert all(e in _EXIT_OPCODES for e in reachable_exits)
 
 
 def validate_module(clif: str) -> int:
@@ -367,10 +373,13 @@ def test_match_fail_traps():
 
 
 # ---------------------------------------------------------------------------
-# Placeholder behavior for non-direct functions
+# CPS emission for suspending functions in the subset; placeholders otherwise
 # ---------------------------------------------------------------------------
 
-def test_effectful_function_is_placeholder_not_bogus_body():
+def test_effectful_function_in_subset_emits_cps_state_machine():
+    # A suspending function whose ops are all in the direct i64 subset now
+    # emits the CPS shape instead of the old placeholder: %run_<f> with a
+    # br_table dispatch and a %resume_<f>_<k> shim per resume point.
     f = make_func("worker", [
         block([
             ("params", ("x",)),
@@ -379,13 +388,77 @@ def test_effectful_function_is_placeholder_not_bogus_body():
         block([], ("ret", "pv1")),
     ], suspending=True)
     clif = emit_clif([f])
-    assert "function %worker(" not in clif  # no emitted body at all
+    assert "placeholder -- unsupported" not in clif
+    assert "function %worker(" not in clif  # only the CPS entry points exist
+    assert "; frame %worker: size=24, [0]=state:i64, [8]=result:i64, [16]=x:i64" in clif
+    assert "function %run_worker(i64) -> i64 {" in clif
+    assert re.search(r"br_table v\d+, block\d+, \[block\d+, block\d+\]", clif)
+    assert "function %resume_worker_1(i64, i64) -> i64 {" in clif
+    assert re.search(r"return_call fn0\(v0\)", clif)
+    assert validate_module(clif) == 2  # %run_worker + %resume_worker_1
+
+
+def test_suspending_function_outside_subset_stays_placeholder():
+    # Suspending + a struct op: still a comment-only placeholder, with both
+    # the op reason and the CPS-scope reason.
+    f = make_func("worker", [
+        block([
+            ("params", ("x",)),
+            ("let", "s1", ("alloc_struct", "Point", "local"), (("x", "x"),)),
+            ("perform", "pv1", "State", "get", (), 1, "pv1"),
+        ], ("br", 1)),
+        block([], ("ret", "pv1")),
+    ], suspending=True)
+    clif = emit_clif([f])
+    assert "%run_worker" not in clif
     assert "placeholder -- unsupported" in clif
-    assert "uses effects (perform)" in clif
+    assert "uses structs (alloc_struct)" in clif
+    assert "suspending function outside the CPS-emittable subset" in clif
     assert "; declare %worker(i64) -> i64" in clif
     # every non-empty line of the placeholder is a comment
     chunk = [c for c in clif.split("\n\n") if "worker" in c][0]
     assert all(line.startswith(";") for line in chunk.splitlines() if line.strip())
+
+
+def test_suspending_function_with_floats_stays_placeholder():
+    f = make_func("worker", [
+        block([
+            ("params", ()),
+            ("let", "c1", ("const", 1.5), ()),
+            ("perform", "pv1", "State", "get", (), 1, "pv1"),
+        ], ("br", 1)),
+        block([
+            ("let", "s", ("binop", "+"), ("pv1", "c1")),
+        ], ("ret", "s")),
+    ], suspending=True)
+    clif = emit_clif([f])
+    assert "%run_worker" not in clif
+    assert "placeholder -- unsupported" in clif
+    assert "CPS subset is i64-only" in clif
+
+
+def test_suspending_call_from_suspending_function_stays_placeholder():
+    callee = make_func("helper", [
+        block([
+            ("params", ()),
+            ("perform", "pv1", "State", "get", (), 1, "pv1"),
+        ], ("br", 1)),
+        block([], ("ret", "pv1")),
+    ], suspending=True)
+    caller = make_func("outer", [
+        block([
+            ("params", ()),
+            ("perform", "pv2", "State", "get", (), 1, "pv2"),
+        ], ("br", 1)),
+        block([
+            ("let", "r", ("call", "helper"), ()),
+        ], ("ret", "r")),
+    ], suspending=True)
+    clif = emit_clif([callee, caller])
+    assert "function %run_helper(i64) -> i64 {" in clif  # callee is fine
+    assert "%run_outer" not in clif
+    assert "calls suspending function 'helper'" in clif
+    validate_module(clif)
 
 
 def test_handle_scope_and_resume_are_placeholders():
