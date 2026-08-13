@@ -601,8 +601,15 @@ class HIRBuilder:
                                       op='Call',
                                       callee=f"{STATIC_CALL_PREFIX}{parts[0]}{IMPL_SEP}{last}",
                                       operands=tuple(arg_exprs))
-            if len(parts) >= 2 and (last in self._trait_method_names
-                                    or last in _BUILTIN_METHODS):
+            # A capitalized base that is not an impl target is a TYPE name
+            # (`Vec.new()`), not a runtime receiver: fall through to the
+            # plain dotted-callee path so runtime builtins keep working even
+            # when some unrelated impl defines a method with the same name.
+            base_is_foreign_type = (str(parts[0])[:1].isupper()
+                                    and str(parts[0]) not in self._impl_type_names)
+            if (len(parts) >= 2 and not base_is_foreign_type
+                    and (last in self._trait_method_names
+                         or last in _BUILTIN_METHODS)):
                 recv: HExpr = self._mk_hexpr(frozen_ctx.node_id, 'Expr', ty,
                                              frozen_ctx.span, op='Var',
                                              var_name=str(parts[0]))

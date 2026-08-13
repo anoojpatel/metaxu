@@ -17,6 +17,13 @@ class MirFunc:
     blocks: list[MirBlock]
     suspending: bool
 
+    def param_names(self) -> tuple:
+        """Parameter names from the entry block's params op (empty if none)."""
+        for op in (self.blocks[0].ops if self.blocks else ()):
+            if op[0] == "params":
+                return tuple(op[1])
+        return ()
+
 
 def dump_mir(funcs: Sequence[MirFunc]) -> str:
     out: list[str] = []

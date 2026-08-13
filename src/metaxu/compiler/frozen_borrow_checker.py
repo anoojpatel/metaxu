@@ -383,11 +383,11 @@ class FrozenBorrowChecker:
         # one: drop who referenced the old value, and drop the old binding's
         # own outgoing references (removing it from targets' holder lists).
         self.referenced_by.pop(var_name, None)
-        for (target, mode) in self.reference_graph.pop(var_name, []):
+        for (target, ref_mode) in self.reference_graph.pop(var_name, []):
             holders = self.referenced_by.get(target)
             if holders:
                 self.referenced_by[target] = [
-                    h for h in holders if h != (var_name, mode)
+                    h for h in holders if h != (var_name, ref_mode)
                 ]
         self.variables[var_name] = VariableInfo(
             name=var_name,
