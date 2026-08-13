@@ -123,8 +123,26 @@ def _value_of(node: Any) -> Any | None:
                 {
                     "name": getattr(f, "name", None),
                     "type": _type_display(getattr(f, "type_info", None)),
+                    # Per-field mode annotations (@mut/@const/@local ...) are
+                    # attached by the parser as `field.modes`; carry them so
+                    # deep ownership validation can see declared field modes.
+                    "mode": _mode_value(getattr(f, "modes", None)),
                 }
                 for f in getattr(node, "fields", None) or []
+            ],
+        }
+    if isinstance(node, fast.EnumDefinition):
+        return {
+            "name": getattr(node, "name", None),
+            "variants": [
+                {
+                    "name": getattr(v, "name", None),
+                    "fields": [
+                        {"name": fname, "type": _type_display(ftype)}
+                        for (fname, ftype) in (getattr(v, "fields", None) or [])
+                    ],
+                }
+                for v in getattr(node, "variants", None) or []
             ],
         }
     if isinstance(node, fast.StructInstantiation):
