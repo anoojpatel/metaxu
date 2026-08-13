@@ -85,6 +85,51 @@ class _FuncLowerer:
         self.terminate(("ret", self.ret_var))
 
     # ------------------------------------------------------------------
+    # Mut-capture analysis (write-back through shared cells)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _assigned_names(e: "HExpr | None", acc: set | None = None) -> set:
+        """Source names assigned (plain `x = ...`, not `x.f = ...`) anywhere
+        inside ``e``, including nested lambdas and handler arms.
+
+        Used to decide which enclosing bindings a sub-function mutates: those
+        slots are boxed into shared MxCells (``cell_wrap``) before capture so
+        the writes are visible outside the sub-function instead of being
+        silently lost in a by-value environment copy.
+        """
+        acc = set() if acc is None else acc
+        if e is None:
+            return acc
+        if e.op == "Assign" and e.var_name and "." not in e.var_name:
+            acc.add(e.var_name)
+        walk = _FuncLowerer._assigned_names
+        for child in (e.assign_value, e.left, e.right, e.cond, e.scrutinee,
+                      e.base, e.field_val, e.lambda_body, e.handle_body):
+            walk(child, acc)
+        for seq in (e.operands, e.then_ops, e.else_ops, e.loop_body,
+                    e.cases, e.perform_args):
+            for sub in (seq or ()):
+                walk(sub, acc)
+        for (_n, sub) in (e.bindings or ()):
+            walk(sub, acc)
+        for (_n, sub) in (e.fields or ()):
+            walk(sub, acc)
+        for (_p, body) in (e.match_arms or ()):
+            walk(body, acc)
+        for (_op, _params, body) in (e.handle_cases or ()):
+            walk(body, acc)
+        return acc
+
+    def _wrap_mut_captures(self, names) -> None:
+        """Emit cell_wrap for each enclosing binding in ``names`` so the
+        sub-function about to capture the env aliases (not copies) them."""
+        for name in sorted(names):
+            slot = self.state.env.get(name)
+            if slot is not None:
+                self.emit(("cell_wrap", slot))
+
+    # ------------------------------------------------------------------
     # Sub-function compilation (lambdas, effect handler cases)
     # ------------------------------------------------------------------
 
@@ -380,6 +425,17 @@ class _FuncLowerer:
             # name the body actually references — capture (slot, slot) pairs,
             # same convention as handle_scope below.
             cap_names: List[tuple] = []
+            # Captured bindings the lambda body ASSIGNS to are boxed into
+            # shared cells first, so the mutation writes back to the
+            # enclosing frame instead of vanishing in a by-value copy.
+            # The HIR body scan is authoritative here — the parser's
+            # 'borrow_mut' capture mode over-approximates (it flags any
+            # variable merely PASSED to a function), and wrapping read-only
+            # captures would demote them in the native backends for nothing.
+            assigned = self._assigned_names(e.lambda_body)
+            capture_names = {cname for (cname, _m) in (e.captures or ())}
+            self._wrap_mut_captures(assigned & capture_names
+                                    & set(self.state.env))
             for (cname, cmode) in (e.captures or ()):
                 # 'auto' captures come from comprehension free-name analysis
                 # (hir._comprehension_lambda): only names actually bound in
@@ -436,6 +492,9 @@ class _FuncLowerer:
             body_fn = f"__try_body_{scope_tag}"
             self._lower_subfunc(body_fn, (), e.handle_body, ty_sig=e.ty,
                                 suspending=False)
+            assigned = self._assigned_names(e.handle_body)
+            self._assigned_names(catch_he, assigned)
+            self._wrap_mut_captures(assigned & set(self.state.env))
             captured = tuple(sorted({v for v in self.state.env.values() if isinstance(v, str)}))
             captures = tuple((name, name) for name in captured)
             dst = self.state.fresh("tres")
@@ -463,6 +522,13 @@ class _FuncLowerer:
             body_fn = f"__handle_body_{effect}_{scope_tag}"
             self._lower_subfunc(body_fn, (), e.handle_body, ty_sig=e.ty,
                                 suspending=False)
+            # Bindings the delimited body or a handler arm assigns to are
+            # boxed into shared cells so the writes survive the per-frame
+            # env copies (by-value capture silently swallowed them before).
+            assigned = self._assigned_names(e.handle_body)
+            for (_op, _params, body_he) in (e.handle_cases or ()):
+                self._assigned_names(body_he, assigned)
+            self._wrap_mut_captures(assigned & set(self.state.env))
             # Capture every live MIR value so body/case sub-functions can see
             # enclosing locals (read-only value semantics, like closures).
             captured = tuple(sorted({v for v in self.state.env.values() if isinstance(v, str)}))
@@ -573,7 +639,9 @@ def lower_hir_to_mir(funcs: Sequence[HFun], borrow_errors: List[Any] | None = No
         # Epilogue: drops + ret (joined with any early returns via ret_bb)
         plan = drops.get(str(f.sym))
         fl.finish_body(res, plan.drop_at_end if plan else ())
-        out.append(MirFunc(name=str(f.sym), ty_sig=f.ret_ty, blocks=fl.blocks, suspending=bool(f.body.suspends)))
+        out.append(MirFunc(name=str(f.sym), ty_sig=f.ret_ty, blocks=fl.blocks,
+                           suspending=bool(f.body.suspends),
+                           globals_decl=tuple(getattr(f, "globals_decl", ()) or ())))
         # Emit any lambdas that were compiled during lowering
         out.extend(fl._pending_lambdas)
     return out

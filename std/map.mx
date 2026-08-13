@@ -11,9 +11,9 @@
 # Map values are shared references (their Vecs are), so `put`/`remove`
 # mutate the map in place; `get`/`keys`/`values` never mutate.
 #
-# `remove` rebuilds the vectors through pop/push because Vec has no
-# element-removal builtin and `v[i] = x` index assignment does not store
-# yet (silent no-op) — see std/README.md.
+# `remove` shifts the tail left with `v[i] = x` index assignment (a real
+# in-place store) and pops the last slot; still O(n), like every other
+# operation here.
 
 export {
     Map,
@@ -100,25 +100,28 @@ fn put(m: Map, k, v) {
 fn remove(m: Map, k) {
     let @mut ks = m.ks;
     let @mut vs = m.vs;
-    let @mut tk = Vec.new();
-    let @mut tv = Vec.new();
+    let @mut at = 0 - 1;
     let @mut removed = None;
-    # drain into temporaries (pop reverses; reversed again below)
-    while len(ks) > 0 {
-        tk.push(ks.pop());
-        tv.push(vs.pop())
+    let @mut i = 0;
+    while i < len(ks) {
+        if ks[i] == k {
+            at = i;
+            removed = Some(vs[i])
+        } else { () };
+        i = i + 1
     }
-    # push back everything except k, restoring the original order
-    let @mut i = len(tk);
-    while i > 0 {
-        if tk[i - 1] == k {
-            removed = Some(tv[i - 1])
-        } else {
-            ks.push(tk[i - 1]);
-            vs.push(tv[i - 1])
+    if at >= 0 {
+        # shift the tail left one slot in place, then drop the last
+        let @mut j = at;
+        while j < len(ks) - 1 {
+            ks[j] = ks[j + 1];
+            vs[j] = vs[j + 1];
+            j = j + 1
         };
-        i = i - 1
-    }
+        ks.pop();
+        vs.pop();
+        ()
+    } else { () };
     removed
 }
 

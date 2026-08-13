@@ -117,6 +117,28 @@ class MxClosure:
     captured: Dict[str, Any] = field(default_factory=dict)
 
 
+class MxCell:
+    """A shared mutable slot backing a mut-captured variable.
+
+    Scalars (int/bool/float/str) have value semantics, so a closure or
+    handler frame that captured one by value could assign to it and the
+    write was silently lost (the stdlib worked around this with
+    one-element Vec "cells"). When MIR lowering sees a sub-function assign
+    to an enclosing binding it emits a ``cell_wrap`` op: the enclosing slot
+    is boxed into one MxCell whose identity is shared by every environment
+    that captures it. Reads auto-deref (see _lookup); writes go through the
+    cell (see the "let" op), so mutation is visible in every frame sharing
+    the cell — real write-back, not a copy.
+    """
+    __slots__ = ("value",)
+
+    def __init__(self, value: Any) -> None:
+        self.value = value
+
+    def __repr__(self) -> str:
+        return f"<cell {self.value!r}>"
+
+
 class MxVec:
     """A growable vector (`Vec<T>`): a MUTABLE runtime object.
 
@@ -373,6 +395,11 @@ class MirInterpreter:
         }
         self._next_mutex_id: int = 1
         self._next_thread_id: int = 1
+        # Module-level constants: initialized by running __module_init (if
+        # loaded) before the first entry-point call; read by _lookup as the
+        # fallback after frame-local bindings.
+        self._globals: Dict[str, Any] = {}
+        self._globals_ready: bool = False
         self._register_builtins()
 
     # ------------------------------------------------------------------
@@ -400,11 +427,30 @@ class MirInterpreter:
     # ------------------------------------------------------------------
 
     def call(self, func_name: str, args: List[Any]) -> Any:
+        self._ensure_globals()
         f = self._funcs.get(func_name)
         if f is None:
             raise InterpError(f"Unknown function: {func_name!r}")
         env: Dict[str, Any] = {}
         return self._call_func(f, args, env)
+
+    def _ensure_globals(self) -> None:
+        """Run the synthesized __module_init once (module-level `let`
+        bindings), publishing its declared names as globals."""
+        if self._globals_ready:
+            return
+        self._globals_ready = True
+        init = self._funcs.get("__module_init")
+        if init is None:
+            return
+        out: Dict[str, Any] = {}
+        self._call_func(init, [], {}, out_env=out)
+        for name in init.globals_decl:
+            if name not in out:
+                raise InterpError(
+                    f"module constant {name!r} was declared but its "
+                    "initializer bound nothing (bad lowering)")
+            self._globals[name] = out[name]
 
     # ------------------------------------------------------------------
     # Internal execution
@@ -436,7 +482,8 @@ class MirInterpreter:
                 # at a block whose ret var may only be bound on the
                 # non-suspended path (see stack-effect tests). All other
                 # operand lookups are strict.
-                if isinstance(term[1], str) and term[1] not in env:
+                if (isinstance(term[1], str) and term[1] not in env
+                        and term[1] not in self._globals):
                     return result
                 return self._lookup(term[1], env, f)
             elif term[0] == "br":
@@ -544,7 +591,14 @@ class MirInterpreter:
         if not isinstance(a, str):
             return a
         if a in env:
-            return env[a]
+            v = env[a]
+            # Mut-captured slots are boxed (see MxCell): reads auto-deref so
+            # the cell is invisible everywhere except capture/write plumbing.
+            if isinstance(v, MxCell):
+                return v.value
+            return v
+        if a in self._globals:
+            return self._globals[a]
         raise InterpError(f"Unbound variable {a!r} in {f.name!r} (bad lowering or use-after-drop)")
 
     def _run_ops(self, ops: List[tuple], env: Dict[str, Any], f: MirFunc) -> Any:
@@ -556,8 +610,23 @@ class MirInterpreter:
             elif tag == "let":
                 dst, rhs, args = op[1], op[2], op[3]
                 val = self._eval_rhs(rhs, args, env, f)
-                env[dst] = val
+                cur = env.get(dst)
+                if isinstance(cur, MxCell) and not isinstance(val, MxCell):
+                    # Write THROUGH the shared cell so every frame that
+                    # captured this binding observes the new value.
+                    cur.value = val
+                else:
+                    env[dst] = val
                 last = val
+            elif tag == "cell_wrap":
+                # ("cell_wrap", slot): box the slot into a shared MxCell
+                # (idempotent) so sub-functions capturing it can write back.
+                name = op[1]
+                if name not in env:
+                    raise InterpError(
+                        f"cell_wrap: unbound variable {name!r} in {f.name!r}")
+                if not isinstance(env[name], MxCell):
+                    env[name] = MxCell(env[name])
             elif tag == "drop":
                 # Remove the binding; any subsequent use raises via _lookup.
                 name = op[1]
@@ -710,6 +779,11 @@ class MirInterpreter:
             # closure received as a parameter) shadows funcs/builtins: call the
             # closure's MirFunc with its captured env seeding the frame.
             local_val = env.get(callee_name)
+            if local_val is None:
+                # A module constant bound to a closure is callable too.
+                local_val = self._globals.get(callee_name)
+            if isinstance(local_val, MxCell):
+                local_val = local_val.value
             if isinstance(local_val, MxClosure):
                 target = self._funcs.get(local_val.func_name)
                 if target is None:
@@ -945,7 +1019,16 @@ class MirInterpreter:
             func_name: str = rhs[1]
             captured: Dict[str, Any] = {}
             for (cname, cval_name) in args:
-                captured[cname] = self._lookup(cval_name, env, f)
+                # Raw (non-deref) capture: a cell-wrapped slot must be
+                # captured as the CELL so the closure aliases the binding.
+                if isinstance(cval_name, str):
+                    if cval_name not in env:
+                        raise InterpError(
+                            f"Unbound variable {cval_name!r} in {f.name!r} "
+                            "(bad lowering or use-after-drop)")
+                    captured[cname] = env[cval_name]
+                else:
+                    captured[cname] = cval_name
             return MxClosure(func_name=func_name, captured=captured)
         elif kind == "call_closure":
             # ("call_closure",), (closure_name, arg1, arg2, ...)
@@ -979,8 +1062,14 @@ class MirInterpreter:
             if not isinstance(passed, MxStruct):
                 continue
             newv = final_env.get(pname, passed)
+            if isinstance(newv, MxCell):
+                newv = newv.value
             if newv is not passed and isinstance(newv, MxStruct):
-                caller_env[slot] = newv
+                cur = caller_env.get(slot)
+                if isinstance(cur, MxCell):
+                    cur.value = newv
+                else:
+                    caller_env[slot] = newv
 
     # ------------------------------------------------------------------
     # Trait method dispatch (runtime, on the receiver's type name)
@@ -1086,6 +1175,9 @@ class MirInterpreter:
         self._builtins["cos"] = _make_math_method("cos", math.cos)
         # --- Runtime library: indexing / slicing / fixed-size vectors -------
         self._builtins["__index_get"] = _builtin_index_get
+        self._builtins["__index_set"] = _builtin_index_set
+        self._builtins["__index_store"] = _builtin_index_store
+        self._builtins["__zip"] = _builtin_zip
         self._builtins["__slice_get"] = _builtin_slice_get
         self._builtins["__range"] = _builtin_range
         self._builtins["__vec_dim"] = _builtin_vec_dim
@@ -1583,6 +1675,78 @@ def _builtin_index_get(base: Any, idx: Any) -> Any:
         raise InterpError(
             f"index out of bounds: {idx} (length {len(seq)})")
     return seq[idx]
+
+
+def _builtin_zip(*seqs: Any) -> Any:
+    """Lockstep iteration source for zip comprehensions:
+    `f(a, b) for (a, b) in (xs, ys)`. Strict: same-length sequences only."""
+    if not seqs:
+        raise InterpError("zip: expected at least one sequence")
+    mats = [_index_target(s, "zip") for s in seqs]
+    lengths = sorted({len(m) for m in mats})
+    if len(lengths) != 1:
+        raise InterpError(
+            f"zip: sequences have different lengths {lengths}")
+    return [tuple(vals) for vals in zip(*mats)]
+
+
+def _builtin_index_store(base: Any, idx: Any, value: Any) -> Any:
+    """Store-back form of `v[i] = x` for assignable places: returns the
+    updated receiver, which the lowering rebinds to the place.
+
+    - MxVec: mutates the one shared vector in place (the returned object is
+      the same object, so the rebind is a no-op) — identity semantics.
+    - MxVector (fixed `vector[T, N]`): value semantics — a functional update
+      producing a new vector, written back to the variable/field, exactly
+      like struct field assignment.
+    Everything else errors loudly.
+    """
+    if isinstance(base, MxVec):
+        _builtin_index_set(base, idx, value)
+        return base
+    if isinstance(base, MxVector):
+        if not isinstance(idx, int) or isinstance(idx, bool):
+            raise InterpError(
+                f"index assignment: expected an integer index, got {idx!r}")
+        if idx < 0 or idx >= len(base.elements):
+            raise InterpError(
+                f"index assignment out of bounds: {idx} "
+                f"(length {len(base.elements)})")
+        elems = list(base.elements)
+        elems[idx] = value
+        return MxVector(elements=tuple(elems))
+    if isinstance(base, str):
+        raise InterpError("cannot assign into a string: strings are immutable")
+    raise InterpError(
+        f"index assignment: cannot assign into a "
+        f"{_runtime_type_name(base)!r} value")
+
+
+def _builtin_index_set(base: Any, idx: Any, value: Any) -> Any:
+    """`v[i] = x`: in-place element store on the shared MxVec.
+
+    Only Vec supports it — Vec is the one runtime type with documented
+    identity semantics (see MxVec). Everything else is immutable here, and a
+    silent no-op store is exactly the bug this builtin replaces, so immutable
+    receivers are a hard error.
+    """
+    if isinstance(base, MxVector):
+        raise InterpError(
+            "cannot assign into an immutable vector: vector[T, N] values have "
+            "value semantics (build a new vector, or use Vec for mutable data)")
+    if isinstance(base, str):
+        raise InterpError("cannot assign into a string: strings are immutable")
+    if not isinstance(base, MxVec):
+        raise InterpError(
+            f"index assignment: cannot assign into a "
+            f"{_runtime_type_name(base)!r} value")
+    if not isinstance(idx, int) or isinstance(idx, bool):
+        raise InterpError(f"index assignment: expected an integer index, got {idx!r}")
+    if idx < 0 or idx >= len(base.items):
+        raise InterpError(
+            f"index assignment out of bounds: {idx} (length {len(base.items)})")
+    base.items[idx] = value
+    return UNIT
 
 
 def _builtin_slice_get(base: Any, start: Any, stop: Any, step: Any) -> Any:

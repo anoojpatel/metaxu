@@ -6,10 +6,11 @@
 #   sqrt, sin and cos as builtin methods on numbers, wrapped here as
 #   plain functions. The rest of libm (tan/exp/log/floor/...) is
 #   deferred until the runtime grows those builtins.
-# - Ante's pi/tau/e are module-level constants. Metaxu's module system
-#   does not yet resolve module-level `let` bindings across (or even
-#   within) module files — they compile but read back as unit — so the
-#   constants are zero-argument functions.
+# - Ante's pi/tau/e are module-level constants, and so are these:
+#   module-level `let` bindings are initialized before the entry point
+#   and live in one global constant namespace (like types/traits/
+#   effects; a duplicate constant name in two modules is a compile
+#   error). Read them as plain names: `pi`, not `pi()`.
 # - Ante's checked_* overflow family is deferred (Metaxu ints are
 #   arbitrary-precision in the interpreter; overflow is native-codegen
 #   territory).
@@ -31,11 +32,11 @@ export {
     powi
 }
 
-fn pi() -> float { 3.141592653589793 }
+let pi = 3.141592653589793;
 
-fn tau() -> float { 6.283185307179586 }
+let tau = 6.283185307179586;
 
-fn e() -> float { 2.718281828459045 }
+let e = 2.718281828459045;
 
 # Absolute value (int or float).
 fn abs(x) {

@@ -389,7 +389,8 @@ class Parser:
     def p_multiplicative_expression(self, p):
         '''multiplicative_expression : cast_expression
                                    | multiplicative_expression TIMES cast_expression
-                                   | multiplicative_expression DIVIDE cast_expression'''
+                                   | multiplicative_expression DIVIDE cast_expression
+                                   | multiplicative_expression MOD cast_expression'''
         if len(p) == 2:
             p[0] = p[1]
         else:
