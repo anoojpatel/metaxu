@@ -5,7 +5,9 @@ directory, appends a tiny C-ABI ``@main`` wrapper, compiles it with
 ``clang -O2`` and executes the binary, returning ``(exit_code, stdout)``.
 
 The native metaxu runtime (``src/metaxu/runtime/native/metaxu_rt.c``:
-mx_vec_* / mx_str_* / mx_*_to_str) is compiled via its cached build recipe
+mx_vec_* / mx_str_* / mx_*_to_str, plus ``metaxu_effects.c``: mx_handle /
+mx_perform / mx_resume — the ucontext coroutine scheduler backing
+algebraic effects) is compiled via its cached build recipe
 and linked into every binary, so modules emitted with native vec/string
 builtin lowerings resolve their ``mx_*`` declares.  When the caller passes
 ``-fsanitize=address`` in ``clang_args`` the runtime object is rebuilt
@@ -45,23 +47,24 @@ import re
 import subprocess
 import tempfile
 
-from metaxu.runtime.native.build import DEFAULT_BUILD_DIR, compile_runtime
+from metaxu.runtime.native.build import DEFAULT_BUILD_DIR, runtime_objects
 
 from .codegen_llvm import mangle
 
 __all__ = ["compile_and_run", "LlvmRunError"]
 
 
-def _runtime_object(clang_args: tuple[str, ...]) -> str:
-    """The native runtime object to link, ASan-instrumented when the module
-    itself is being sanitized (separate cache dir per flag set)."""
+def _runtime_object_paths(clang_args: tuple[str, ...]) -> list[str]:
+    """The native runtime objects to link (metaxu_rt.o + metaxu_effects.o),
+    ASan-instrumented when the module itself is being sanitized (separate
+    cache dir per flag set)."""
     if any("-fsanitize=address" in a for a in clang_args):
-        obj = compile_runtime(
+        objs = runtime_objects(
             build_dir=DEFAULT_BUILD_DIR.parent / "_build_asan",
             extra_cflags=("-fsanitize=address", "-fno-omit-frame-pointer"))
     else:
-        obj = compile_runtime()
-    return str(obj)
+        objs = runtime_objects()
+    return [str(o) for o in objs]
 
 
 class LlvmRunError(RuntimeError):
@@ -148,7 +151,7 @@ def compile_and_run(llvm_ir: str, entry: str = "main", *,
 
     compile_proc = subprocess.run(
         ["clang", "-O2", "-Wno-override-module", ll_path,
-         _runtime_object(clang_args), "-o", bin_path, "-lm",
+         *_runtime_object_paths(clang_args), "-o", bin_path, "-lm",
          *clang_args],
         capture_output=True, text=True, timeout=timeout)
     if compile_proc.returncode != 0:

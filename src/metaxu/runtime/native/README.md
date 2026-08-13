@@ -14,9 +14,16 @@ current inline lowering of runtime builtins.
 ## Files
 
 - `metaxu_rt.h` / `metaxu_rt.c` — the runtime (no dependencies beyond libc/libm)
-- `build.py` — build recipe: `compile_runtime()` returns the cached `.o`,
-  `build_archive()` the `.a`; also runnable as a script
-- Tests: `src/metaxu/compiler/tests/test_native_runtime.py`
+- `metaxu_effects.h` / `metaxu_effects.c` — the algebraic-effects runtime:
+  delimited single-shot deep-handler continuations on ucontext coroutines
+  (`mx_handle` / `mx_perform` / `mx_resume`), matching the interpreter's
+  parked-thread model; ASan fiber-annotated; leak-clean scheduler
+- `build.py` — build recipe: `compile_runtime()` /
+  `compile_effects_runtime()` return the cached `.o`s (`runtime_objects()`
+  both), `build_archive()` the `.a`; also runnable as a script
+- Tests: `src/metaxu/compiler/tests/test_native_runtime.py` and
+  `src/metaxu/compiler/tests/test_native_effects_rt.py` (C drivers
+  replaying the interpreter's effect-shape catalogue)
 
 ## ABI
 
