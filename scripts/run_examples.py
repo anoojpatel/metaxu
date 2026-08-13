@@ -51,7 +51,7 @@ def run_one(path: str, stage: str) -> tuple[bool, str]:
             from metaxu.compiler.lower_hir_to_mir import lower_hir_to_mir
             from metaxu.compiler.mir_interp import MirInterpreter, UNIT
 
-            ctx = build_context_from_source(source)
+            ctx = build_context_from_source(source, file_path=path)
             run_pipeline_ctx(ctx)  # strict checks (raises on negative fixtures)
             hir_funcs = HIRBuilder(ctx.tables, id_map=ctx.id_map).build(ctx.frozen_root)
             interp = MirInterpreter()
@@ -74,7 +74,7 @@ def run_one(path: str, stage: str) -> tuple[bool, str]:
             return True, f"{entry}() = {result!r}"[:60]
         from metaxu.compiler.pipeline import run_pipeline_from_source
 
-        _ast, hir, mir, clif = run_pipeline_from_source(source)
+        _ast, hir, mir, clif = run_pipeline_from_source(source, file_path=path)
         if expected_error:
             return False, f"expected a '{expected_error}' diagnostic but the pipeline accepted the file"
         return True, f"hir={len(hir)}b mir={len(mir)}b clif={len(clif)}b"

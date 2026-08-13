@@ -882,6 +882,20 @@ class FromImport(Node):
         self.relative_level = relative_level
         self.is_public = is_public
 
+class ExportDeclaration(Node):
+    """A file-level `export { name [as alias], ... }` list.
+
+    Module blocks carry their export list on ModuleBody.exports; files (which
+    are implicit modules) carry theirs as this statement. Consumed by the
+    module resolution pass (compiler/module_loader.py)."""
+    def __init__(self, names):
+        super().__init__()
+        self.names = names  # list[tuple[str, str|None]]
+
+    def __str__(self):
+        return f"ExportDeclaration({', '.join(n for n, _a in self.names)})"
+
+
 class VisibilityRules(Node):
     def __init__(self, rules):
         super().__init__()

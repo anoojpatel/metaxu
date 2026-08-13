@@ -243,6 +243,7 @@ class Parser:
                      | import_statement
                      | from_import_statement
                      | module_declaration
+                     | export_statement
                      | visibility_block
                      | unsafe_block
                      | effect_declaration
@@ -1585,6 +1586,15 @@ class Parser:
             p[0] = (p[1], None)
         else:
             p[0] = (p[1], p[3])
+
+    def p_export_statement(self, p):
+        '''export_statement : EXPORT LBRACE export_list RBRACE
+                            | EXPORT LBRACE export_list COMMA RBRACE'''
+        # A file-level `export { ... }` list: files are modules too, so they
+        # need the same explicit-export syntax module blocks get from
+        # p_module_body. Carried as a statement and consumed by the module
+        # resolution pass (compiler/module_loader.py).
+        p[0] = ast.ExportDeclaration(names=p[3])
 
     def p_import_statement(self, p):
         '''import_statement : PUBLIC IMPORT module_path
