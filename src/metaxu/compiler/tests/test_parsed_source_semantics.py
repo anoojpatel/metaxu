@@ -365,3 +365,37 @@ def test_legitimate_literal_uses_accepted():
     run_pipeline_from_source('fn f() -> int { 1 + 2 * 3 }')
     run_pipeline_from_source('fn f(c: bool) -> int { if c { 1 } else { 2 } }')
     run_pipeline_from_source('fn f() -> bool { if true { false } else { true } }')
+
+
+def test_doubly_nested_shadow_restores_stackwise():
+    """Two nested scopes each shadowing x must restore the moved flag."""
+    src = """
+fn f() -> int {
+    let x = 1;
+    let y = move(x);
+    {
+        let x = 2;
+        {
+            let x = 3;
+            x
+        };
+        x
+    };
+    x
+}
+"""
+    with pytest.raises(BorrowCheckError, match="moved"):
+        run_pipeline_from_source(src)
+
+
+def test_same_scope_rebinding_still_clears_move():
+    """Same-scope `let x` after a move IS a fresh binding: no false positive."""
+    src = """
+fn f() -> int {
+    let x = 1;
+    let y = move(x);
+    let x = 2;
+    x
+}
+"""
+    run_pipeline_from_source(src)  # must not raise
