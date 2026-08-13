@@ -70,12 +70,68 @@ tag test because compile_pattern interleaves nested sub-pattern blocks
 between the tag branch and later slot reads, making a dominator trace
 fragile exactly where it matters (nested ctor patterns).
 
-Everything else — suspending functions (perform/resume/handle_scope: the
-CPS lowering lives in codegen_clif for now), try_scope,
+Increment 7 makes ALGEBRAIC EFFECTS native: handle_scope / perform /
+resume lower to the C effects runtime (src/metaxu/runtime/native/
+metaxu_effects.c), a small ucontext coroutine scheduler that reproduces
+the MIR interpreter's parked-thread model exactly — deep handlers,
+single-shot resume returning the WHOLE delimited body's value, abort when
+a case returns without resuming, dynamic innermost-first routing over a
+process-wide scope stack (busy handler frames skipped so handler
+self-performs route outward).  See the ALGEBRAIC EFFECTS section below.
+Suspending functions are no longer demoted: the coroutine stack IS the
+continuation, so no CPS transform is needed (codegen_clif's CPS state
+machines remain the CLIF story).
+
+Everything else — try_scope,
 fixed-size vector literals/comprehensions/slices — is emitted as a
 clearly marked, comment-only placeholder carrying the reasons, never as
 silently wrong code.  Functions that call a placeholder function are
 themselves demoted (the module must link), with an explicit reason.
+
+ALGEBRAIC EFFECTS (increment 7):
+  * `handle ... with {cases} in {body}` lowers (in MIR) to per-site body /
+    handler-case subfunctions plus a `handle_scope` op capturing the
+    enclosing frame's values.  Natively each site gets ONE shared env
+    struct `%henv.<site>` holding the union of the FREE NAMES of its body
+    and case subfunctions (computed by a module-wide fixpoint that sees
+    through nested handle sites); the site fills it like a closure env
+    (eager, by value; aggregates copied whole) and passes it as both the
+    body env and the handler env of `mx_handle`.  Body/case subfunctions
+    are emitted like lambdas: a leading `ptr %cl.env` parameter and a
+    prelude that reloads (only) their own free names from the struct.
+  * per site, codegen emits two internal shims: a BODY THUNK
+    `i64 (ptr env)` calling the compiled body fn and word-encoding its
+    result, and a DISPATCHER `i64 (ptr env, i64 op_index, ptr args,
+    ptr k)` that switches on the op index (dense, the site's case order —
+    documented in the IR), decodes the argument words to the case's param
+    kinds, calls the compiled case fn (its trailing `__k` param receives
+    `k`), and word-encodes its return.  Two private constant arrays per
+    site carry the op-name strings and per-op case arities for the
+    runtime's dynamic routing and UNIT-padding/arity checks.
+  * `perform` stores its argument words into a per-function
+    `[8 x i64]` scratch alloca and calls `mx_perform(effect, op, args,
+    nargs)`; the runtime parks the current coroutine and returns the
+    resumed value.  `resume` (only valid inside the handler case that
+    received the continuation — its own trailing `__k` param) calls
+    `mx_resume(k, value_word)`.
+  * every value crossing the effect boundary travels as an opaque 8-byte
+    WORD (i64 / f64 bitcast / str-vec ptrtoint — the Vec-element
+    convention).  Because routing is DYNAMIC (by op name, innermost
+    scope first), kinds unify through module-wide cells keyed by OP NAME:
+    perform arguments ⊔ handler-case params per index, perform results ⊔
+    resume values; and per SITE: handle value ⊔ body return ⊔ case
+    returns ⊔ resume results.  Two same-named ops with irreconcilable
+    types conflict and demote (a sound over-approximation of the dynamic
+    routing).  Aggregates crossing the boundary demote (no boxing across
+    scopes this increment); a continuation captured into a nested scope
+    env or closure demotes (resume must run on its scope's owner stack).
+  * `__k` continuation values get the dedicated non-word kind ``kont``
+    (an opaque `mx_k*`); it may only flow from a case's param into its
+    own resume ops.
+  * memory: the effects runtime frees its coroutine stacks, scope records
+    and continuation records at scope completion/abort (leak-clean, ASan
+    fiber-annotated); the site env is a frame alloca (the enclosing frame
+    outlives `mx_handle`, which returns only after the scope ends).
 
 Type model (documented conventions):
   * ints, bools and unit are all ``i64``; unit is the constant 0.
@@ -339,6 +395,10 @@ from .hir import TRAIT_CALL_PREFIX
 I64 = "i64"
 F64 = "f64"
 STR = "str"
+# An opaque effect continuation (`mx_k*`): the trailing `__k` parameter of
+# a handler-case subfunction.  A pointer, but NOT a word kind — it may only
+# flow from the case's own param into its resume ops; anywhere else demotes.
+KONT = "kont"
 CONFLICT = "conflict"
 _STRUCT_PREFIX = "struct:"
 _ENUM_PREFIX = "enum:"
@@ -407,7 +467,16 @@ _RT_SIGS = {
     "mx_i64_to_str": ("ptr", ("i64",)),
     "mx_f64_to_str": ("ptr", ("double",)),
     "mx_str_eq": ("i64", ("ptr", "ptr")),
+    # Algebraic effects runtime (metaxu_effects.c).
+    "mx_handle": ("i64", ("ptr", "ptr", "ptr", "ptr", "ptr", "ptr", "ptr",
+                          "i64")),
+    "mx_perform": ("i64", ("ptr", "ptr", "ptr", "i64")),
+    "mx_resume": ("i64", ("ptr", "i64")),
 }
+
+# Native effect-op argument/parameter limit (metaxu_effects.h
+# MX_EFFECT_MAX_ARGS): performs or handler cases beyond it demote.
+_MAX_EFFECT_ARGS = 8
 
 _I64_MIN, _I64_MAX = -(2 ** 63), 2 ** 63 - 1
 
@@ -467,21 +536,28 @@ _HEADER = (
     ";   __trait$ method calls are resolved statically against the\n"
     ";   receiver's inferred kind (impl fn -> builtin -> plain fn),\n"
     ";   mirroring the interpreter's runtime dispatch;\n"
+    ";   algebraic effects run on the native effects runtime\n"
+    ";   (metaxu_effects.c): handle_scope -> env fill + mx_handle over a\n"
+    ";   per-site body thunk + op dispatcher (dense op indices documented\n"
+    ";   per site), perform -> mx_perform (argument words in a scratch\n"
+    ";   array), resume -> mx_resume; boundary values travel as opaque\n"
+    ";   8-byte words; scope bodies run on ucontext coroutines with the\n"
+    ";   interpreter's deep/single-shot/abort semantics;\n"
     "; functions outside the subset appear as comment-only placeholders."
 )
 
 
 def _llparam(kind: str) -> str:
     """The LLVM parameter/return-slot type for a value kind (aggregates -> ptr)."""
-    if _is_agg(kind) or _is_vec(kind):
+    if _is_agg(kind) or _is_vec(kind) or kind == KONT:
         return "ptr"
     return _LLTY.get(kind, "i64")
 
 
 def _llscalar(kind: str) -> str:
     """The LLVM type of a non-aggregate (register-sized) value kind.
-    Vec values are opaque `mx_vec*` pointers."""
-    if _is_vec(kind):
+    Vec values are opaque `mx_vec*` pointers; kont is an opaque `mx_k*`."""
+    if _is_vec(kind) or kind == KONT:
         return "ptr"
     return _LLTY.get(kind, "i64")
 
@@ -703,9 +779,16 @@ class _Info:
     # Runtime-dispatched trait method calls: (dst, method name, args) —
     # statically resolved against the receiver's inferred kind.
     trait_calls: List[Tuple[str, str, Tuple[str, ...]]] = field(default_factory=list)
-    # Capture names this function receives through its env (it is a lambda).
+    # Capture names this function receives through its env (a lambda's
+    # captures, or a handle-scope subfunction's free names).
     env_captures: Tuple[str, ...] = ()
     is_lambda: bool = False
+    # Handle-scope subfunction (body or handler case) of a site.
+    is_scope_member: bool = False
+    scope_site: Optional[str] = None
+    scope_role: Optional[str] = None  # "body" | "case"
+    # Function contains perform ops (needs the [8 x i64] scratch alloca).
+    has_perform: bool = False
     # Results of copy/select ops that are provably never observed (see
     # _dead_results): excluded from kind unification, emitted as comments.
     dead_results: Set[str] = field(default_factory=set)
@@ -735,9 +818,11 @@ def _find_tag_consts(f: MirFunc) -> Dict[str, str]:
                 elif rhs[0] == "const" and isinstance(rhs[1], str) \
                         and not isinstance(rhs[1], bool):
                     str_consts[dst] = rhs[1]
-                if rhs[0] == "alloc_struct" or rhs[0] == "make_closure":
+                if rhs[0] in ("alloc_struct", "make_closure", "handle_scope",
+                              "try_scope"):
                     for (_n, v) in args:
-                        count_use(v)
+                        if isinstance(v, str):
+                            count_use(v)
                 else:
                     for a in args:
                         count_use(a)
@@ -788,9 +873,11 @@ def _dead_results(f: MirFunc) -> Set[str]:
                 if rk in ("copy", "select"):
                     for a in args:
                         soft_uses.setdefault(a, []).append(dst)
-                elif rk in ("alloc_struct", "make_closure"):
+                elif rk in ("alloc_struct", "make_closure", "handle_scope",
+                            "try_scope"):
                     for pair in args:
-                        hard_used.add(pair[1])
+                        if isinstance(pair[1], str):
+                            hard_used.add(pair[1])
                 elif rk == "call":
                     hard_used.add(rhs[1])  # closure callee var (if any)
                     hard_used.update(args)
@@ -840,28 +927,28 @@ def _blocks_in_cycles(f: MirFunc) -> Set[int]:
     return {i for i in range(n) if i in reach[i]}
 
 
-def _analyze(f: MirFunc, module_names: Set[str], closures: "_ClosureTable") -> _Info:
+def _analyze(f: MirFunc, module_names: Set[str], closures: "_ClosureTable",
+             scopes: "_ScopeTable") -> _Info:
     info = _Info(f=f)
     try:
-        _analyze_inner(info, module_names, closures)
+        _analyze_inner(info, module_names, closures, scopes)
     except Exception as exc:  # defensive: malformed MIR must never crash codegen
         info.add_reason(f"analysis error: {type(exc).__name__}: {exc}")
     return info
 
 
 def _analyze_inner(info: _Info, module_names: Set[str],
-                   closures: "_ClosureTable") -> None:
+                   closures: "_ClosureTable", scopes: "_ScopeTable") -> None:
     f = info.f
     if not f.blocks:
         info.add_reason("function has no blocks")
         return
     if f.blocks[0].ops and f.blocks[0].ops[0][0] == "params":
         info.params = tuple(f.blocks[0].ops[0][1])
+    # Suspending functions EMIT since increment 7: perform/resume/
+    # handle_scope lower to the native effects runtime (the coroutine stack
+    # is the continuation, no CPS transform needed).
     info.suspending = is_suspending(f)
-    if info.suspending:
-        info.add_reason(
-            "suspending function (LLVM CPS lowering not implemented; "
-            "effects run in the interpreter / CLIF CPS)")
     info.tag_consts = _find_tag_consts(f)
     info.dead_results = _dead_results(f)
     cycle_blocks = _blocks_in_cycles(f)
@@ -873,6 +960,19 @@ def _analyze_inner(info: _Info, module_names: Set[str],
         info.env_captures = closures.targets[f.name]
         if f.name in closures.bad:
             info.add_reason(closures.bad[f.name])
+
+    # A handle-scope subfunction (body or handler case) reloads its free
+    # names from the site's shared env struct, lambda-style.
+    if f.name in scopes.member_site:
+        if info.is_lambda:
+            info.add_reason(
+                "function is both a lambda and a handle-scope subfunction")
+        info.is_scope_member = True
+        info.scope_site = scopes.member_site[f.name]
+        info.scope_role = scopes.member_role[f.name]
+        info.env_captures = scopes.free_names.get(f.name, ())
+        if f.name in scopes.bad:
+            info.add_reason(scopes.bad[f.name])
 
     for p in info.params:
         info.def_count[p] = 1
@@ -898,7 +998,22 @@ def _analyze_inner(info: _Info, module_names: Set[str],
                     info.add_reason("params op outside entry block")
                 continue
             if kind == "perform":
-                # Suspension point; the function is already demoted above.
+                # ("perform", dst, effect, op, args, resume_bb, resume_slot):
+                # a real suspension point, lowered to mx_perform (the native
+                # runtime parks this call stack and returns the resumed
+                # value).  The op defines dst; the block then branches to
+                # the resume block.
+                if len(op) < 7:
+                    info.add_reason("malformed perform op")
+                    continue
+                if len(op[4]) > _MAX_EFFECT_ARGS:
+                    info.add_reason(
+                        f"perform with {len(op[4])} arguments (native limit "
+                        f"is {_MAX_EFFECT_ARGS})")
+                for a in op[4]:
+                    add_use(a, bi)
+                add_def(op[1], bi)
+                info.has_perform = True
                 continue
             if kind == "drop":
                 continue  # emitted as a comment
@@ -983,8 +1098,47 @@ def _analyze_inner(info: _Info, module_names: Set[str],
                 add_def(dst, bi)
                 info.closure_defs.append(
                     (dst, lname, tuple(cn for (cn, _vn) in args)))
-            elif rk in ("resume", "handle_scope"):
-                info.add_reason(f"uses effects ({rk})")
+            elif rk == "resume":
+                # ("resume",), (k, value): consume the single-shot
+                # continuation via mx_resume.  Only sound when running on
+                # the scope's owner stack, which the compiler guarantees by
+                # only accepting a resume of the containing handler case's
+                # OWN trailing __k parameter (a continuation smuggled into
+                # a nested scope body / lambda env would pump the scope
+                # from a foreign coroutine — demote instead).
+                if not (info.scope_role == "case" and len(args) == 2
+                        and args[0] in info.params):
+                    info.add_reason(
+                        "resume outside its own handler case (the "
+                        "continuation would escape its scope's owner stack)")
+                for a in args:
+                    add_use(a, bi)
+                add_def(dst, bi)
+            elif rk == "handle_scope":
+                # ("handle_scope", body_fn, effect, cases), captures:
+                # lowered to env fill + mx_handle (body thunk + dispatcher
+                # shims emitted per site).
+                site_rec = scopes.sites.get(rhs[1])
+                if site_rec is None or site_rec.owner != f.name:
+                    info.add_reason(
+                        f"handle site {rhs[1]!r} unresolved (not this "
+                        "function's handle_scope)")
+                elif f.name in scopes.bad:
+                    info.add_reason(scopes.bad[f.name])
+                else:
+                    if len(site_rec.cases) == 0:
+                        info.add_reason("handle_scope with no handler cases")
+                    for (_opn, cparams, _hfn) in site_rec.cases:
+                        if len(cparams) > _MAX_EFFECT_ARGS:
+                            info.add_reason(
+                                f"handler case with {len(cparams)} parameters "
+                                f"(native limit is {_MAX_EFFECT_ARGS})")
+                    # Only the captures the site's members actually need are
+                    # live values here (the lowering captures every env name
+                    # conservatively; the interpreter is non-strict).
+                    for n in scopes.env_fields.get(rhs[1], ()):
+                        add_use(site_rec.cap_vals.get(n, n), bi)
+                add_def(dst, bi)
             elif rk == "try_scope":
                 info.add_reason("uses try/catch (try_scope)")
             else:
@@ -1032,6 +1186,11 @@ def _analyze_inner(info: _Info, module_names: Set[str],
             info.add_reason(
                 f"direct call to lambda {callee!r} (callable only through "
                 "its closure value)")
+        elif callee in scopes.member_site:
+            # Body/case subfunctions are only callable through the effects
+            # runtime (a direct call would skip the env parameter).
+            info.add_reason(
+                f"direct call to handle-scope subfunction {callee!r}")
         elif callee in module_names:
             direct_calls.append((dst, callee, cargs))
         elif callee in _PRINT_BUILTINS or callee in _MATH_EXTERNS or callee in _INLINE_BUILTINS:
@@ -1268,6 +1427,226 @@ def _build_closure_table(funcs: Sequence[MirFunc]) -> _ClosureTable:
 
 
 # ---------------------------------------------------------------------------
+# Module-wide handle-scope table (effects: sites, members, kind cells)
+# ---------------------------------------------------------------------------
+#
+# Every MIR `handle_scope` op names a body subfunction and per-op handler
+# case subfunctions (lower_hir_to_mir generates one unique set per handle
+# expression).  Natively each SITE gets one shared env struct filled by the
+# owner; body/case fns reload their free names from it (lambda-style).
+# Because perform routing is DYNAMIC (innermost non-busy scope handling the
+# op name), kinds crossing the boundary unify through module-wide cells
+# keyed by OP NAME (args, results) and by SITE (the handle value).
+
+@dataclass
+class _ScopeSite:
+    site: str                 # site id == body fn name (unique per handle)
+    owner: str                # function containing the handle_scope op
+    body_fn: str
+    effect: str               # '' matches any effect at routing time
+    # (op name, declared case params (without __k), case fn name) in the
+    # site's dense op-index order (the dispatcher switches on this index).
+    cases: Tuple[Tuple[str, Tuple[str, ...], str], ...]
+    cap_vals: Dict[str, str] = field(default_factory=dict)  # cap name -> value var
+
+    def member_fns(self) -> Tuple[str, ...]:
+        return (self.body_fn,) + tuple(hfn for (_o, _p, hfn) in self.cases)
+
+
+@dataclass
+class _ScopeTable:
+    sites: Dict[str, _ScopeSite] = field(default_factory=dict)
+    member_site: Dict[str, str] = field(default_factory=dict)  # fn -> site id
+    member_role: Dict[str, str] = field(default_factory=dict)  # fn -> body|case
+    case_op: Dict[str, str] = field(default_factory=dict)      # case fn -> op
+    # member fn -> its OWN free names (reloaded from the site env).
+    free_names: Dict[str, Tuple[str, ...]] = field(default_factory=dict)
+    # site -> env field order (sorted union of member free names).
+    env_fields: Dict[str, Tuple[str, ...]] = field(default_factory=dict)
+    # (site, name) -> env field kind (two-way cells, like closure captures).
+    cells: Dict[Tuple[str, str], str] = field(default_factory=dict)
+    # site -> handle-value kind (handle dst ⊔ body ret ⊔ case ret ⊔ resume
+    # results: they are all the same delimited-body completion value).
+    value_cells: Dict[str, str] = field(default_factory=dict)
+    # op name -> perform-result kind (perform dsts ⊔ resume values), and
+    # (op name, index) -> op argument kind (perform args ⊔ case params).
+    # Keyed by op name ALONE because routing is dynamic by op name — a
+    # sound over-approximation joining every scope that could catch it.
+    op_results: Dict[str, str] = field(default_factory=dict)
+    op_args: Dict[Tuple[str, int], str] = field(default_factory=dict)
+    sites_of_owner: Dict[str, List[str]] = field(default_factory=dict)
+    bad: Dict[str, str] = field(default_factory=dict)  # fn name -> reason
+
+    def _mark(self, store, key, kind: str) -> bool:
+        cur = store.get(key, I64)
+        nk = _join(cur, kind)
+        if nk != cur:
+            store[key] = nk
+            return True
+        return False
+
+    def cell_kind(self, site: str, name: str) -> str:
+        return self.cells.get((site, name), I64)
+
+    def mark_cell(self, site: str, name: str, kind: str) -> bool:
+        return self._mark(self.cells, (site, name), kind)
+
+    def value_kind(self, site: str) -> str:
+        return self.value_cells.get(site, I64)
+
+    def mark_value(self, site: str, kind: str) -> bool:
+        return self._mark(self.value_cells, site, kind)
+
+    def op_result_kind(self, op: str) -> str:
+        return self.op_results.get(op, I64)
+
+    def mark_op_result(self, op: str, kind: str) -> bool:
+        return self._mark(self.op_results, op, kind)
+
+    def op_arg_kind(self, op: str, i: int) -> str:
+        return self.op_args.get((op, i), I64)
+
+    def mark_op_arg(self, op: str, i: int, kind: str) -> bool:
+        return self._mark(self.op_args, (op, i), kind)
+
+    def mark_bad(self, rec: _ScopeSite, reason: str) -> None:
+        """A site problem demotes the owner and every member."""
+        self.bad.setdefault(rec.owner, reason)
+        for m in rec.member_fns():
+            self.bad.setdefault(m, reason)
+
+
+def _fn_defs_uses_sites(f: MirFunc) -> Tuple[Set[str], Set[str], List[str]]:
+    """(defined names, directly used names, handle sites contained) of a
+    function — the base facts for the free-name fixpoint."""
+    defs: Set[str] = set()
+    uses: Set[str] = set()
+    sites: List[str] = []
+    for b in f.blocks:
+        for op in b.ops:
+            k = op[0]
+            if k == "params":
+                defs.update(op[1])
+            elif k == "perform" and len(op) >= 7:
+                uses.update(op[4])
+                defs.add(op[1])
+            elif k == "let" and len(op) == 4:
+                _, dst, rhs, args = op
+                defs.add(dst)
+                rk = rhs[0]
+                if rk in ("alloc_struct", "make_closure", "try_scope"):
+                    uses.update(v for (_n, v) in args if isinstance(v, str))
+                elif rk == "handle_scope":
+                    sites.append(rhs[1])
+                    # capture VALUES are used only as far as the site's
+                    # members need them (the lowering captures every env
+                    # name conservatively; the interpreter is non-strict
+                    # about unbound ones) — added during the fixpoint.
+                elif rk == "call":
+                    uses.update(a for a in args if isinstance(a, str))
+                else:
+                    uses.update(a for a in args if isinstance(a, str))
+        t = b.term
+        if t[0] in ("br_if", "ret") and isinstance(t[1], str):
+            uses.add(t[1])
+    return defs, uses, sites
+
+
+def _build_scope_table(funcs: Sequence[MirFunc]) -> _ScopeTable:
+    table = _ScopeTable()
+    by_name = {f.name: f for f in funcs}
+    # 1. Collect sites.
+    for f in funcs:
+        for b in f.blocks:
+            for op in b.ops:
+                if op[0] != "let" or len(op) != 4 or op[2][0] != "handle_scope":
+                    continue
+                body_fn, effect = op[2][1], op[2][2]
+                cases: List[Tuple[str, Tuple[str, ...], str]] = []
+                for (op_name, case_params, hfn) in op[2][3]:
+                    if isinstance(case_params, str):  # legacy bare string
+                        case_params = (case_params,)
+                    cases.append((op_name, tuple(case_params), hfn))
+                rec = _ScopeSite(
+                    site=body_fn, owner=f.name, body_fn=body_fn, effect=effect,
+                    cases=tuple(cases),
+                    cap_vals={cn: vn for (cn, vn) in op[3]
+                              if isinstance(vn, str)})
+                if body_fn in table.sites:
+                    table.mark_bad(rec, f"handle site {body_fn!r} appears at "
+                                        "multiple handle_scope ops")
+                    table.mark_bad(table.sites[body_fn],
+                                   f"handle site {body_fn!r} appears at "
+                                   "multiple handle_scope ops")
+                    continue
+                table.sites[body_fn] = rec
+                table.sites_of_owner.setdefault(f.name, []).append(body_fn)
+    # 2. Register members.
+    for site, rec in table.sites.items():
+        roles = [(rec.body_fn, "body", None)] + [
+            (hfn, "case", op_name) for (op_name, _p, hfn) in rec.cases]
+        for (fname, role, op_name) in roles:
+            if fname not in by_name:
+                table.mark_bad(rec, f"handle-scope subfunction {fname!r} "
+                                    "missing from the module")
+                continue
+            if fname in table.member_site and table.member_site[fname] != site:
+                table.mark_bad(rec, f"function {fname!r} belongs to multiple "
+                                    "handle sites")
+                table.mark_bad(table.sites[table.member_site[fname]],
+                               f"function {fname!r} belongs to multiple "
+                               "handle sites")
+                continue
+            table.member_site[fname] = site
+            table.member_role[fname] = role
+            if role == "case":
+                table.case_op[fname] = op_name
+    # 3. Free-name fixpoint per member (a member's needs include the needs
+    # of any handle sites nested inside it, mapped through those sites'
+    # capture-value names).
+    base = {name: _fn_defs_uses_sites(f) for name, f in by_name.items()}
+    free: Dict[str, Set[str]] = {m: set() for m in table.member_site}
+
+    def site_needs(site_id: str) -> Set[str]:
+        rec2 = table.sites.get(site_id)
+        if rec2 is None:
+            return set()
+        need: Set[str] = set()
+        for m2 in rec2.member_fns():
+            for n in free.get(m2, ()):
+                need.add(rec2.cap_vals.get(n, n))
+        return need
+
+    changed = True
+    while changed:
+        changed = False
+        for m in table.member_site:
+            if m not in by_name:
+                continue
+            defs, uses, inner_sites = base[m]
+            need = set(uses)
+            for s2 in inner_sites:
+                need |= site_needs(s2)
+            nf = need - defs
+            if nf != free[m]:
+                free[m] = nf
+                changed = True
+    for m in table.member_site:
+        table.free_names[m] = tuple(sorted(free.get(m, ())))
+    # 4. Site env layout + capture validation.
+    for site, rec in table.sites.items():
+        union: Set[str] = set()
+        for m in rec.member_fns():
+            union |= free.get(m, set())
+        table.env_fields[site] = tuple(sorted(union))
+        missing = sorted(n for n in union if n not in rec.cap_vals)
+        if missing:
+            table.mark_bad(rec, "handle-scope subfunctions reference names "
+                                f"absent from the site's captures: {missing}")
+    return table
+
+
+# ---------------------------------------------------------------------------
 # Module-wide trait-impl table and static trait-call resolution
 # ---------------------------------------------------------------------------
 #
@@ -1444,7 +1823,8 @@ class _Sig:
 
 def _infer_kinds(info: _Info, sigs: Dict[str, _Sig], structs: _StructTable,
                  variants: _VariantTable, closures: _ClosureTable,
-                 traits: _TraitTable, module_names: Set[str],
+                 traits: _TraitTable, scopes: _ScopeTable,
+                 module_names: Set[str],
                  assume_final: bool = False,
                  ) -> Tuple[Dict[str, str], bool]:
     """One inner fixpoint over a function.  Returns (kinds, global_changed)
@@ -1547,8 +1927,48 @@ def _infer_kinds(info: _Info, sigs: Dict[str, _Sig], structs: _StructTable,
                 if closures.mark_cell(fname, cap, nk):
                     changed = global_changed = True
                 changed = mark(cap, nk) or changed
+        # Handle-scope subfunctions: env captures unify with the site's
+        # cells; body/case returns unify with the site's value cell (they
+        # ARE the delimited body's completion value under deep semantics);
+        # case params unify with the op's argument cells; __k is a kont.
+        if info.is_scope_member:
+            site = info.scope_site
+            for cap in info.env_captures:
+                nk = _join(scopes.cell_kind(site, cap), get(cap))
+                if scopes.mark_cell(site, cap, nk):
+                    changed = global_changed = True
+                changed = mark(cap, nk) or changed
+            for r in info.ret_vars:
+                nk = _join(scopes.value_kind(site), get(r))
+                if scopes.mark_value(site, nk):
+                    changed = global_changed = True
+                changed = mark(r, nk) or changed
+            if info.scope_role == "case":
+                opn = scopes.case_op.get(fname)
+                for i, p in enumerate(info.params):
+                    if p == "__k":
+                        changed = mark(p, KONT) or changed
+                    elif opn is not None:
+                        nk = _join(scopes.op_arg_kind(opn, i), get(p))
+                        if scopes.mark_op_arg(opn, i, nk):
+                            changed = global_changed = True
+                        changed = mark(p, nk) or changed
         for b in info.f.blocks:
             for op in b.ops:
+                if op[0] == "perform" and len(op) >= 7:
+                    # Boundary-crossing values unify through the op-name
+                    # cells (routing is dynamic; see _ScopeTable).
+                    dst, opn, pargs = op[1], op[3], op[4]
+                    for i, a in enumerate(pargs):
+                        nk = _join(scopes.op_arg_kind(opn, i), get(a))
+                        if scopes.mark_op_arg(opn, i, nk):
+                            changed = global_changed = True
+                        changed = mark(a, nk) or changed
+                    nk = _join(scopes.op_result_kind(opn), get(dst))
+                    if scopes.mark_op_result(opn, nk):
+                        changed = global_changed = True
+                    changed = mark(dst, nk) or changed
+                    continue
                 if op[0] != "let" or len(op) != 4:
                     continue
                 _, dst, rhs, args = op
@@ -1707,6 +2127,40 @@ def _infer_kinds(info: _Info, sigs: Dict[str, _Sig], structs: _StructTable,
                         if structs.mark_field(sname, rhs[1], nk):
                             changed = global_changed = True
                         changed = mark(args[1], nk) or changed
+                elif rk == "resume":
+                    # resume(v): v unifies with the handled op's result cell
+                    # (it becomes some perform's value); the resume result
+                    # unifies with the site's value cell (deep semantics:
+                    # it is the whole delimited body's completion value).
+                    if len(args) == 2:
+                        changed = mark(args[0], KONT) or changed
+                        opn = scopes.case_op.get(fname)
+                        if opn is not None:
+                            nk = _join(scopes.op_result_kind(opn),
+                                       get(args[1]))
+                            if scopes.mark_op_result(opn, nk):
+                                changed = global_changed = True
+                            changed = mark(args[1], nk) or changed
+                        site = scopes.member_site.get(fname)
+                        if site is not None:
+                            nk = _join(scopes.value_kind(site), get(dst))
+                            if scopes.mark_value(site, nk):
+                                changed = global_changed = True
+                            changed = mark(dst, nk) or changed
+                elif rk == "handle_scope":
+                    site = rhs[1]
+                    site_rec = scopes.sites.get(site)
+                    if site_rec is not None:
+                        nk = _join(scopes.value_kind(site), get(dst))
+                        if scopes.mark_value(site, nk):
+                            changed = global_changed = True
+                        changed = mark(dst, nk) or changed
+                        for n in scopes.env_fields.get(site, ()):
+                            vn = site_rec.cap_vals.get(n, n)
+                            nk = _join(scopes.cell_kind(site, n), get(vn))
+                            if scopes.mark_cell(site, n, nk):
+                                changed = global_changed = True
+                            changed = mark(vn, nk) or changed
     return kinds, global_changed
 
 
@@ -1717,11 +2171,33 @@ def _infer_kinds(info: _Info, sigs: Dict[str, _Sig], structs: _StructTable,
 def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                        structs: _StructTable, variants: _VariantTable,
                        closures: _ClosureTable, traits: _TraitTable,
-                       module_names: Set[str]) -> List[str]:
+                       scopes: _ScopeTable, module_names: Set[str],
+                       ) -> List[str]:
     probs: List[str] = []
 
     def ty(n: str) -> str:
         return kinds.get(n, I64)
+
+    def check_boundary(kind: str, what: str) -> None:
+        """A value crossing the effect boundary must be an 8-byte word."""
+        if not _is_word_kind(kind):
+            probs.append(
+                f"{what} of kind {kind} cannot cross the effect boundary "
+                "(only i64/f64/str/vec word kinds; no aggregate boxing "
+                "across scopes)")
+
+    def check_env_cell(kind: str, what: str) -> None:
+        """A handle-site env field must be storable like a closure capture."""
+        if _is_closure(kind):
+            probs.append(f"{what} is a closure ({kind}) (its env pointer may "
+                         "outlive the creating frame)")
+        elif kind == KONT:
+            probs.append(f"{what} is an effect continuation (resume must run "
+                         "on its scope's owner stack)")
+        elif kind == CONFLICT:
+            probs.append(f"{what} has conflicting kinds")
+        elif _is_agg(kind) and _kind_size(kind, structs, variants) is None:
+            probs.append(f"{what} has an infinite layout")
 
     def check_builtin(name: str, dst: str, args: Tuple[str, ...]) -> None:
         """Validate a native-runtime builtin call's final kinds."""
@@ -1793,10 +2269,48 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
 
     for b in info.f.blocks:
         for op in b.ops:
+            if op[0] == "perform" and len(op) >= 7:
+                for a in op[4]:
+                    check_boundary(ty(a), f"perform argument {a!r}")
+                check_boundary(ty(op[1]), f"perform result {op[1]!r}")
+                continue
             if op[0] != "let" or len(op) != 4:
                 continue
             _, dst, rhs, args = op
             rk = rhs[0]
+            if rk == "resume":
+                if len(args) == 2:
+                    if ty(args[0]) != KONT:
+                        probs.append(
+                            f"resume continuation {args[0]!r} has kind "
+                            f"{ty(args[0])}, not kont")
+                    check_boundary(ty(args[1]), f"resume value {args[1]!r}")
+                    check_boundary(ty(dst), f"resume result {dst!r}")
+                continue
+            if rk == "handle_scope":
+                site = rhs[1]
+                check_boundary(ty(dst), f"handle value {dst!r}")
+                vk = scopes.value_kind(site)
+                if vk == CONFLICT:
+                    probs.append(
+                        f"handle site {site!r} has conflicting value kinds")
+                for n in scopes.env_fields.get(site, ()):
+                    check_env_cell(scopes.cell_kind(site, n),
+                                   f"handle-site capture {n!r}")
+                for (opn, cparams, _hfn) in (
+                        scopes.sites[site].cases
+                        if site in scopes.sites else ()):
+                    if scopes.op_result_kind(opn) == CONFLICT:
+                        probs.append(
+                            f"effect op {opn!r} has conflicting result kinds "
+                            "across its performs/handlers")
+                    for i in range(len(cparams)):
+                        if scopes.op_arg_kind(opn, i) == CONFLICT:
+                            probs.append(
+                                f"effect op {opn!r} argument {i} has "
+                                "conflicting kinds across its "
+                                "performs/handlers")
+                continue
             if rk in ("const", "const_ty"):
                 if _is_agg(ty(dst)) and dst not in info.dead_results:
                     probs.append(
@@ -1980,7 +2494,7 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                             f"{ename or 'anon'!r}: variant {vname!r} stores "
                             f"{store_k} where merged flows require {sk} (no "
                             "coercion through tagged-union storage)")
-                    elif _is_closure(sk):
+                    elif _is_closure(sk) or sk == KONT:
                         probs.append(
                             f"enum {ename or 'anon'!r} payload slot {i} holds "
                             f"a closure ({sk}) (its env pointer may outlive "
@@ -2058,7 +2572,7 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                     probs.append(
                         f"variant_field {idx} of enum {ename or 'anon'!r} "
                         f"variant {vname!r} has a conflicting slot kind")
-                elif _is_closure(sk):
+                elif _is_closure(sk) or sk == KONT:
                     probs.append(
                         f"enum {ename or 'anon'!r} payload slot {idx} holds "
                         f"a closure ({sk}) (its env pointer may outlive the "
@@ -2112,6 +2626,10 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                 probs.append(
                     f"struct {sname!r} field {fn_!r} holds a closure "
                     f"({fk}) (its env pointer may outlive the creating frame)")
+            elif fk == KONT:
+                probs.append(
+                    f"struct {sname!r} field {fn_!r} holds an effect "
+                    "continuation")
             elif fk == CONFLICT:
                 probs.append(f"struct {sname!r} field {fn_!r} has conflicting kinds")
     # Enum payload slot validity (closures, conflicts, infinite layouts) is
@@ -2129,7 +2647,7 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
         ename = _enum_name(k)
         for v in sorted(ref):
             for i, sk in enumerate(ref[v]):
-                if _is_closure(sk):
+                if _is_closure(sk) or sk == KONT:
                     probs.append(
                         f"enum {ename or 'anon'!r} payload slot {i} holds a "
                         f"closure ({sk}) (its env pointer may outlive the "
@@ -2151,8 +2669,29 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                 probs.append(
                     f"capture {cap!r} is itself a closure (closure-in-closure "
                     "envs are a later increment)")
+            elif ck == KONT:
+                probs.append(
+                    f"capture {cap!r} is an effect continuation (resume must "
+                    "run on its scope's owner stack)")
             elif ck == CONFLICT:
                 probs.append(f"capture {cap!r} has conflicting kinds")
+    # Handle-scope subfunctions: env fields and the scope's boundary values.
+    if info.is_scope_member:
+        site = info.scope_site
+        for cap in info.env_captures:
+            check_env_cell(scopes.cell_kind(site, cap),
+                           f"handle-site capture {cap!r}")
+        check_boundary(scopes.value_kind(site),
+                       f"handle value of site {site!r}")
+        if info.scope_role == "case":
+            opn = scopes.case_op.get(info.f.name)
+            if opn is not None:
+                check_boundary(scopes.op_result_kind(opn),
+                               f"effect op {opn!r} result")
+                for i, p in enumerate(info.params):
+                    if p != "__k":
+                        check_boundary(ty(p),
+                                       f"effect op {opn!r} parameter {p!r}")
     return probs
 
 
@@ -2285,9 +2824,15 @@ def _provably_dead_vecs(f: MirFunc, kinds: Dict[str, str],
                         if any(a in group for a in oargs):
                             ok = False
                         continue
-                    if rk == "alloc_struct" or rk == "make_closure":
+                    if rk in ("alloc_struct", "make_closure", "handle_scope",
+                              "try_scope"):
+                        # captured into an env (or a scope env): escapes
                         if any(v in group for (_n, v) in oargs):
                             ok = False
+                        continue
+                    if rk == "resume":
+                        if any(a in group for a in oargs):
+                            ok = False  # crosses the effect boundary
                         continue
                     # binop / select / field ops / variants / everything else:
                     # any appearance of a group member disqualifies.
@@ -2320,11 +2865,121 @@ class _ModuleState:
         self.uses_closure_pair = False         # %mx.closure type needed
         # lambda name -> ((capture name, kind), ...) for %env.L emission
         self.env_types: Dict[str, Tuple[Tuple[str, str], ...]] = {}
+        # handle site -> ((env field name, kind), ...) for %henv.<site>
+        self.scope_env_types: Dict[str, Tuple[Tuple[str, str], ...]] = {}
+        # handle site -> (owner fn, member fns): final assembly only keeps
+        # artifacts of sites whose owner+members all emitted (cascade-safe).
+        self.scope_sites: Dict[str, Tuple[str, Tuple[str, ...]]] = {}
+        # handle site -> op-name/arity constant-array globals text
+        self.scope_tables: Dict[str, str] = {}
+        # handle site -> body thunk + dispatcher define text
+        self.scope_thunks: Dict[str, str] = {}
 
     def intern_string(self, content: str) -> str:
         if content not in self.strings:
             self.strings[content] = f"@.str.{len(self.strings)}"
         return self.strings[content]
+
+
+def _scope_body_sym(site: str) -> str:
+    return "mxfx.body." + _sanitize(site)
+
+
+def _scope_disp_sym(site: str) -> str:
+    return "mxfx.disp." + _sanitize(site)
+
+
+def _scope_ops_sym(site: str) -> str:
+    return "mxfx.ops." + _sanitize(site)
+
+
+def _scope_np_sym(site: str) -> str:
+    return "mxfx.np." + _sanitize(site)
+
+
+def _word_encode(val: str, kind: str, dst: str) -> Tuple[List[str], str]:
+    """Lines turning a typed value into an opaque i64 boundary word."""
+    if kind == F64:
+        return [f"  {dst} = bitcast double {val} to i64"], dst
+    if _llscalar(kind) == "ptr":
+        return [f"  {dst} = ptrtoint ptr {val} to i64"], dst
+    return [], val
+
+
+def _word_decode(val: str, kind: str, dst: str) -> Tuple[List[str], str]:
+    """Inverse of _word_encode."""
+    if kind == F64:
+        return [f"  {dst} = bitcast i64 {val} to double"], dst
+    if _llscalar(kind) == "ptr":
+        return [f"  {dst} = inttoptr i64 {val} to ptr"], dst
+    return [], val
+
+
+def _emit_scope_artifacts(site: str, rec: _ScopeSite, sigs: Dict[str, _Sig],
+                          mod: _ModuleState) -> None:
+    """Per-handle-site shims for the effects runtime: the op-name /
+    case-arity constant tables, the body thunk (`i64 (ptr env)`) and the
+    dispatcher (`i64 (ptr env, i64 op_index, ptr args, ptr k)`).  Op
+    indices are DENSE in the site's case order (documented per arm)."""
+    if site in mod.scope_thunks:
+        return
+    n = len(rec.cases)
+    op_ptrs, nps = [], []
+    for (opn, cparams, _hfn) in rec.cases:
+        op_ptrs.append(f"ptr {mod.intern_string(opn)}")
+        nps.append(f"i64 {len(cparams)}")
+    mod.scope_tables[site] = (
+        f"; handle site {site}: op index order "
+        f"{[opn for (opn, _p, _h) in rec.cases]}\n"
+        f"@{_scope_ops_sym(site)} = private unnamed_addr constant "
+        f"[{n} x ptr] [{', '.join(op_ptrs)}]\n"
+        f"@{_scope_np_sym(site)} = private unnamed_addr constant "
+        f"[{n} x i64] [{', '.join(nps)}]")
+
+    bsig = sigs[rec.body_fn]
+    brty = _llscalar(bsig.ret)
+    bl = [f"define internal i64 @{_scope_body_sym(site)}(ptr %env) {{",
+          "entry:",
+          f"  %r = call {brty} @{mangle(rec.body_fn)}(ptr %env)"]
+    enc, v = _word_encode("%r", bsig.ret, "%w")
+    bl += enc
+    bl.append(f"  ret i64 {v}")
+    bl.append("}")
+
+    dl = [f"define internal i64 @{_scope_disp_sym(site)}"
+          "(ptr %env, i64 %op, ptr %args, ptr %k) {",
+          "entry:"]
+    if n:
+        arms = " ".join(f"i64 {i}, label %case{i}" for i in range(n))
+        dl.append(f"  switch i64 %op, label %unreach [ {arms} ]")
+    else:
+        dl.append("  br label %unreach")
+    for i, (opn, cparams, hfn) in enumerate(rec.cases):
+        csig = sigs[hfn]
+        dl.append(f"case{i}:  ; op {opn!r} -> @{mangle(hfn)}")
+        avals = ["ptr %env"]
+        for j in range(len(cparams)):
+            pk = csig.params[j] if j < len(csig.params) else I64
+            wp, wv = f"%c{i}.a{j}p", f"%c{i}.a{j}w"
+            dl.append(
+                f"  {wp} = getelementptr inbounds i64, ptr %args, i64 {j}")
+            dl.append(f"  {wv} = load i64, ptr {wp}")
+            enc, v = _word_decode(wv, pk, f"%c{i}.a{j}")
+            dl += enc
+            avals.append(f"{_llscalar(pk)} {v}")
+        avals.append("ptr %k")
+        crty = _llscalar(csig.ret)
+        dl.append(f"  %c{i}.r = call {crty} @{mangle(hfn)}({', '.join(avals)})")
+        enc, v = _word_encode(f"%c{i}.r", csig.ret, f"%c{i}.w")
+        dl += enc
+        dl.append(f"  ret i64 {v}")
+    dl.append("unreach:")
+    dl.append("  call void @abort()  ; dispatcher op index out of range")
+    dl.append("  unreachable")
+    dl.append("}")
+    mod.uses_abort = True
+    mod.scope_thunks[site] = "\n".join(bl) + "\n\n" + "\n".join(dl)
+    mod.scope_sites[site] = (rec.owner, rec.member_fns())
 
 
 def _emit_placeholder(info: _Info, sig: _Sig) -> str:
@@ -2341,8 +2996,8 @@ def _emit_placeholder(info: _Info, sig: _Sig) -> str:
 def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                    structs: _StructTable, variants: _VariantTable,
                    closures: _ClosureTable, traits: _TraitTable,
-                   module_names: Set[str], mod: _ModuleState,
-                   emitted_names: Set[str]) -> str:
+                   scopes: _ScopeTable, module_names: Set[str],
+                   mod: _ModuleState, emitted_names: Set[str]) -> str:
     f = info.f
     sig = sigs[f.name]
 
@@ -2493,7 +3148,9 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
     # writes back the unchanged aggregate — observationally a no-op.
     # Closure calls get NO write-back in the interpreter, so lambdas never
     # copy out.  Only struct kinds write back (enums/closures never do).
-    writeback_params = [] if info.is_lambda else [
+    # (Handle-scope subfunctions never copy out either: the interpreter
+    # calls them without its write-back path.)
+    writeback_params = [] if (info.is_lambda or info.is_scope_member) else [
         p for p in info.params
         if _is_struct(kinds.get(p, I64)) and info.def_count.get(p, 0) > 1]
 
@@ -2643,7 +3300,7 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
     for p in info.params:
         if p not in slotset and p not in aggset:
             valmap[p] = f"%a.{_sanitize(p)}"
-    if info.is_lambda:
+    if info.is_lambda or info.is_scope_member:
         for c in info.env_captures:
             if c not in slotset and c not in aggset:
                 valmap[c] = f"%cap.{_sanitize(c)}"
@@ -2667,6 +3324,23 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                 env_entry.append(
                     f"  {name} = alloca %env.{_sanitize(lname)}"
                     f"  ; closure env for {op[1]} -> {lname}")
+            elif op[0] == "let" and len(op) == 4 and op[2][0] == "handle_scope":
+                # One frame alloca per handle site: the frame outlives
+                # mx_handle (it returns only after the scope completes or
+                # aborts), so a stack env is always safe here — the body
+                # coroutine reads it through a pointer into this parked
+                # frame.
+                site = op[2][1]
+                name = f"%henv.site{env_seq}"
+                env_seq += 1
+                env_allocas[id(op)] = name
+                env_entry.append(
+                    f"  {name} = alloca %henv.{_sanitize(site)}"
+                    f"  ; handle-site env for {op[1]}")
+    if info.has_perform:
+        env_entry.append(
+            f"  %perform.args = alloca [{_MAX_EFFECT_ARGS} x i64]"
+            "  ; perform argument-word scratch")
 
     body: List[str] = []
     for bi, b in enumerate(f.blocks):
@@ -2688,6 +3362,30 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                 lines.append("  unreachable")
                 terminated = True
                 break
+            if opk == "perform":
+                # ("perform", dst, effect, op, args, resume_bb, resume_slot):
+                # store the argument words into the scratch array and call
+                # mx_perform; the runtime parks this call stack at this
+                # exact point and returns the resumed value.
+                _, pdst, peffect, pop, pargs = op[0], op[1], op[2], op[3], op[4]
+                for i, a in enumerate(pargs):
+                    w = to_word(kind(a), use(a, lines), lines)
+                    p = fresh()
+                    lines.append(
+                        f"  {p} = getelementptr inbounds "
+                        f"[{_MAX_EFFECT_ARGS} x i64], ptr %perform.args, "
+                        f"i64 0, i64 {i}")
+                    lines.append(f"  store i64 {w}, ptr {p}")
+                eg = mod.intern_string(peffect)
+                og = mod.intern_string(pop)
+                mod.runtime_syms.add("mx_perform")
+                w = fresh()
+                lines.append(
+                    f"  {w} = call i64 @mx_perform(ptr {eg}, ptr {og}, "
+                    f"ptr %perform.args, i64 {len(pargs)})"
+                    f"  ; perform {peffect or '?'}.{pop}")
+                setval(pdst, from_word(kind(pdst), w, lines), lines)
+                continue
             # opk == "let" (analysis guarantees this)
             _, dst, rhs, opargs = op
             rk = rhs[0]
@@ -3104,6 +3802,69 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                     f"  {p1} = getelementptr inbounds {_CLOSURE_PAIR_TY}, "
                     f"ptr {struct_ref(dst)}, i32 0, i32 1")
                 lines.append(f"  store ptr {envp}, ptr {p1}")
+            elif rk == "resume":
+                # Single-shot resume of this case's own continuation: the
+                # runtime unparks the body and returns its completion value
+                # (deep semantics) — or never returns on abort unwinding.
+                kp = use(opargs[0], lines)
+                w = to_word(kind(opargs[1]), use(opargs[1], lines), lines)
+                mod.runtime_syms.add("mx_resume")
+                v = fresh()
+                lines.append(f"  {v} = call i64 @mx_resume(ptr {kp}, i64 {w})")
+                setval(dst, from_word(kind(dst), v, lines), lines)
+            elif rk == "handle_scope":
+                site = rhs[1]
+                rec = scopes.sites.get(site)
+                if rec is None:
+                    raise _Unsupported(f"handle site {site!r} unresolved")
+                if rec.body_fn not in emitted_names or any(
+                        hfn not in emitted_names
+                        for (_o, _p, hfn) in rec.cases):
+                    raise _Unsupported(
+                        f"handle site {site!r} has non-emitted subfunctions")
+                bsig = sigs[rec.body_fn]
+                if bsig.params or _is_agg(bsig.ret):
+                    raise _Unsupported(
+                        f"handle body {rec.body_fn!r} has an unexpected "
+                        "signature")
+                for (_opn, cparams, hfn) in rec.cases:
+                    csig = sigs[hfn]
+                    if len(csig.params) != len(cparams) + 1 \
+                            or _is_agg(csig.ret):
+                        raise _Unsupported(
+                            f"handler case {hfn!r} has an unexpected "
+                            "signature")
+                fields = [(n, scopes.cell_kind(site, n))
+                          for n in scopes.env_fields.get(site, ())]
+                mod.scope_env_types[site] = tuple(fields)
+                envp = env_allocas.get(id(op))
+                if envp is None:  # unreachable: prescan covers every site
+                    raise _Unsupported("handle site missing env storage")
+                ety = f"%henv.{_sanitize(site)}"
+                for i, (cn, ck) in enumerate(fields):
+                    vn = rec.cap_vals.get(cn, cn)
+                    p = fresh()
+                    lines.append(
+                        f"  {p} = getelementptr inbounds {ety}, ptr {envp}, "
+                        f"i32 0, i32 {i}")
+                    if _is_agg(ck):
+                        agg_copy(_agg_ty(ck), use(vn, lines), p, lines)
+                    else:
+                        lines.append(
+                            f"  store {_llscalar(ck)} {use(vn, lines)}, "
+                            f"ptr {p}")
+                _emit_scope_artifacts(site, rec, sigs, mod)
+                eg = mod.intern_string(rec.effect)
+                mod.runtime_syms.add("mx_handle")
+                v = fresh()
+                lines.append(
+                    f"  {v} = call i64 @mx_handle("
+                    f"ptr @{_scope_body_sym(site)}, ptr {envp}, "
+                    f"ptr @{_scope_disp_sym(site)}, ptr {envp}, "
+                    f"ptr {eg}, ptr @{_scope_ops_sym(site)}, "
+                    f"ptr @{_scope_np_sym(site)}, i64 {len(rec.cases)})"
+                    f"  ; handle {rec.effect or '(any)'}")
+                setval(dst, from_word(kind(dst), v, lines), lines)
             else:  # unreachable given analysis
                 raise _Unsupported(f"op {rk!r} slipped past analysis")
 
@@ -3151,7 +3912,7 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
     pdecls = []
     if sret:
         pdecls.append("ptr %agg.ret")
-    if info.is_lambda:
+    if info.is_lambda or info.is_scope_member:
         pdecls.append("ptr %cl.env")
     for p, pk in zip(info.params, sig.params):
         pdecls.append(f"{_llparam(pk)} %a.{_sanitize(p)}")
@@ -3187,13 +3948,25 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                      struct_ref(p), entry)
         elif p in slotset:
             entry.append(f"  store {llty(p)} %a.{_sanitize(p)}, ptr {slot_ref(p)}")
-    if info.is_lambda:
-        # Reload every capture from the env struct (creator stored them at
-        # the make_closure site, eagerly, by value).
-        fields = env_fields(f.name)
-        mod.env_types[f.name] = fields
-        ety = f"%env.{_sanitize(f.name)}"
+    if info.is_lambda or info.is_scope_member:
+        # Reload captures from the env struct (the creator stored them at
+        # the make_closure / handle_scope site, eagerly, by value).  A
+        # scope member reloads only its OWN free names, indexed into the
+        # site's shared field order.
+        if info.is_lambda:
+            fields = env_fields(f.name)
+            mod.env_types[f.name] = fields
+            ety = f"%env.{_sanitize(f.name)}"
+        else:
+            fields = tuple(
+                (n, scopes.cell_kind(info.scope_site, n))
+                for n in scopes.env_fields.get(info.scope_site, ()))
+            mod.scope_env_types[info.scope_site] = fields
+            ety = f"%henv.{_sanitize(info.scope_site)}"
+        wanted = set(info.env_captures)
         for i, (cn, ck) in enumerate(fields):
+            if cn not in wanted:
+                continue
             p = f"%capp.{_sanitize(cn)}"
             entry.append(
                 f"  {p} = getelementptr inbounds {ety}, ptr %cl.env, "
@@ -3349,7 +4122,8 @@ def emit_llvm(funcs: Sequence[MirFunc]) -> str:
     structs = _build_struct_table(funcs)
     closures = _build_closure_table(funcs)
     traits = _build_trait_table(module_names)
-    infos = [_analyze(f, module_names, closures) for f in funcs]
+    scopes = _build_scope_table(funcs)
+    infos = [_analyze(f, module_names, closures, scopes) for f in funcs]
     variants = _build_variant_table(funcs, infos)
 
     def dep_names(info: _Info, kinds: Dict[str, str]) -> Set[str]:
@@ -3362,6 +4136,11 @@ def emit_llvm(funcs: Sequence[MirFunc]) -> str:
                 if callee in module_names and callee not in _NATIVE_RT_CALLS}
         deps |= {lname for (_d, lname, _c) in info.closure_defs
                  if lname in module_names}
+        # A handle site's owner cannot link without its body/case
+        # subfunctions (the site's shims call them).
+        for site in scopes.sites_of_owner.get(info.f.name, ()):
+            deps |= {m for m in scopes.sites[site].member_fns()
+                     if m in module_names}
         for (_d, cvar, _a) in info.closure_calls:
             ck = kinds.get(cvar, I64)
             if _is_closure(ck) and _closure_lambda(ck) in module_names:
@@ -3402,7 +4181,7 @@ def emit_llvm(funcs: Sequence[MirFunc]) -> str:
             changed = False
             for info in candidates:
                 kinds, cell_changed = _infer_kinds(
-                    info, sigs, structs, variants, closures, traits,
+                    info, sigs, structs, variants, closures, traits, scopes,
                     module_names, assume_final=assume_final)
                 changed = changed or cell_changed
                 if kind_sets.get(info.f.name) != kinds:
@@ -3482,7 +4261,7 @@ def emit_llvm(funcs: Sequence[MirFunc]) -> str:
     for info in candidates:
         kinds = kind_sets.get(info.f.name, {})
         for p in _check_consistency(info, kinds, sigs, structs, variants,
-                                    closures, traits, module_names):
+                                    closures, traits, scopes, module_names):
             info.add_reason(p)
 
     # A function referencing a placeholder cannot link: cascade demotion
@@ -3517,8 +4296,8 @@ def emit_llvm(funcs: Sequence[MirFunc]) -> str:
             kinds = kind_sets.get(name, {})
             try:
                 chunk = _emit_function(info, kinds, sigs, structs, variants,
-                                       closures, traits, module_names, mod,
-                                       emitted)
+                                       closures, traits, scopes,
+                                       module_names, mod, emitted)
             except _Unsupported as exc:
                 info.add_reason(exc.reason)
             except Exception as exc:  # never crash the pipeline
@@ -3543,11 +4322,32 @@ def emit_llvm(funcs: Sequence[MirFunc]) -> str:
                     emitted_chunks.pop(other.f.name, None)
             progress = True
 
+    # Handle-site artifact liveness: an env TYPE is referenced by the owner
+    # (env fill) and by every member's prelude, so it stays whenever any of
+    # them emitted; the shims/tables call the members and are referenced
+    # only by the owner's mx_handle call, so they need owner AND members.
+    live_scope_envs = {
+        site for site in mod.scope_env_types
+        if (site in scopes.sites
+            and (scopes.sites[site].owner in emitted_chunks
+                 or any(m in emitted_chunks
+                        for m in scopes.sites[site].member_fns())))}
+    live_scope_shims = {
+        site for site, (owner, members) in mod.scope_sites.items()
+        if owner in emitted_chunks
+        and all(m in emitted_chunks for m in members)}
+
     # Close the used type sets over nested references: inline struct fields
     # and boxed enum payload slots name %struct/%enum types that may never
     # appear as a local variable kind, and env structs may inline aggregates.
     for fields in mod.env_types.values():
         for (_cn, k) in fields:
+            if _is_struct(k):
+                used_structs.add(_struct_name(k))
+            elif _is_enum(k):
+                mod.used_enums.add(_enum_name(k))
+    for site in live_scope_envs:
+        for (_cn, k) in mod.scope_env_types[site]:
             if _is_struct(k):
                 used_structs.add(_struct_name(k))
             elif _is_enum(k):
@@ -3591,7 +4391,22 @@ def emit_llvm(funcs: Sequence[MirFunc]) -> str:
     ct = _emit_closure_types(mod)
     if ct:
         chunks.append(ct)
+    henv_lines = []
+    for site in sorted(live_scope_envs):
+        fields = mod.scope_env_types[site]
+        ftys = ", ".join(_llcell(k) for (_cn, k) in fields)
+        desc = ", ".join(cn for (cn, _k) in fields)
+        henv_lines.append(
+            f"%henv.{_sanitize(site)} = type "
+            f"{{ {ftys} }}" if ftys else
+            f"%henv.{_sanitize(site)} = type {{}}")
+        henv_lines[-1] += f"  ; handle-site env: {desc or '(none)'}"
+    if henv_lines:
+        chunks.append("\n".join(henv_lines))
     chunks.extend(_emit_runtime(mod))
+    for site in sorted(live_scope_shims):
+        chunks.append(mod.scope_tables[site])
+        chunks.append(mod.scope_thunks[site])
     for info in infos:
         chunk = emitted_chunks.get(info.f.name)
         if chunk is not None:
