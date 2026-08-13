@@ -88,13 +88,18 @@ def _placeholder_reasons(llvm_ir: str, sym: str) -> list[str]:
 def compile_and_run(llvm_ir: str, entry: str = "main", *,
                     workdir: str | None = None,
                     timeout: float = 60.0,
-                    clang_args: tuple[str, ...] = ()) -> tuple[int, str]:
+                    clang_args: tuple[str, ...] = (),
+                    run_env: dict[str, str] | None = None) -> tuple[int, str]:
     """Compile ``llvm_ir`` with clang and run it; return (exit_code, stdout).
 
     ``entry`` is the metaxu function name (unmangled).  ``workdir`` keeps the
     .ll/.bin files for inspection instead of a fresh temp dir.  ``clang_args``
     are appended to the clang invocation (e.g. ("-fsanitize=address",) so the
     differential tests can prove the emitted malloc/free pairs sound).
+    ``run_env`` entries are overlaid on the inherited environment for the
+    binary's execution — e.g. {"ASAN_OPTIONS": "detect_leaks=0"} for programs
+    whose payload boxes / heap closure envs leak BY DESIGN, where ASan should
+    prove only no-UAF/no-double-free, not leak-freedom.
     """
     sym = mangle(entry)
     m = re.search(
@@ -125,6 +130,10 @@ def compile_and_run(llvm_ir: str, entry: str = "main", *,
             f"clang failed (exit {compile_proc.returncode}) on {ll_path}:\n"
             f"{compile_proc.stderr}")
 
+    env = None
+    if run_env:
+        env = dict(os.environ)
+        env.update(run_env)
     run_proc = subprocess.run(
-        [bin_path], capture_output=True, text=True, timeout=timeout)
+        [bin_path], capture_output=True, text=True, timeout=timeout, env=env)
     return run_proc.returncode, run_proc.stdout

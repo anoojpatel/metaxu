@@ -15,8 +15,16 @@ Increment 3 adds enum variants (make_variant / variant_tag / variant_field
 as tagged unions) and stack-environment closures (make_closure + direct
 locally-bound closure calls); see the dedicated sections below.
 
+Increment 4 adds recursive/nested aggregates: enum payload slots holding
+aggregates are HEAP-BOXED (making recursive enums like linked lists and
+trees representable), struct fields holding structs/enums are INLINED in
+the parent layout, and closures that escape (returned, or created in a
+loop) get HEAP environments.  See the dedicated sections below — and note
+the prominently documented free strategy: boxes and heap envs LEAK BY
+DESIGN this increment.
+
 Everything else — suspending functions (perform/resume/handle_scope: the
-CPS lowering lives in codegen_clif for now), try_scope, escaping closures,
+CPS lowering lives in codegen_clif for now), try_scope,
 vector/string runtime builtins — is emitted as a clearly marked,
 comment-only placeholder carrying the reasons, never as silently wrong
 code.  Functions that call a placeholder function are themselves demoted
@@ -77,8 +85,20 @@ Type model (documented conventions):
         first-class LLVM aggregates were considered and rejected to keep
         one uniform path.  No ABI ``sret`` attribute is needed: all such
         calls are module-internal.
-    Nested struct fields (a struct kind inside a struct field cell) are
-    still demoted — a later increment.
+    NESTED AGGREGATE FIELDS (increment 4): a struct field whose kind is
+    itself a struct or enum is laid out INLINE in the parent %struct.T
+    (the field's LLVM type is the nested %struct.X / %enum.E), fully
+    stack-based: alloc_struct copies the aggregate value into the field
+    region, field_get copies it out into the destination's own storage,
+    field_set copies the whole parent then overwrites the region — plain
+    value semantics with recursive GEPs, no heap.  Struct sizes are
+    computed recursively (every leaf cell is 8 bytes; enum payload slots
+    are 8 bytes each — aggregates there are boxed pointers, see below), so
+    @global malloc sizes stay exact.  A struct-in-struct cycle with no
+    intervening enum box has no finite layout and demotes (such a value
+    could never be constructed anyway).  A field holding a closure still
+    demotes: the pair's env pointer may aim at a stack frame the struct
+    could outlive.
   * ``print``/``println`` of a single value routes by operand type to
     @metaxu_print_i64 / @metaxu_print_f64 / @metaxu_print_str, small
     helpers defined in this module on top of a declared @printf
@@ -122,9 +142,35 @@ ENUM VARIANTS (increment 3) are tagged unions:
   * variant values are aggregates with the same value semantics as
     structs: entry-block alloca per variant-kinded variable, aggregate
     copies, ptr + callee byval-copy across calls, sret-style returns.
-    There is no @global form (make_variant carries no locality); a payload
-    slot holding another aggregate (recursive enums like a linked list, or
-    struct payloads) demotes — a heap-boxed-payload increment lifts that.
+    There is no @global form (make_variant carries no locality).
+
+BOXED AGGREGATE PAYLOADS (increment 4): a payload slot whose unified kind
+is itself a struct or enum stores a HEAP POINTER to a boxed copy of the
+aggregate (the 8-byte slot holds the ptr), which makes recursive enums
+(linked lists, trees) representable with a finite layout:
+  * ``make_variant`` mallocs the box (exact recursive size) and copies the
+    aggregate value in; ``variant_field`` loads the pointer and copies the
+    aggregate out into the destination's own storage — value semantics are
+    preserved at both edges.
+  * boxes are WRITE-ONCE: the only store through a box pointer is the fill
+    at the make_variant site.  Aggregate copies (variable defs, byval
+    params, sret returns, env captures, boxing itself) copy the pointer
+    shallowly, so boxes are freely shared — which is observationally
+    equivalent to the interpreter's value semantics precisely because no
+    native code path ever mutates a filled box (MIR has no payload-set op,
+    and field_set copies its base aggregate wholesale).
+  * FREE STRATEGY (the documented, prominently stated choice): boxes LEAK
+    BY DESIGN this increment.  Shallow sharing means box ownership is not
+    unique, so any per-value free would need deep copies at every
+    aggregate copy to avoid double-frees; instead no box is ever freed.
+    This is provably sound (a leak can never be a use-after-free or
+    double-free); ASan tests for box programs therefore assert with
+    ``detect_leaks=0`` — they prove no UAF/double-free, not leak-freedom.
+    The @global struct malloc/free protocol is UNCHANGED and remains fully
+    leak-clean; struct blocks are freed at frame exit while any boxes
+    referenced from their field regions are simply leaked.
+  * a payload slot holding a closure still demotes (its env pointer may
+    aim at a stack frame the boxed value could outlive).
 
 CLOSURES (increment 3) are fn-pointer + stack-environment pairs:
   * a closure value is ``%mx.closure = type { ptr, ptr }`` — the lambda's
@@ -136,9 +182,6 @@ CLOSURES (increment 3) are fn-pointer + stack-environment pairs:
   * ``make_closure`` gets one entry-block env alloca per op site, stores
     the captured values (eager, by value — matching the interpreter) and
     then the {fn, env} pair into the closure variable's own pair alloca.
-    A make_closure inside a CFG cycle demotes: re-executing the site would
-    overwrite the shared env storage while previously created pair copies
-    may still alias it.
   * the lambda is emitted with a leading ``ptr %cl.env`` parameter (after
     ``%agg.ret`` when sret) and re-loads every capture from the env struct
     in its prelude; its other free names still demote.
@@ -149,9 +192,27 @@ CLOSURES (increment 3) are fn-pointer + stack-environment pairs:
     reaching one call site is a kind conflict and demotes.
   * closures may be passed DOWN as call arguments (ptr + byval pair copy;
     the env outlives the callee because the creating frame is still
-    live).  Everything that could make the env dangle demotes honestly:
-    returning a closure, storing one in a struct field or variant payload,
-    capturing one in another closure.  A heap-env increment lifts these.
+    live).
+
+HEAP CLOSURE ENVIRONMENTS (increment 4): a lambda is marked heap-env when
+its closure could outlive (or alias across re-executions of) the creating
+site:
+  * RETURNED closures: after the module kind fixpoint, any function whose
+    return kind is ``closure:L`` marks L heap-env.  Kind propagation makes
+    this complete for the emitted subset: a pair that reaches a caller
+    reaches it through some emitted function's return (storing a pair in
+    a struct field / enum payload / another env still demotes the storing
+    function, so no other upward path exists).
+  * LOOPED sites: a make_closure inside a CFG cycle marks L heap-env —
+    each execution mallocs a FRESH env, so earlier pair copies never alias
+    the new one (this replaces the increment-3 demotion).
+  * a heap env is malloc'd at the make_closure site and NEVER FREED — the
+    same leak-by-design contract as payload boxes (an immortal env can
+    never dangle; that is what makes the escape analysis need only be
+    conservative, never precise).  Non-escaping lambdas keep their
+    zero-cost stack envs.
+  * still demoted honestly: storing a closure in a struct field or variant
+    payload, capturing a closure in another closure.
 
 Per-function value kinds (i64 / f64 / str / struct:T / enum:E /
 closure:L) are inferred exactly
@@ -227,7 +288,8 @@ _HEADER = (
     ";   / and % are sdiv/srem (trunc toward zero; interpreter floors);\n"
     ";   local structs -> %struct.T entry allocas + GEP (value semantics,\n"
     ";   whole-aggregate copies; zero heap management -- the frame owns them);\n"
-    ";   @global structs -> entry-block malloc(8 * nfields) + GEP on the heap\n"
+    ";   @global structs -> entry-block malloc(recursive layout size) + GEP\n"
+    ";   on the heap\n"
     ";   pointer, freed on every ret path: sound because value semantics means\n"
     ";   the storage pointer never escapes the frame (aggregates cross frames\n"
     ";   by copy).  Any storage whose lifetime cannot be proven leaks by\n"
@@ -243,7 +305,18 @@ _HEADER = (
     ";   variant names mapped to dense integer tags (module-wide table in a\n"
     ";   comment below); pattern tag tests compare integers, never strings;\n"
     ";   closures -> %mx.closure = { ptr fn, ptr env } pairs over per-lambda\n"
-    ";   stack %env.L structs; lambdas take env as a leading param.\n"
+    ";   stack %env.L structs; lambdas take env as a leading param;\n"
+    ";   escaping closures (returned / created in a loop) malloc their env\n"
+    ";   at the site instead (heap env, leaked by design: immortal envs\n"
+    ";   cannot dangle);\n"
+    ";   struct fields holding structs/enums are laid out INLINE in the\n"
+    ";   parent type (recursive GEPs, still stack-based, value semantics);\n"
+    ";   enum payload slots holding aggregates store a HEAP POINTER to a\n"
+    ";   write-once boxed copy (make_variant boxes in, variant_field copies\n"
+    ";   out).  FREE STRATEGY: payload boxes and heap closure envs LEAK BY\n"
+    ";   DESIGN (never freed) -- shallow pointer sharing makes ownership\n"
+    ";   non-unique, and a leak is provably sound where a free is not.\n"
+    ";   @global struct blocks are still freed at frame exit as before.\n"
     "; functions outside the subset appear as comment-only placeholders."
 )
 
@@ -310,6 +383,12 @@ def _agg_ty(kind: str) -> str:
     if _is_enum(kind):
         return _enum_llname(_enum_name(kind))
     return _CLOSURE_PAIR_TY
+
+
+def _llcell(kind: str) -> str:
+    """The LLVM type of an INLINE storage cell for a kind: scalars map via
+    _LLTY, aggregates inline their named type (struct fields, env fields)."""
+    return _agg_ty(kind) if _is_agg(kind) else _LLTY.get(kind, "i64")
 
 
 def _join(a: str, b: str) -> str:
@@ -641,10 +720,10 @@ def _analyze_inner(info: _Info, module_names: Set[str],
                     info.add_reason(
                         f"make_closure of unknown function {lname!r}")
                 if bi in cycle_blocks:
-                    info.add_reason(
-                        "make_closure inside a loop (re-executing the site "
-                        "would overwrite the shared stack env while earlier "
-                        "pair copies may still alias it)")
+                    # Re-executing a stack-env site would overwrite storage
+                    # earlier pair copies may still alias: give this lambda a
+                    # fresh heap env per execution instead (leaked by design).
+                    closures.heap_env.add(lname)
                 for (_cn, vn) in args:
                     add_use(vn, bi)
                 add_def(dst, bi)
@@ -800,6 +879,38 @@ def _build_variant_table(funcs: Sequence[MirFunc],
 
 
 # ---------------------------------------------------------------------------
+# Recursive size computation (nested layouts + boxed payload slots)
+# ---------------------------------------------------------------------------
+
+def _kind_size(kind: str, structs: "_StructTable", variants: "_VariantTable",
+               _seen: Tuple[str, ...] = ()) -> Optional[int]:
+    """Byte size of a value kind's storage, or None for an infinite layout.
+
+    Scalars are 8 bytes; a closure pair is 16; an enum is 8 (tag) + 8 per
+    payload slot (aggregate slots hold an 8-byte box POINTER, which is what
+    breaks recursion); a struct is the sum of its inline field sizes.  Only
+    struct-in-struct chains recurse, so a cycle there (no intervening enum
+    box) has no finite layout and returns None."""
+    if _is_struct(kind):
+        if kind in _seen:
+            return None
+        sname = _struct_name(kind)
+        total = 0
+        for fn_ in structs.fields.get(sname, ()):
+            fs = _kind_size(structs.field_kind(sname, fn_), structs, variants,
+                            _seen + (kind,))
+            if fs is None:
+                return None
+            total += fs
+        return total
+    if _is_enum(kind):
+        return 8 + 8 * variants.payload_max.get(_enum_name(kind), 0)
+    if _is_closure(kind):
+        return 16
+    return 8  # i64 / f64 / str-ptr (and the CONFLICT sentinel, never emitted)
+
+
+# ---------------------------------------------------------------------------
 # Module-wide closure table (make_closure targets and their captures)
 # ---------------------------------------------------------------------------
 
@@ -813,6 +924,11 @@ class _ClosureTable:
     cells: Dict[Tuple[str, str], str] = field(default_factory=dict)
     # lambda name -> arity declared at the make_closure site.
     arity: Dict[str, int] = field(default_factory=dict)
+    # Lambdas whose envs are malloc'd at the site (leaked by design) because
+    # their closures may escape: returned anywhere in the module, or created
+    # inside a CFG cycle.  Membership is conservative and only ever ADDS heap
+    # allocation — a heap env is always sound (it can never dangle).
+    heap_env: Set[str] = field(default_factory=set)
 
     def cell_kind(self, lname: str, cap: str) -> str:
         return self.cells.get((lname, cap), I64)
@@ -1043,7 +1159,12 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                 continue
             _, dst, rhs, args = op
             rk = rhs[0]
-            if rk == "binop":
+            if rk in ("const", "const_ty"):
+                if _is_agg(ty(dst)) and dst not in info.dead_results:
+                    probs.append(
+                        f"constant {dst!r} promoted to aggregate kind "
+                        f"{ty(dst)} (no scalar-to-aggregate coercion)")
+            elif rk == "binop":
                 o = rhs[1]
                 if o in _CMP_INT:
                     if ty(dst) not in (I64,):
@@ -1135,7 +1256,7 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                 ename = rhs[1]
                 for i, a in enumerate(args):
                     ck = variants.cell_kind(ename, i)
-                    if ty(a) != ck and ck in _SCALARS:
+                    if ty(a) != ck and (ck in _SCALARS or _is_agg(ck)):
                         probs.append(
                             f"heterogeneous payload slot {i} of enum "
                             f"{ename or 'anon'!r}: variant {rhs[2]!r} stores "
@@ -1177,40 +1298,56 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                             f"lambda {lname!r} capture {cn!r} has conflicting kinds")
         if b.term[0] == "br_if" and ty(b.term[1]) != I64:
             probs.append(f"br_if condition {b.term[1]!r} is {ty(b.term[1])}")
-        if b.term[0] == "ret" and _is_closure(ty(b.term[1])):
-            # The pair's env pointer aims into this frame: returning it would
-            # dangle.  A heap-env increment can lift this.
+        if b.term[0] == "ret" and _is_closure(ty(b.term[1])) \
+                and _closure_lambda(ty(b.term[1])) not in closures.heap_env:
+            # Defensive: the module driver marks every returned lambda
+            # heap-env from its sig before this check runs, so this only
+            # fires if that invariant is ever broken — a stack env crossing
+            # a return would dangle.
             probs.append(
-                "returns a closure (its stack env would dangle; heap-env "
-                "closures are a later increment)")
+                f"returns closure of lambda "
+                f"{_closure_lambda(ty(b.term[1]))!r} not marked heap-env "
+                "(stack env would dangle)")
         # ret of a struct/enum value is fine: sret-style, the aggregate is
         # copied into the caller-provided %agg.ret slot (never a raw frame
-        # pointer).
+        # pointer).  ret of a heap-env closure is fine: the pair is copied
+        # sret-style and its env pointer aims at an immortal heap block.
 
-    # Struct field / enum payload / capture kinds must be scalar.
+    # Struct fields inline nested structs/enums (must have a finite layout);
+    # enum payload slots box nested structs/enums; closures in either place
+    # still demote (their env pointer may aim at a dying stack frame).
     used_structs = {_struct_name(k) for k in kinds.values() if _is_struct(k)}
     for sname in sorted(used_structs):
+        if _kind_size(_STRUCT_PREFIX + sname, structs, variants) is None:
+            probs.append(
+                f"struct {sname!r} has a recursively inlined layout (a "
+                "struct-in-struct cycle with no intervening enum box has no "
+                "finite size)")
         for fn_ in structs.fields.get(sname, ()):
             fk = structs.field_kind(sname, fn_)
-            if _is_agg(fk):
+            if _is_closure(fk):
                 probs.append(
-                    f"struct {sname!r} field {fn_!r} holds an aggregate "
-                    f"({fk}) (nested aggregate fields are a later increment)")
+                    f"struct {sname!r} field {fn_!r} holds a closure "
+                    f"({fk}) (its env pointer may outlive the creating frame)")
             elif fk == CONFLICT:
                 probs.append(f"struct {sname!r} field {fn_!r} has conflicting kinds")
     used_enums = {_enum_name(k) for k in kinds.values() if _is_enum(k)}
     for ename in sorted(used_enums):
         for i in range(variants.payload_max.get(ename, 0)):
             ck = variants.cell_kind(ename, i)
-            if _is_agg(ck):
+            if _is_closure(ck):
                 probs.append(
-                    f"enum {ename or 'anon'!r} payload slot {i} holds an "
-                    f"aggregate ({ck}) (heap-boxed payloads — e.g. recursive "
-                    "enums — are a later increment)")
+                    f"enum {ename or 'anon'!r} payload slot {i} holds a "
+                    f"closure ({ck}) (its env pointer may outlive the "
+                    "creating frame)")
             elif ck == CONFLICT:
                 probs.append(
                     f"enum {ename or 'anon'!r} payload slot {i} has "
                     "conflicting kinds")
+            elif _is_agg(ck) and _kind_size(ck, structs, variants) is None:
+                probs.append(
+                    f"enum {ename or 'anon'!r} payload slot {i} boxes a "
+                    f"value of {ck} whose layout is infinite")
     # Captures this function loads from its own env must be liftable too.
     if info.is_lambda:
         for cap in info.env_captures:
@@ -1415,9 +1552,10 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
             if c not in slotset and c not in aggset:
                 valmap[c] = f"%cap.{_sanitize(c)}"
 
-    # One env alloca per make_closure site, named and created in the entry
-    # block (storage must dominate every use; the site itself may sit in a
-    # conditional block).
+    # One env alloca per stack-env make_closure site, named and created in
+    # the entry block (storage must dominate every use; the site itself may
+    # sit in a conditional block).  Heap-env lambdas malloc a FRESH env at
+    # the site instead (each execution gets its own immortal block).
     env_allocas: Dict[int, str] = {}
     env_entry: List[str] = []
     env_seq = 0
@@ -1425,6 +1563,8 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
         for op in b.ops:
             if op[0] == "let" and len(op) == 4 and op[2][0] == "make_closure":
                 lname = op[2][1]
+                if lname in closures.heap_env:
+                    continue
                 name = f"%env.site{env_seq}.{_sanitize(op[1])}"
                 env_seq += 1
                 env_allocas[id(op)] = name
@@ -1640,15 +1780,28 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                 for (fn_, fv) in opargs:
                     p = gep(sname, struct_ref(dst), fn_, lines)
                     fk = structs.field_kind(sname, fn_)
-                    lines.append(f"  store {_LLTY[fk]} {use(fv, lines)}, ptr {p}")
+                    if _is_agg(fk):
+                        # nested aggregate field: copy the value into the
+                        # inline field region (value semantics, no heap)
+                        agg_copy(_agg_ty(fk), use(fv, lines), p, lines)
+                    else:
+                        lines.append(
+                            f"  store {_LLTY[fk]} {use(fv, lines)}, ptr {p}")
             elif rk == "field_get":
                 sname = _struct_name(kind(opargs[0]))
                 base = use(opargs[0], lines)
                 p = gep(sname, base, rhs[1], lines)
                 fk = structs.field_kind(sname, rhs[1])
-                v = fresh()
-                lines.append(f"  {v} = load {_LLTY[fk]}, ptr {p}")
-                setval(dst, v, lines)
+                if _is_agg(fk):
+                    if dst not in aggset:
+                        raise _Unsupported(
+                            f"field_get result {dst!r} not aggregate-kinded "
+                            f"for nested field {rhs[1]!r}")
+                    agg_copy(_agg_ty(fk), p, struct_ref(dst), lines)
+                else:
+                    v = fresh()
+                    lines.append(f"  {v} = load {_LLTY[fk]}, ptr {p}")
+                    setval(dst, v, lines)
             elif rk == "field_set":
                 # Value semantics: dst = copy of base with one field updated.
                 sname = _struct_name(kind(opargs[0]))
@@ -1658,7 +1811,11 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                 agg_copy(f"%struct.{_sanitize(sname)}", base, struct_ref(dst), lines)
                 p = gep(sname, struct_ref(dst), rhs[1], lines)
                 fk = structs.field_kind(sname, rhs[1])
-                lines.append(f"  store {_LLTY[fk]} {use(opargs[1], lines)}, ptr {p}")
+                if _is_agg(fk):
+                    agg_copy(_agg_ty(fk), use(opargs[1], lines), p, lines)
+                else:
+                    lines.append(
+                        f"  store {_LLTY[fk]} {use(opargs[1], lines)}, ptr {p}")
             elif rk == "make_variant":
                 # Tagged union: store the integer tag, then the payload slots.
                 ename, vname = rhs[1], rhs[2]
@@ -1675,8 +1832,26 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                 for i, fv in enumerate(opargs):
                     ck = variants.cell_kind(ename, i)
                     p = enum_gep(ename, struct_ref(dst), lines, payload=i)
-                    lines.append(
-                        f"  store {_LLTY[ck]} {use(fv, lines)}, ptr {p}")
+                    if _is_agg(ck):
+                        # Boxed aggregate payload: malloc a write-once box,
+                        # copy the aggregate in, store the POINTER in the
+                        # 8-byte slot.  Never freed (leak by design: shallow
+                        # pair/aggregate copies share box pointers, so no
+                        # free can be proven unique — see module docstring).
+                        size = _kind_size(ck, structs, variants)
+                        if size is None:
+                            raise _Unsupported(
+                                f"boxed payload of {ck} has infinite layout")
+                        mod.uses_malloc = True
+                        box = fresh()
+                        lines.append(
+                            f"  {box} = call ptr @malloc(i64 {max(size, 8)})"
+                            f"  ; boxed {ck} payload (leaks by design)")
+                        agg_copy(_agg_ty(ck), use(fv, lines), box, lines)
+                        lines.append(f"  store ptr {box}, ptr {p}")
+                    else:
+                        lines.append(
+                            f"  store {_LLTY[ck]} {use(fv, lines)}, ptr {p}")
             elif rk == "variant_tag":
                 bk = kind(opargs[0])
                 if not _is_enum(bk):
@@ -1696,9 +1871,21 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                 ck = variants.cell_kind(ename, rhs[1])
                 base = use(opargs[0], lines)
                 p = enum_gep(ename, base, lines, payload=rhs[1])
-                v = fresh()
-                lines.append(f"  {v} = load {_LLTY[ck]}, ptr {p}")
-                setval(dst, v, lines)
+                if _is_agg(ck):
+                    # Boxed payload: load the box pointer, copy the aggregate
+                    # out into the destination's own storage (value
+                    # semantics; the box itself stays untouched and shared).
+                    if dst not in aggset:
+                        raise _Unsupported(
+                            f"variant_field result {dst!r} not "
+                            f"aggregate-kinded for boxed slot {rhs[1]}")
+                    box = fresh()
+                    lines.append(f"  {box} = load ptr, ptr {p}")
+                    agg_copy(_agg_ty(ck), box, struct_ref(dst), lines)
+                else:
+                    v = fresh()
+                    lines.append(f"  {v} = load {_LLTY[ck]}, ptr {p}")
+                    setval(dst, v, lines)
             elif rk == "make_closure":
                 # Fill this site's env struct with the captured values, then
                 # store the {fn, env} pair into the closure variable.
@@ -1709,13 +1896,30 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                 if lname not in emitted_names:
                     raise _Unsupported(
                         f"make_closure of non-emitted lambda {lname!r}")
-                envp = env_allocas.get(id(op))
-                if envp is None:  # unreachable: prescan covers every site
-                    raise _Unsupported("make_closure site missing env storage")
                 fields = env_fields(lname)
                 mod.env_types[lname] = fields
                 mod.uses_closure_pair = True
                 ety = f"%env.{_sanitize(lname)}"
+                if lname in closures.heap_env:
+                    # Escaping (or looped) closure: malloc a fresh env at
+                    # the site, never freed (leak by design — an immortal
+                    # env can never dangle, see module docstring).
+                    esize = 0
+                    for (_cn, ck) in fields:
+                        s = _kind_size(ck, structs, variants)
+                        if s is None:
+                            raise _Unsupported(
+                                f"env capture of {ck} has infinite layout")
+                        esize += s
+                    mod.uses_malloc = True
+                    envp = fresh()
+                    lines.append(
+                        f"  {envp} = call ptr @malloc(i64 {max(esize, 8)})"
+                        f"  ; heap env for {dst} -> {lname} (leaks by design)")
+                else:
+                    envp = env_allocas.get(id(op))
+                    if envp is None:  # unreachable: prescan covers every site
+                        raise _Unsupported("make_closure site missing env storage")
                 for i, ((cn, ck), (_cn2, vn)) in enumerate(zip(fields, opargs)):
                     p = fresh()
                     lines.append(
@@ -1794,10 +1998,14 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
     entry.extend(env_entry)
     for n in heap_vars:
         sname = _struct_name(kind(n))
-        size = 8 * len(structs.fields.get(sname, ()))  # all field kinds are 8 bytes
+        # Recursive layout size: leaf cells are 8 bytes, nested aggregates
+        # inline, boxed payload slots are 8-byte pointers.
+        size = _kind_size(kind(n), structs, variants)
+        if size is None:  # unreachable: consistency demoted infinite layouts
+            raise _Unsupported(f"@global struct {sname!r} has infinite layout")
         mod.uses_malloc = True
         entry.append(
-            f"  {struct_ref(n)} = call ptr @malloc(i64 {size})"
+            f"  {struct_ref(n)} = call ptr @malloc(i64 {max(size, 8)})"
             f"  ; @global struct {n}: {sname}, freed on ret paths")
     for p in info.params:
         if p in aggset:
@@ -1895,7 +2103,9 @@ def _emit_struct_types(structs: _StructTable, used: Set[str]) -> Optional[str]:
     for sname in sorted(used):
         if sname in structs.bad:
             continue
-        ftys = ", ".join(_LLTY.get(structs.field_kind(sname, fn_), "i64")
+        # Nested aggregate fields inline their named type (LLVM permits
+        # forward references between named types, so order is free).
+        ftys = ", ".join(_llcell(structs.field_kind(sname, fn_))
                          for fn_ in structs.fields.get(sname, ()))
         fields_desc = ", ".join(structs.fields.get(sname, ()))
         lines.append(f"%struct.{_sanitize(sname)} = type {{ {ftys} }}  ; {fields_desc}")
@@ -2024,6 +2234,16 @@ def emit_llvm(funcs: Sequence[MirFunc]) -> str:
         if not changed:
             break
 
+    # A lambda whose closure is RETURNED by any function needs a heap env:
+    # the pair crosses the creating frame's boundary, so a stack env would
+    # dangle.  sig.ret is the join of every ret-var kind across the module
+    # fixpoint, so this is complete for the emitted subset (storing a pair
+    # in a field/payload/env demotes the storing function instead).  Over-
+    # marking is sound — a heap env only leaks, it can never dangle.
+    for sig in sigs.values():
+        if _is_closure(sig.ret):
+            closures.heap_env.add(_closure_lambda(sig.ret))
+
     # Post-fixpoint consistency; anything wrong becomes a placeholder reason.
     for info in candidates:
         kinds = kind_sets.get(info.f.name, {})
@@ -2087,6 +2307,43 @@ def emit_llvm(funcs: Sequence[MirFunc]) -> str:
                     emitted.discard(other.f.name)
                     emitted_chunks.pop(other.f.name, None)
             progress = True
+
+    # Close the used type sets over nested references: inline struct fields
+    # and boxed enum payload slots name %struct/%enum types that may never
+    # appear as a local variable kind, and env structs may inline aggregates.
+    for fields in mod.env_types.values():
+        for (_cn, k) in fields:
+            if _is_struct(k):
+                used_structs.add(_struct_name(k))
+            elif _is_enum(k):
+                mod.used_enums.add(_enum_name(k))
+    while True:
+        more_structs: Set[str] = set()
+        more_enums: Set[str] = set()
+        for sname in used_structs:
+            for fn_ in structs.fields.get(sname, ()):
+                fk = structs.field_kind(sname, fn_)
+                # A referenced type with an infinite layout is never emitted
+                # (every function touching it was demoted): do not pull it.
+                if _kind_size(fk, structs, variants) is None:
+                    continue
+                if _is_struct(fk):
+                    more_structs.add(_struct_name(fk))
+                elif _is_enum(fk):
+                    more_enums.add(_enum_name(fk))
+        for ename in mod.used_enums:
+            for i in range(variants.payload_max.get(ename, 0)):
+                ck = variants.cell_kind(ename, i)
+                if _kind_size(ck, structs, variants) is None:
+                    continue
+                if _is_struct(ck):
+                    more_structs.add(_struct_name(ck))
+                elif _is_enum(ck):
+                    more_enums.add(_enum_name(ck))
+        if more_structs <= used_structs and more_enums <= mod.used_enums:
+            break
+        used_structs |= more_structs
+        mod.used_enums |= more_enums
 
     chunks: List[str] = [_HEADER]
     st = _emit_struct_types(structs, used_structs)
