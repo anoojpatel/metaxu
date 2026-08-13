@@ -1,0 +1,221 @@
+"""End-to-end tests for algebraic effects with real single-shot continuations.
+
+Source -> parse -> desugar -> freeze -> infer -> HIR -> MIR -> interpreter.
+
+These assert the semantics documented in docs (effects_and_handlers example):
+- `perform Effect.op(args)` suspends the performing frame at the perform site
+- the matching handler case runs with the op argument and the continuation
+- `resume(v)` runs the rest of the suspended frame with v as the perform's
+  value, exactly once (second resume raises)
+- a handler that returns without resuming aborts the handle scope; the
+  handler's value becomes the handle expression's value and the suspended
+  code after the perform never runs
+- handlers are deep: every perform in the body (including in called
+  functions) is handled by the same installed handler
+- handle scopes nest, innermost handler wins for its ops
+"""
+from __future__ import annotations
+
+import pytest
+
+from metaxu.compiler.pipeline import build_context_from_source
+from metaxu.compiler.hir import HIRBuilder
+from metaxu.compiler.lower_hir_to_mir import lower_hir_to_mir
+from metaxu.compiler.mir_interp import MirInterpreter, UNIT
+
+
+def run_main(source: str):
+    """Compile source down to MIR and execute main(); returns (result, prints)."""
+    ctx = build_context_from_source(source)
+    hir = HIRBuilder(ctx.tables, id_map=ctx.id_map).build(ctx.frozen_root)
+    mir = lower_hir_to_mir(hir)
+    interp = MirInterpreter()
+    interp.load(mir)
+    prints: list[str] = []
+    interp.register_builtin("print", lambda *a: (prints.append(" ".join(str(x) for x in a)), UNIT)[1])
+    return interp.call("main", []), prints
+
+
+def test_resume_supplies_perform_value():
+    """The value passed to resume() is the value of the perform expression."""
+    result, _ = run_main("""
+effect Ask {
+    ask() -> int
+}
+
+fn main() -> int {
+    handle Ask with {
+        ask() -> resume(7)
+    } in {
+        perform Ask.ask() + 1
+    }
+}
+""")
+    assert result == 8
+
+
+def test_deep_handler_across_function_calls():
+    """A perform inside a called function is caught by the caller's handler,
+    and resume threads the value back through the call."""
+    result, _ = run_main("""
+effect Ask {
+    ask() -> int
+}
+
+fn helper() performs Ask -> int {
+    let x = perform Ask.ask();
+    x * 10
+}
+
+fn main() -> int {
+    handle Ask with {
+        ask() -> resume(4)
+    } in {
+        helper() + 2
+    }
+}
+""")
+    assert result == 42
+
+
+def test_multiple_performs_same_handler():
+    """Deep handlers: the handler stays installed for every perform in the body."""
+    result, _ = run_main("""
+effect Ask {
+    ask() -> int
+}
+
+fn main() -> int {
+    handle Ask with {
+        ask() -> resume(5)
+    } in {
+        let a = perform Ask.ask();
+        let b = perform Ask.ask();
+        a + b
+    }
+}
+""")
+    assert result == 10
+
+
+def test_abort_when_handler_does_not_resume():
+    """A handler that returns without resuming aborts the handle scope: its
+    value becomes the handle result and the code after the perform is skipped."""
+    result, prints = run_main("""
+effect Fail {
+    fail() -> int
+}
+
+fn main() -> int {
+    handle Fail with {
+        fail() -> 99
+    } in {
+        let x = perform Fail.fail();
+        print("unreachable");
+        x + 1
+    }
+}
+""")
+    assert result == 99
+    assert prints == []  # nothing after the perform ran
+
+
+def test_handler_can_transform_resumed_result():
+    """Code in the handler after resume() sees the body's final value: the
+    handler's own return value is the handle result (deep-handler semantics)."""
+    result, _ = run_main("""
+effect Ask {
+    ask() -> int
+}
+
+fn main() -> int {
+    handle Ask with {
+        ask() -> {
+            let rest = resume(1);
+            rest + 100
+        }
+    } in {
+        perform Ask.ask() + 2
+    }
+}
+""")
+    # body result = 1 + 2 = 3; handler transforms it to 103
+    assert result == 103
+
+
+def test_nested_handles_two_effects():
+    """Nested handle scopes: each effect's ops route to its own handler."""
+    result, prints = run_main("""
+effect State {
+    get() -> int
+}
+
+effect Logger {
+    log(message: string) -> Unit
+}
+
+fn body() performs State, Logger -> int {
+    let v = perform State.get();
+    perform Logger.log("got it");
+    v + 1
+}
+
+fn main() -> int {
+    handle State with {
+        get() -> resume(41)
+    } in {
+        handle Logger with {
+            log(message) -> {
+                print(message);
+                resume(())
+            }
+        } in {
+            body()
+        }
+    }
+}
+""")
+    assert result == 42
+    assert prints == ["got it"]
+
+
+def test_handler_receives_op_argument():
+    """The op's argument arrives as the handler case's parameter."""
+    result, prints = run_main("""
+effect Logger {
+    log(message: string) -> Unit
+}
+
+fn main() -> int {
+    handle Logger with {
+        log(message) -> {
+            print(message);
+            resume(())
+        }
+    } in {
+        perform Logger.log("hello");
+        perform Logger.log("world");
+        0
+    }
+}
+""")
+    assert result == 0
+    assert prints == ["hello", "world"]
+
+
+def test_single_shot_double_resume_raises():
+    """Resuming the same continuation twice violates single-shot semantics."""
+    with pytest.raises(Exception, match="[Ss]ingle-shot|already consumed"):
+        run_main("""
+effect Ask {
+    ask() -> int
+}
+
+fn main() -> int {
+    handle Ask with {
+        ask() -> resume(1) + resume(2)
+    } in {
+        perform Ask.ask()
+    }
+}
+""")

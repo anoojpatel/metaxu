@@ -281,34 +281,55 @@ class _FuncLowerer:
                 self._lower_subfunc(lname, e.lambda_params, e.lambda_body,
                                     ty_sig=e.ty, suspending=bool(e.suspends))
             return dst
-        # Perform: perform effect_op(args)
+        # Perform: perform Effect.op(args) — a real suspension point. The op
+        # ends its block; the continuation is "this function from resume_bb on"
+        # plus (implicitly) the Python-level call stack below this frame.
         if e.op == "Perform" and e.effect_op is not None:
             arg_names: List[str] = [self.lower_expr(a) for a in (e.perform_args or ())]
             dst = self.state.fresh("pv")
-            self.emit(("let", dst, ("perform", e.effect_op), tuple(arg_names)))
+            raw = str(e.effect_op)
+            effect_name, _, op_name = raw.rpartition(".")
+            resume_bb = self.new_block()
+            self.emit(("perform", dst, effect_name, op_name, tuple(arg_names),
+                       resume_bb, dst))
+            self.terminate(("br", resume_bb))
+            self.switch_to(resume_bb)
             return dst
-        # Resume: resume(value) inside a handle case — identity, just return the value
+        # Resume: resume(value) inside a handle case — consume the single-shot
+        # continuation bound to the handler's implicit __k parameter.
         if e.op == "Resume":
             args_list = list(e.perform_args or ())
-            if args_list:
-                return self.lower_expr(args_list[0])
-            return self.unit_value()
-        # Handle: handle effect with cases in body
+            val = self.lower_expr(args_list[0]) if args_list else self.unit_value()
+            dst = self.state.fresh("rv")
+            self.emit(("let", dst, ("resume",), ("__k", val)))
+            return dst
+        # Handle: handle Effect with { cases } in body. The body and each case
+        # compile to sub-functions; at runtime handle_scope pushes a delimited
+        # handler frame, runs the body under it, and catches handler aborts
+        # (a case returning without calling resume).
         if e.op == "Handle" and e.handle_body is not None:
-            # Compile each handler case body into a standalone sub-function.
+            effect = str(e.handle_effect or "")
+            if "<" in effect:  # strip generic args: State<int> -> State
+                effect = effect.split("<", 1)[0]
+            scope_tag = self.state.fresh("hs")
+            cases_encoded: List[tuple] = []
             for (op_name, param_name, body_he) in (e.handle_cases or ()):
-                self._lower_subfunc(f"__handler_{op_name}", (param_name,), body_he,
+                hfn = f"__handler_{effect}_{op_name}_{scope_tag}"
+                self._lower_subfunc(hfn, (param_name, "__k"), body_he,
                                     ty_sig=e.ty, suspending=False)
-            # Emit push_handler, run body, pop_handler
-            encoded = tuple(
-                (op_name, param_name)
-                for (op_name, param_name, _) in (e.handle_cases or ())
-            )
-            handler_id = self.state.fresh("hid")
-            self.emit(("let", handler_id, ("push_handler", e.handle_effect or ""), encoded))
-            body_val = self.lower_expr(e.handle_body)
-            self.emit(("let", handler_id, ("pop_handler", e.handle_effect or ""), ()))
-            return body_val
+                cases_encoded.append((op_name, param_name, hfn))
+            body_fn = f"__handle_body_{effect}_{scope_tag}"
+            self._lower_subfunc(body_fn, (), e.handle_body, ty_sig=e.ty,
+                                suspending=False)
+            # Capture every live MIR value so body/case sub-functions can see
+            # enclosing locals (read-only value semantics, like closures).
+            captured = tuple(sorted({v for v in self.state.env.values() if isinstance(v, str)}))
+            captures = tuple((name, name) for name in captured)
+            dst = self.state.fresh("hres")
+            self.emit(("let", dst,
+                       ("handle_scope", body_fn, effect, tuple(cases_encoded)),
+                       captures))
+            return dst
         # Fallback: const of type
         dst = self.state.fresh("ret")
         self.emit(("let", dst, ("const_ty", str(e.ty)), ()))
