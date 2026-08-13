@@ -321,3 +321,56 @@ fn main() -> int {
     }
 }
 """)
+
+
+def test_handler_perform_routes_to_outer_handler():
+    """A handler case performing its own effect evaluates OUTSIDE its own
+    delimitation: the perform routes to the next enclosing handler of that
+    effect instead of deadlocking on the handler's own frame."""
+    result, _ = run_main("""
+effect Ask {
+    ask() -> int
+}
+
+fn main() -> int {
+    handle Ask with {
+        ask() -> resume(100)
+    } in {
+        handle Ask with {
+            ask() -> {
+                let outer = perform Ask.ask();
+                resume(outer + 1)
+            }
+        } in {
+            perform Ask.ask()
+        }
+    }
+}
+""")
+    # inner body performs -> inner handler performs -> OUTER handler resumes
+    # 100 -> inner handler resumes 101 -> inner body value 101 -> both handles
+    # complete with 101.
+    assert result == 101
+
+
+def test_multiple_performs_still_reach_inner_handler_after_resume():
+    """Deep-handler re-arming: after resume(), later performs in the body must
+    still reach the SAME (inner) handler, not leak to an outer one."""
+    result, _ = run_main("""
+effect Ask {
+    ask() -> int
+}
+
+fn main() -> int {
+    handle Ask with {
+        ask() -> resume(1000)
+    } in {
+        handle Ask with {
+            ask() -> resume(1)
+        } in {
+            perform Ask.ask() + perform Ask.ask()
+        }
+    }
+}
+""")
+    assert result == 2  # both performs hit the inner handler
