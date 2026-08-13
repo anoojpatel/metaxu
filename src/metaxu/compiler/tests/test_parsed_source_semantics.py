@@ -340,3 +340,28 @@ fn main() -> int {
 }
 """
     run_pipeline_from_source(src)  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# Inference class-conflict detection (the SimpleSub error channel was dead:
+# all types are inference vars, so unify() could never fail; conflicts are
+# detected on the constraint graph instead and fail compilation)
+# ---------------------------------------------------------------------------
+
+def test_int_plus_string_rejected():
+    from metaxu.compiler.pipeline import TypeCheckError
+    with pytest.raises(TypeCheckError, match="Int and String"):
+        run_pipeline_from_source('fn f() -> int { 1 + "a" }')
+
+
+def test_int_literal_condition_rejected():
+    from metaxu.compiler.pipeline import TypeCheckError
+    with pytest.raises(TypeCheckError, match="Bool and Int"):
+        run_pipeline_from_source('fn f() -> int { if 1 { 2 } else { 3 } }')
+
+
+def test_legitimate_literal_uses_accepted():
+    run_pipeline_from_source('fn f() -> string { "a" + "b" }')
+    run_pipeline_from_source('fn f() -> int { 1 + 2 * 3 }')
+    run_pipeline_from_source('fn f(c: bool) -> int { if c { 1 } else { 2 } }')
+    run_pipeline_from_source('fn f() -> bool { if true { false } else { true } }')

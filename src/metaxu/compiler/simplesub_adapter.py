@@ -102,12 +102,76 @@ class SimpleSubFacade:
             return ty.bounds
         return None
 
+    # Literal classes that are mutually exclusive: one value cannot be, say,
+    # both an Int and a String. Used for constraint-graph conflict detection.
+    _LITERAL_CLASSES = frozenset({"Int", "String", "Bool", "Float"})
+
+    def _detect_class_conflicts(self) -> list[str]:
+        """Union type vars along *unify* edges and flag components that carry
+        contradictory literal classes (e.g. `1 + \"a\"` unifies an Int-classed
+        var with a String-classed var).
+
+        Subtype edges are deliberately NOT merged: they are directional
+        (every statement's type flows into its block's type), and merging
+        them would conflate unrelated values.
+        """
+        parent: dict[int, int] = {}
+
+        def find(x: int) -> int:
+            while parent.setdefault(x, x) != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a: int, b: int) -> None:
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[ra] = rb
+
+        def key(ty: Any) -> int | None:
+            tid = getattr(ty, "id", None)
+            return tid if isinstance(tid, int) else None
+
+        classes: dict[int, set[str]] = {}
+        nodes: dict[int, int] = {}
+        for c in self._constraints:
+            if c[0] == "class" and c[1] in self._LITERAL_CLASSES:
+                _, cls, args, node_id = c
+                for ty in args:
+                    k = key(ty)
+                    if k is not None:
+                        classes.setdefault(k, set()).add(cls)
+                        if isinstance(node_id, int):
+                            nodes.setdefault(k, node_id)
+            elif c[0] == "unify":
+                ka, kb = key(c[1]), key(c[2])
+                if ka is not None and kb is not None:
+                    union(ka, kb)
+
+        merged: dict[int, set[str]] = {}
+        rep_node: dict[int, int] = {}
+        for k, cls_set in classes.items():
+            rep = find(k)
+            merged.setdefault(rep, set()).update(cls_set)
+            if k in nodes:
+                rep_node.setdefault(rep, nodes[k])
+        errors = []
+        for rep, cls_set in merged.items():
+            if len(cls_set) > 1:
+                where = f" at node {rep_node[rep]}" if rep in rep_node else ""
+                errors.append(
+                    "type mismatch: one value is required to be "
+                    + " and ".join(sorted(cls_set)) + where
+                )
+        return errors
+
     # --- Solving ---
     def solve(self) -> None:
         # Run frozen constraint checker for custom validations
         from .frozen_constraint_checker import check_constraints
 
         self.errors, self.effect_info = check_constraints(self._constraints, self.function_types)
+        self.errors = list(self.errors) + self._detect_class_conflicts()
 
         # If real TypeInferencer is available, translate buffered constraints
         if self._ss is not None and _Polarity is not None:

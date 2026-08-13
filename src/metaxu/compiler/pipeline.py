@@ -30,6 +30,11 @@ def run_pipeline(
     all_errors = list(tables.constraints.get(-2, []))
     type_errors = [e for e in all_errors if getattr(e, "kind", "").startswith("type-")]
     borrow_errors = [e for e in all_errors if e not in type_errors]
+    # Inference-level diagnostics live under key -1. Most are advisory
+    # ("Unresolved callee ..."), but constraint-graph class conflicts are
+    # hard type errors.
+    type_errors += [e for e in tables.constraints.get(-1, ())
+                    if str(e).startswith("type mismatch:")]
     if strict and type_errors:
         raise TypeCheckError(type_errors)
     if strict and borrow_errors:
