@@ -21,6 +21,7 @@ def check_constraints(constraints: Sequence[tuple], function_types: dict = None)
     effect_info = EffectInfo()
     fn_return_ty: dict[Any, Any] = {}
     subtype_edges: list[tuple[Any, Any]] = []
+    effect_classes: dict[str, str] = {}  # effect_name -> "stack" | "suspend"
     if function_types is None:
         function_types = {}
 
@@ -50,6 +51,9 @@ def check_constraints(constraints: Sequence[tuple], function_types: dict = None)
         elif tag == "effect":
             _, fn_ty, effect_name, _node_id = constraint
             effect_info.effects_by_type.setdefault(fn_ty, set()).add(effect_name)
+        elif tag == "effect_class":
+            _, effect_name, effect_class, _node_id = constraint
+            effect_classes[effect_name] = effect_class
         elif tag == "call":
             _, callee_ty, _arg_tys, result_ty, node_id = constraint
             call_counts[callee_ty] = call_counts.get(callee_ty, 0) + 1
@@ -86,8 +90,12 @@ def check_constraints(constraints: Sequence[tuple], function_types: dict = None)
                 if effect not in effect_info.effects_by_type.get(ret_ty, set()):
                     effect_info.effects_by_type.setdefault(ret_ty, set()).add(effect)
 
+    # A function suspends only if it performs at least one suspend-class
+    # effect. Stack-class effects behave like plain calls (see
+    # docs/effects/continuation_design.md). Effects with no declared class
+    # are conservatively treated as suspend-class.
     for fn_ty, effects in effect_info.effects_by_type.items():
-        if effects:
+        if any(effect_classes.get(effect, "suspend") == "suspend" for effect in effects):
             effect_info.suspends.add(fn_ty)
 
     return errors, effect_info

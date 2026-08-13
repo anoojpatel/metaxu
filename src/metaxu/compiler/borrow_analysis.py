@@ -1,9 +1,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Set
+from typing import Any, Dict, List, Set
 
 from .hir import HFun, HExpr
+
+# BorrowError kinds that imply a variable's value has been moved out, so the
+# function epilogue must not drop it again.
+_MOVE_ERROR_KINDS = {
+    "use-after-move",
+    "move-after-move",
+    "borrow-after-move",
+}
 
 
 @dataclass(slots=True)
@@ -55,18 +63,14 @@ def plan_drops(funcs: List[HFun], borrow_errors: List[Any] | None = None) -> Dic
         Dictionary mapping function symbols to DropPlans
     """
     plans: Dict[str, DropPlan] = {}
-    # Parse borrow errors to find moved/invalidated variables
+    # Use structured BorrowError data (kind, variable) to find variables whose
+    # value has been moved out and must not be dropped again.
     moved_vars: Set[str] = set()
-    if borrow_errors:
-        for err in borrow_errors:
-            err_str = str(err).lower()
-            if "moved" in err_str:
-                # Try to extract variable name from error message
-                # Error format: "Variable 'x' was moved"
-                import re
-                match = re.search(r"'(\w+)'", str(err))
-                if match:
-                    moved_vars.add(match.group(1))
+    for err in borrow_errors or []:
+        kind = getattr(err, "kind", None)
+        variable = getattr(err, "variable", None)
+        if variable and kind in _MOVE_ERROR_KINDS:
+            moved_vars.add(str(variable))
     
     for f in funcs:
         lets: List[tuple[str, object]] = []

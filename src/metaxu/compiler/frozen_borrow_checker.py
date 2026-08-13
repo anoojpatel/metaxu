@@ -13,9 +13,35 @@ from typing import Any, Dict, Set, List, Tuple, Optional
 
 @dataclass
 class BorrowError:
-    """A borrow checking error with location information."""
+    """A structured borrow checking error.
+
+    Fields:
+        message: Human-readable description (also returned by str()).
+        node_id: Frozen AST node id where the error was detected.
+        kind: Machine-readable error category, e.g. "use-after-move",
+              "borrow-conflict", "locality-escape", "suspend-local",
+              "reference-conflict", "dangling-reference", "linearity".
+        variable: The variable the error is about, when applicable.
+    """
     message: str
     node_id: int
+    kind: str = "borrow"
+    variable: Optional[str] = None
+
+    def __str__(self) -> str:
+        return self.message
+
+
+class BorrowCheckError(Exception):
+    """Raised by the pipeline when borrow checking fails in strict mode.
+
+    Carries the structured list of BorrowError objects in `errors`.
+    """
+
+    def __init__(self, errors: List[BorrowError]):
+        self.errors = list(errors)
+        summary = "; ".join(str(e) for e in self.errors) or "borrow check failed"
+        super().__init__(f"borrow check failed: {summary}")
 
 
 @dataclass
@@ -53,7 +79,8 @@ class FrozenBorrowChecker:
         self.scope_stack: List[Set[str]] = []
         self.region_stack: List[int] = []
         self.variables: Dict[str, VariableInfo] = {}  # variable_name -> VariableInfo
-        self.reference_graph: Dict[str, List[Tuple[str, str]]] = {}  # var -> [(referenced_var, mode)]
+        self.reference_graph: Dict[str, List[Tuple[str, str]]] = {}  # holder -> [(referenced_var, mode)]
+        self.referenced_by: Dict[str, List[Tuple[str, str]]] = {}  # referenced_var -> [(holder, mode)]
         self.call_counts: Dict[str, int] = {}  # callable_name -> count
         self.errors: List[BorrowError] = []
         
@@ -132,11 +159,15 @@ class FrozenBorrowChecker:
         - Error if variable is exclusively borrowed
         """
         if var_name in self.borrow_state.invalidated:
-            self.errors.append(BorrowError(f"Cannot borrow {var_name} as shared after it was moved", node_id))
+            self.errors.append(BorrowError(
+                f"Cannot borrow {var_name} as shared after it was moved", node_id,
+                kind="borrow-after-move", variable=var_name))
             return False
-        
+
         if var_name in self.borrow_state.exclusive_borrows:
-            self.errors.append(BorrowError(f"Cannot borrow {var_name} as shared while exclusively borrowed", node_id))
+            self.errors.append(BorrowError(
+                f"Cannot borrow {var_name} as shared while exclusively borrowed", node_id,
+                kind="borrow-conflict", variable=var_name))
             return False
         
         self.add_shared_borrow(var_name)
@@ -152,11 +183,15 @@ class FrozenBorrowChecker:
         - Semantics: Like passing by value - callee can destroy/move the value
         """
         if var_name in self.borrow_state.invalidated:
-            self.errors.append(BorrowError(f"Cannot borrow {var_name} as unique after it was moved", node_id))
+            self.errors.append(BorrowError(
+                f"Cannot borrow {var_name} as unique after it was moved", node_id,
+                kind="borrow-after-move", variable=var_name))
             return False
-        
+
         if self.is_borrowed(var_name):
-            self.errors.append(BorrowError(f"Cannot borrow {var_name} as unique while borrowed", node_id))
+            self.errors.append(BorrowError(
+                f"Cannot borrow {var_name} as unique while borrowed", node_id,
+                kind="borrow-conflict", variable=var_name))
             return False
         
         # Transfer ownership - invalidate the source variable
@@ -174,11 +209,15 @@ class FrozenBorrowChecker:
         - Semantics: Like Rust's &mut - borrowing a reference to existing data
         """
         if var_name in self.borrow_state.invalidated:
-            self.errors.append(BorrowError(f"Cannot borrow {var_name} as exclusive after it was moved", node_id))
+            self.errors.append(BorrowError(
+                f"Cannot borrow {var_name} as exclusive after it was moved", node_id,
+                kind="borrow-after-move", variable=var_name))
             return False
-        
+
         if self.is_borrowed(var_name):
-            self.errors.append(BorrowError(f"Cannot borrow {var_name} as exclusive while borrowed", node_id))
+            self.errors.append(BorrowError(
+                f"Cannot borrow {var_name} as exclusive while borrowed", node_id,
+                kind="borrow-conflict", variable=var_name))
             return False
         
         # Add exclusive borrow - does NOT invalidate source (it's a reference)
@@ -194,9 +233,11 @@ class FrozenBorrowChecker:
         - Releases all borrows
         """
         if var_name in self.borrow_state.invalidated:
-            self.errors.append(BorrowError(f"Cannot move {var_name} after it was already moved", node_id))
+            self.errors.append(BorrowError(
+                f"Cannot move {var_name} after it was already moved", node_id,
+                kind="move-after-move", variable=var_name))
             return False
-        
+
         self.invalidate_variable(var_name)
         return True
     
@@ -208,9 +249,11 @@ class FrozenBorrowChecker:
         - Cannot use a variable that is exclusively borrowed by someone else
         """
         if var_name in self.borrow_state.invalidated:
-            self.errors.append(BorrowError(f"Cannot use {var_name} after it was moved", node_id))
+            self.errors.append(BorrowError(
+                f"Cannot use {var_name} after it was moved", node_id,
+                kind="use-after-move", variable=var_name))
             return False
-        
+
         return True
     
     def declare_variable(self, var_name: str, mode: str, locality: str, node_id: int):
@@ -236,110 +279,122 @@ class FrozenBorrowChecker:
     
     def check_locality(self, var_name: str, target_region: Optional[int] = None, node_id: int = 0) -> bool:
         """Check if a variable would escape its region.
-        
+
         Rules:
-        - Local variables cannot escape their region
-        - Global variables can escape their region
-        
+        - Local (@local) values cannot escape to an *older* (outer) region than
+          the one they were declared in. Using a local from an enclosing region
+          inside a nested region is fine; the escape direction is outward.
+        - Global values can escape freely.
+
         Arguments:
             var_name: Name of the variable to check
-            target_region: Target region (defaults to current region)
+            target_region: Region the value would flow into (defaults to current region)
             node_id: Node ID for error reporting
         """
         if var_name not in self.variables:
             # Variable not declared, skip locality check
             return True
-        
+
         var_info = self.variables[var_name]
-        
+
         if var_info.locality != "local":
             # Global variables can escape
             return True
-        
+
         target = target_region if target_region is not None else self.current_region()
-        if var_info.region != target:
+        if var_info.region > target:
             self.errors.append(BorrowError(
                 f"Local variable '{var_name}' cannot escape its region (region {var_info.region} -> {target})",
-                node_id
+                node_id,
+                kind="locality-escape",
+                variable=var_name,
             ))
             return False
-        
+
         return True
     
     def track_reference(self, from_var: str, to_var: str, mode: str):
         """Track a reference relationship between variables.
-        
+
         Arguments:
             from_var: Variable that holds the reference
             to_var: Variable being referenced
             mode: Mode of the reference ("shared", "unique", "exclusive")
         """
-        if from_var not in self.reference_graph:
-            self.reference_graph[from_var] = []
-        self.reference_graph[from_var].append((to_var, mode))
-        
+        self.reference_graph.setdefault(from_var, []).append((to_var, mode))
+        self.referenced_by.setdefault(to_var, []).append((from_var, mode))
+
         # Check for global-to-local reference (dangling reference prevention)
         from_info = self.variables.get(from_var)
         to_info = self.variables.get(to_var)
-        
+
         if from_info and to_info:
             # Global holding reference to local = ERROR (local would escape)
             if from_info.locality == "global" and to_info.locality == "local":
                 self.errors.append(BorrowError(
                     f"Global variable '{from_var}' cannot hold reference to local variable '{to_var}' (would create dangling reference)",
-                    from_info.node_id
+                    from_info.node_id,
+                    kind="dangling-reference",
+                    variable=to_var,
                 ))
             # Local holding reference to global = OK (global outlives local)
             # No error needed
-    
+
     def check_reference_conflicts(self, var_name: str, node_id: int) -> bool:
-        """Check if a variable has conflicting references.
-        
+        """Check if a referenced variable has conflicting references.
+
         Rules:
-        - A variable cannot have both mutable and const references to the same underlying value
-        - A variable with UNIQUE mode cannot be referenced by multiple variables
-        - A variable with EXCLUSIVE mode cannot have any other references
-        
+        - A value cannot have both mutable and const references outstanding
+        - A value with UNIQUE mode cannot be referenced by multiple holders
+        - A value with EXCLUSIVE mode cannot have any other references
+
         Arguments:
-            var_name: Name of the variable to check
+            var_name: Name of the *referenced* variable to check
             node_id: Node ID for error reporting
         """
-        if var_name not in self.reference_graph:
+        references = self.referenced_by.get(var_name)
+        if not references:
             return True
-        
+
         var_info = self.variables.get(var_name)
         if not var_info:
             return True
-        
-        references = self.reference_graph[var_name]
-        
+
+        holders = [holder for holder, _ in references]
+
         # Check EXCLUSIVE mode - no other references allowed
         if var_info.mode == "exclusive" and references:
             self.errors.append(BorrowError(
-                f"Variable '{var_name}' has exclusive mode but is referenced by {[r[0] for r in references]}",
-                node_id
+                f"Variable '{var_name}' has exclusive mode but is referenced by {holders}",
+                node_id,
+                kind="reference-conflict",
+                variable=var_name,
             ))
             return False
-        
+
         # Check UNIQUE mode - only one reference allowed
         if var_info.mode == "unique" and len(references) > 1:
             self.errors.append(BorrowError(
-                f"Variable '{var_name}' has unique mode but is referenced by {[r[0] for r in references]}",
-                node_id
+                f"Variable '{var_name}' has unique mode but is referenced by {holders}",
+                node_id,
+                kind="reference-conflict",
+                variable=var_name,
             ))
             return False
-        
+
         # Check for mut vs const conflicts
         has_mutable = any(mode in ("unique", "exclusive") for _, mode in references)
         has_const = any(mode == "shared" for _, mode in references)
-        
+
         if has_mutable and has_const:
             self.errors.append(BorrowError(
                 f"Variable '{var_name}' has both mutable and const references",
-                node_id
+                node_id,
+                kind="reference-conflict",
+                variable=var_name,
             ))
             return False
-        
+
         return True
     
     def check_linearity(self, callable_name: str, linearity: str, node_id: int) -> bool:
@@ -360,7 +415,9 @@ class FrozenBorrowChecker:
             if count >= 1:
                 self.errors.append(BorrowError(
                     f"Once callable '{callable_name}' invoked more than once",
-                    node_id
+                    node_id,
+                    kind="linearity",
+                    variable=callable_name,
                 ))
                 return False
             self.call_counts[callable_name] = count + 1
@@ -383,10 +440,23 @@ class FrozenBorrowChecker:
             expression_var: Variable name in the exclave expression
             node_id: Node ID for error reporting
         """
-        # Exclave uses copy semantics, so no borrow checking errors needed
-        # The value is copied to caller's frame, original remains valid
+        # Exclave copies the value to the caller's frame, so it is a *legal*
+        # escape for @local values. The only illegal case is exclaving a value
+        # that has already been moved (nothing left to copy).
+        if expression_var in self.borrow_state.invalidated:
+            self.errors.append(BorrowError(
+                f"Cannot exclave {expression_var} after it was moved",
+                node_id,
+                kind="use-after-move",
+                variable=expression_var,
+            ))
+            return False
         return True
-    
-    def get_errors(self) -> List[Tuple[str, int]]:
-        """Get all borrow checking errors as (message, node_id) tuples."""
-        return [(error.message, error.node_id) for error in self.errors]
+
+    def get_errors(self) -> List[BorrowError]:
+        """Get all borrow checking errors as structured BorrowError objects.
+
+        Each error carries (kind, variable, node_id, message); str(error)
+        yields the display message.
+        """
+        return list(self.errors)
