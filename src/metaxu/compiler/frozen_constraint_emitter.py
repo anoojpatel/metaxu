@@ -96,6 +96,7 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
     handler_contexts: list[dict[str, str]] = []  # Stack of handler contexts: effect_name -> effect_class
     handler_locals: list[set[str]] = []  # Track variables assigned in handler contexts
     handler_operations: list[list[str]] = []  # Track operations in handler (for stack effect checking)
+    struct_defs: dict[str, dict[str, Any]] = {}  # struct name -> frozen payload (fields/type_params)
 
     def bind(name: Any, ty: Any) -> None:
         if isinstance(name, str):
@@ -124,6 +125,71 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
     def payload_dict(node: Any) -> dict[str, Any]:
         value = getattr(node, "value", None)
         return value if isinstance(value, dict) else {}
+
+    _PRIMITIVE_NAMES = {
+        "int": "Int", "Int": "Int",
+        "str": "String", "string": "String", "String": "String",
+        "bool": "Bool", "Bool": "Bool",
+        "float": "Float", "Float": "Float",
+    }
+
+    def _literal_type_name(value: Any) -> str | None:
+        if isinstance(value, bool):
+            return "Bool"
+        if isinstance(value, int):
+            return "Int"
+        if isinstance(value, float):
+            return "Float"
+        if isinstance(value, str):
+            return "String"
+        return None
+
+    def _check_struct_field_types(node: Any, struct_name: str) -> None:
+        """Check literal field values against the struct's declared field types.
+
+        Conservative: only flags a mismatch when the declared type (after
+        substituting the instantiation's type arguments for the struct's
+        type parameters) and the literal's type are both known primitives.
+        Non-literal fields are left to inference.
+        """
+        definition = struct_defs.get(struct_name)
+        if not definition:
+            return
+        declared = {
+            f.get("name"): f.get("type")
+            for f in definition.get("fields", []) or []
+            if isinstance(f, dict)
+        }
+        params = [p for p in definition.get("type_params", []) or [] if isinstance(p, str)]
+        args = [a for a in payload_dict(node).get("type_args", []) or [] if isinstance(a, str)]
+        substitution = dict(zip(params, args))
+        for field in getattr(node, "children", ()):
+            if getattr(field, "kind", None) != "StructField":
+                continue
+            field_name = payload_dict(field).get("name")
+            expected = declared.get(field_name)
+            if isinstance(expected, str):
+                expected = substitution.get(expected, expected)
+            expected = _PRIMITIVE_NAMES.get(expected) if isinstance(expected, str) else None
+            if expected is None:
+                continue
+            literal = next(
+                (c for c in getattr(field, "children", ()) if getattr(c, "kind", None) == "Literal"),
+                None,
+            )
+            if literal is None:
+                continue
+            actual = _literal_type_name(getattr(literal, "value", None))
+            if actual is not None and actual != expected:
+                borrow_checker.errors.append(BorrowError(
+                    message=(
+                        f"type mismatch for field '{field_name}' of {struct_name}: "
+                        f"expected {expected}, got {actual}"
+                    ),
+                    node_id=field.node_id,
+                    kind="type-mismatch",
+                    variable=field_name if isinstance(field_name, str) else None,
+                ))
 
     def param_nodes(children: Any) -> list[Any]:
         return [child for child in children if getattr(child, "kind", None) == "Parameter"]
@@ -580,7 +646,12 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
             value = payload_dict(node)
             var_name = value.get("variable")
             if isinstance(var_name, str):
-                borrow_checker.check_borrow_unique(var_name, node.node_id)
+                # Surface `&mut x` parses to BorrowUnique, but per
+                # docs/ownership_and_borrowing.md it is an exclusive
+                # *reference*: aliasing-XOR-mutation while live, and the
+                # source stays valid once the borrow ends. Ownership
+                # transfer only happens via moves, not `&mut`.
+                borrow_checker.check_borrow_exclusive(var_name, node.node_id)
                 simplesub.add_class_constraint("BorrowUnique", [node_ty], node.node_id)
         if kind == "BorrowExclusive" and node_ty is not None:
             value = payload_dict(node)
@@ -605,11 +676,16 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
             if isinstance(inner_var, str):
                 borrow_checker.check_exclave(inner_var, node.node_id)
             simplesub.add_class_constraint("Exclave", [node_ty], node.node_id)
+        if kind == "StructDefinition":
+            name = payload_name(node)
+            if isinstance(name, str):
+                struct_defs[name] = payload_dict(node)
         if kind == "StructInstantiation" and node_ty is not None:
             simplesub.add_class_constraint("Struct", [node_ty], node.node_id)
             name = payload_name(node)
             if isinstance(name, str):
                 simplesub.add_class_constraint(f"Struct:{name}", [node_ty], node.node_id)
+                _check_struct_field_types(node, name)
         if kind == "StructField" and node_ty is not None:
             for child in children:
                 child_ty = types.get(child.node_id)
@@ -627,6 +703,18 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
             if node_ty is not None and child_ty is not None:
                 simplesub.add_subtype(child_ty, node_ty)
             walk(child)
+
+        if kind == "FunctionCall":
+            # Borrows taken directly in argument position (`f(&mut x)`) live
+            # only for the duration of the call; release them so `x` is
+            # borrowable again afterwards. Named references (`let r = &mut x`)
+            # are not affected — their borrow is tracked via the Assignment
+            # binding, and this release is keyed off the call's own children.
+            for child in children:
+                if child.kind in _BORROW_NODE_MODES:
+                    arg_var = payload_dict(child).get("variable")
+                    if isinstance(arg_var, str):
+                        borrow_checker.release_borrows(arg_var)
 
     walk(frozen_root)
     # Publish declared effect classes so the constraint checker can

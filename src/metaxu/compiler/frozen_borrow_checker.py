@@ -44,6 +44,20 @@ class BorrowCheckError(Exception):
         super().__init__(f"borrow check failed: {summary}")
 
 
+class TypeCheckError(Exception):
+    """Raised by the pipeline when type checking fails in strict mode.
+
+    Carries the structured list of BorrowError objects (kind "type-*")
+    in `errors` — type errors share the structured-diagnostic channel
+    with borrow errors but surface as their own exception type.
+    """
+
+    def __init__(self, errors: List[BorrowError]):
+        self.errors = list(errors)
+        summary = "; ".join(str(e) for e in self.errors) or "type check failed"
+        super().__init__(f"type check failed: {summary}")
+
+
 @dataclass
 class BorrowState:
     """Tracks borrow state for variables."""

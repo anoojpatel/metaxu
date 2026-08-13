@@ -110,9 +110,28 @@ def _value_of(node: Any) -> Any | None:
             "captures": dict(getattr(node, "capture_modes", {}) or {}),
             "linearity": _mode_value(getattr(node, "linearity", None)),
         }
+    if isinstance(node, fast.StructDefinition):
+        return {
+            "name": getattr(node, "name", None),
+            "type_params": [
+                _type_display(tp) for tp in getattr(node, "type_params", None) or []
+            ],
+            "fields": [
+                {
+                    "name": getattr(f, "name", None),
+                    "type": _type_display(getattr(f, "type_info", None)),
+                }
+                for f in getattr(node, "fields", None) or []
+            ],
+        }
     if isinstance(node, fast.StructInstantiation):
         struct_name = getattr(node, "struct_name", None)
-        return {"name": str(struct_name) if struct_name is not None else None}
+        return {
+            "name": str(struct_name) if struct_name is not None else None,
+            "type_args": [
+                _type_display(a) for a in getattr(node, "type_args", None) or []
+            ],
+        }
     if isinstance(node, fast.StructField):
         return {"name": getattr(node, "name", None)}
     if isinstance(node, fast.FieldAccess):
@@ -128,6 +147,28 @@ def _value_of(node: Any) -> Any | None:
     if isinstance(node, fast.ExclaveExpression):
         return {"expression": getattr(node, "expression", None)}
     return None
+
+
+def _type_display(t: Any) -> str | None:
+    """Best-effort display name for a surface type expression.
+
+    Handles TypeReference/TypeParameter/Variable (all carry .name) and
+    TypeApplication (constructor + args). Used so the frozen AST keeps
+    enough declared-type information for field-level type checking.
+    """
+    if t is None:
+        return None
+    if isinstance(t, str):
+        return t
+    name = getattr(t, "name", None)
+    if isinstance(name, str):
+        return name
+    ctor = getattr(t, "type_constructor", None)
+    if ctor is not None:
+        base = ctor if isinstance(ctor, str) else _type_display(ctor)
+        args = [_type_display(a) or "?" for a in getattr(t, "type_args", None) or []]
+        return f"{base}[{', '.join(args)}]" if args else base
+    return str(t)
 
 
 def _mode_value(mode: Any) -> Any | None:
