@@ -312,11 +312,16 @@ class MirInterpreter:
     # Internal execution
     # ------------------------------------------------------------------
 
-    def _call_func(self, f: MirFunc, args: List[Any], outer_env: Dict[str, Any]) -> Any:
+    def _call_func(self, f: MirFunc, args: List[Any], outer_env: Dict[str, Any],
+                   out_env: Optional[Dict[str, Any]] = None) -> Any:
         env: Dict[str, Any] = dict(outer_env)
         for name, val in zip(f.param_names(), args):
             env[name] = val
-        return self._run_blocks(f, 0, env)
+        result = self._run_blocks(f, 0, env)
+        if out_env is not None:
+            out_env.update(env)
+            out_env["__params__"] = tuple(f.param_names())
+        return result
 
     def _run_blocks(self, f: MirFunc, start: int, env: Dict[str, Any]) -> Any:
         bi = start
@@ -526,15 +531,29 @@ class MirInterpreter:
         elif kind == "call":
             callee_name: str = rhs[1]
             arg_vals = [self._lookup(a, env, f) for a in args]
+            # Struct arguments are passed by reference for mutation purposes:
+            # after the callee completes, any struct param it rebound (via
+            # `self.field = ...` / `list.field = ...`, which the borrow
+            # checker only admits through @mut-capable bindings) is written
+            # back to the caller's slot. Without this, methods like
+            # Stack.push updated a private copy and the mutation silently
+            # vanished (Vec already has identity semantics; see MxVec).
+            final_env: Dict[str, Any] = {}
             # Trait method call: dispatch on the receiver's runtime type.
             if callee_name.startswith(TRAIT_CALL_PREFIX):
-                return self._dispatch_trait_call(
-                    callee_name[len(TRAIT_CALL_PREFIX):], arg_vals)
+                result = self._dispatch_trait_call(
+                    callee_name[len(TRAIT_CALL_PREFIX):], arg_vals,
+                    out_env=final_env)
+                self._write_back_struct_args(args, arg_vals, final_env, env)
+                return result
             # Static impl-method call: `Type.method(args)` — resolved by the
             # (type, method) pair, no receiver involved.
             if callee_name.startswith(STATIC_CALL_PREFIX):
                 type_name, _, method = callee_name[len(STATIC_CALL_PREFIX):].partition(IMPL_SEP)
-                return self._dispatch_static_call(type_name, method, arg_vals)
+                result = self._dispatch_static_call(type_name, method, arg_vals,
+                                                    out_env=final_env)
+                self._write_back_struct_args(args, arg_vals, final_env, env)
+                return result
             # A local bound to a closure value (`let g = fn(y) ...; g(2)`, or a
             # closure received as a parameter) shadows funcs/builtins: call the
             # closure's MirFunc with its captured env seeding the frame.
@@ -552,7 +571,9 @@ class MirInterpreter:
             target = self._funcs.get(callee_name)
             if target is None:
                 raise InterpError(f"Unknown callee: {callee_name!r}")
-            return self._call_func(target, arg_vals, {})
+            result = self._call_func(target, arg_vals, {}, out_env=final_env)
+            self._write_back_struct_args(args, arg_vals, final_env, env)
+            return result
         elif kind == "binop":
             op_name = rhs[1]
             lv = self._lookup(args[0], env, f)
@@ -771,11 +792,33 @@ class MirInterpreter:
         else:
             raise InterpError(f"Unknown rhs kind: {kind!r}")
 
+    def _write_back_struct_args(self, arg_slots: tuple, arg_vals: List[Any],
+                                final_env: Dict[str, Any],
+                                caller_env: Dict[str, Any]) -> None:
+        """Propagate struct mutations from a completed callee to the caller.
+
+        For each argument that was an MxStruct, if the callee's final binding
+        of the corresponding parameter is a *different* struct value (the
+        callee rebound it, i.e. assigned through it), the caller's argument
+        slot is updated. Non-struct args and untouched params are left alone,
+        preserving value semantics everywhere else.
+        """
+        pnames = final_env.get("__params__")
+        if not pnames:
+            return
+        for slot, pname, passed in zip(arg_slots, pnames, arg_vals):
+            if not isinstance(passed, MxStruct):
+                continue
+            newv = final_env.get(pname, passed)
+            if newv is not passed and isinstance(newv, MxStruct):
+                caller_env[slot] = newv
+
     # ------------------------------------------------------------------
     # Trait method dispatch (runtime, on the receiver's type name)
     # ------------------------------------------------------------------
 
-    def _dispatch_trait_call(self, method: str, arg_vals: List[Any]) -> Any:
+    def _dispatch_trait_call(self, method: str, arg_vals: List[Any],
+                             out_env: Optional[Dict[str, Any]] = None) -> Any:
         """Resolve `recv.method(args)` against loaded __impl$Trait$Type$method
         functions using the receiver's runtime type name.
 
@@ -806,13 +849,14 @@ class MirInterpreter:
                             f"Ambiguous trait method call: {method!r} on type "
                             f"{recv_ty!r} is implemented by multiple traits: {opts}")
                     fname = next(iter(traits.values()))
-                    return self._call_func(self._funcs[fname], arg_vals, {})
+                    return self._call_func(self._funcs[fname], arg_vals, {},
+                                           out_env=out_env)
         # Fallbacks: builtin method, then a plain function of the same name.
         if method in self._builtins:
             return self._builtins[method](*arg_vals)
         target = self._funcs.get(method)
         if target is not None:
-            return self._call_func(target, arg_vals, {})
+            return self._call_func(target, arg_vals, {}, out_env=out_env)
         if by_type:
             impl_types = ", ".join(sorted(by_type))
             raise InterpError(
@@ -823,7 +867,8 @@ class MirInterpreter:
             f"(receiver type: {recv_ty!r})")
 
     def _dispatch_static_call(self, type_name: str, method: str,
-                              arg_vals: List[Any]) -> Any:
+                              arg_vals: List[Any],
+                              out_env: Optional[Dict[str, Any]] = None) -> Any:
         """Resolve `Type.method(args)` against __impl$Trait$Type$method funcs."""
         traits = self._impl_index.get(method, {}).get(type_name)
         if traits:
@@ -833,13 +878,15 @@ class MirInterpreter:
                     f"Ambiguous static method call: {method!r} on type "
                     f"{type_name!r} is implemented by multiple traits: {opts}")
             fname = next(iter(traits.values()))
-            return self._call_func(self._funcs[fname], arg_vals, {})
+            return self._call_func(self._funcs[fname], arg_vals, {},
+                                   out_env=out_env)
         # No impl provides it: fall back to a plain dotted function or
         # builtin (`Vec.new`) before giving up, so a type with impls keeps
         # access to same-named non-impl entry points.
         dotted = f"{type_name}.{method}"
         if dotted in self._funcs:
-            return self._call_func(self._funcs[dotted], arg_vals, {})
+            return self._call_func(self._funcs[dotted], arg_vals, {},
+                                   out_env=out_env)
         if dotted in self._builtins:
             return self._builtins[dotted](*arg_vals)
         raise InterpError(
