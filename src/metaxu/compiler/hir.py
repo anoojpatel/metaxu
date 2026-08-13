@@ -272,6 +272,24 @@ class HIRBuilder:
                 current = self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span, op="FieldGet", base=current, field_name=str(field))
             return current
 
+        # Option constructors in expression position: Some(x) / None.
+        # (In pattern position these are handled by _convert_pattern.)
+        if isinstance(orig, fast.SomeExpression):
+            inner = getattr(orig, 'value', None)
+            inner_he = self._from_orig_expr(inner, ctx_for(inner)) if inner is not None else None
+            ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, 'Unknown'))
+            return self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span,
+                                  op="MakeVariant",
+                                  enum_name=self._variant_to_enum.get("Some", "Option"),
+                                  variant_name="Some",
+                                  operands=(inner_he,) if inner_he is not None else ())
+        if isinstance(orig, fast.NoneExpression):
+            ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, 'Unknown'))
+            return self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span,
+                                  op="MakeVariant",
+                                  enum_name=self._variant_to_enum.get("None", "Option"),
+                                  variant_name="None", operands=())
+
         # PrintStatement: `print(args)` — lower to a builtin call
         if isinstance(orig, fast.PrintStatement):
             arg_exprs = []
@@ -598,6 +616,38 @@ class HIRBuilder:
         # LiteralPattern(True); tolerate bare values defensively too)
         if isinstance(p, (bool, int, float, str)):
             return HPattern(kind="literal", value=p)
+        # The parser's arm grammar is `expression => body`, so parsed match
+        # arms carry *expression* nodes as patterns. Convert the pattern-like
+        # expression forms.
+        if isinstance(p, fast.Literal):
+            return HPattern(kind="literal", value=getattr(p, 'value', None))
+        if isinstance(p, fast.Variable):
+            name = str(getattr(p, 'name', '_') or '_')
+            if name == "_":
+                return HPattern(kind="wildcard")
+            return HPattern(kind="var", name=name)
+        if isinstance(p, fast.NoneExpression):
+            return HPattern(kind="ctor", name="None",
+                            enum_name=self._variant_to_enum.get("None"), subpatterns=())
+        if isinstance(p, fast.SomeExpression):
+            inner = getattr(p, 'value', None)
+            subs = (self._convert_pattern(inner),) if inner is not None else ()
+            return HPattern(kind="ctor", name="Some",
+                            enum_name=self._variant_to_enum.get("Some"), subpatterns=subs)
+        if isinstance(p, fast.FunctionCall):
+            callee = str(getattr(p, 'name', '') or '')
+            if callee in self._variant_to_enum:
+                subs = tuple(self._convert_pattern(a)
+                             for a in getattr(p, 'arguments', []) or [])
+                return HPattern(kind="ctor", name=callee,
+                                enum_name=self._variant_to_enum[callee], subpatterns=subs)
+        if isinstance(p, fast.QualifiedFunctionCall):
+            parts = list(getattr(p, 'parts', []) or [])
+            if len(parts) >= 2:
+                subs = tuple(self._convert_pattern(a)
+                             for a in getattr(p, 'arguments', []) or [])
+                return HPattern(kind="ctor", name=str(parts[-1]),
+                                enum_name=str(parts[-2]), subpatterns=subs)
         # Unknown pattern node: treat as wildcard so lowering stays total.
         return HPattern(kind="wildcard")
 

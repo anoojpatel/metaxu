@@ -118,8 +118,7 @@ class Parser:
             return ast.VectorLiteral(callee.base_type, callee.size, args)
         if isinstance(callee, ast.GenericInstance):
             inner = self._make_call(callee.base, args)
-            if hasattr(inner, 'type_args') or True:
-                inner.type_args = callee.type_args
+            inner.type_args = callee.type_args
             return inner
         parts = self._name_parts(callee)
         if parts is not None:
@@ -541,12 +540,14 @@ class Parser:
         if len(p) == 2:
             if p.slice[1].type == 'IDENTIFIER':
                 name = p[1]
-                low = name.lower()
-                if low == 'true':
+                # Exact keyword spellings only: `true`/`false` literals and
+                # the `None` option constructor. Other capitalizations are
+                # ordinary identifiers.
+                if name == 'true':
                     p[0] = ast.Literal(True)
-                elif low == 'false':
+                elif name == 'false':
                     p[0] = ast.Literal(False)
-                elif low == 'none':
+                elif name == 'None':
                     p[0] = ast.NoneExpression()
                 else:
                     p[0] = ast.Variable(name)

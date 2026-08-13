@@ -71,7 +71,10 @@ def _value_of(node: Any) -> Any | None:
     if isinstance(node, fast.ComparisonExpression):
         return {"operator": getattr(node, "operator", None)}
     if isinstance(node, fast.LetBinding):
-        return {"name": getattr(node, "identifier", None)}
+        return {
+            "name": getattr(node, "identifier", None),
+            "mode": _mode_value(getattr(node, "mode", None)),
+        }
     if isinstance(node, fast.Parameter):
         return {
             "name": getattr(node, "name", None),
@@ -172,9 +175,31 @@ def _type_display(t: Any) -> str | None:
 
 
 def _mode_value(mode: Any) -> Any | None:
+    """Normalize surface mode annotations to plain strings for the payload.
+
+    The parser produces ModeAnnotation nodes (wrapping a Uniqueness/Locality/
+    LinearityMode carrying .mode) and sometimes lists of them; downstream
+    (_split_mode in the constraint emitter) understands strings and lists of
+    strings.
+    """
     if mode is None:
         return None
-    return getattr(mode, "mode", mode if isinstance(mode, str) else None)
+    if isinstance(mode, str):
+        return mode
+    if isinstance(mode, (list, tuple)):
+        values = [v for v in (_mode_value(m) for m in mode) if v is not None]
+        flat: list[str] = []
+        for v in values:
+            if isinstance(v, list):
+                flat.extend(v)
+            else:
+                flat.append(v)
+        return flat or None
+    inner = getattr(mode, "mode_type", None)
+    if inner is not None:
+        return _mode_value(inner)
+    value = getattr(mode, "mode", None)
+    return value if isinstance(value, str) else None
 
 
 def _effect_name(effect: Any) -> str:
