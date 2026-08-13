@@ -29,6 +29,7 @@
  * | mx_i64_to_str    | char* (int64_t)                            | fresh malloc'd decimal string |
  * | mx_f64_to_str    | char* (double)                             | fresh malloc'd string, Python str(float) format |
  * | mx_str_eq        | int64_t (const char*, const char*)         | 1 if contents equal, else 0 |
+ * | mx_str_free      | void (char*)                               | frees a produced string; NULL is a no-op |
  *
  * Vec semantics (mirrors MxVec in mir_interp.py)
  * ----------------------------------------------
@@ -56,7 +57,12 @@
  *     undefined (same as free()).
  *   - mx_str_concat / mx_i64_to_str / mx_f64_to_str return fresh buffers
  *     allocated with malloc; the caller owns them and frees them with
- *     free().  Inputs are never modified or retained.
+ *     mx_str_free (or plain free()).  Inputs are never modified or
+ *     retained — a concat result NEVER aliases an input, which is what
+ *     lets the backend free an operand right after producing from it.
+ *   - mx_str_free(NULL) is a no-op; only PRODUCED strings may be freed
+ *     (never interned literal constants — the backend distinguishes
+ *     provenance statically).
  *   - mx_str_len / mx_str_eq allocate nothing.
  *
  * Float formatting
@@ -96,6 +102,7 @@ int64_t mx_str_len(const char *s);
 char   *mx_i64_to_str(int64_t value);
 char   *mx_f64_to_str(double value);
 int64_t mx_str_eq(const char *a, const char *b);
+void    mx_str_free(char *s);
 
 #ifdef __cplusplus
 }

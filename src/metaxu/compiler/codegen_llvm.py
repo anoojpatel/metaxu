@@ -82,6 +82,30 @@ Suspending functions are no longer demoted: the coroutine stack IS the
 continuation, so no CPS transform is needed (codegen_clif's CPS state
 machines remain the CLIF story).
 
+Increment 8 moves toward zero-cost: RECLAIM what can be proven, ELIDE the
+copies the value-semantics discipline already makes redundant.  The
+soundness bar is unchanged — a leak is acceptable, a UAF/double-free never:
+  * OWNED STRINGS: concat/to_string results are fresh mallocs; a string
+    variable whose every def is a literal/producer/ANF-transfer-copy and
+    whose every use is non-retaining (concat operand, ==/!=, print, len)
+    owns its produced values through a null-initialized shadow slot — each
+    redefinition frees the previous value (a concat loop no longer grows),
+    frame exit frees the last, literal defs store null (interned constants
+    are NEVER freed; provenance is static).  See _owned_strings.
+  * UNIQUE BOXES: an entry-block make_variant whose enum value (closed
+    over intra-frame copies) is used only as a variant_tag/variant_field
+    base — never returned, passed, stored, captured, or re-boxed — has
+    sole ownership of its payload boxes; they are freed on every ret path.
+    Everything shared stays leaked by design.  See _unique_box_enums.
+  * COPY ELISION (a): an aggregate param that is never rebound and never
+    reaches a callee's write-back position skips the entry byval copy and
+    reads the caller's aggregate through the passed pointer (nothing ever
+    writes that storage).  (b): a variant_field result that is only ever
+    read becomes a BOX VIEW — a pointer aliasing the write-once box instead
+    of an aggregate copy; copies of a view alias the same box under the
+    same read-only conditions.  Both elisions are marked with
+    `; elide-copy:` comments in the IR.
+
 Everything else — try_scope,
 fixed-size vector literals/comprehensions/slices — is emitted as a
 clearly marked, comment-only placeholder carrying the reasons, never as
@@ -467,6 +491,7 @@ _RT_SIGS = {
     "mx_i64_to_str": ("ptr", ("i64",)),
     "mx_f64_to_str": ("ptr", ("double",)),
     "mx_str_eq": ("i64", ("ptr", "ptr")),
+    "mx_str_free": ("void", ("ptr",)),
     # Algebraic effects runtime (metaxu_effects.c).
     "mx_handle": ("i64", ("ptr", "ptr", "ptr", "ptr", "ptr", "ptr", "ptr",
                           "i64")),
@@ -543,6 +568,14 @@ _HEADER = (
     ";   array), resume -> mx_resume; boundary values travel as opaque\n"
     ";   8-byte words; scope bodies run on ucontext coroutines with the\n"
     ";   interpreter's deep/single-shot/abort semantics;\n"
+    ";   RECLAMATION (increment 8): owned strings (produced, provably\n"
+    ";   non-retained) are freed at redefinition + frame exit via shadow\n"
+    ";   slots (literals never freed); unique payload boxes (entry-block\n"
+    ";   make_variant values only ever tag/field-read) are freed on ret\n"
+    ";   paths; everything unproven still leaks by design.  COPY ELISION:\n"
+    ";   never-rebound aggregate params skip the byval copy (read the\n"
+    ";   caller's storage); read-only variant_field results read through\n"
+    ";   the write-once box pointer ('; elide-copy:' comments mark both);\n"
     "; functions outside the subset appear as comment-only placeholders."
 )
 
@@ -2847,6 +2880,311 @@ def _provably_dead_vecs(f: MirFunc, kinds: Dict[str, str],
 
 
 # ---------------------------------------------------------------------------
+# Owned-string analysis (increment 8: which produced strings may be freed)
+# ---------------------------------------------------------------------------
+#
+# Concat/to_string results are FRESH mallocs (metaxu_rt.c never returns or
+# retains an input), so a string value whose flow the backend fully sees can
+# be reclaimed.  A variable v is an OWNED STRING when:
+#   * every def of v is a str literal (`const`), a producing op (str + str
+#     concat, or to_string/int_to_str of an i64/f64), or a `copy` from an
+#     EXCLUSIVE TRANSFER TEMP — a variable whose single def is itself a
+#     literal/producing op and whose only use is that one copy (the ANF
+#     shape `t = s + "x"; s = copy t` every re-assignment lowers to);
+#   * every use of v is NON-RETAINING: a concat operand, a ==/!= string
+#     comparison, a print/println argument, or a str len receiver.  Anything
+#     else — returned, stored in any aggregate/env/Vec, passed to any other
+#     call (including to_string of a str, which is an identity ALIAS),
+#     copied to a non-transfer variable, crossing an effect boundary —
+#     disqualifies v, and its produced values keep leaking by design.
+#
+# Emission gives each owned v a shadow slot (`%strown.v`, null-initialized)
+# holding the pointer v currently OWNS: a producing def frees the previous
+# owned pointer and stores the new one; a literal def frees and stores null
+# (interned literal constants are never freed — provenance is static); every
+# ret path frees the final owned pointer.  Freeing at the next def is sound
+# because v's old value is unreachable there — its only aliases were v
+# itself (just overwritten; later reads see the new def) and the transfer
+# temp, whose single use has already executed.  A frame abandoned by an
+# effect abort skips its rets and leaks (sound; a leak is never a UAF).
+
+_STR_PRODUCER_BUILTINS = ("to_string", "int_to_str")
+
+
+def _owned_strings(f: MirFunc, kinds: Dict[str, str], info: _Info,
+                   builtin_of) -> Tuple[List[str], Set[str], Set[str]]:
+    """Ownership facts for produced strings this frame provably owns (see
+    the section comment above): freed at redefinition and at frame exit.
+
+    Returns (owned variables, literal transfer temps, producer transfer
+    temps) — the temp sets cover only temps feeding OWNED variables, so
+    emission can tell a copy-def carrying an interned literal (record null:
+    never freed) from one carrying a fresh produced pointer (record it)."""
+    if not f.blocks:
+        return [], set(), set()
+
+    def kd(n: str) -> str:
+        return kinds.get(n, I64)
+
+    strvars = {n for n in info.def_count
+               if kd(n) == STR and n not in info.params
+               and n not in info.env_captures
+               and n not in info.dead_results
+               and n not in info.tag_consts}
+    if not strvars:
+        return [], set(), set()
+
+    # def shapes: ("lit",) / ("prod",) / ("xcopy", src) / ("bad",)
+    defs: Dict[str, List[tuple]] = {n: [] for n in strvars}
+    # use shapes: ("ok",) / ("copysrc", dst) / ("bad",)
+    uses: Dict[str, List[tuple]] = {n: [] for n in strvars}
+
+    def mark_use(n: Any, u: tuple) -> None:
+        if isinstance(n, str) and n in strvars:
+            uses[n].append(u)
+
+    def is_str_concat(rhs: tuple, args: tuple, dst: str) -> bool:
+        return (rhs[0] == "binop" and rhs[1] == "+" and len(args) == 2
+                and kd(args[0]) == STR and kd(args[1]) == STR
+                and kd(dst) == STR)
+
+    for b in f.blocks:
+        for op in b.ops:
+            k0 = op[0]
+            if k0 == "perform" and len(op) >= 7:
+                for a in op[4]:
+                    mark_use(a, ("bad",))
+                if op[1] in strvars:
+                    defs[op[1]].append(("bad",))
+                continue
+            if k0 != "let" or len(op) != 4:
+                continue
+            _, dst, rhs, args = op
+            rk = rhs[0]
+            # --- classify defs of string variables
+            if dst in strvars:
+                if rk == "const" and isinstance(rhs[1], str) \
+                        and not isinstance(rhs[1], bool):
+                    defs[dst].append(("lit",))
+                elif is_str_concat(rhs, args, dst):
+                    defs[dst].append(("prod",))
+                elif rk == "call":
+                    bname = builtin_of(rhs[1], tuple(args))
+                    if bname in _STR_PRODUCER_BUILTINS and len(args) == 1 \
+                            and kd(args[0]) in (I64, F64):
+                        defs[dst].append(("prod",))
+                    else:
+                        defs[dst].append(("bad",))
+                elif rk == "copy" and args:
+                    defs[dst].append(("xcopy", args[0]))
+                else:
+                    defs[dst].append(("bad",))
+            # --- classify uses of string variables
+            if is_str_concat(rhs, args, dst):
+                for a in args:
+                    mark_use(a, ("ok",))
+            elif rk == "binop" and rhs[1] in ("==", "!=") and len(args) == 2 \
+                    and kd(args[0]) == STR and kd(args[1]) == STR:
+                for a in args:
+                    mark_use(a, ("ok",))
+            elif rk == "copy":
+                if args:
+                    mark_use(args[0], ("copysrc", dst))
+            elif rk == "call":
+                callee = rhs[1]
+                if callee in info.def_count:
+                    for a in args:
+                        mark_use(a, ("bad",))  # closure call: env unseen
+                elif callee in _PRINT_BUILTINS:
+                    for a in args:
+                        mark_use(a, ("ok",))  # printf reads, never retains
+                else:
+                    bname = builtin_of(callee, tuple(args))
+                    if bname == "len" and len(args) == 1 \
+                            and kd(args[0]) == STR:
+                        mark_use(args[0], ("ok",))  # mx_str_len reads only
+                    else:
+                        # includes to_string of a str (identity ALIAS), any
+                        # module function, push, and every other callee.
+                        for a in args:
+                            mark_use(a, ("bad",))
+            elif rk in ("alloc_struct", "make_closure", "handle_scope",
+                        "try_scope"):
+                for pair in args:
+                    if isinstance(pair, tuple) and len(pair) == 2:
+                        mark_use(pair[1], ("bad",))
+            else:
+                # select / field ops / variants / resume / anything else:
+                # retaining or unanalyzed — disqualify.
+                for a in args:
+                    mark_use(a, ("bad",))
+        t = b.term
+        if t[0] in ("br_if", "ret"):
+            mark_use(t[1], ("bad",))
+
+    # Exclusive transfer temps: single def (lit/prod), single use, and that
+    # use is a copy — ownership moves to the copy's destination.
+    xfer_prod: Dict[str, str] = {}
+    xfer_lit: Dict[str, str] = {}
+    for tv in strvars:
+        ds, us = defs[tv], uses[tv]
+        if len(ds) == 1 and info.def_count.get(tv, 0) == 1 \
+                and len(us) == 1 and us[0][0] == "copysrc":
+            if ds[0][0] == "prod":
+                xfer_prod[tv] = us[0][1]
+            elif ds[0][0] == "lit":
+                xfer_lit[tv] = us[0][1]
+
+    owned: List[str] = []
+    for v in sorted(strvars):
+        ds, us = defs[v], uses[v]
+        # Every def must have been classified (a def this scan did not see —
+        # e.g. a param — cannot happen for strvars, but stay exact).
+        if not ds or len(ds) != info.def_count.get(v, 0):
+            continue
+        if any(u[0] != "ok" for u in us):
+            continue
+        prods = 0
+        ok = True
+        for d in ds:
+            if d[0] == "prod":
+                prods += 1
+            elif d[0] == "lit":
+                pass
+            elif d[0] == "xcopy":
+                if xfer_prod.get(d[1]) == v:
+                    prods += 1
+                elif xfer_lit.get(d[1]) == v:
+                    pass
+                else:
+                    ok = False
+            else:
+                ok = False
+        if ok and prods:
+            owned.append(v)
+    owned_set = set(owned)
+    lit_temps = {t for t, tgt in xfer_lit.items() if tgt in owned_set}
+    prod_temps = {t for t, tgt in xfer_prod.items() if tgt in owned_set}
+    return owned, lit_temps, prod_temps
+
+
+# ---------------------------------------------------------------------------
+# Unique-box analysis (increment 8: which payload boxes may be freed)
+# ---------------------------------------------------------------------------
+
+def _unique_box_enums(f: MirFunc, kinds: Dict[str, str],
+                      info: _Info) -> Set[str]:
+    """make_variant destinations whose payload boxes are UNIQUELY owned by
+    this frame, so freeing them on every ret path is sound.
+
+    Boxes normally leak by design because aggregate copies share box
+    pointers shallowly.  But when the containing enum value provably never
+    gets aggregate-copied beyond this frame's full view, the box has exactly
+    one owner.  The proof mirrors _provably_dead_vecs: the make_variant
+    happens unconditionally in the ENTRY block (exactly once per
+    invocation, entry not in a CFG cycle), and the value — closed over
+    intra-frame `copy` aliases — is used ONLY as the base of variant_tag /
+    variant_field reads.  It is never returned, never passed to any call
+    (a callee could capture its copy into an immortal heap closure env),
+    never stored in a struct field / Vec / closure env / handle-site env,
+    never re-boxed as another make_variant's payload, and never crosses an
+    effect boundary.  variant_field only COPIES OUT of the box (boxes are
+    write-once), so reads never extend the box's ownership.  Anything not
+    provable stays leaked: a leak is sound, a bad free is not."""
+    if not f.blocks or 0 in _blocks_in_cycles(f):
+        return set()
+
+    defs: Dict[str, List[Tuple[tuple, tuple]]] = {}
+    for b in f.blocks:
+        for op in b.ops:
+            if op[0] == "let" and len(op) == 4:
+                defs.setdefault(op[1], []).append((op[2], op[3]))
+
+    candidates = []
+    for op in f.blocks[0].ops:
+        if op[0] != "let" or len(op) != 4 or op[2][0] != "make_variant":
+            continue
+        dst = op[1]
+        dk = kinds.get(dst, I64)
+        ref = _enum_refinement(dk) if _is_enum(dk) else None
+        if ref is None:
+            continue
+        slots = ref.get(op[2][2], ())
+        if not any(_is_agg(sk) for sk in slots):
+            continue  # nothing boxed: nothing to reclaim
+        candidates.append(dst)
+    if not candidates:
+        return set()
+
+    result: Set[str] = set()
+    for site in candidates:
+        site_defs = defs.get(site, [])
+        if len(site_defs) != 1 or site_defs[0][0][0] != "make_variant":
+            continue
+        # Close the alias group over plain copies (all intra-frame).
+        group: Set[str] = {site}
+        changed = True
+        while changed:
+            changed = False
+            for b in f.blocks:
+                for op in b.ops:
+                    if op[0] == "let" and len(op) == 4 \
+                            and op[2][0] == "copy" and op[3] \
+                            and op[3][0] in group and op[1] not in group:
+                        group.add(op[1])
+                        changed = True
+        ok = not any(m in info.params or m in info.env_captures
+                     for m in group)
+        # Every group member's every def is the site's make_variant (site
+        # only) or a copy from within the group.
+        if ok:
+            for m in group:
+                for (rhs, dargs) in defs.get(m, []):
+                    if m == site and rhs[0] == "make_variant":
+                        continue
+                    if rhs[0] == "copy" and dargs and dargs[0] in group:
+                        continue
+                    ok = False
+        # Every use of every group member is a variant_tag/variant_field
+        # base read or an intra-group copy.
+        if ok:
+            for b in f.blocks:
+                for op in b.ops:
+                    if not ok:
+                        break
+                    k0 = op[0]
+                    if k0 in ("params", "drop", "match_fail"):
+                        continue
+                    if k0 == "perform" and len(op) >= 7:
+                        if any(a in group for a in op[4]):
+                            ok = False
+                        continue
+                    if k0 != "let" or len(op) != 4:
+                        ok = False  # unknown op shape: cannot see its uses
+                        continue
+                    _, _dst, rhs, oargs = op
+                    rk = rhs[0]
+                    if rk in ("variant_tag", "variant_field"):
+                        continue  # base-pointer read only
+                    if rk == "copy":
+                        continue  # group copies were closed over above
+                    if rk in ("alloc_struct", "make_closure", "handle_scope",
+                              "try_scope"):
+                        if any(isinstance(p, tuple) and len(p) == 2
+                               and p[1] in group for p in oargs):
+                            ok = False
+                        continue
+                    if any(isinstance(a, str) and a in group for a in oargs):
+                        ok = False
+                t = b.term
+                if t[0] in ("br_if", "ret") and t[1] in group:
+                    ok = False
+        if ok:
+            result.add(site)
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Emission
 # ---------------------------------------------------------------------------
 
@@ -2997,7 +3335,8 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                    structs: _StructTable, variants: _VariantTable,
                    closures: _ClosureTable, traits: _TraitTable,
                    scopes: _ScopeTable, module_names: Set[str],
-                   mod: _ModuleState, emitted_names: Set[str]) -> str:
+                   mod: _ModuleState, emitted_names: Set[str],
+                   writeback_map: Dict[str, frozenset]) -> str:
     f = info.f
     sig = sigs[f.name]
 
@@ -3036,13 +3375,31 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
     def slot_ref(n: str) -> str:
         return f"%slot.{_sanitize(n)}"
 
+    def strown_ref(n: str) -> str:
+        return f"%strown.{_sanitize(n)}"
+
+    def bp_ref(n: str) -> str:
+        return f"%bp.{_sanitize(n)}"
+
     def struct_ref(n: str) -> str:
-        """The storage pointer for an aggregate variable (alloca or heap block)."""
+        """The storage pointer for an aggregate variable (alloca or heap
+        block).  Copy-elided params alias the caller's storage directly;
+        box-view variables have no storage of their own (their pointer slot
+        is read through use()) and must never be written through."""
+        if n in boxview:
+            raise _Unsupported(
+                f"write through box-view variable {n!r} (elision invariant)")
+        if n in elided_params:
+            return f"%a.{_sanitize(n)}"
         if n in heapset:
             return f"%hv.{_sanitize(n)}"
         return f"%sv.{_sanitize(n)}"
 
     def use(name: str, lines: List[str]) -> str:
+        if name in boxview:
+            v = fresh()
+            lines.append(f"  {v} = load ptr, ptr {bp_ref(name)}")
+            return v
         if name in aggset:
             return struct_ref(name)
         if name in slotset:
@@ -3138,6 +3495,118 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
     vec_free_vars = _provably_dead_vecs(f, kinds, builtin_of)
     vec_free_set = set(vec_free_vars)
 
+    # OWNED STRINGS (increment 8): produced strings this frame provably
+    # owns; each gets a null-initialized shadow slot holding the pointer to
+    # free at the next redefinition / at frame exit (see _owned_strings).
+    # The temp sets distinguish transfer copies carrying interned LITERALS
+    # (record null: constants are never freed) from ones carrying fresh
+    # produced pointers.
+    owned_strs, str_lit_temps, str_prod_temps = _owned_strings(
+        f, kinds, info, builtin_of)
+    owned_str_set = set(owned_strs)
+
+    # UNIQUE BOXES (increment 8): entry-block make_variant sites whose
+    # payload boxes are uniquely owned by this frame (never copied out of
+    # it, see _unique_box_enums); their box pointers are recorded at the
+    # site and freed on every ret path.
+    unique_box_sites = _unique_box_enums(f, kinds, info)
+    unique_box_regs: List[Tuple[str, str, int]] = []  # (reg, dst, slot)
+
+    def passed_to_rebound(v: str) -> bool:
+        """True when v is ever passed as an aggregate call argument at a
+        position the resolved callee WRITES BACK (a rebound struct param
+        copies out through the caller's pointer on ret) — or to a callee
+        whose write-back behavior is unknown.  Used to keep the two copy
+        elisions away from storage a callee may write."""
+        for b in f.blocks:
+            for op in b.ops:
+                if op[0] != "let" or len(op) != 4 or op[2][0] != "call":
+                    continue
+                _d, rhs2, cargs = op[1], op[2], op[3]
+                if v not in cargs:
+                    continue
+                callee2 = rhs2[1]
+                if callee2 in info.def_count:
+                    # Closure call: lambdas never write back (interpreter
+                    # closure-call parity), whatever lambda it resolves to.
+                    continue
+                if builtin_of(callee2, tuple(cargs)) is not None:
+                    continue  # native runtime builtins never write back
+                if callee2.startswith(TRAIT_CALL_PREFIX):
+                    res2, tgt2 = _resolve_trait_call(
+                        callee2[len(TRAIT_CALL_PREFIX):],
+                        kind(cargs[0]) if cargs else I64, traits,
+                        module_names, assume_final=True)
+                    target = tgt2 if res2 == "func" else None
+                else:
+                    target = callee2
+                rebound = writeback_map.get(target) if target else None
+                if rebound is None:
+                    return True  # unknown callee: assume the worst
+                for i, a in enumerate(cargs):
+                    if a == v and i in rebound:
+                        return True
+        return False
+
+    # COPY ELISION (a): an aggregate param never redefined needs no entry
+    # byval copy — nothing ever writes its storage (its only def is the
+    # param itself; rebound params keep the copy + write-back, and a struct
+    # param passed onward to a rebound callee position keeps the copy so
+    # the callee's write-back hits OUR copy, exactly like the interpreter
+    # writing back into our binding, not our caller's).
+    elided_params: Set[str] = set()
+    for p in info.params:
+        pk = kinds.get(p, I64)
+        if not _is_agg(pk) or info.def_count.get(p, 0) != 1:
+            continue
+        if _is_struct(pk) and passed_to_rebound(p):
+            continue
+        elided_params.add(p)
+
+    # COPY ELISION (b): a variant_field result that is only ever READ can
+    # be a BOX VIEW — a pointer slot aliasing the write-once box instead of
+    # an aggregate copied out of it.  Sound because boxes are write-once
+    # (no native code path mutates a filled box), the view's every use is a
+    # pointer READ (all aggregate uses read through use()), and the only
+    # writer a read could summon — a callee's struct write-back — is
+    # excluded exactly like elision (a).  Copies of a view alias the same
+    # box (pointer copy), recursively elidable under the same conditions.
+    def read_only_agg(v: str) -> bool:
+        vk = kinds.get(v, I64)
+        if info.def_count.get(v, 0) != 1 or v in info.params:
+            return False
+        if _is_struct(vk) and passed_to_rebound(v):
+            return False
+        return True
+
+    boxview: Set[str] = set()
+    bv_changed = True
+    while bv_changed:
+        bv_changed = False
+        for b in f.blocks:
+            for op in b.ops:
+                if op[0] != "let" or len(op) != 4:
+                    continue
+                _, bdst, brhs, bargs = op
+                if bdst in boxview:
+                    continue
+                if brhs[0] == "variant_field" and len(brhs) > 2 and bargs:
+                    bk = kinds.get(bargs[0], I64)
+                    if not (_is_enum(bk) and _is_agg(kinds.get(bdst, I64))):
+                        continue
+                    bref = _enum_refinement(bk) or {}
+                    bslots = bref.get(brhs[2])
+                    if bslots is not None and brhs[1] < len(bslots) \
+                            and _is_agg(bslots[brhs[1]]) \
+                            and read_only_agg(bdst):
+                        boxview.add(bdst)
+                        bv_changed = True
+                elif brhs[0] == "copy" and bargs and bargs[0] in boxview:
+                    if _is_agg(kinds.get(bdst, I64)) and read_only_agg(bdst) \
+                            and bdst not in info.dead_results:
+                        boxview.add(bdst)
+                        bv_changed = True
+
     # COPY-IN/COPY-OUT struct params: the interpreter WRITES BACK a struct
     # argument when the callee rebinds the parameter (mir_interp.
     # _write_back_struct_args — `self.field = ...` methods mutate the
@@ -3176,6 +3645,34 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
             mod.runtime_syms.add("mx_vec_free")
             lines.append(f"  call void @mx_vec_free(ptr {use(n, lines)})"
                          f"  ; local Vec {n}: provably non-escaping")
+        for (reg, bdst, bslot) in unique_box_regs:
+            lines.append(f"  call void @free(ptr {reg})"
+                         f"  ; unique box: {bdst} slot {bslot} (this frame "
+                         "is the sole owner)")
+        for n in owned_strs:
+            mod.runtime_syms.add("mx_str_free")
+            ov = fresh()
+            lines.append(f"  {ov} = load ptr, ptr {strown_ref(n)}")
+            lines.append(f"  call void @mx_str_free(ptr {ov})"
+                         f"  ; owned string {n}: freed at frame exit")
+
+    def owned_str_update(v: str, is_literal: bool, lines: List[str]) -> None:
+        """After a def of an owned string variable: free the previously
+        owned pointer (its last alias was just overwritten) and record the
+        new one — null for literal defs (interned constants are never
+        freed), the fresh produced pointer otherwise."""
+        mod.runtime_syms.add("mx_str_free")
+        old = fresh()
+        lines.append(f"  {old} = load ptr, ptr {strown_ref(v)}")
+        lines.append(f"  call void @mx_str_free(ptr {old})"
+                     f"  ; owned string {v}: previous value freed")
+        if is_literal:
+            lines.append(f"  store ptr null, ptr {strown_ref(v)}"
+                         f"  ; owned string {v}: literal (never freed)")
+        else:
+            cur = use(v, lines)
+            lines.append(f"  store ptr {cur}, ptr {strown_ref(v)}"
+                         f"  ; owned string {v}: fresh malloc now owned")
 
     def to_word(k: str, v: str, lines: List[str]) -> str:
         """Reinterpret a value of word kind k as the opaque i64 element word
@@ -3278,9 +3775,12 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                 sym = "mx_f64_to_str" if k == F64 else "mx_i64_to_str"
                 mod.runtime_syms.add(sym)
                 v = fresh()
+                snote = ("owned (freed when dead)"
+                         if dst in owned_str_set or dst in str_prod_temps
+                         else "leaks by design")
                 lines.append(
                     f"  {v} = call ptr @{sym}({_llscalar(k)} {a})"
-                    "  ; fresh malloc'd string (leaks by design)")
+                    f"  ; fresh malloc'd string ({snote})")
                 setval(dst, v, lines)
         elif name in _MATH_EXTERNS:
             mod.math_used.add(name)
@@ -3409,7 +3909,16 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                 if kind(opargs[0]) != kind(dst):
                     raise _Unsupported(
                         f"copy between kinds {kind(opargs[0])} -> {kind(dst)}")
-                if dst in aggset:
+                if dst in boxview:
+                    # Box-view alias: the source is itself a box view (the
+                    # elision fixpoint only marks copies from views), so
+                    # copy the POINTER, not the aggregate.
+                    src = use(opargs[0], lines)
+                    lines.append(
+                        f"  store ptr {src}, ptr {bp_ref(dst)}"
+                        f"  ; elide-copy: {dst} aliases the box view "
+                        "(read-only result)")
+                elif dst in aggset:
                     src = use(opargs[0], lines)
                     agg_copy(_agg_ty(kind(dst)), src, struct_ref(dst), lines)
                 else:
@@ -3422,13 +3931,17 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                 is_str = kind(opargs[0]) == STR and kind(opargs[1]) == STR
                 if is_str and o == "+":
                     # String concatenation -> fresh malloc'd string from the
-                    # native runtime; never freed (leaks by design, same
-                    # contract as boxes/heap envs this increment).
+                    # native runtime; freed when the ownership analysis
+                    # proves the value non-retained, otherwise leaked by
+                    # design (same contract as boxes/heap envs).
                     mod.runtime_syms.add("mx_str_concat")
                     v = fresh()
+                    snote = ("owned (freed when dead)"
+                             if dst in owned_str_set or dst in str_prod_temps
+                             else "leaks by design")
                     lines.append(
                         f"  {v} = call ptr @mx_str_concat(ptr {l}, ptr {r})"
-                        "  ; leaks by design")
+                        f"  ; {snote}")
                     setval(dst, v, lines)
                 elif is_str and o in ("==", "!="):
                     # Content equality via mx_str_eq (returns 0/1), exactly
@@ -3659,18 +4172,26 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                     if _is_agg(ck):
                         # Boxed aggregate payload: malloc a write-once box,
                         # copy the aggregate in, store the POINTER in the
-                        # 8-byte slot.  Never freed (leak by design: shallow
-                        # pair/aggregate copies share box pointers, so no
-                        # free can be proven unique — see module docstring).
+                        # 8-byte slot.  Normally never freed (leak by
+                        # design: shallow pair/aggregate copies share box
+                        # pointers, so no free can be proven unique — see
+                        # module docstring) — EXCEPT at a unique-box site,
+                        # where this frame is provably the box's only owner
+                        # and every ret path frees it (_unique_box_enums).
                         size = _kind_size(ck, structs, variants)
                         if size is None:
                             raise _Unsupported(
                                 f"boxed payload of {ck} has infinite layout")
                         mod.uses_malloc = True
                         box = fresh()
+                        if dst in unique_box_sites:
+                            note = "unique: freed at frame exit"
+                            unique_box_regs.append((box, dst, i))
+                        else:
+                            note = "leaks by design"
                         lines.append(
                             f"  {box} = call ptr @malloc(i64 {max(size, 8)})"
-                            f"  ; boxed {ck} payload (leaks by design)")
+                            f"  ; boxed {ck} payload ({note})")
                         agg_copy(_agg_ty(ck), use(fv, lines), box, lines)
                         lines.append(f"  store ptr {box}, ptr {p}")
                     else:
@@ -3734,16 +4255,24 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                 base = use(opargs[0], lines)
                 p = enum_gep(ename, base, lines, payload=rhs[1])
                 if _is_agg(ck):
-                    # Boxed payload: load the box pointer, copy the aggregate
-                    # out into the destination's own storage (value
-                    # semantics; the box itself stays untouched and shared).
+                    # Boxed payload: load the box pointer, then either
+                    # alias it (BOX VIEW: the result is only ever read, so
+                    # it may read through the write-once box directly) or
+                    # copy the aggregate out into the destination's own
+                    # storage (value semantics; the box stays shared).
                     if dst not in aggset:
                         raise _Unsupported(
                             f"variant_field result {dst!r} not "
                             f"aggregate-kinded for boxed slot {rhs[1]}")
                     box = fresh()
                     lines.append(f"  {box} = load ptr, ptr {p}")
-                    agg_copy(_agg_ty(ck), box, struct_ref(dst), lines)
+                    if dst in boxview:
+                        lines.append(
+                            f"  store ptr {box}, ptr {bp_ref(dst)}"
+                            f"  ; elide-copy: variant_field {dst} reads "
+                            "through the box pointer (read-only result)")
+                    else:
+                        agg_copy(_agg_ty(ck), box, struct_ref(dst), lines)
                 else:
                     v = fresh()
                     lines.append(f"  {v} = load {_llscalar(ck)}, ptr {p}")
@@ -3868,6 +4397,18 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
             else:  # unreachable given analysis
                 raise _Unsupported(f"op {rk!r} slipped past analysis")
 
+            # Owned-string bookkeeping: every def of an owned string frees
+            # the previously owned pointer and records the new provenance
+            # (the analysis guarantees all defs are const/concat/
+            # to_string/transfer-copy shapes).  A def is LITERAL when it is
+            # a const or a transfer copy of a literal temp — interned
+            # constants must never be recorded as freeable.
+            if dst in owned_str_set and rk in ("const", "binop", "call",
+                                               "copy"):
+                is_lit = rk == "const" or (
+                    rk == "copy" and opargs and opargs[0] in str_lit_temps)
+                owned_str_update(dst, is_lit, lines)
+
         if not terminated:
             t = b.term
             if t[0] == "br":
@@ -3924,8 +4465,21 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
     for n in agg_vars:
         if n in heapset:
             continue  # heap-backed: malloc'd below instead of an alloca
+        if n in elided_params:
+            continue  # reads through the caller's pointer: no storage
+        if n in boxview:
+            # Box view: a pointer slot aliasing the write-once box instead
+            # of an aggregate copied out of it (null until the read).
+            entry.append(
+                f"  {bp_ref(n)} = alloca ptr  ; box view: {n}")
+            entry.append(f"  store ptr null, ptr {bp_ref(n)}")
+            continue
         entry.append(
             f"  {struct_ref(n)} = alloca {_agg_ty(kind(n))}  ; aggregate: {n}")
+    for n in owned_strs:
+        entry.append(
+            f"  {strown_ref(n)} = alloca ptr  ; owned string shadow: {n}")
+        entry.append(f"  store ptr null, ptr {strown_ref(n)}")
     entry.extend(env_entry)
     for n in heap_vars:
         sname = _struct_name(kind(n))
@@ -3939,11 +4493,16 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
             f"  {struct_ref(n)} = call ptr @malloc(i64 {max(size, 8)})"
             f"  ; @global struct {n}: {sname}, freed on ret paths")
     for p in info.params:
-        if p in aggset:
+        if p in elided_params:
+            # COPY ELISION (a): this param is never rebound and never
+            # reaches a write-back position, so nothing ever writes its
+            # storage — read the caller's aggregate through its pointer.
+            entry.append(f"  ; elide-copy: param {p} reads through the "
+                         "caller's pointer (never rebound, no write-back)")
+        elif p in aggset:
             # byval-copy: the caller passed a pointer to ITS storage; copy the
             # aggregate into this frame's own storage to preserve MIR value
-            # semantics (a borrow-informed increment can elide this for
-            # @const params).
+            # semantics (rebound params also copy back OUT on ret paths).
             agg_copy(_agg_ty(kind(p)), f"%a.{_sanitize(p)}",
                      struct_ref(p), entry)
         elif p in slotset:
@@ -4264,6 +4823,23 @@ def emit_llvm(funcs: Sequence[MirFunc]) -> str:
                                     closures, traits, scopes, module_names):
             info.add_reason(p)
 
+    # WRITE-BACK MAP (increment 8, for copy elision): per function, the
+    # argument positions whose struct param is rebound — the callee copies
+    # that param back out through the caller's pointer on ret, so callers
+    # must never alias such a position with elided (copy-free) storage.
+    # Lambdas and handle-scope subfunctions never write back (interpreter
+    # parity), so their positions are all safe.
+    writeback_map: Dict[str, frozenset] = {}
+    for info in infos:
+        ks = kind_sets.get(info.f.name, {})
+        if info.is_lambda or info.is_scope_member:
+            writeback_map[info.f.name] = frozenset()
+        else:
+            writeback_map[info.f.name] = frozenset(
+                i for i, p in enumerate(info.params)
+                if _is_struct(ks.get(p, I64))
+                and info.def_count.get(p, 0) > 1)
+
     # A function referencing a placeholder cannot link: cascade demotion
     # (direct calls, make_closure fn-pointer targets, closure calls).
     emitted = {info.f.name for info in infos if not info.reasons}
@@ -4297,7 +4873,8 @@ def emit_llvm(funcs: Sequence[MirFunc]) -> str:
             try:
                 chunk = _emit_function(info, kinds, sigs, structs, variants,
                                        closures, traits, scopes,
-                                       module_names, mod, emitted)
+                                       module_names, mod, emitted,
+                                       writeback_map)
             except _Unsupported as exc:
                 info.add_reason(exc.reason)
             except Exception as exc:  # never crash the pipeline
