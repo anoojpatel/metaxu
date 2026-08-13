@@ -216,6 +216,57 @@ caveat:
     op with a default that also appears in some scope demotes (dynamic
     default routing has no native lowering).
 
+Increment 11 makes vector arithmetic emit REAL LLVM SIMD IR where the
+shape is statically provable, closing the gap between the fixed-vector
+runtime (increment 10's C loops) and the design intent that vector math
+actually vectorizes (`<N x double>` IS a SIMD register type):
+  * STATIC LENGTHS: a per-function analysis (_fvec_static_lens) tracks
+    each fixed-vector variable's element count as a small lattice —
+    bottom -> known N -> dynamic — joined over ALL defs of the name (the
+    same one-fact-per-variable discipline as the kind map) and iterated
+    to fixpoint.  Producers with provable counts: literals (element
+    count), zeros/filled (const count), const-bounds ranges, slices with
+    const/None bounds over known inputs (CPython slice.indices — exactly
+    mx_fvec_slice's semantics), comprehension outputs (input length, else
+    the const declared size mx_fvec_map enforces by abort), copies,
+    selects, casts, and binop results (any operand's known length —
+    sound because mx_fvec_binop aborts on vector-vector mismatch, so
+    every CONTINUING path shares one length).  Parameters, captures,
+    call results, struct/enum reads, effect crossings and const-None
+    slot initializers are dynamic.  The lengths live in a side table
+    keyed by variable, deliberately NOT in the kind strings: kinds flow
+    through module-wide unification cells (sigs, struct fields, closure
+    envs, effect-op cells) where a length component would be destroyed
+    by every rebuild-from-element-kind join site — the side table keeps
+    the kind lattice untouched and the join rules locally auditable.
+  * INLINE VECTOR IR: a flat float/int vector binop whose operand
+    lengths are known (mode 0: both known AND equal; broadcast modes:
+    the one vector operand known) and 1 <= N <= 64 emits inline IR
+    instead of the mx_fvec_binop call: `<N x double>` / `<N x i64>`
+    loads straight off the block's element words (byte offset 8 — the
+    { i64 len, [len x i64] } layout; f64 words are bitcast-stored so the
+    f64 view of the same memory is the identity; align 8, the block's
+    real alignment), one vector fadd/fsub/fmul/fdiv or add/sub/mul,
+    scalar broadcast via insertelement + shufflevector splat, and a
+    store into a fresh mx_fvec_new result block (calloc'd with the len
+    header already set; leaks by design like every fvec block).
+  * DOCUMENTED CHOICE — int / and % keep the runtime call even with
+    known lengths: mx_fvec_scalar_op aborts loudly on division by zero
+    where a vector sdiv/srem would be UB; float ops are IEEE on both
+    paths (fdiv by zero -> inf/nan, matching the C loop exactly).
+  * NEVER WRONG, ONLY FASTER: every unproven shape — dynamic or
+    mismatched lengths, nested matrices (depth > 0), N outside
+    [1, 64], float %, int division — falls back to the increment 10
+    runtime call, which remains correct (and carries the abort
+    semantics the inline path must never skip).
+  * REDUCTIONS: emit_fvec_reduce is the ready lowering for horizontal
+    sums (`llvm.vector.reduce.fadd` ORDERED with a -0.0 seed — the
+    exact fadd identity, bit-identical to the interpreter's
+    left-to-right fold — / `llvm.vector.reduce.add`).  No MIR shape
+    reaches it yet: example 06's sum/dot/norm demote UPSTREAM on
+    closure-kind conflicts that are not this backend's to fix; the
+    helper is tested on synthetic modules so the wiring is proven.
+
 Everything else — try_scope, `type_of` (no interpreter builtin exists),
 comprehensions over Vecs, string slicing/indexing — is emitted as a
 clearly marked, comment-only placeholder carrying the reasons, never as
@@ -784,6 +835,14 @@ _HEADER = (
     ";   interpreter's vector repr via mx_fvec_to_str; performs of ops no\n"
     ";   module scope handles lower to DIRECT CALLS of their declared\n"
     ";   __effect_default fns;\n"
+    ";   VECTOR SIMD (increment 11): flat float/int vector binops whose\n"
+    ";   operand lengths are statically known emit INLINE <N x double> /\n"
+    ";   <N x i64> IR (loads off the word block at byte offset 8, one\n"
+    ";   vector fadd/fsub/fmul/fdiv or add/sub/mul, splat broadcast for\n"
+    ";   scalars, store into a fresh mx_fvec_new block); int / and % and\n"
+    ";   every unproven shape (dynamic/mismatched lengths, matrices,\n"
+    ";   N > 64) keep the mx_fvec_binop C loop -- the always-correct path\n"
+    ";   with its division-by-zero and length-mismatch aborts;\n"
     "; functions outside the subset appear as comment-only placeholders."
 )
 
@@ -4353,6 +4412,214 @@ class _ModuleState:
         return self.strings[content]
 
 
+# ---------------------------------------------------------------------------
+# Fixed-vector static lengths (increment 11)
+# ---------------------------------------------------------------------------
+
+# Static-length lattice value for "provably unknown / dynamic" (the safe
+# top).  A missing entry is the bottom: no def has produced a fact yet
+# (equivalent to dynamic at every use site — the fast path requires a
+# known length, so bottom and top both fall back to the runtime call).
+_FLEN_DYN = -1
+
+# Inline SIMD is only emitted for lengths in [1, _FLEN_MAX]: `<N x double>`
+# is legal for any N, but a huge constant vector would bloat the IR and
+# spill anyway — beyond the cap the C loop (which LLVM may still
+# auto-vectorize) is the better lowering.
+_FLEN_MAX = 64
+
+
+def _fvec_static_lens(f: MirFunc, kinds: Dict[str, str],
+                      info: _Info) -> Dict[str, int]:
+    """Per-variable static lengths of fixed-vector values (increment 11).
+
+    Returns var -> length where length >= 0 means EVERY value the variable
+    can hold at any use has exactly that many elements, and _FLEN_DYN means
+    unknown.  Sound join rules — mismatched or unknown lengths degrade to
+    dynamic, never to a wrong number:
+
+      * producers with a statically-known count: ``__vec_lit`` (element
+        count), ``__vec_zeros``/``__vec_filled`` (const count arg),
+        ``__range`` (both bounds const), ``__slice_get`` (const/None bounds
+        over a known input, CPython slice.indices semantics — exactly what
+        mx_fvec_slice implements), ``__vec_comprehension`` (input length,
+        else the const declared size the runtime enforces), ``__cast``
+        identity reinterpretations, copies and selects.
+      * a binop result takes any operand's known length: mx_fvec_binop
+        ABORTS on a vector-vector length mismatch, so on every continuing
+        path the operands (and result) share one length (the inline fast
+        path itself additionally requires BOTH operand lengths known-equal
+        — see the emission site — so a mismatch still reaches the aborting
+        runtime call).
+      * everything else — parameters, captures, call results, struct/enum
+        reads, effect boundaries, and ``const None`` slot initializers
+        (a possibly-null vector must never take the inline path) — is
+        dynamic.
+
+    Per-name facts join over ALL defs of the name (the same discipline as
+    the kind map: one kind/length per variable), iterated to fixpoint so
+    copy chains and loop-carried joins settle."""
+    lens: Dict[str, int] = {}
+
+    def is_v(n: str) -> bool:
+        return _is_fvec(kinds.get(n, I64))
+
+    def join2(a: Optional[int], b: Optional[int]) -> Optional[int]:
+        if a is None:
+            return b
+        if b is None:
+            return a
+        return a if a == b else _FLEN_DYN
+
+    def mark(n: str, v: Optional[int]) -> bool:
+        nv = join2(lens.get(n), v)
+        if nv is not None and nv != lens.get(n):
+            lens[n] = nv
+            return True
+        return False
+
+    def slice_len(recv: str, bounds: Tuple[str, ...]) -> Optional[int]:
+        n = lens.get(recv)
+        if n is None or n == _FLEN_DYN:
+            return _FLEN_DYN
+        vals: List[Optional[int]] = []
+        for a in bounds:
+            if a in info.const_nones:
+                vals.append(None)
+            elif a in info.const_ints:
+                vals.append(info.const_ints[a])
+            else:
+                return _FLEN_DYN  # dynamic bound (emission demotes anyway)
+        try:
+            return len(range(*slice(*vals).indices(n)))
+        except ValueError:  # step 0: the runtime aborts; never inline after
+            return _FLEN_DYN
+
+    changed = True
+    while changed:
+        changed = False
+        for p in (*info.params, *info.env_captures):
+            if is_v(p):
+                changed = mark(p, _FLEN_DYN) or changed
+        for b in f.blocks:
+            for op in b.ops:
+                if op[0] == "perform":
+                    if is_v(op[1]):
+                        changed = mark(op[1], _FLEN_DYN) or changed
+                    continue
+                if op[0] == "promote_matrix":
+                    # mx_fvec_promote preserves length, but the promoted
+                    # names are parameters (already dynamic).
+                    for n in (tuple(op[1]) if len(op) > 1 else ()):
+                        if is_v(n):
+                            changed = mark(n, _FLEN_DYN) or changed
+                    continue
+                if op[0] != "let" or len(op) != 4:
+                    continue
+                _, dst, rhs, args = op
+                if not is_v(dst):
+                    continue
+                rk = rhs[0]
+                if rk == "copy":
+                    changed = mark(dst, lens.get(args[0])) or changed
+                elif rk == "select":
+                    v = join2(lens.get(args[1]), lens.get(args[2])) \
+                        if len(args) == 3 else _FLEN_DYN
+                    changed = mark(dst, v) or changed
+                elif rk == "binop":
+                    known = [lens[a] for a in args
+                             if is_v(a) and lens.get(a) not in (None, _FLEN_DYN)]
+                    if known:
+                        changed = mark(dst, known[0]) or changed
+                    elif any(is_v(a) and lens.get(a) == _FLEN_DYN
+                             for a in args):
+                        changed = mark(dst, _FLEN_DYN) or changed
+                elif rk == "call":
+                    callee = rhs[1]
+                    v: Optional[int] = _FLEN_DYN
+                    if callee in info.def_count:
+                        pass  # closure-call result: dynamic
+                    elif callee == "__vec_lit":
+                        v = len(args) - 1
+                    elif callee in ("__vec_zeros", "__vec_filled") and args:
+                        c = info.const_ints.get(args[0])
+                        v = c if c is not None and c >= 0 else _FLEN_DYN
+                    elif callee == "__range" and len(args) == 2:
+                        s = info.const_ints.get(args[0])
+                        e = info.const_ints.get(args[1])
+                        v = max(0, e - s) \
+                            if s is not None and e is not None else _FLEN_DYN
+                    elif callee == "__slice_get" and len(args) == 4:
+                        v = slice_len(args[0], args[1:])
+                    elif callee == "__vec_comprehension" and len(args) == 3:
+                        v = lens.get(args[2])
+                        if v is None or v == _FLEN_DYN:
+                            # mx_fvec_map aborts unless the input length
+                            # equals the const declared size, so on every
+                            # continuing path that size IS the length.
+                            c = info.const_ints.get(args[0])
+                            v = c if c is not None and c >= 0 else _FLEN_DYN
+                    elif callee == "__cast":
+                        # dst is only vector-kinded in the identity
+                        # reinterpretation case.
+                        v = lens.get(args[0]) if args else _FLEN_DYN
+                    changed = mark(dst, v) or changed
+                else:
+                    # const (incl. None slot initializers), call-adjacent
+                    # defs, struct/enum reads, handle_scope, resume, ...
+                    changed = mark(dst, _FLEN_DYN) or changed
+    return lens
+
+
+def emit_fvec_reduce(vec_ptr: str, n: int, leaf: str,
+                     tmp_prefix: str) -> Tuple[str, List[str], str]:
+    """INCREMENT 11 emission helper: horizontal reduction (sum) of a
+    static-length-``n`` flat fixed vector via ``llvm.vector.reduce``.
+
+    Returns ``(declare_line, body_lines, result_ssa)``: the intrinsic
+    declaration the module needs once, the instruction lines to splice into
+    a block, and the SSA name (``double`` for an f64 leaf, ``i64`` for an
+    int leaf) holding the sum.
+
+    The f64 form is the ORDERED reduction (no ``reassoc`` flag), seeded
+    with ``-0.0`` — the exact identity of ``fadd`` — so the result is
+    bit-identical to the interpreter's left-to-right ``e0 + e1 + ...``
+    fold for every input, NaN/inf/-0.0 included.
+
+    No MIR shape reaches this yet: example 06's ``sum``/``dot``/``norm``
+    demote UPSTREAM on closure-kind conflicts (map/reduce take different
+    lambdas at one call site), which is not this backend's to fix.  The
+    helper is the ready lowering — synthetic-module tests pin that the IR
+    it emits verifies, runs, and matches Python's fold exactly."""
+    if n < 1:
+        raise ValueError(f"reduction needs a static length >= 1, got {n}")
+    if leaf not in (I64, F64):
+        raise ValueError(f"reduction leaf must be i64/f64, got {leaf!r}")
+    ety = "double" if leaf == F64 else "i64"
+    vty = f"<{n} x {ety}>"
+    if leaf == F64:
+        intr = f"llvm.vector.reduce.fadd.v{n}f64"
+        decl = f"declare double @{intr}(double, {vty})"
+    else:
+        intr = f"llvm.vector.reduce.add.v{n}i64"
+        decl = f"declare i64 @{intr}({vty})"
+    p = f"%{tmp_prefix}.elems"
+    v = f"%{tmp_prefix}.v"
+    r = f"%{tmp_prefix}.sum"
+    body = [
+        f"  {p} = getelementptr inbounds i8, ptr {vec_ptr}, i64 8",
+        f"  {v} = load {vty}, ptr {p}, align 8"
+        f"  ; element words as {vty} (block layout: i64 len, then words)",
+    ]
+    if leaf == F64:
+        body.append(
+            f"  {r} = call double @{intr}(double -0.000000e+00, {vty} {v})"
+            "  ; ordered fadd reduction (-0.0 seed: exact fadd identity)")
+    else:
+        body.append(f"  {r} = call i64 @{intr}({vty} {v})")
+    return decl, body, r
+
+
 def _scope_body_sym(site: str) -> str:
     return "mxfx.body." + _sanitize(site)
 
@@ -4640,6 +4907,17 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
     # no free can be proven unique (same contract as boxes/heap envs).
     vec_free_vars = _provably_dead_vecs(f, kinds, builtin_of)
     vec_free_set = set(vec_free_vars)
+
+    # Fixed-vector static lengths (increment 11): var -> element count when
+    # every def is provably that long, _FLEN_DYN otherwise.  Drives the
+    # inline `<N x double>` / `<N x i64>` fast path for element-wise binops.
+    fvec_lens = _fvec_static_lens(f, kinds, info)
+
+    def fvec_len_of(n: str) -> Optional[int]:
+        """The usable static length of a vector variable: an int in
+        [1, _FLEN_MAX], or None (unknown / dynamic / out of range)."""
+        v = fvec_lens.get(n)
+        return v if v is not None and 1 <= v <= _FLEN_MAX else None
 
     # OWNED STRINGS (increment 8): produced strings this frame provably
     # owns; each gets a null-initialized shadow slot holding the pointer to
@@ -5339,14 +5617,91 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                 is_str = kind(opargs[0]) == STR and kind(opargs[1]) == STR
                 if any(_is_fvec(kind(x)) for x in (dst, *opargs)):
                     # Element-wise vector arithmetic with scalar
-                    # broadcasting -> mx_fvec_binop (recursion handles
-                    # nested matrices); the consistency check pinned the
-                    # operand shapes and the numeric leaf kind.
+                    # broadcasting.  FAST PATH (increment 11): a FLAT
+                    # float/int vector whose operand lengths are statically
+                    # known emits real SIMD IR — `<N x double>` / `<N x i64>`
+                    # loads straight off the block's word array (layout:
+                    # { i64 len, [len x i64] }, elements at byte offset 8,
+                    # f64s bitcast-stored, so the f64 view of the same
+                    # memory is the identity), one vector arithmetic
+                    # instruction, and a store into a fresh mx_fvec_new
+                    # block.  Everything unproven — dynamic or mismatched
+                    # lengths, nested matrices, N outside [1, _FLEN_MAX] —
+                    # falls back to the mx_fvec_binop C loop, which is
+                    # always correct (and ABORTS on vector-vector length
+                    # mismatches the inline path must therefore never
+                    # reach: mode 0 requires both lengths known-EQUAL).
+                    # Int / and % keep the runtime call even with known
+                    # lengths — DOCUMENTED CHOICE: mx_fvec_scalar_op aborts
+                    # loudly on division by zero, and a vector sdiv would
+                    # be UB there instead; the float ops are IEEE both ways.
                     dk = kind(dst)
                     leaf, depth = _fvec_leaf(dk)
                     lk0, rk0 = kind(opargs[0]), kind(opargs[1])
                     mode = (0 if _is_fvec(lk0) and _is_fvec(rk0)
                             else 1 if _is_fvec(lk0) else 2)
+                    simd_ok = (
+                        depth == 0
+                        and (leaf == F64 and o in ("+", "-", "*", "/")
+                             or leaf == I64 and o in ("+", "-", "*")))
+                    simd_n: Optional[int] = None
+                    if simd_ok:
+                        if mode == 0:
+                            n0 = fvec_len_of(opargs[0])
+                            n1 = fvec_len_of(opargs[1])
+                            simd_n = n0 if n0 is not None and n0 == n1 \
+                                else None
+                        else:
+                            simd_n = fvec_len_of(
+                                opargs[0] if mode == 1 else opargs[1])
+                    if simd_n is not None:
+                        ety = "double" if leaf == F64 else "i64"
+                        vty = f"<{simd_n} x {ety}>"
+
+                        def vload(ptr_ssa: str) -> str:
+                            ep, vv = fresh(), fresh()
+                            lines.append(
+                                f"  {ep} = getelementptr inbounds i8, "
+                                f"ptr {ptr_ssa}, i64 8")
+                            lines.append(
+                                f"  {vv} = load {vty}, ptr {ep}, align 8")
+                            return vv
+
+                        def vsplat(scal_ssa: str) -> str:
+                            t0, t1 = fresh(), fresh()
+                            lines.append(
+                                f"  {t0} = insertelement {vty} poison, "
+                                f"{ety} {scal_ssa}, i64 0")
+                            lines.append(
+                                f"  {t1} = shufflevector {vty} {t0}, "
+                                f"{vty} poison, "
+                                f"<{simd_n} x i32> zeroinitializer"
+                                "  ; scalar broadcast splat")
+                            return t1
+
+                        lv = vload(l) if _is_fvec(lk0) else vsplat(l)
+                        rv = vload(r) if _is_fvec(rk0) else vsplat(r)
+                        mnem = _ARITH_FLT[o] if leaf == F64 \
+                            else _ARITH_INT[o]
+                        rvec = fresh()
+                        lines.append(
+                            f"  {rvec} = {mnem} {vty} {lv}, {rv}"
+                            f"  ; element-wise {o} inline SIMD "
+                            f"(static length {simd_n})")
+                        mod.runtime_syms.add("mx_fvec_new")
+                        out = fresh()
+                        lines.append(
+                            f"  {out} = call ptr @mx_fvec_new("
+                            f"i64 {simd_n})"
+                            "  ; result block (leaks by design)")
+                        outp = fresh()
+                        lines.append(
+                            f"  {outp} = getelementptr inbounds i8, "
+                            f"ptr {out}, i64 8")
+                        lines.append(
+                            f"  store {vty} {rvec}, ptr {outp}, align 8")
+                        setval(dst, out, lines)
+                        continue
                     lw = to_word(lk0, l, lines)
                     rw = to_word(rk0, r, lines)
                     mod.runtime_syms.add("mx_fvec_binop")
