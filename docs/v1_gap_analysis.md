@@ -8,10 +8,19 @@ completion work; it will be updated as gaps close.
 ## Status: closed (this branch)
 
 All workstreams below landed on this branch, each verified by source-level
-tests (233 passing) and the example gate (`scripts/run_examples.py`:
+tests (282 passing) and the example gates (`scripts/run_examples.py`:
 19/19 through parse -> desugar -> freeze -> infer -> HIR -> MIR -> CLIF,
-with `test_borrow_check.mx` / `test_type_error.mx` required to be REJECTED
-with borrow/type diagnostics — they are negative fixtures).
+15/19 executing correctly at `--stage run`, with `test_borrow_check.mx` /
+`test_type_error.mx` required to be REJECTED with borrow/type diagnostics —
+they are negative fixtures).
+
+Also landed since: trait method dispatch (implement blocks desugar to
+mangled functions; runtime dispatch on the receiver's type, user impls win
+over builtins) and a minimal runtime library (mutable Vec, immutable
+vector[T,N] with element-wise ops, indexing/slicing, sqrt/sin/cos,
+to_string/len). The remaining non-executing examples need real FFI/threads
+(05, effect_mapping), a SimdOp handler + const-generic N at runtime (06),
+and try/catch lowering (04).
 
 Highlights beyond the original list, found by an adversarial review of the
 branch diff and fixed with regression tests (`test_parsed_source_semantics.py`,
