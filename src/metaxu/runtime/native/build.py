@@ -24,6 +24,8 @@ from typing import Optional, Sequence
 NATIVE_DIR = Path(__file__).resolve().parent
 RUNTIME_C = NATIVE_DIR / "metaxu_rt.c"
 RUNTIME_H = NATIVE_DIR / "metaxu_rt.h"
+EFFECTS_C = NATIVE_DIR / "metaxu_effects.c"
+EFFECTS_H = NATIVE_DIR / "metaxu_effects.h"
 DEFAULT_BUILD_DIR = NATIVE_DIR / "_build"
 
 # C11, optimized, PIC so the object can also land in shared objects later.
@@ -74,17 +76,62 @@ def compile_runtime(
     return obj
 
 
+def _effects_mtime() -> float:
+    return max(p.stat().st_mtime for p in (EFFECTS_C, EFFECTS_H, Path(__file__)))
+
+
+def compile_effects_runtime(
+    build_dir: Optional[Path] = None,
+    clang: str = "clang",
+    extra_cflags: Sequence[str] = (),
+) -> Path:
+    """Compile metaxu_effects.c (the ucontext coroutine scheduler backing
+    handle_scope/perform/resume) to metaxu_effects.o and return its path.
+
+    Same contract as compile_runtime: mtime-cached, extra flags (e.g.
+    ``-fsanitize=address``) should come with a dedicated ``build_dir``.
+    """
+    build_dir = Path(build_dir) if build_dir is not None else DEFAULT_BUILD_DIR
+    build_dir.mkdir(parents=True, exist_ok=True)
+    obj = build_dir / "metaxu_effects.o"
+    if obj.exists() and obj.stat().st_mtime >= _effects_mtime():
+        return obj
+    _run(
+        [clang, *CFLAGS, *extra_cflags, "-c", str(EFFECTS_C), "-o", str(obj)],
+        "compiling metaxu_effects.c",
+    )
+    return obj
+
+
+def runtime_objects(
+    build_dir: Optional[Path] = None,
+    clang: str = "clang",
+    extra_cflags: Sequence[str] = (),
+) -> tuple[Path, Path]:
+    """Every native runtime object a metaxu binary links: (metaxu_rt.o,
+    metaxu_effects.o)."""
+    return (
+        compile_runtime(build_dir=build_dir, clang=clang,
+                        extra_cflags=extra_cflags),
+        compile_effects_runtime(build_dir=build_dir, clang=clang,
+                                extra_cflags=extra_cflags),
+    )
+
+
 def build_archive(
     build_dir: Optional[Path] = None,
     clang: str = "clang",
     ar: str = "ar",
 ) -> Path:
-    """Build libmetaxu_rt.a (via ``ar rcs``) and return its path."""
+    """Build libmetaxu_rt.a (via ``ar rcs``; both runtime objects) and
+    return its path."""
     obj = compile_runtime(build_dir=build_dir, clang=clang)
+    fx = compile_effects_runtime(build_dir=build_dir, clang=clang)
     lib = obj.parent / "libmetaxu_rt.a"
-    if _is_fresh(lib) and lib.stat().st_mtime >= obj.stat().st_mtime:
+    if _is_fresh(lib) and lib.stat().st_mtime >= max(
+            obj.stat().st_mtime, fx.stat().st_mtime):
         return lib
-    _run([ar, "rcs", str(lib), str(obj)], "archiving libmetaxu_rt.a")
+    _run([ar, "rcs", str(lib), str(obj), str(fx)], "archiving libmetaxu_rt.a")
     return lib
 
 
