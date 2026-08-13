@@ -15,6 +15,13 @@ Three layers:
    every MIR function must appear either as a real define or as an explicit
    placeholder comment carrying at least one reason, and (when opt is
    available) every module must pass LLVM's own IR verifier.
+
+Increment 2 (ownership memory model) adds: struct params byval-copied
+through a ptr, sret-style struct returns, @global structs malloc'd on the
+heap and freed on every ret path, and multi-arg print.  The heap tests run
+the native binary under clang -fsanitize=address when the ASan runtime is
+present (exit 0 == no leak, no double-free, no use-after-free); when the
+runtime is missing they are skipped, not silently weakened.
 """
 from __future__ import annotations
 
@@ -81,15 +88,55 @@ def count_placeholders(ir: str) -> int:
     return len(re.findall(r"placeholder -- unsupported", ir))
 
 
-def assert_native_matches_interp(source: str, tmp_path, entry: str = "main"):
+def assert_native_matches_interp(source: str, tmp_path, entry: str = "main",
+                                 clang_args: tuple[str, ...] = ()):
     """The differential assertion: clang-compiled result == interpreter."""
     result, expected_out = interp_run(source, entry)
     ir = llvm_from_source(source)
-    exit_code, stdout = compile_and_run(ir, entry, workdir=str(tmp_path))
+    exit_code, stdout = compile_and_run(ir, entry, workdir=str(tmp_path),
+                                        clang_args=clang_args)
     assert stdout == expected_out
     if result is not UNIT and isinstance(result, (bool, int)):
         assert exit_code == int(result) % 256
     return ir
+
+
+_ASAN_PROBE: list[bool] = []
+
+
+def asan_available() -> bool:
+    """True when clang can link -fsanitize=address (ASan runtime installed)."""
+    if not _ASAN_PROBE:
+        if shutil.which("clang") is None:
+            _ASAN_PROBE.append(False)
+        else:
+            import tempfile, os
+            with tempfile.TemporaryDirectory(prefix="metaxu_asan_probe_") as d:
+                c = os.path.join(d, "t.c")
+                with open(c, "w") as fh:
+                    fh.write("int main(void){return 0;}\n")
+                proc = subprocess.run(
+                    ["clang", "-fsanitize=address", c, "-o", os.path.join(d, "t")],
+                    capture_output=True, text=True)
+                _ASAN_PROBE.append(proc.returncode == 0)
+    return _ASAN_PROBE[0]
+
+
+needs_asan = pytest.mark.skipif(
+    not asan_available(),
+    reason="clang ASan runtime not available (compile probe failed)")
+
+
+def assert_native_matches_interp_asan(source: str, tmp_path, entry: str = "main"):
+    """Differential + ASan: exit 0 under ASan proves the emitted frees sound
+    (no leak, no double-free, no use-after-free) for programs whose @global
+    structs are all freed.  Only call under @needs_asan."""
+    # ASan replaces the exit code on error, so require interpreter results
+    # that are observed via stdout plus a 0 exit.
+    result, _ = interp_run(source, entry)
+    assert result in (UNIT, 0), "ASan differential sources must exit 0"
+    return assert_native_matches_interp(
+        source, tmp_path, entry, clang_args=("-fsanitize=address",))
 
 
 # ---------------------------------------------------------------------------
@@ -190,8 +237,8 @@ fn main() -> int {
     assert re.search(
         r"getelementptr inbounds %struct\.Point, ptr %sv\.\w+, i32 0, i32 1", ir)
     # no heap traffic for local structs: the frame owns the memory
-    assert "malloc" not in ir
-    assert "free" not in ir
+    assert "call ptr @malloc" not in ir
+    assert "call void @free" not in ir
 
 
 def test_struct_field_assignment_value_semantics():
@@ -268,30 +315,122 @@ def test_suspending_function_is_placeholder():
     assert all(line.startswith(";") for line in chunk.splitlines() if line.strip())
 
 
-def test_global_struct_is_placeholder():
+def test_unknown_locality_is_placeholder():
+    # "local" allocas and "global" mallocs are lowered; anything else must
+    # demote rather than guess a storage class.
     f = make_func("boxer", [
         block([
             ("params", ("n",)),
-            ("let", "b1", ("alloc_struct", "Box", "global"), (("val", "n"),)),
+            ("let", "b1", ("alloc_struct", "Box", "region"), (("val", "n"),)),
             ("let", "v", ("field_get", "val"), ("b1",)),
         ], ("ret", "v")),
     ])
     ir = emit_llvm([f])
     assert count_placeholders(ir) == 1
-    assert "@global struct" in ir
-    assert "later increment" in ir
+    assert "unknown locality 'region'" in ir
 
 
-def test_returning_struct_is_placeholder_not_dangling_pointer():
+# ---------------------------------------------------------------------------
+# Increment 2 structural tests: struct calls/returns and @global heap structs
+# ---------------------------------------------------------------------------
+
+def test_let_global_annotation_reaches_mir_alloc_struct():
+    # Seam regression: `let @global x = S {...}` must reach MIR as an
+    # alloc_struct with locality "global" (hir.py used to drop string-token
+    # mode annotations, silently degrading @global to a local alloc).
+    funcs = mir_from_source("""
+struct Point { x: int, y: int }
+fn main() -> int {
+    let @global g = Point { x: 1, y: 2 };
+    let l = Point { x: 3, y: 4 };
+    g.x + l.y
+}
+""")
+    localities = [op[2][2]
+                  for f in funcs for b in f.blocks for op in b.ops
+                  if op[0] == "let" and op[2][0] == "alloc_struct"]
+    assert localities.count("global") == 1
+    assert localities.count("local") == 1
+
+def test_struct_param_passes_ptr_with_callee_byval_copy():
+    ir = llvm_from_source("""
+struct Point { x: int, y: int }
+fn getx(p: Point) -> int { p.x }
+fn main() -> int {
+    let p = Point { x: 3, y: 4 };
+    getx(p)
+}
+""")
+    assert count_placeholders(ir) == 0
+    # callee: struct param arrives as ptr...
+    assert "define i64 @mx_getx(ptr %a.p)" in ir
+    # ...and is byval-copied into the callee's own storage in the prelude
+    assert re.search(r"load %struct\.Point, ptr %a\.p", ir)
+    assert re.search(r"store %struct\.Point %t\d+, ptr %sv\.p", ir)
+    # caller passes the storage pointer of its struct variable
+    assert re.search(r"call i64 @mx_getx\(ptr %sv\.\w+\)", ir)
+
+
+def test_struct_return_is_sret_style():
     ir = llvm_from_source("""
 struct Point { x: int, y: int }
 fn mk() -> Point { Point { x: 1, y: 2 } }
 fn main() -> int { let p = mk(); p.x }
 """)
-    assert count_placeholders(ir) == 2  # mk itself + main which calls it
-    assert "returns a struct value" in ir or "returns local struct" in ir
-    assert "struct value returned from call to 'mk'" in ir
-    assert not re.search(r"^define ", ir, re.M)  # no defines at all
+    assert count_placeholders(ir) == 0
+    # callee: leading result-slot pointer, void return, aggregate copy out
+    assert "define void @mx_mk(ptr %agg.ret)" in ir
+    assert re.search(r"store %struct\.Point %t\d+, ptr %agg\.ret", ir)
+    assert re.search(r"^  ret void", ir, re.M)
+    # caller passes its own struct variable's storage as the result slot
+    assert re.search(r"call void @mx_mk\(ptr %sv\.\w+\)", ir)
+
+
+def test_global_struct_mallocs_in_entry_and_frees_on_ret():
+    ir = llvm_from_source("""
+struct Point { x: int, y: int }
+fn main() -> int {
+    let @global g = Point { x: 3, y: 4 };
+    g.x + g.y
+}
+""")
+    assert count_placeholders(ir) == 0
+    assert "declare noalias ptr @malloc(i64)" in ir
+    assert "declare void @free(ptr)" in ir
+    # 2 fields x 8 bytes, malloc'd in the entry prelude, GEP on the heap ptr
+    assert re.search(r"%hv\.\w+ = call ptr @malloc\(i64 16\)", ir)
+    assert re.search(r"getelementptr inbounds %struct\.Point, ptr %hv\.\w+", ir)
+    # every ret path frees the block before returning
+    body = ir[ir.index("define i64 @mx_main"):]
+    assert re.search(r"call void @free\(ptr %hv\.\w+\)", body)
+    assert body.index("call void @free") < body.index("ret i64")
+
+
+def test_local_structs_stay_on_the_stack_next_to_global_ones():
+    ir = llvm_from_source("""
+struct Point { x: int, y: int }
+fn main() -> int {
+    let a = Point { x: 1, y: 2 };
+    let @global b = Point { x: 10, y: 20 };
+    a.x + b.y
+}
+""")
+    assert count_placeholders(ir) == 0
+    assert re.search(r"%sv\.\w+ = alloca %struct\.Point", ir)  # local
+    assert re.search(r"%hv\.\w+ = call ptr @malloc\(i64 16\)", ir)  # @global
+    assert ir.count("call ptr @malloc") == 1  # only the @global one
+
+
+def test_multi_arg_print_joins_with_spaces():
+    ir = llvm_from_source('fn main() { print(1 + 1, "and", 3) }')
+    assert count_placeholders(ir) == 0
+    # one printf with a space-joined format string, matching print(*args)
+    assert re.search(
+        r'@\.str\.\d+ = private unnamed_addr constant \[\d+ x i8\] '
+        r'c"%lld %s %lld\\0A\\00"', ir)
+    assert re.search(
+        r"call i32 \(ptr, \.\.\.\) @printf\(ptr @\.str\.\d+, "
+        r"i64 %t\d+, ptr @\.str\.\d+, i64 3\)", ir)
 
 
 def test_variants_and_closures_are_placeholders():
@@ -373,7 +512,7 @@ def _example_files():
 def test_all_examples_emit_defines_or_explicit_placeholders(path):
     funcs = mir_from_source(path.read_text())
     ir = emit_llvm(funcs)  # must never crash
-    defines = set(re.findall(r"^define (?:i64|double|ptr) @(\w+)\(", ir, re.M))
+    defines = set(re.findall(r"^define (?:i64|double|ptr|void) @(\w+)\(", ir, re.M))
     placeholders = set(re.findall(
         r"^; function @(\w+): placeholder -- unsupported", ir, re.M))
     for f in funcs:
@@ -527,3 +666,139 @@ def test_native_result_larger_than_exit_code_range_via_stdout(tmp_path):
     # stdout, and the exit-code assertion is modulo 256 by convention.
     assert_native_matches_interp(
         "fn main() -> int { print(999 + 1); 999 + 1 }", tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Increment 2 native differentials: value semantics across calls, sret
+# returns, @global heap structs (ASan-proven frees), multi-arg print
+# ---------------------------------------------------------------------------
+
+@needs_clang
+def test_native_struct_param_mutation_does_not_leak_to_caller(tmp_path):
+    # The callee byval-copies its struct parameter, so mutating the local
+    # copy must not affect the caller's struct (MIR value semantics).
+    assert_native_matches_interp("""
+struct Box { v: int }
+fn bump(b: Box) -> int {
+    let mut c = b;
+    c.v = c.v + 100;
+    c.v
+}
+fn main() -> int {
+    let bx = Box { v: 7 };
+    let r = bump(bx);
+    print(r);
+    print(bx.v);
+    bx.v
+}
+""", tmp_path)
+
+
+@needs_clang
+def test_native_struct_returned_from_function(tmp_path):
+    ir = assert_native_matches_interp("""
+struct Point { x: int, y: int }
+fn mk(a: int, b: int) -> Point { Point { x: a * 2, y: b + 5 } }
+fn main() -> int {
+    let p = mk(10, 20);
+    print(p.x);
+    print(p.y);
+    p.x + p.y
+}
+""", tmp_path)
+    assert "define void @mx_mk(ptr %agg.ret, i64 %a.a, i64 %a.b)" in ir
+
+
+@needs_clang
+def test_native_struct_through_call_chain(tmp_path):
+    # A struct crossing two frames: passed in, updated (value semantics),
+    # and returned back out sret-style.
+    assert_native_matches_interp("""
+struct Point { x: int, y: int }
+fn shift(p: Point, dx: int) -> Point {
+    Point { x: p.x + dx, y: p.y }
+}
+fn main() -> int {
+    let a = Point { x: 3, y: 4 };
+    let b = shift(a, 10);
+    print(a.x, b.x, b.y);
+    a.x + b.x + b.y
+}
+""", tmp_path)
+
+
+@needs_clang
+@needs_asan
+def test_native_global_struct_alloc_use_free_under_asan(tmp_path):
+    # Exit 0 under -fsanitize=address proves the malloc/free pairing sound:
+    # no leak (LeakSanitizer), no double-free, no use-after-free.
+    ir = assert_native_matches_interp_asan("""
+struct Point { x: int, y: int }
+fn main() -> int {
+    let @global g = Point { x: 30, y: 12 };
+    print(g.x + g.y);
+    0
+}
+""", tmp_path)
+    assert re.search(r"call ptr @malloc\(i64 16\)", ir)
+    assert re.search(r"call void @free\(ptr %hv\.\w+\)", ir)
+
+
+@needs_clang
+@needs_asan
+def test_native_mixed_local_and_global_structs_under_asan(tmp_path):
+    # A function mixing frame-owned and heap-owned structs, with the heap
+    # value crossing a call boundary by copy (the callee must never retain
+    # or free the caller's heap block).
+    ir = assert_native_matches_interp_asan("""
+struct Pair { a: int, b: int }
+fn total(p: Pair) -> int { p.a + p.b }
+fn main() -> int {
+    let stackp = Pair { a: 1, b: 2 };
+    let @global heapp = Pair { a: 10, b: 20 };
+    print(total(stackp));
+    print(total(heapp));
+    print(stackp.a + heapp.b);
+    0
+}
+""", tmp_path)
+    assert ir.count("call ptr @malloc") == 1
+    # exactly one free (in main); the callee frees nothing it did not malloc
+    assert ir.count("call void @free") == 1
+
+
+@needs_clang
+@needs_asan
+def test_native_global_struct_in_loop_under_asan(tmp_path):
+    # The @global alloc site executes per iteration in MIR, but the variable
+    # has a single storage block (value semantics: each def overwrites it
+    # wholesale), so one malloc + one free per invocation is sound and
+    # ASan-clean.
+    assert_native_matches_interp_asan("""
+struct Acc { n: int }
+fn main() -> int {
+    let mut total = 0;
+    let mut i = 0;
+    while i < 4 {
+        let @global a = Acc { n: i * 10 };
+        total = total + a.n;
+        i = i + 1;
+    }
+    print(total);
+    0
+}
+""", tmp_path)
+
+
+@needs_clang
+def test_native_multi_arg_print_matches_interpreter_join(tmp_path):
+    # Interpreter print(*args) joins with a single space; the native printf
+    # format string must match exactly.
+    assert_native_matches_interp("""
+fn main() -> int {
+    print(1, 2, 3);
+    print("x", 42);
+    print(7 * 6, "is the answer");
+    0
+}
+""", tmp_path)

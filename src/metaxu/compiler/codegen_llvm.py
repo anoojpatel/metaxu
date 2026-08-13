@@ -13,11 +13,11 @@ subset:
 
 Everything else — suspending functions (perform/resume/handle_scope: the
 CPS lowering lives in codegen_clif for now), try_scope, closures
-(make_closure / indirect calls), variants, vector/string runtime builtins,
-@global (heap) structs, structs that escape the frame — is emitted as a
-clearly marked, comment-only placeholder carrying the reasons, never as
-silently wrong code.  Functions that call a placeholder function are
-themselves demoted (the module must link), with an explicit reason.
+(make_closure / indirect calls), variants, vector/string runtime builtins —
+is emitted as a clearly marked, comment-only placeholder carrying the
+reasons, never as silently wrong code.  Functions that call a placeholder
+function are themselves demoted (the module must link), with an explicit
+reason.
 
 Type model (documented conventions):
   * ints, bools and unit are all ``i64``; unit is the constant 0.
@@ -32,24 +32,60 @@ Type model (documented conventions):
   * int / and % use ``sdiv``/``srem`` (C truncating semantics).  The MIR
     interpreter uses Python floor semantics; these agree for non-negative
     operands.  Division by zero is UB natively (the interpreter raises).
-  * LOCAL (default / @local) structs are the first memory increment of the
-    mode story: a named ``%struct.T`` per struct type, one entry-block
-    ``alloca`` per struct-typed MIR variable, ``getelementptr`` +
-    load/store for fields.  MIR struct ops have value semantics
-    (``field_set`` yields an updated copy), so every def of a struct
-    variable stores a whole aggregate into that variable's own alloca —
-    no aliasing, and SROA/mem2reg scalarize it at -O2.  Zero memory
-    management: the frame is the allocation.  A struct value that would
-    escape the frame (returned, passed to or from a call, @global) demotes
-    the function to a placeholder instead of emitting a dangling pointer;
-    @global/heap structs (malloc + drop-planned frees) are a later
-    increment.
+  * LOCAL (default / @local) structs: a named ``%struct.T`` per struct
+    type, one entry-block ``alloca`` per struct-typed MIR variable,
+    ``getelementptr`` + load/store for fields.  MIR struct ops have value
+    semantics (``field_set`` yields an updated copy), so every def of a
+    struct variable stores a whole aggregate into that variable's own
+    storage — no aliasing, and SROA/mem2reg scalarize it at -O2.  Zero
+    memory management for locals: the frame is the allocation.
+  * @GLOBAL structs live on the heap: a struct variable defined by an
+    ``alloc_struct`` with locality "global" gets its storage from an
+    entry-block ``call ptr @malloc(i64 <8 * nfields>)`` instead of an
+    alloca (every scalar field kind — i64/double/ptr — is 8 bytes, so the
+    size and the GEP layout are exact), field access GEPs the heap
+    pointer, and every ``ret`` path frees the block with
+    ``call void @free(ptr ...)``.  Freeing at function exit is provably
+    sound here because MIR struct values have pure value semantics: every
+    cross-frame transfer below (parameter, return) moves the *aggregate*
+    by copy, never the storage pointer, so a callee's heap block can never
+    be reached after the callee returns.  Should a future op let a raw
+    struct pointer escape, that op must demote or suppress the free: a
+    leak is safe, a dangling pointer is not (unproven lifetimes leak by
+    design in this increment).  abort()/unreachable paths do not free
+    (the process is dying).  A variable whose defs mix @local and @global
+    allocations is uniformly heap-backed (storage location is unobservable
+    under value semantics; the conservative cost is one malloc+free).
+    This agrees with borrow_analysis.plan_drops, whose only drop point
+    today is function exit (drop_at_end -> MIR ``drop`` ops); the frees do
+    not depend on its needs_drop heuristic, only on the non-escape
+    guarantee above.
+  * struct values CROSS CALL BOUNDARIES by pointer, preserving MIR value
+    semantics at both edges:
+      - struct parameters are passed as ``ptr`` and the callee immediately
+        copies the aggregate into its own storage in the entry prelude
+        (byval-copy).  A later borrow-informed increment can elide that
+        copy for @const/read-only params once the borrow checker's results
+        are threaded into codegen.
+      - struct returns are sret-style (the ONE convention used
+        everywhere): the caller passes its result variable's storage as a
+        leading ``ptr %agg.ret`` argument, the callee copies the returned
+        aggregate into it and returns ``void``.  Small-struct returns as
+        first-class LLVM aggregates were considered and rejected to keep
+        one uniform path.  No ABI ``sret`` attribute is needed: all such
+        calls are module-internal.
+    Nested struct fields (a struct kind inside a struct field cell) are
+    still demoted — a later increment.
   * ``print``/``println`` of a single value routes by operand type to
     @metaxu_print_i64 / @metaxu_print_f64 / @metaxu_print_str, small
     helpers defined in this module on top of a declared @printf
-    ("%lld\n" / "%g\n" / "%s\n").  Note: float and bool formatting can
-    differ from the Python interpreter's str(); differential tests should
-    print ints/strings or compare via comparisons.
+    ("%lld\n" / "%g\n" / "%s\n").  Multi-argument print calls one @printf
+    with a per-call format string joining the per-kind directives with
+    single spaces ("%lld %s\n" etc.), matching the interpreter's
+    ``print(*args)`` (sep=" ").  Note: float and bool formatting can
+    differ from the Python interpreter's str() ("%g" vs repr; bools are
+    kind-erased to i64 and print as 1/0, not "True"/"False"); differential
+    tests should print ints/strings or compare via comparisons.
   * every metaxu function symbol is prefixed ``mx_`` (and sanitized to
     [A-Za-z0-9_]) so user functions named main/printf/abs cannot collide
     with libc; the native entry wrapper lives in llvm_run.py.
@@ -121,10 +157,27 @@ _HEADER = (
     ";   / and % are sdiv/srem (trunc toward zero; interpreter floors);\n"
     ";   local structs -> %struct.T entry allocas + GEP (value semantics,\n"
     ";   whole-aggregate copies; zero heap management -- the frame owns them);\n"
+    ";   @global structs -> entry-block malloc(8 * nfields) + GEP on the heap\n"
+    ";   pointer, freed on every ret path: sound because value semantics means\n"
+    ";   the storage pointer never escapes the frame (aggregates cross frames\n"
+    ";   by copy).  Any storage whose lifetime cannot be proven leaks by\n"
+    ";   design rather than risking a double-free/use-after-free;\n"
+    ";   struct params pass as ptr + callee byval-copy into own storage\n"
+    ";   (a borrow-informed increment can elide the copy for @const params);\n"
+    ";   struct returns are sret-style: caller passes its result slot as a\n"
+    ";   leading ptr %agg.ret arg, callee copies the aggregate in, rets void;\n"
     ";   print/println route by operand type to @metaxu_print_{i64,f64,str};\n"
+    ";   multi-arg print joins per-kind printf directives with spaces;\n"
     ";   metaxu symbols are prefixed mx_ to stay clear of libc names.\n"
     "; functions outside the subset appear as comment-only placeholders."
 )
+
+
+def _llparam(kind: str) -> str:
+    """The LLVM parameter/return-slot type for a value kind (structs -> ptr)."""
+    if _is_struct(kind):
+        return "ptr"
+    return _LLTY.get(kind, "i64")
 
 
 def _sanitize(name: str) -> str:
@@ -199,6 +252,8 @@ class _Info:
     calls: List[Tuple[str, str, Tuple[str, ...]]] = field(default_factory=list)
     slots: List[str] = field(default_factory=list)
     suspending: bool = False
+    # Variables defined by an @global alloc_struct: heap-backed storage.
+    global_alloc_vars: Set[str] = field(default_factory=set)
 
     def add_reason(self, r: str) -> None:
         if r not in self.reasons:
@@ -294,6 +349,12 @@ def _analyze_inner(info: _Info, module_names: Set[str]) -> None:
                     add_use(a, bi)
                 add_def(dst, bi)
             elif rk == "alloc_struct":
+                locality = rhs[2] if len(rhs) > 2 else "local"
+                if locality == "global":
+                    info.global_alloc_vars.add(dst)
+                elif locality != "local":
+                    info.add_reason(
+                        f"unknown locality {locality!r} for struct {rhs[1]!r}")
                 for (_fname, fval) in args:
                     add_use(fval, bi)
                 add_def(dst, bi)
@@ -534,13 +595,8 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
         if ty(name) == CONFLICT:
             probs.append(f"irreconcilable value kinds for {name!r}")
 
-    own = sigs.get(info.f.name)
-    if own is not None:
-        for p, pk in zip(info.params, own.params):
-            if _is_struct(pk):
-                probs.append(f"struct-typed parameter {p!r} (structs must not cross frames)")
-        if _is_struct(own.ret):
-            probs.append("returns a struct value (aggregate returns are a later increment)")
+    # Struct-kinded params and returns are supported: params pass as ptr with
+    # a callee byval-copy, returns are sret-style (see module docstring).
 
     for b in info.f.blocks:
         for op in b.ops:
@@ -569,12 +625,9 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
             elif rk == "call":
                 callee = rhs[1]
                 if callee in _PRINT_BUILTINS:
-                    if len(args) != 1:
-                        probs.append(
-                            f"{callee} with {len(args)} arguments "
-                            "(only single-value print is lowered)")
-                    elif ty(args[0]) not in (I64, F64, STR):
-                        probs.append(f"print of unsupported kind {ty(args[0])}")
+                    for a in args:
+                        if ty(a) not in (I64, F64, STR):
+                            probs.append(f"print of unsupported kind {ty(a)}")
                 elif callee in _MATH_EXTERNS or callee in _INLINE_BUILTINS:
                     pass  # kinds pinned during inference
                 elif callee in module_names:
@@ -583,26 +636,18 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                         probs.append(f"call to {callee!r} with wrong arity")
                         continue
                     for a, pk in zip(args, sig.params):
-                        if _is_struct(ty(a)):
-                            probs.append(
-                                f"struct value {a!r} passed to {callee!r} "
-                                "(structs must not cross frames)")
-                        elif ty(a) != pk:
+                        if ty(a) != pk:
                             probs.append(
                                 f"call to {callee!r}: arg {a!r} is {ty(a)}, expects {pk}")
-                    if _is_struct(ty(dst)) or _is_struct(sig.ret):
-                        probs.append(f"struct value returned from call to {callee!r}")
-                    elif ty(dst) != sig.ret:
+                    if ty(dst) != sig.ret:
                         probs.append(
                             f"call to {callee!r}: result {dst!r} is {ty(dst)}, "
                             f"returns {sig.ret}")
             elif rk == "alloc_struct":
+                # locality "local" -> frame alloca; "global" -> heap malloc
+                # with free at function exit (unknown localities were already
+                # demoted during analysis).
                 sname = rhs[1]
-                locality = rhs[2] if len(rhs) > 2 else "local"
-                if locality != "local":
-                    probs.append(
-                        f"@{locality} struct {sname!r} (heap structs with "
-                        "drop-planned frees are a later increment)")
                 if sname in structs.bad:
                     probs.append(structs.bad[sname])
                 elif set(fn_ for (fn_, _fv) in args) != set(structs.fields.get(sname, ())):
@@ -620,10 +665,8 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                         probs.append(f"struct {sname!r} has no field {rhs[1]!r}")
         if b.term[0] == "br_if" and ty(b.term[1]) != I64:
             probs.append(f"br_if condition {b.term[1]!r} is {ty(b.term[1])}")
-        if b.term[0] == "ret" and _is_struct(ty(b.term[1])):
-            probs.append(
-                f"returns local struct {b.term[1]!r} (would dangle; "
-                "aggregate returns are a later increment)")
+        # ret of a struct value is fine: sret-style, the aggregate is copied
+        # into the caller-provided %agg.ret slot (never a raw frame pointer).
 
     # Struct field kinds must themselves be scalar in this increment.
     used_structs = {_struct_name(k) for k in kinds.values() if _is_struct(k)}
@@ -667,6 +710,8 @@ class _ModuleState:
         self.print_helpers: Set[str] = set()  # subset of {"i64","f64","str"}
         self.math_used: Set[str] = set()
         self.uses_abort = False
+        self.uses_malloc = False   # @global structs: malloc/free declares
+        self.uses_printf = False   # direct variadic printf (multi-arg print)
 
     def intern_string(self, content: str) -> str:
         if content not in self.strings:
@@ -676,8 +721,8 @@ class _ModuleState:
 
 def _emit_placeholder(info: _Info, sig: _Sig) -> str:
     sym = mangle(info.f.name)
-    ptys = ", ".join(_LLTY.get(k, "i64") for k in sig.params)
-    rty = _LLTY.get(sig.ret, "i64")
+    ptys = ", ".join(_llparam(k) for k in sig.params)
+    rty = "void (sret ptr)" if _is_struct(sig.ret) else _LLTY.get(sig.ret, "i64")
     lines = [f"; function @{sym}: placeholder -- unsupported for direct LLVM emission"]
     for r in info.reasons:
         lines.append(f";   reason: {r}")
@@ -701,6 +746,12 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
     slotset = set(slots)
     struct_vars = sorted(n for n in info.def_count if _is_struct(kind(n)))
     structset = set(struct_vars)
+    # Heap-backed struct variables (@global alloc_struct defs): storage is an
+    # entry-block malloc'd block instead of an alloca, freed on every ret.
+    heap_vars = sorted(n for n in struct_vars if n in info.global_alloc_vars)
+    heapset = set(heap_vars)
+    struct_params = [p for p in info.params if p in structset]
+    sret = _is_struct(sig.ret)
 
     counter = 0
 
@@ -716,6 +767,9 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
         return f"%slot.{_sanitize(n)}"
 
     def struct_ref(n: str) -> str:
+        """The storage pointer for a struct variable (alloca or heap block)."""
+        if n in heapset:
+            return f"%hv.{_sanitize(n)}"
         return f"%sv.{_sanitize(n)}"
 
     def use(name: str, lines: List[str]) -> str:
@@ -772,10 +826,21 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
         lines.append(f"  {v} = load {sty}, ptr {src_ptr}")
         lines.append(f"  store {sty} {v}, ptr {dst_ptr}")
 
+    def emit_frees(lines: List[str]) -> None:
+        """Free every heap-backed @global struct block (called on ret paths).
+
+        Sound because the malloc unconditionally happens in the entry block
+        (exactly once per invocation) and value semantics guarantees the
+        storage pointer never escapes this frame (see module docstring)."""
+        for n in heap_vars:
+            lines.append(f"  call void @free(ptr {struct_ref(n)})"
+                         f"  ; @global struct {n}: end of frame")
+
     # Params are visible from the entry block on: SSA args directly, spilled
-    # params through their slot (the store happens in the entry prelude).
+    # params through their slot (the store happens in the entry prelude);
+    # struct params through their own storage (byval-copied in the prelude).
     for p in info.params:
-        if p not in slotset:
+        if p not in slotset and p not in structset:
             valmap[p] = f"%a.{_sanitize(p)}"
 
     body: List[str] = []
@@ -787,7 +852,10 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
             if opk == "params":
                 continue
             if opk == "drop":
-                lines.append(f"  ; drop {op[1]} (scalar/local: frame-owned, no-op)")
+                if op[1] in heapset:
+                    lines.append(f"  ; drop {op[1]} (@global struct: freed on ret paths)")
+                else:
+                    lines.append(f"  ; drop {op[1]} (scalar/local: frame-owned, no-op)")
                 continue
             if opk == "match_fail":
                 mod.uses_abort = True
@@ -851,12 +919,27 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
             elif rk == "call":
                 callee = rhs[1]
                 if callee in _PRINT_BUILTINS:
-                    a = use(opargs[0], lines)
-                    k = kind(opargs[0])
-                    mod.print_helpers.add(k)
-                    hn = {I64: "metaxu_print_i64", F64: "metaxu_print_f64",
-                          STR: "metaxu_print_str"}[k]
-                    lines.append(f"  call void @{hn}({_LLTY[k]} {a})")
+                    if len(opargs) == 1:
+                        a = use(opargs[0], lines)
+                        k = kind(opargs[0])
+                        mod.print_helpers.add(k)
+                        hn = {I64: "metaxu_print_i64", F64: "metaxu_print_f64",
+                              STR: "metaxu_print_str"}[k]
+                        lines.append(f"  call void @{hn}({_LLTY[k]} {a})")
+                    else:
+                        # 0 or 2+ args: one printf with space-joined per-kind
+                        # directives, matching the interpreter's print(*args).
+                        fmt = " ".join(
+                            {I64: "%lld", F64: "%g", STR: "%s"}[kind(a)]
+                            for a in opargs) + "\n"
+                        avals = [f"{_LLTY[kind(a)]} {use(a, lines)}"
+                                 for a in opargs]
+                        g = mod.intern_string(fmt)
+                        mod.uses_printf = True
+                        r = fresh()
+                        call_args = ", ".join([f"ptr {g}"] + avals)
+                        lines.append(
+                            f"  {r} = call i32 (ptr, ...) @printf({call_args})")
                     setval(dst, "0", lines)  # unit
                 elif callee == "neg":
                     a = use(opargs[0], lines)
@@ -884,12 +967,24 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                     csig = sigs[callee]
                     avals = []
                     for a, pk in zip(opargs, csig.params):
-                        avals.append(f"{_LLTY[pk]} {use(a, lines)}")
-                    v = fresh()
-                    rty = _LLTY[csig.ret]
-                    lines.append(
-                        f"  {v} = call {rty} @{mangle(callee)}({', '.join(avals)})")
-                    setval(dst, v, lines)
+                        # struct args pass their storage pointer; the callee
+                        # byval-copies the aggregate in its entry prelude.
+                        avals.append(f"{_llparam(pk)} {use(a, lines)}")
+                    if _is_struct(csig.ret):
+                        # sret-style: dst's own storage is the result slot.
+                        if dst not in structset:
+                            raise _Unsupported(
+                                f"call result {dst!r} not struct-kinded for "
+                                f"sret call to {callee!r}")
+                        avals.insert(0, f"ptr {struct_ref(dst)}")
+                        lines.append(
+                            f"  call void @{mangle(callee)}({', '.join(avals)})")
+                    else:
+                        v = fresh()
+                        rty = _LLTY[csig.ret]
+                        lines.append(
+                            f"  {v} = call {rty} @{mangle(callee)}({', '.join(avals)})")
+                        setval(dst, v, lines)
             elif rk == "alloc_struct":
                 sname = rhs[1]
                 if dst not in structset:
@@ -929,26 +1024,60 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                 lines.append(f"  {cb} = icmp ne i64 {c}, 0")
                 lines.append(f"  br i1 {cb}, label %bb{t[2]}, label %bb{t[3]}")
             elif t[0] == "ret":
-                rv = use(t[1], lines)
-                lines.append(f"  ret {_LLTY[sig.ret]} {rv}")
-            else:  # ("unreachable",) placeholder terminator
+                if sret:
+                    if kind(t[1]) != sig.ret:
+                        raise _Unsupported(
+                            f"return value {t[1]!r} is {kind(t[1])}, "
+                            f"function returns {sig.ret}")
+                    # Copy the aggregate into the caller's slot BEFORE any
+                    # frees (the returned value may live in a heap block).
+                    src = use(t[1], lines)
+                    struct_copy(_struct_name(sig.ret), src, "%agg.ret", lines)
+                    emit_frees(lines)
+                    lines.append("  ret void")
+                else:
+                    rv = use(t[1], lines)
+                    emit_frees(lines)
+                    lines.append(f"  ret {_LLTY[sig.ret]} {rv}")
+            else:  # ("unreachable",) placeholder terminator (no frees: dead end)
                 lines.append("  unreachable")
         body.append(f"bb{bi}:")
         body.extend(lines)
 
-    # Assemble: define header, entry block (allocas + param spills), blocks.
+    # Assemble: define header, entry block (allocas + heap mallocs + param
+    # spills/byval-copies), blocks.  A struct return prepends the caller's
+    # result slot as a leading `ptr %agg.ret` parameter (sret-style).
     pdecls = []
+    if sret:
+        pdecls.append("ptr %agg.ret")
     for p, pk in zip(info.params, sig.params):
-        pdecls.append(f"{_LLTY[pk]} %a.{_sanitize(p)}")
-    out = [f"define {_LLTY[sig.ret]} @{mangle(f.name)}({', '.join(pdecls)}) {{"]
+        pdecls.append(f"{_llparam(pk)} %a.{_sanitize(p)}")
+    rty = "void" if sret else _LLTY[sig.ret]
+    out = [f"define {rty} @{mangle(f.name)}({', '.join(pdecls)}) {{"]
     entry: List[str] = []
     for n in slots:
         entry.append(f"  {slot_ref(n)} = alloca {llty(n)}  ; mir slot: {n}")
     for n in struct_vars:
+        if n in heapset:
+            continue  # heap-backed: malloc'd below instead of an alloca
         sty = f"%struct.{_sanitize(_struct_name(kind(n)))}"
         entry.append(f"  {struct_ref(n)} = alloca {sty}  ; local struct: {n}")
+    for n in heap_vars:
+        sname = _struct_name(kind(n))
+        size = 8 * len(structs.fields.get(sname, ()))  # all field kinds are 8 bytes
+        mod.uses_malloc = True
+        entry.append(
+            f"  {struct_ref(n)} = call ptr @malloc(i64 {size})"
+            f"  ; @global struct {n}: {sname}, freed on ret paths")
     for p in info.params:
-        if p in slotset:
+        if p in structset:
+            # byval-copy: the caller passed a pointer to ITS storage; copy the
+            # aggregate into this frame's own storage to preserve MIR value
+            # semantics (a borrow-informed increment can elide this for
+            # @const params).
+            struct_copy(_struct_name(kind(p)), f"%a.{_sanitize(p)}",
+                        struct_ref(p), entry)
+        elif p in slotset:
             entry.append(f"  store {llty(p)} %a.{_sanitize(p)}, ptr {slot_ref(p)}")
     entry.append("  br label %bb0")
     out.append("entry:")
@@ -983,10 +1112,13 @@ def _emit_runtime(mod: _ModuleState) -> List[str]:
             _string_global(gname, content)
             for content, gname in sorted(mod.strings.items(), key=lambda kv: kv[1])))
     decls: List[str] = []
-    if mod.print_helpers:
+    if mod.print_helpers or mod.uses_printf:
         decls.append("declare i32 @printf(ptr, ...)")
     if mod.uses_abort:
         decls.append("declare void @abort() noreturn")
+    if mod.uses_malloc:
+        decls.append("declare noalias ptr @malloc(i64)")
+        decls.append("declare void @free(ptr)")
     for name in sorted(mod.math_used):
         decls.append(f"declare double @{name}(double)")
     if decls:

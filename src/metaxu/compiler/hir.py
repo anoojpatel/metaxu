@@ -547,7 +547,15 @@ class HIRBuilder:
                 he = self._from_orig_expr(init, frozen_ctx)
                 if name and he is not None:
                     binds.append((name, he))
-                    bind_modes[str(name)] = self._extract_modeinfo(getattr(b, 'mode', None))
+                    mi = self._extract_modeinfo(getattr(b, 'mode', None))
+                    bind_modes[str(name)] = mi
+                    # `let @global x = S { ... }` allocates on the heap: the
+                    # binding's locality annotation is the allocation site's
+                    # locality, so it must reach MIR's alloc_struct (dropping
+                    # it here is exactly the "silently degraded mode" seam the
+                    # conventions warn about).
+                    if mi.locality == "global" and he.op == "Struct":
+                        he.locality = "global"
             ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, "Unit"))
             return self._mk_hexpr(frozen_ctx.node_id, "Stmt", ty, frozen_ctx.span, op="Let", bindings=tuple(binds), bind_modes=bind_modes)
 
@@ -1056,9 +1064,36 @@ class HIRBuilder:
         # Unknown pattern node: treat as wildcard so lowering stays total.
         return HPattern(kind="wildcard")
 
+    # Plain-string mode tokens as produced by the parser's binding_prefix
+    # (`let @global x = ...` builds ModeAnnotation('global'): mode_type is the
+    # bare token, not a Uniqueness/Locality/LinearityMode node).
+    _UNIQUENESS_TOKENS = {"unique", "exclusive", "shared", "owned", "const"}
+    _LOCALITY_TOKENS = {"local", "global"}
+    _LINEARITY_TOKENS = {"once", "separate", "many"}
+
+    def _absorb_mode_token(self, mi: ModeInfo, tok: Any) -> None:
+        if not isinstance(tok, str):
+            return
+        if tok == "mut":
+            mi.uniqueness = mi.uniqueness or "mutable"
+        elif tok in self._UNIQUENESS_TOKENS:
+            mi.uniqueness = mi.uniqueness or tok
+        elif tok in self._LOCALITY_TOKENS:
+            mi.locality = mi.locality or tok
+        elif tok in self._LINEARITY_TOKENS:
+            mi.linearity = mi.linearity or tok
+
     def _extract_modeinfo(self, mode: Any) -> ModeInfo:
         mi = ModeInfo()
         if mode is None:
+            return mi
+        # A list of annotations (parser binding_prefix): merge every entry.
+        if isinstance(mode, (list, tuple)):
+            for m in mode:
+                sub = self._extract_modeinfo(m)
+                mi.uniqueness = mi.uniqueness or sub.uniqueness
+                mi.locality = mi.locality or sub.locality
+                mi.linearity = mi.linearity or sub.linearity
             return mi
         # UniquenessMode
         if isinstance(mode, fast.ModeAnnotation):
@@ -1070,6 +1105,7 @@ class HIRBuilder:
                 mi.locality = getattr(mt, 'mode', None)
             if isinstance(mt, fast.LinearityMode):
                 mi.linearity = getattr(mt, 'mode', None)
+            self._absorb_mode_token(mi, mt)
         elif isinstance(mode, fast.UniquenessMode):
             mi.uniqueness = getattr(mode, 'mode', None)
         elif isinstance(mode, fast.LocalityMode):
