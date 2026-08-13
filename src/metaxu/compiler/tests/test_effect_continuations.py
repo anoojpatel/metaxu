@@ -374,3 +374,21 @@ fn main() -> int {
 }
 """)
     assert result == 2  # both performs hit the inner handler
+
+
+def test_multi_argument_effect_op():
+    """An op with two arguments binds both handler-case parameters."""
+    result, _ = run_main("""
+effect Math {
+    add(a: int, b: int) -> int
+}
+
+fn main() -> int {
+    handle Math with {
+        add(a, b) -> resume(a + b)
+    } in {
+        perform Math.add(40, 2)
+    }
+}
+""")
+    assert result == 42

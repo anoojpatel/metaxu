@@ -332,15 +332,20 @@ class MirInterpreter:
             raise msg[1]  # _ScopeAbort for an outer scope: keep unwinding
         # ("perform", op_name, arg_vals, k)
         _, op_name, arg_vals, sk = msg
-        param_name, handler_fn_name = frame["cases"][op_name]
+        case_params, handler_fn_name = frame["cases"][op_name]
+        if isinstance(case_params, str):
+            case_params = (case_params,)
         target = self._funcs.get(handler_fn_name)
         if target is None:
             raise InterpError(f"Missing handler function {handler_fn_name!r}")
         handler_env = dict(frame["captured"])
-        handler_arg = arg_vals[0] if arg_vals else UNIT
+        # Bind the op's arguments positionally to the case parameters,
+        # padding with UNIT when the perform supplied fewer.
+        handler_args = list(arg_vals[:len(case_params)])
+        handler_args += [UNIT] * (len(case_params) - len(handler_args))
         frame["busy"] = True
         try:
-            handler_result = self._call_func(target, [handler_arg, sk], handler_env)
+            handler_result = self._call_func(target, [*handler_args, sk], handler_env)
         finally:
             frame["busy"] = False
         if sk.used:

@@ -342,11 +342,15 @@ class _FuncLowerer:
                 effect = effect.split("<", 1)[0]
             scope_tag = self.state.fresh("hs")
             cases_encoded: List[tuple] = []
-            for (op_name, param_name, body_he) in (e.handle_cases or ()):
+            for (op_name, case_params, body_he) in (e.handle_cases or ()):
+                # case_params is a tuple of parameter names (multi-arg ops);
+                # tolerate a legacy bare string.
+                if isinstance(case_params, str):
+                    case_params = (case_params,)
                 hfn = f"__handler_{effect}_{op_name}_{scope_tag}"
-                self._lower_subfunc(hfn, (param_name, "__k"), body_he,
+                self._lower_subfunc(hfn, (*case_params, "__k"), body_he,
                                     ty_sig=e.ty, suspending=False)
-                cases_encoded.append((op_name, param_name, hfn))
+                cases_encoded.append((op_name, tuple(case_params), hfn))
             body_fn = f"__handle_body_{effect}_{scope_tag}"
             self._lower_subfunc(body_fn, (), e.handle_body, ty_sig=e.ty,
                                 suspending=False)
