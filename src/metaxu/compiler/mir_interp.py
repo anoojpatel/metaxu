@@ -596,7 +596,11 @@ class MirInterpreter:
                 raise InterpError(f"variant_tag: expected MxVariant, got {type(v).__name__!r}")
             return v.tag
         elif kind == "variant_field":
-            # ("variant_field", index), (variant_name_ref,)
+            # ("variant_field", index[, ctor_name]), (variant_name_ref,)
+            # The optional third element (the pattern's ctor name, added for
+            # variant-aware backends) is deliberately ignored here: the
+            # interpreter reads the field positionally, and legacy
+            # two-element ops stay valid.
             idx: int = rhs[1]
             v = self._lookup(args[0], env, f)
             if not isinstance(v, MxVariant):
