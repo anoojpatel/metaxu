@@ -77,6 +77,8 @@ This document tracks high-level goals, status, and pointers across the new Pytho
     confirmed bugs found and fixed, each pinned by a regression test)
 
 - Pending (Highlights — each needs a design decision or major ABI work)
+  - Incremental module compilation: per-module codegen units with
+    signature-hash cache keys and linkonce monomorphization (see section 9)
   - Assoc type concretization
   - Frame chaining across suspending calls (needs a parked-return protocol
     and frame allocator in the runtime ABI); CLIF-level effect dispatch
@@ -162,6 +164,39 @@ This document tracks high-level goals, status, and pointers across the new Pytho
   - Iterator + next_or (traits/assoc types) (pending)
   - read_u32 (suspending + CPS) (pending)
   - Borrow/mode validation and errors (pending)
+
+### 9) Incremental Module Compilation (pending — own phase)
+- Files: `module_loader.py`, `pipeline.py`, `codegen_llvm.py`, `llvm_run.py`
+- Today: whole-program only. The module loader merges every imported file
+  into one Program before analysis; one inference run, one LLVM module,
+  one clang invocation. Function-level namespacing (dotted renames like
+  `math.vector.dot`) keeps modules apart, but nothing is cached between
+  compilations except the C runtime objects (mtime-cached .o files).
+- Two whole-module analyses currently block per-module codegen and must be
+  cut at module boundaries first:
+  - Kind inference: the emitter's kind fixpoint flows callee kinds from
+    all callers module-wide. At module boundaries this must be replaced by
+    DECLARED signatures — which implies a language rule that public
+    (exported) functions require type annotations. Advisory until then.
+  - Monomorphization: clones are reachability-driven over the whole call
+    graph. Assign each clone to the INSTANTIATING module's codegen unit
+    with linkonce/weak linkage so duplicate specializations merge at link
+    time (the Rust model).
+- Plan (in order):
+  1. Codegen units: each module emits its own .ll -> .o, cached under a
+     key = hash(module source, compiler version, and the SIGNATURES of
+     everything it imports). Signature hashing is the crux: a body-only
+     edit must not invalidate importers. The loader already computes the
+     dependency DAG, so unit partitioning and cache keys live there.
+  2. Stable ABI: the dotted-name mangling (module system) plus `$`
+     specialization suffixes (monomorphize) are already deterministic;
+     freeze them as the object-level ABI and document.
+  3. Link step: clang links the cached per-module .o set + runtime
+     objects; only dirtied units re-emit ("last-minute linking").
+  4. Cross-module inlining/opt: accept the loss initially (LLVM LTO can
+     recover it later via -flto on the cached bitcode instead of .o).
+- Interpreter path stays whole-program (it is the semantics reference and
+  compilation speed there is not a bottleneck).
 
 ## How to Run
 
