@@ -30,7 +30,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from .mir import MirBlock, MirFunc
 from .desugar import IMPL_SEP, parse_impl_method_name
-from .hir import STATIC_CALL_PREFIX, TRAIT_CALL_PREFIX
+from .hir import EFFECT_RUNTIME_CALL_PREFIX, STATIC_CALL_PREFIX, TRAIT_CALL_PREFIX
 
 
 # ---------------------------------------------------------------------------
@@ -200,6 +200,47 @@ class MxFile:
         return f"<*FILE {self.path!r} {state}>"
 
 
+class MxMutex:
+    """Runtime mutex behind the EFFECT_MUTEX_* primitives (effect_mapping.mx).
+
+    The interpreter executes on a single logical thread (spawned "threads"
+    run to completion at spawn — see _rt_thread_spawn), so a non-recursive
+    mutex has exact semantics: locking a mutex that is already locked can
+    never succeed later — it IS a deadlock — and unlocking an unlocked mutex
+    is a program error. Both fail loudly rather than no-op.
+    """
+    __slots__ = ("mutex_id", "locked")
+
+    def __init__(self, mutex_id: int) -> None:
+        self.mutex_id = mutex_id
+        self.locked = False
+
+    def __repr__(self) -> str:
+        state = "locked" if self.locked else "unlocked"
+        return f"<Mutex#{self.mutex_id} {state}>"
+
+
+class MxThread:
+    """Runtime thread handle behind EFFECT_SPAWN / EFFECT_JOIN.
+
+    The single-threaded interpreter realizes one legal schedule of real
+    thread semantics: the spawned function runs to completion at spawn time
+    (as if the child ran immediately and finished before the parent resumed),
+    and join returns its stored result. Joining twice is an error (the handle
+    is consumed), matching pthread_join.
+    """
+    __slots__ = ("thread_id", "result", "joined")
+
+    def __init__(self, thread_id: int, result: Any) -> None:
+        self.thread_id = thread_id
+        self.result = result
+        self.joined = False
+
+    def __repr__(self) -> str:
+        state = "joined" if self.joined else "done"
+        return f"<Thread#{self.thread_id} {state}>"
+
+
 # ---------------------------------------------------------------------------
 # Effect handler registry
 # ---------------------------------------------------------------------------
@@ -320,6 +361,18 @@ class MirInterpreter:
         self._c_heap: Dict[int, bytearray] = {}
         self._c_freed: set[int] = set()
         self._next_alloc_id: int = 1
+        # Runtime shims for effect ops mapped via `with SYMBOL` clauses
+        # (effect_mapping.mx). Keyed by the declared runtime symbol; a mapped
+        # op whose symbol has no shim here fails loudly at perform time.
+        self._effect_runtime_shims: Dict[str, Callable[[List[Any]], Any]] = {
+            "EFFECT_MUTEX_CREATE": self._rt_mutex_create,
+            "EFFECT_MUTEX_LOCK": self._rt_mutex_lock,
+            "EFFECT_MUTEX_UNLOCK": self._rt_mutex_unlock,
+            "EFFECT_SPAWN": self._rt_thread_spawn,
+            "EFFECT_JOIN": self._rt_thread_join,
+        }
+        self._next_mutex_id: int = 1
+        self._next_thread_id: int = 1
         self._register_builtins()
 
     # ------------------------------------------------------------------
@@ -564,6 +617,27 @@ class MirInterpreter:
                 # bind dst to the handler's return and keep running this block.
                 handler = self._effect_handlers.get(effect_name)
                 if handler is None:
+                    # Runtime-mapped op: `op(...) -> T with SYMBOL` in the
+                    # effect declaration compiled to a thunk
+                    # __effect_runtime$E$op that invokes the interpreter's
+                    # shim for SYMBOL (Mutex/Thread primitives). Handlers in
+                    # scope always win (checked above) — effects stay
+                    # virtualizable; the mapping is the op's ground
+                    # implementation when nothing intercepts it, and it takes
+                    # precedence over a declared `= expr` default.
+                    runtime_fn = self._funcs.get(
+                        f"__effect_runtime{IMPL_SEP}{effect_name}{IMPL_SEP}{op_name}")
+                    if runtime_fn is not None:
+                        n_params = len(runtime_fn.param_names())
+                        if len(arg_vals) > n_params:
+                            raise InterpError(
+                                f"Effect op {op_name!r} performed with "
+                                f"{len(arg_vals)} argument(s) but its runtime "
+                                f"mapping declares only {n_params} parameter(s)")
+                        rt_val = self._call_func(runtime_fn, arg_vals, {})
+                        env[dst] = rt_val
+                        last = rt_val
+                        continue
                     # Declared default handler: an effect op with a
                     # `= expr` default compiles to __effect_default$E$op.
                     # With no handler in scope the perform evaluates it and
@@ -642,6 +716,19 @@ class MirInterpreter:
                     raise InterpError(
                         f"call: no func {local_val.func_name!r} for closure {callee_name!r}")
                 return self._call_func(target, arg_vals, local_val.captured)
+            # Runtime primitive behind a `with SYMBOL` effect mapping: the
+            # __effect_runtime$E$op thunk's body calls
+            # __mx_effect_runtime$SYMBOL. Dispatch to the shim table; an
+            # unmapped symbol is a loud error, never a silent no-op.
+            if callee_name.startswith(EFFECT_RUNTIME_CALL_PREFIX):
+                symbol = callee_name[len(EFFECT_RUNTIME_CALL_PREFIX):]
+                shim = self._effect_runtime_shims.get(symbol)
+                if shim is None:
+                    raise InterpError(
+                        f"effect op is mapped to runtime primitive {symbol!r}, "
+                        f"but this interpreter provides no shim for it "
+                        f"(available: {', '.join(sorted(self._effect_runtime_shims))})")
+                return shim(arg_vals)
             # Builtins first
             if callee_name in self._builtins:
                 return self._builtins[callee_name](*arg_vals)
@@ -1204,6 +1291,82 @@ class MirInterpreter:
         handle.closed = True
         return 0
 
+    # ------------------------------------------------------------------
+    # Runtime shims for `with SYMBOL`-mapped effect ops (effect_mapping.mx)
+    # ------------------------------------------------------------------
+    # Single-threaded execution model, stated once: spawn runs the child
+    # function to completion immediately (a legal schedule of real thread
+    # semantics — child finishes before the parent resumes), so mutex
+    # lock/unlock are exact, not simulated: a lock that cannot be acquired
+    # NOW can never be acquired (deadlock -> loud error).
+
+    def _rt_mutex_create(self, args: List[Any]) -> Any:
+        if args:
+            raise InterpError(
+                f"EFFECT_MUTEX_CREATE takes no arguments, got {len(args)}")
+        m = MxMutex(self._next_mutex_id)
+        self._next_mutex_id += 1
+        return m
+
+    def _rt_mutex_lock(self, args: List[Any]) -> Any:
+        if len(args) != 1 or not isinstance(args[0], MxMutex):
+            raise InterpError(
+                f"EFFECT_MUTEX_LOCK expects one Mutex argument, got "
+                f"{[_runtime_type_name(a) for a in args]!r}")
+        m = args[0]
+        if m.locked:
+            raise InterpError(
+                f"deadlock: EFFECT_MUTEX_LOCK on {m!r}, which is already "
+                f"locked — in the single-threaded interpreter no other "
+                f"thread can ever release it")
+        m.locked = True
+        return UNIT
+
+    def _rt_mutex_unlock(self, args: List[Any]) -> Any:
+        if len(args) != 1 or not isinstance(args[0], MxMutex):
+            raise InterpError(
+                f"EFFECT_MUTEX_UNLOCK expects one Mutex argument, got "
+                f"{[_runtime_type_name(a) for a in args]!r}")
+        m = args[0]
+        if not m.locked:
+            raise InterpError(
+                f"EFFECT_MUTEX_UNLOCK on {m!r}, which is not locked")
+        m.locked = False
+        return UNIT
+
+    def _rt_thread_spawn(self, args: List[Any]) -> Any:
+        if len(args) != 1:
+            raise InterpError(
+                f"EFFECT_SPAWN expects one function argument, got {len(args)}")
+        fn = args[0]
+        if not isinstance(fn, MxClosure):
+            raise InterpError(
+                f"EFFECT_SPAWN expects a closure, got "
+                f"{_runtime_type_name(fn)!r}")
+        target = self._funcs.get(fn.func_name)
+        if target is None:
+            raise InterpError(f"EFFECT_SPAWN: no func {fn.func_name!r} for closure")
+        if target.param_names():
+            raise InterpError(
+                f"EFFECT_SPAWN: spawned function must take no arguments, "
+                f"but {fn.func_name!r} declares {len(target.param_names())}")
+        # Run the child to completion now (see execution model note above).
+        result = self._call_func(target, [], dict(fn.captured))
+        t = MxThread(self._next_thread_id, result)
+        self._next_thread_id += 1
+        return t
+
+    def _rt_thread_join(self, args: List[Any]) -> Any:
+        if len(args) != 1 or not isinstance(args[0], MxThread):
+            raise InterpError(
+                f"EFFECT_JOIN expects one Thread argument, got "
+                f"{[_runtime_type_name(a) for a in args]!r}")
+        t = args[0]
+        if t.joined:
+            raise InterpError(f"EFFECT_JOIN on {t!r}: thread already joined")
+        t.joined = True
+        return t.result
+
     def _builtin_vec_comprehension(self, n: Any, fn: Any, iterable: Any) -> Any:
         """Evaluate `vector[T, N](expr for targets in iterable)` at runtime."""
         if isinstance(iterable, MxVector):
@@ -1273,6 +1436,12 @@ def _runtime_type_name(v: Any) -> str:
         return "Ptr"
     if isinstance(v, MxFile):
         return "FILE"
+    if isinstance(v, MxMutex):
+        return "Mutex"
+    if isinstance(v, MxThread):
+        return "Thread"
+    if isinstance(v, MxClosure):
+        return "Closure"
     if v is None:
         return "Null"
     return type(v).__name__
