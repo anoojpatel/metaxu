@@ -45,19 +45,35 @@ This document tracks high-level goals, status, and pointers across the new Pytho
   - Borrow checker spec document (frozen_borrow_spec.md)
   - Old BorrowChecker in type_checker.py deprecated
 
-- In Progress
-  - HIR build over real AST (desugarings deferred)
-  - MIR ANF coverage expansion
-  - Golden test suite growth
-  - Better drop planning from borrow analysis
+- Completed since (see `docs/v1_gap_analysis.md` for full detail)
+  - HIR build over real parsed AST: patterns (ctor/literal/negative/bare
+    variant), enums, while loops, assignments, closures with captures,
+    structs/field access, index/slice/vector expressions, effects
+  - MIR: real multi-block control flow, decision-tree pattern compilation,
+    strict interpreter (unbound names error), runtime library (Vec,
+    vector[T,N], math builtins), trait dispatch on runtime types
+  - Effects: delimited single-shot continuations (deep handlers, aborts,
+    nested scopes, handler self-performs, multi-arg ops); stack/suspend
+    class enforcement
+  - Trait impl desugaring (implement blocks -> mangled functions with
+    runtime dispatch; user impls win over builtins)
+  - Struct field mode validation (deep @global/@local ownership rules,
+    transitive, with structured deep-locality diagnostics)
+  - Selective CPS: frame layouts (cps_frames.py), %run_<f> br_table state
+    machines parking via enqueue/sched_read, %resume_<f>_<k> shims
+  - CLIF direct codegen: real multi-block Cranelift IR text for the direct
+    subset; declaration-only placeholders elsewhere; structural validator
+  - Type enforcement: TypeCheckError for struct-field literal mismatches
+    and constraint-graph class conflicts (1 + "a", non-bool conditions)
+  - Example gates: 19/19 pipeline (2 negative fixtures rejected),
+    15/19 executing, pinned in pytest with golden outputs
 
 - Pending (Highlights)
-  - Trait dictionary desugaring; assoc type concretization; coherence checks
-  - HIR-level borrow analysis (DropPlan from frozen AST borrow checker results)
-  - Selective CPS for suspending functions; scheduler integration
-  - Struct/enum field mode validation (deep ownership rules)
-  - End-to-end goldens (Iterator/next_or, suspending read_u32)
-  - Comprehensive borrow checker tests
+  - Coherence checks at impl load; assoc type concretization
+  - Frame chaining across suspending calls; CLIF-level effect dispatch
+  - FFI/threads runtime (unblocks 05_unsafe_and_ffi, effect_mapping)
+  - try/catch semantics (undefined in docs; needs a design decision)
+  - Full biunification with principal-type coalescing
 
 ## Roadmap Details
 
