@@ -22,6 +22,15 @@ heap and freed on every ret path, and multi-arg print.  The heap tests run
 the native binary under clang -fsanitize=address when the ASan runtime is
 present (exit 0 == no leak, no double-free, no use-after-free); when the
 runtime is missing they are skipped, not silently weakened.
+
+Increment 3 (variants + closures) adds: enums as %enum.E tagged unions
+(integer tag + [N x i64] payload slots; variant names mapped to dense
+module-wide integer tags so pattern tag tests compare integers, never
+strings), and closures as {fn ptr, env ptr} pairs over per-lambda stack env
+structs (direct locally-bound calls and closures passed DOWN as arguments;
+anything that would make the stack env dangle — returning a closure,
+storing it in a field/payload, capturing it in another closure, creating
+one in a loop — demotes honestly).
 """
 from __future__ import annotations
 
@@ -433,21 +442,47 @@ def test_multi_arg_print_joins_with_spaces():
         r"i64 %t\d+, ptr @\.str\.\d+, i64 3\)", ir)
 
 
-def test_variants_and_closures_are_placeholders():
+def test_escaping_and_malformed_closures_are_placeholders():
+    # Increment 3 lifts variants and direct local closures, so the honest
+    # demotions move to the genuinely unsupported shapes: a make_closure of a
+    # function that is not in the module (no fn pointer to take), and a
+    # closure created inside a loop (env re-init would alias earlier pairs).
     fs = [
-        make_func("v", [block([
-            ("params", ()),
-            ("let", "v1", ("make_variant", "Opt", "Some"), ("a",)),
-        ], ("ret", "v1"))]),
         make_func("c", [block([
             ("params", ()),
             ("let", "c1", ("make_closure", "lambda1", ("x",)), ()),
         ], ("ret", "c1"))]),
+        make_func("looper", [
+            block([("params", ())], ("br", 1)),
+            block([
+                ("let", "c2", ("make_closure", "inner", ("x",)), ()),
+            ], ("br", 1)),
+        ]),
+        make_func("inner", [block([
+            ("params", ("x",)),
+        ], ("ret", "x"))]),
     ]
     ir = emit_llvm(fs)
-    assert count_placeholders(ir) == 2
-    assert "uses variants (make_variant)" in ir
-    assert "uses closures (make_closure)" in ir
+    assert "make_closure of unknown function 'lambda1'" in ir
+    assert "make_closure inside a loop" in ir
+
+
+def test_returned_closure_is_placeholder():
+    # `let f = fn(y) -> x + y; f` escaping upward would dangle its stack env.
+    ir = llvm_from_source("""
+fn make_adder(x: int) -> fn(int) -> int {
+    let f = fn(y: int) -> x + y;
+    f
+}
+fn main() -> int {
+    let add2 = make_adder(2);
+    add2(40)
+}
+""")
+    assert "returns a closure" in ir
+    assert "stack env would dangle" in ir
+    # the caller of the demoted function is demoted too (cascade)
+    assert count_placeholders(ir) >= 2
 
 
 def test_unknown_external_and_runtime_builtin_are_placeholders():
@@ -802,3 +837,356 @@ fn main() -> int {
     0
 }
 """, tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Increment 3 structural tests: enum tagged unions
+# ---------------------------------------------------------------------------
+
+_OPTION_MATCH_SRC = """
+enum Option { Some(int), None }
+fn unwrap_or(o: Option, d: int) -> int {
+    match o { Some(x) -> x, None -> d }
+}
+fn main() -> int {
+    let a = Some(5);
+    let b = None;
+    print(unwrap_or(a, 0));
+    print(unwrap_or(b, 7));
+    unwrap_or(a, 0)
+}
+"""
+
+
+def test_enum_tagged_union_type_and_documented_tags():
+    ir = llvm_from_source(_OPTION_MATCH_SRC)
+    assert count_placeholders(ir) == 0
+    # tagged union: integer tag + payload slots sized to the largest variant
+    assert "%enum.Option = type { i64, [1 x i64] }" in ir
+    # the module documents the dense variant-name -> integer mapping
+    assert "; variant tag mapping (module-wide, dense): None=0, Some=1" in ir
+    # make_variant stores the integer tag (with a doc comment)...
+    assert re.search(r"store i64 1, ptr %t\d+  ; tag Some=1", ir)
+    assert re.search(r"store i64 0, ptr %t\d+  ; tag None=0", ir)
+    # ...and the payload through a GEP into the slot array
+    assert re.search(
+        r"getelementptr inbounds %enum\.Option, ptr %sv\.\w+, i32 0, i32 1, i32 0", ir)
+
+
+def test_enum_pattern_tag_test_compares_integers_not_strings():
+    ir = llvm_from_source(_OPTION_MATCH_SRC)
+    # the compiled pattern's variant-name strings lower to integer tags:
+    # no string constant for a variant name reaches the module
+    assert '"Some' not in ir and '"None' not in ir
+    assert "; tag literal: 'Some' -> 1" in ir
+    assert re.search(r"icmp eq i64 %t\d+, 1", ir)  # tag == Some
+    # enum values cross the call boundary as ptr (byval-copy in the callee)
+    assert "define i64 @mx_unwrap_or(ptr %a.o, i64 %a.d)" in ir
+    assert re.search(r"load %enum\.Option, ptr %a\.o", ir)
+
+
+def test_enum_returned_from_function_is_sret_style():
+    ir = llvm_from_source("""
+enum Option { Some(int), None }
+fn mk(n: int) -> Option { if n > 0 { Some(n) } else { None } }
+fn main() -> int { let o = mk(3); match o { Some(x) -> x, None -> 0 } }
+""")
+    assert count_placeholders(ir) == 0
+    assert "define void @mx_mk(ptr %agg.ret, i64 %a.n)" in ir
+    assert re.search(r"store %enum\.Option %t\d+, ptr %agg\.ret", ir)
+    assert re.search(r"call void @mx_mk\(ptr %sv\.\w+, i64 3\)", ir)
+
+
+def test_recursive_enum_payload_demotes_honestly():
+    # A linked-list-style enum (payload holds another aggregate) cannot live
+    # in flat 8-byte payload slots: demote with the heap-boxing reason, never
+    # emit wrong code.
+    ir = llvm_from_source("""
+enum IntList { Cons(int, IntList), Nil }
+fn main() -> int {
+    let l = Cons(1, Cons(2, Nil));
+    match l { Cons(h, t) -> h, Nil -> 0 }
+}
+""")
+    assert count_placeholders(ir) >= 1
+    assert "payload slot 1 holds an aggregate" in ir
+    assert "heap-boxed payloads" in ir
+
+
+def test_heterogeneous_payload_slot_demotes_instead_of_coercing():
+    # Two variants of one enum may legally store different types in the same
+    # slot; the tagged union must not silently coerce the int store to the
+    # unified slot kind (str here), so the function demotes.
+    ir = llvm_from_source("""
+enum Mix { A(int), B(str) }
+fn main() -> int {
+    let a = A(1);
+    let b = B("x");
+    0
+}
+""")
+    assert count_placeholders(ir) == 1
+    assert "heterogeneous payload slot 0 of enum 'Mix'" in ir
+    assert "no coercion through tagged-union storage" in ir
+
+
+def test_dead_statement_position_match_result_does_not_poison_kinds():
+    # Statement-position if/match results are copy-merged from arms of
+    # different kinds (unit/i64 vs enum).  Those results are provably dead;
+    # the dead copies must be elided rather than unifying a live i64 loop
+    # flag with an enum kind.
+    ir = llvm_from_source("""
+enum State { Go(int), Stop }
+fn main() -> int {
+    let mut cur = Go(2);
+    let mut running = 1;
+    while running == 1 {
+        match cur {
+            Go(x) -> { if x == 0 { running = 0; } else { cur = Go(x - 1); } },
+            Stop -> { running = 0; }
+        }
+    }
+    0
+}
+""")
+    assert count_placeholders(ir) == 0
+    assert "; dead copy elided:" in ir
+
+
+# ---------------------------------------------------------------------------
+# Increment 3 structural tests: closures
+# ---------------------------------------------------------------------------
+
+_CLOSURE_SRC = """
+fn main() -> int {
+    let x = 10;
+    let g = fn(y: int) -> x + y;
+    g(5)
+}
+"""
+
+
+def test_closure_pair_env_struct_and_leading_env_param():
+    ir = llvm_from_source(_CLOSURE_SRC)
+    assert count_placeholders(ir) == 0
+    # closure value representation: the {fn, env} pair type
+    assert "%mx.closure = type { ptr, ptr }" in ir
+    # per-lambda env struct holding the captured value
+    assert re.search(r"%env\.lambda\d+ = type \{ i64 \}", ir)
+    # site: env alloca, capture store, then fn+env stored into the pair
+    assert re.search(r"%env\.site0\.\w+ = alloca %env\.lambda\d+", ir)
+    assert re.search(r"store ptr @mx_lambda\d+, ptr %t\d+", ir)
+    assert re.search(r"store ptr %env\.site0\.\w+, ptr %t\d+", ir)
+    # the lambda takes env as a leading param and reloads the capture
+    assert re.search(r"define i64 @mx_lambda\d+\(ptr %cl\.env, i64 %a\.y\)", ir)
+    assert re.search(r"%cap\.\w+ = load i64, ptr %capp\.\w+", ir)
+
+
+def test_closure_call_loads_fn_and_env_from_pair():
+    ir = llvm_from_source(_CLOSURE_SRC)
+    # the call goes through the pair: load fn ptr, load env ptr, indirect call
+    assert re.search(
+        r"getelementptr inbounds %mx\.closure, ptr %sv\.\w+, i32 0, i32 0", ir)
+    assert re.search(
+        r"getelementptr inbounds %mx\.closure, ptr %sv\.\w+, i32 0, i32 1", ir)
+    assert re.search(r"%t\d+ = call i64 %t\d+\(ptr %t\d+, i64 5\)", ir)
+
+
+def test_closure_in_loop_demotes():
+    # Re-executing a make_closure site overwrites its shared stack env while
+    # earlier pair copies may still alias it: demote, never emit wrong code.
+    ir = llvm_from_source("""
+fn main() -> int {
+    let mut i = 0;
+    let mut s = 0;
+    while i < 3 {
+        let f = fn(y: int) -> y + i;
+        s = s + f(1);
+        i = i + 1;
+    }
+    s
+}
+""")
+    assert "make_closure inside a loop" in ir
+
+
+# ---------------------------------------------------------------------------
+# Increment 3 native differentials: enums and closures vs. the interpreter
+# ---------------------------------------------------------------------------
+
+@needs_clang
+def test_native_enum_match_with_payload_extraction(tmp_path):
+    # Some(5) -> 5, None -> default: the canonical Option shape.
+    assert_native_matches_interp(_OPTION_MATCH_SRC, tmp_path)
+
+
+@needs_clang
+def test_native_enum_match_multiple_variants_and_literal_patterns(tmp_path):
+    # Mixed ctor patterns, a literal subpattern inside a ctor (Add(0)), and a
+    # nullary variant, all against the same scrutinee.
+    assert_native_matches_interp("""
+enum Op { Add(int), Mul(int), Nop }
+fn apply(op: Op, base: int) -> int {
+    match op {
+        Add(0) -> base,
+        Add(x) -> base + x,
+        Mul(x) -> base * x,
+        Nop -> 0 - base
+    }
+}
+fn main() -> int {
+    print(apply(Add(0), 10));
+    print(apply(Add(5), 10));
+    print(apply(Mul(3), 10));
+    print(apply(Nop, 10));
+    apply(Mul(2), 7)
+}
+""", tmp_path)
+
+
+@needs_clang
+def test_native_enum_state_machine_while_loop(tmp_path):
+    # A while loop driven by re-matching a mutable enum variable each
+    # iteration (linked-list-style traversal without aggregate payloads:
+    # recursive enum chains demote until payloads can be heap-boxed).
+    assert_native_matches_interp("""
+enum State { Go(int), Stop }
+fn main() -> int {
+    let mut cur = Go(5);
+    let mut sum = 0;
+    let mut running = 1;
+    while running == 1 {
+        match cur {
+            Go(x) -> {
+                sum = sum + x;
+                if x == 0 { running = 0; } else { cur = Go(x - 1); }
+            },
+            Stop -> { running = 0; }
+        }
+    }
+    print(sum);
+    sum
+}
+""", tmp_path)
+
+
+@needs_clang
+def test_native_enum_returned_and_str_payload(tmp_path):
+    # Enums crossing frames both ways (param + sret return) and a string
+    # payload slot.  NB: slot 0 must be kind-homogeneous across variants
+    # (an int-payload variant here would demote by the no-coercion rule, see
+    # test_heterogeneous_payload_slot_demotes_instead_of_coercing).
+    assert_native_matches_interp("""
+enum Msg { Text(str), Shout(str, int), Empty }
+fn pick(n: int) -> Msg {
+    if n == 0 { Empty } else { if n < 0 { Text("negative") } else { Shout("plus", n) } }
+}
+fn show(m: Msg) -> int {
+    match m {
+        Text(s) -> { print(s); 1 },
+        Shout(s, k) -> { print(s, k); 2 },
+        Empty -> 0
+    }
+}
+fn main() -> int {
+    print(show(pick(3)));
+    print(show(pick(0 - 4)));
+    print(show(pick(0)));
+    0
+}
+""", tmp_path)
+
+
+@needs_clang
+def test_native_closure_with_one_capture(tmp_path):
+    assert_native_matches_interp("""
+fn main() -> int {
+    let x = 10;
+    let g = fn(y: int) -> x + y;
+    print(g(5));
+    print(g(0 - 3));
+    g(1)
+}
+""", tmp_path)
+
+
+@needs_clang
+def test_native_closure_with_two_captures(tmp_path):
+    assert_native_matches_interp("""
+fn main() -> int {
+    let a = 100;
+    let b = 3;
+    let h = fn(y: int) -> a - b + y;
+    print(h(2));
+    print(h(0));
+    h(0 - 1)
+}
+""", tmp_path)
+
+
+@needs_clang
+def test_native_closure_passed_as_argument(tmp_path):
+    # The receiving function calls a closure it did not create: the call
+    # loads fn+env from the pair parameter (env still live: it sits in the
+    # caller's frame below us).
+    ir = assert_native_matches_interp("""
+fn apply(f: fn(int) -> int, v: int) -> int { f(v) }
+fn twice(f: fn(int) -> int, v: int) -> int { f(f(v)) }
+fn main() -> int {
+    let x = 10;
+    let g = fn(y: int) -> x + y;
+    print(apply(g, 7));
+    print(twice(g, 7));
+    apply(g, 1)
+}
+""", tmp_path)
+    assert "define i64 @mx_apply(ptr %a.f, i64 %a.v)" in ir
+
+
+@needs_clang
+def test_native_closure_capturing_enum_aggregate(tmp_path):
+    # Aggregate captures are copied whole into the env struct.
+    assert_native_matches_interp("""
+enum Option { Some(int), None }
+fn unwrap_or(o: Option, d: int) -> int {
+    match o { Some(x) -> x, None -> d }
+}
+fn main() -> int {
+    let a = Some(5);
+    let g = fn(y: int) -> y + unwrap_or(a, 0);
+    print(g(2));
+    g(10)
+}
+""", tmp_path)
+
+
+@needs_clang
+@needs_asan
+def test_native_enums_closures_and_global_structs_under_asan(tmp_path):
+    # Enums and closures are pure stack storage; mixing them with a @global
+    # heap struct must stay ASan-clean (no leak / double-free / UAF).
+    ir = assert_native_matches_interp_asan("""
+struct Pair { a: int, b: int }
+enum Option { Some(int), None }
+fn get(o: Option, d: int) -> int { match o { Some(x) -> x, None -> d } }
+fn main() -> int {
+    let @global p = Pair { a: 30, b: 12 };
+    let o = Some(p.a);
+    let f = fn(y: int) -> get(o, 0) + y;
+    print(f(p.b));
+    0
+}
+""", tmp_path)
+    assert ir.count("call ptr @malloc") == 1
+    assert ir.count("call void @free") == 1
+
+
+def test_examples_define_census_does_not_regress():
+    # Aggregate emission census across all accepted examples: the number of
+    # real defines must not regress below the increment-3 level.
+    total_defines = 0
+    for path in _example_files():
+        ir = llvm_from_source(path.read_text())
+        total_defines += len(re.findall(
+            r"^define (?:i64|double|ptr|void) @mx_\w+\(", ir, re.M))
+    assert total_defines >= 18

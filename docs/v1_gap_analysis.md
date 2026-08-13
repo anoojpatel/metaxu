@@ -38,10 +38,25 @@ a frame; ASan-verified differential tests prove no leak/double-free), and
 print takes multiple arguments (space-joined printf, matching the
 interpreter). The `let @global x = S {...}` annotation now actually
 reaches MIR's alloc_struct (hir.py previously dropped string-token mode
-annotations -- the classic silently-degraded-mode seam). Deferred LLVM
-increments, always as reasoned placeholders: nested struct fields,
-borrow-informed copy elision for @const params, closures, variants,
-vec/string runtime, effect CPS at the LLVM level.
+annotations -- the classic silently-degraded-mode seam). Increment 3
+(variants + closures) is also on this branch: enums compile to tagged
+unions (%enum.E = { i64 tag, [N x i64] payload }; variant names map to
+dense module-wide integer tags so compiled pattern tests compare integers,
+never strings; payload slot kinds unify per (enum, slot) with an explicit
+no-coercion rule -- heterogeneous slots demote rather than silently
+promoting an int store to the unified kind), and closures compile to
+{ ptr fn, ptr env } pairs over per-lambda stack env structs (direct
+locally-bound calls work, closures pass DOWN as arguments, aggregate
+captures copy whole into the env; everything that would dangle the stack
+env -- returning a closure, storing one in a field/payload, capturing one
+in a closure, creating one in a loop -- demotes with the reason recorded).
+Statement-position if/match results that copy-merge arms of different
+kinds are recognized as provably dead and elided instead of poisoning kind
+inference. Deferred LLVM increments, always as reasoned placeholders:
+heap-boxed enum payloads (recursive enums like linked lists), heap-env
+closures (escaping upward), nested struct fields, borrow-informed copy
+elision for @const params, vec/string runtime, effect CPS at the LLVM
+level.
 
 Roadmap items completed on this branch beyond the v1 criteria:
 - Item 5 (deep field-mode validation): transitive @global/@local ownership
