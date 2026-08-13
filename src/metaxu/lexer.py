@@ -193,6 +193,26 @@ class Lexer:
     #: Tokens that may directly precede a ``<`` that opens generic args.
     _GENERIC_PREV = frozenset({'IDENTIFIER', 'IMPLEMENT', 'IMPL'})
 
+    #: Openers after which ``<`` is unambiguously a generic-parameter list
+    #: (``implement<T> ...`` can never be a comparison), so the follow-set
+    #: check below is skipped.
+    _GENERIC_PREV_UNAMBIGUOUS = frozenset({'IMPLEMENT', 'IMPL'})
+
+    #: Tokens that may directly follow the closing ``>`` of a generic
+    #: argument list (call ``identity<Int>(..)``, struct literal
+    #: ``Stack<Int>{..}``, type positions ``: Stack<Int> =``, ``-> Opt<T>``,
+    #: trait clauses ``where``/``with``/``for``, nesting ``>>``, etc.).
+    #: A token outside this set — in particular an identifier or a literal,
+    #: as in ``f(a < b, c > d)`` — means the angle brackets were comparison
+    #: operators, so they are left as LESS/GREATER.  When ambiguous we
+    #: prefer comparison: expression-level generic instantiation is rare
+    #: and is virtually always followed by ``(`` or ``{``.
+    _GENERIC_FOLLOW = frozenset({
+        'LPAREN', 'LBRACE', 'LBRACE_STRUCT', 'RPAREN', 'RBRACKET',
+        'COMMA', 'SEMICOLON', 'COLON', 'DOUBLECOLON', 'EQUALS', 'ARROW',
+        'GREATER', 'RGENERIC', 'WHERE', 'WITH', 'FOR',
+    })
+
     _GENERIC_SCAN_LIMIT = 80
 
     def _transform(self, toks):
@@ -257,10 +277,18 @@ class Lexer:
                         break
                     j += 1
                 if matched >= 0:
-                    for pos in angle_positions:
-                        toks[pos].type = 'LGENERIC' if toks[pos].type == 'LESS' else 'RGENERIC'
-                    i = matched + 1
-                    continue
+                    # An IMPLEMENT/IMPL opener is unambiguous; after a plain
+                    # identifier, only re-tag when the token following the
+                    # closing '>' can legally follow a type instantiation.
+                    # An identifier/literal there (``f(a < b, c > d)``)
+                    # means these were comparisons — leave LESS/GREATER.
+                    follow = toks[matched + 1].type if matched + 1 < n else None
+                    if toks[i - 1].type in self._GENERIC_PREV_UNAMBIGUOUS \
+                            or follow is None or follow in self._GENERIC_FOLLOW:
+                        for pos in angle_positions:
+                            toks[pos].type = 'LGENERIC' if toks[pos].type == 'LESS' else 'RGENERIC'
+                        i = matched + 1
+                        continue
             i += 1
 
         # --- Pass C: struct literal braces -----------------------------
