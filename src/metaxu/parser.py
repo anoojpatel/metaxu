@@ -14,6 +14,11 @@ logger = logging.getLogger(__name__)
 
 scoped_nodes = (ast.FunctionDeclaration, ast.LambdaExpression, ast.Block, ast.WhileStatement, ast.ForStatement, ast.ModuleBody)
 
+# Lazily-built Parser dedicated to parsing `{expr}` segments of f-strings
+# (see Parser._parse_fstring_expr).  Module-level so the ~0.5s PLY table
+# build happens at most once per process.
+_FSTRING_SEGMENT_PARSER = None
+
 
 class Parser:
     start = 'program'
@@ -575,13 +580,131 @@ class Parser:
     def p_literal(self, p):
         '''literal : NUMBER
                    | FLOAT
-                   | STRING
-                   | FSTRING'''
+                   | STRING'''
         value = p[1]
         if isinstance(value, tuple) and len(value) == 2 and value[1] == 'string':
             p[0] = ast.Literal(value[0])
         else:
             p[0] = ast.Literal(value)
+
+    def p_literal_fstring(self, p):
+        '''literal : FSTRING'''
+        # F-string interpolation desugars AT PARSE TIME into a chain of
+        # string concatenations: literal segments become string Literals,
+        # `{expr}` segments are parsed as ordinary Metaxu expressions and
+        # wrapped in the `to_string` builtin (identity on strings, so the
+        # concat chain is well-typed for any to_string-able value).  The
+        # downstream pipeline (freeze/infer/HIR/MIR, both engines) only ever
+        # sees plain `+` and `to_string` calls, which are already supported
+        # natively — no new AST node, no codegen changes.
+        p[0] = self._desugar_fstring(p[1][0], p.lineno(1))
+
+    # ------------------------------------------------------------------
+    # F-string desugaring (parse-time)
+    # ------------------------------------------------------------------
+
+    def _fstring_error(self, message: str, lineno: int) -> None:
+        raise CompileError(
+            message=message,
+            error_type="ParseError",
+            location=SourceLocation(
+                file=getattr(self.lexer, 'source_file', None) or "<unknown>",
+                line=lineno, column=0))
+
+    def _split_fstring(self, raw: str, lineno: int):
+        """Split f-string text into ('lit', text) / ('expr', text) segments.
+
+        `{{` and `}}` escape to literal braces; `{}` (or whitespace-only
+        braces) and unbalanced braces are compile errors — never a silent
+        literal fallback.
+        """
+        segments = []
+        buf = []
+        i, n = 0, len(raw)
+        while i < n:
+            ch = raw[i]
+            if ch == '{':
+                if i + 1 < n and raw[i + 1] == '{':
+                    buf.append('{')
+                    i += 2
+                    continue
+                end = raw.find('}', i + 1)
+                if end == -1:
+                    self._fstring_error(
+                        f"f-string: unterminated '{{' in f\"{raw}\" "
+                        "(use '{{' for a literal brace)", lineno)
+                inner = raw[i + 1:end]
+                if inner.strip() == "":
+                    self._fstring_error(
+                        f"f-string: empty expression '{{{inner}}}' in "
+                        f"f\"{raw}\"", lineno)
+                if buf:
+                    segments.append(('lit', ''.join(buf)))
+                    buf = []
+                segments.append(('expr', inner))
+                i = end + 1
+            elif ch == '}':
+                if i + 1 < n and raw[i + 1] == '}':
+                    buf.append('}')
+                    i += 2
+                    continue
+                self._fstring_error(
+                    f"f-string: single '}}' in f\"{raw}\" "
+                    "(use '}}' for a literal brace)", lineno)
+            else:
+                buf.append(ch)
+                i += 1
+        if buf:
+            segments.append(('lit', ''.join(buf)))
+        return segments
+
+    def _parse_fstring_expr(self, text: str, raw: str, lineno: int):
+        """Parse one `{...}` segment as a Metaxu expression.
+
+        Uses a dedicated cached Parser instance (building PLY tables is
+        expensive; an FSTRING lexeme cannot contain a quote, hence cannot
+        contain a nested f-string, so this parser is never re-entered).
+        A segment that fails to parse — or parses to anything other than a
+        single expression — is a clear CompileError naming the segment.
+        """
+        global _FSTRING_SEGMENT_PARSER
+        if _FSTRING_SEGMENT_PARSER is None:
+            _FSTRING_SEGMENT_PARSER = Parser()
+        wrapper = "fn __fstring_expr__() { " + text + " }"
+        try:
+            module = _FSTRING_SEGMENT_PARSER.parse(
+                wrapper, file_path=getattr(self.lexer, 'source_file', None)
+                or "<fstring>")
+        except CompileError as exc:
+            self._fstring_error(
+                f"f-string: cannot parse expression segment '{{{text}}}' in "
+                f"f\"{raw}\": {exc.message}", lineno)
+        fn = module.body.statements[0] if module.body.statements else None
+        body = list(getattr(fn, 'body', None) or [])
+        if (fn is None or len(body) != 1
+                or isinstance(body[0], (ast.Statement, ast.LetBinding))
+                or not isinstance(body[0], ast.Node)):
+            self._fstring_error(
+                f"f-string: segment '{{{text}}}' in f\"{raw}\" is not a "
+                "single expression", lineno)
+        return body[0]
+
+    def _desugar_fstring(self, raw: str, lineno: int):
+        """Desugar f-string text into `lit + to_string(expr) + ...`."""
+        segments = self._split_fstring(raw, lineno)
+        parts = []
+        for kind, text in segments:
+            if kind == 'lit':
+                parts.append(ast.Literal(text))
+            else:
+                expr = self._parse_fstring_expr(text, raw, lineno)
+                parts.append(ast.FunctionCall("to_string", [expr]))
+        if not parts:
+            return ast.Literal("")
+        result = parts[0]
+        for nxt in parts[1:]:
+            result = ast.BinaryOperation(result, '+', nxt)
+        return result
 
     def p_list_literal(self, p):
         '''list_literal : LBRACKET RBRACKET
