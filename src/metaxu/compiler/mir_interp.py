@@ -5,7 +5,10 @@ Executes MirFunc/MirBlock ops directly, providing:
 - Control flow: br, br_if, ret
 - Function calls (user-defined + builtins)
 - Effect perform/handle using single-shot continuations (stack and suspend classes)
-- Drop (no-op for now; ownership semantics validated at check time)
+- Enum variants (make_variant / variant_tag / variant_field)
+- Drop (removes the binding; any later use raises InterpError)
+- Strict name resolution: referencing an unbound variable raises InterpError
+  instead of silently evaluating to the name string
 
 Usage:
     interp = MirInterpreter()
@@ -80,6 +83,21 @@ class MxStruct:
     def __repr__(self) -> str:
         fields_str = ", ".join(f"{k}={v!r}" for k, v in self.fields.items())
         return f"{self.name} {{ {fields_str} }}"
+
+
+@dataclass
+class MxVariant:
+    """A runtime enum variant value: tag + positional payload fields."""
+    enum_name: str
+    tag: str
+    fields: tuple = ()
+
+    def __repr__(self) -> str:
+        if not self.fields:
+            return f"{self.enum_name}::{self.tag}" if self.enum_name else self.tag
+        payload = ", ".join(repr(f) for f in self.fields)
+        prefix = f"{self.enum_name}::" if self.enum_name else ""
+        return f"{prefix}{self.tag}({payload})"
 
 
 @dataclass
@@ -178,14 +196,32 @@ class MirInterpreter:
             # Process terminator
             term = block.term
             if term[0] == "ret":
-                return env.get(term[1], result)
+                # NOTE: ret keeps a legacy fallback to the last op's value for
+                # effect-continuation frames: a resumed MxContinuation re-enters
+                # at a block whose ret var may only be bound on the
+                # non-suspended path (see stack-effect tests). All other
+                # operand lookups are strict.
+                if isinstance(term[1], str) and term[1] not in env:
+                    return result
+                return self._lookup(term[1], env, f)
             elif term[0] == "br":
                 bi = term[1]
             elif term[0] == "br_if":
-                cond_val = env.get(term[1], False)
+                cond_val = self._lookup(term[1], env, f)
                 bi = term[2] if _is_truthy(cond_val) else term[3]
+            elif term[0] == "unreachable":
+                raise InterpError(f"Reached unreachable block bb{bi} in {f.name!r}")
             else:
                 raise InterpError(f"Unknown terminator: {term!r}")
+
+    def _lookup(self, a: Any, env: Dict[str, Any], f: MirFunc) -> Any:
+        """Resolve an operand: strings are variable names (must be bound);
+        anything else is an immediate value."""
+        if not isinstance(a, str):
+            return a
+        if a in env:
+            return env[a]
+        raise InterpError(f"Unbound variable {a!r} in {f.name!r} (bad lowering or use-after-drop)")
 
     def _run_ops(self, ops: List[tuple], env: Dict[str, Any], f: MirFunc) -> Any:
         last: Any = UNIT
@@ -199,15 +235,19 @@ class MirInterpreter:
                 env[dst] = val
                 last = val
             elif tag == "drop":
+                # Remove the binding; any subsequent use raises via _lookup.
                 name = op[1]
                 env.pop(name, None)
+            elif tag == "match_fail":
+                detail = op[1] if len(op) > 1 else "no pattern matched"
+                raise InterpError(f"match failure in {f.name!r}: {detail}")
             elif tag == "perform":
                 # ("perform", result_dst, effect_name, op_name, arg_names, resume_block, resume_slot)
                 dst = op[1]
                 effect_name = op[2]
                 op_name = op[3]
                 arg_names: tuple = op[4]
-                arg_vals = [env.get(a, a) for a in arg_names]
+                arg_vals = [self._lookup(a, env, f) for a in arg_names]
                 handler = self._effect_handlers.get(effect_name)
                 if handler is None:
                     raise InterpError(f"No handler for effect {effect_name!r}")
@@ -239,9 +279,12 @@ class MirInterpreter:
             return rhs[1]
         elif kind == "const_ty":
             return UNIT
+        elif kind == "copy":
+            # ("copy",), (src,) — bind dst to the value of src (phi/assignment)
+            return self._lookup(args[0], env, f)
         elif kind == "call":
             callee_name: str = rhs[1]
-            arg_vals = [env.get(a, a) for a in args]
+            arg_vals = [self._lookup(a, env, f) for a in args]
             # Builtins first
             if callee_name in self._builtins:
                 return self._builtins[callee_name](*arg_vals)
@@ -252,13 +295,34 @@ class MirInterpreter:
             return self._call_func(target, arg_vals, {})
         elif kind == "binop":
             op_name = rhs[1]
-            lv = env.get(args[0], args[0])
-            rv = env.get(args[1], args[1])
+            lv = self._lookup(args[0], env, f)
+            rv = self._lookup(args[1], env, f)
             return _eval_binop(op_name, lv, rv)
         elif kind == "select":
             # ("select",), (cond, then_val, else_val) — phi merge for if/else
-            cond = env.get(args[0], args[0])
-            return env.get(args[1], args[1]) if _is_truthy(cond) else env.get(args[2], args[2])
+            cond = self._lookup(args[0], env, f)
+            return self._lookup(args[1], env, f) if _is_truthy(cond) else self._lookup(args[2], env, f)
+        elif kind == "make_variant":
+            # ("make_variant", enum_name, variant_name), (field_val_names...)
+            enum_name: str = rhs[1]
+            variant_name: str = rhs[2]
+            payload = tuple(self._lookup(a, env, f) for a in args)
+            return MxVariant(enum_name=enum_name, tag=variant_name, fields=payload)
+        elif kind == "variant_tag":
+            # ("variant_tag",), (variant_name_ref,)
+            v = self._lookup(args[0], env, f)
+            if not isinstance(v, MxVariant):
+                raise InterpError(f"variant_tag: expected MxVariant, got {type(v).__name__!r}")
+            return v.tag
+        elif kind == "variant_field":
+            # ("variant_field", index), (variant_name_ref,)
+            idx: int = rhs[1]
+            v = self._lookup(args[0], env, f)
+            if not isinstance(v, MxVariant):
+                raise InterpError(f"variant_field: expected MxVariant, got {type(v).__name__!r}")
+            if idx >= len(v.fields):
+                raise InterpError(f"variant_field: index {idx} out of range for {v!r}")
+            return v.fields[idx]
         elif kind == "push_handler":
             # ("push_handler", effect_name), ((op, param_name), ...)
             # Register handler cases on the dynamic stack
@@ -275,7 +339,7 @@ class MirInterpreter:
         elif kind == "perform":
             # ("perform", op_name), (arg1, arg2, ...)
             op_name: str = rhs[1]
-            perform_args = [env.get(a, a) for a in args]
+            perform_args = [self._lookup(a, env, f) for a in args]
             # Search handler stack top-to-bottom
             for frame in reversed(self._handler_stack):
                 if op_name in frame:
@@ -291,20 +355,20 @@ class MirInterpreter:
             locality: str = rhs[2] if len(rhs) > 2 else "local"
             fields: Dict[str, Any] = {}
             for (fname, fval_name) in args:
-                fields[fname] = env.get(fval_name, fval_name)
+                fields[fname] = self._lookup(fval_name, env, f)
             return MxStruct(name=struct_name, fields=fields, locality=locality)
         elif kind == "field_get":
             # ("field_get", field_name), (base_name,)
             field_name: str = rhs[1]
-            base = env.get(args[0], args[0])
+            base = self._lookup(args[0], env, f)
             if not isinstance(base, MxStruct):
                 raise InterpError(f"field_get: expected MxStruct, got {type(base).__name__!r}")
             return base.get(field_name)
         elif kind == "field_set":
             # ("field_set", field_name), (base_name, new_val_name)
             field_name = rhs[1]
-            base = env.get(args[0], args[0])
-            new_val = env.get(args[1], args[1])
+            base = self._lookup(args[0], env, f)
+            new_val = self._lookup(args[1], env, f)
             if not isinstance(base, MxStruct):
                 raise InterpError(f"field_set: expected MxStruct, got {type(base).__name__!r}")
             return base.set(field_name, new_val)
@@ -313,17 +377,17 @@ class MirInterpreter:
             func_name: str = rhs[1]
             captured: Dict[str, Any] = {}
             for (cname, cval_name) in args:
-                captured[cname] = env.get(cval_name, cval_name)
+                captured[cname] = self._lookup(cval_name, env, f)
             return MxClosure(func_name=func_name, captured=captured)
         elif kind == "call_closure":
             # ("call_closure",), (closure_name, arg1, arg2, ...)
-            closure = env.get(args[0], args[0])
+            closure = self._lookup(args[0], env, f)
             if not isinstance(closure, MxClosure):
                 raise InterpError(f"call_closure: expected MxClosure, got {type(closure).__name__!r}")
             target = self._funcs.get(closure.func_name)
             if target is None:
                 raise InterpError(f"call_closure: no func {closure.func_name!r}")
-            arg_vals = [env.get(a, a) for a in args[1:]]
+            arg_vals = [self._lookup(a, env, f) for a in args[1:]]
             # Inject captured env on top of params
             return self._call_func(target, arg_vals, closure.captured)
         else:
