@@ -85,14 +85,13 @@ def build_context_from_source(source: str, file_path: str = "<mem>") -> PhaseCon
     analysis results (e.g. TraitDictionaryDesugarPass needs trait_impls) get a
     populated DesugarContext instead of tables=None.
     """
-    from metaxu.parser import Parser
     import metaxu.metaxu_ast as fast
     from .infer_tables import build_tables_from_frozen_via_simplesub
     from .desugar import run_default_desugaring, DesugarContext
     from .module_loader import resolve_modules
+    from .shared_parser import shared_parser
 
-    parser = Parser()
-    module = parser.parse(source, file_path=file_path)
+    module = shared_parser().parse(source, file_path=file_path)
     program = fast.Program([module]) if not isinstance(module, fast.Program) else module
 
     # Module resolution: load imported files, enforce visibility, namespace
