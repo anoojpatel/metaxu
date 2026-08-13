@@ -143,7 +143,13 @@ class _FuncLowerer:
         if e.op == "Call" and e.callee is not None and e.operands is not None:
             arg_names: List[str] = [self.lower_expr(a) for a in e.operands]
             dst = self.state.fresh("v")
-            self.emit(("let", dst, ("call", e.callee), tuple(arg_names)))
+            # Resolve the callee through the local env: a let-bound closure
+            # (`let g = fn(y) ...; g(2)`) lives in a renamed slot (e.g. g_6),
+            # so the call must reference that slot, not the source name.
+            # Names with no local binding (top-level funcs, builtins) pass
+            # through unchanged.
+            callee = self.state.env.get(e.callee, e.callee)
+            self.emit(("let", dst, ("call", callee), tuple(arg_names)))
             return dst
         if e.op == "BinOp" and e.left is not None and e.right is not None:
             l = self.lower_expr(e.left)
@@ -269,11 +275,15 @@ class _FuncLowerer:
         # Lambda / closure
         if e.op == "Lambda" and e.lambda_params is not None:
             lname = self.state.fresh("lambda")
-            # Capture current env values
+            # Capture current env values. The lambda body is compiled against
+            # the enclosing env's SLOT names (source `x` may live in slot
+            # `x_2`), so the runtime closure env must be keyed by the slot
+            # name the body actually references — capture (slot, slot) pairs,
+            # same convention as handle_scope below.
             cap_names: List[tuple] = []
             for (cname, _cmode) in (e.captures or ()):
-                cval = self.state.env.get(cname, cname)
-                cap_names.append((cname, cval))
+                slot = self.state.env.get(cname, cname)
+                cap_names.append((slot, slot))
             dst = self.state.fresh("cl")
             self.emit(("let", dst, ("make_closure", lname, e.lambda_params), tuple(cap_names)))
             # Compile the lambda body as a deferred sub-function
