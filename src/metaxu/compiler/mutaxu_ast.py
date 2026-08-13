@@ -85,6 +85,19 @@ def _value_of(node: Any) -> Any | None:
             "name": getattr(node, "name", None),
             "params": [getattr(p, "name", None) for p in getattr(node, "params", [])],
             "performs": [_effect_name(e) for e in getattr(node, "performs", []) or []],
+            # Generic signature info (for parametric instantiation checking):
+            # declared type parameters, per-parameter declared type displays
+            # (None for unannotated params), the declared return type display,
+            # and where-clause / inline-bound constraints [{param, trait, kind}].
+            "type_params": [
+                _type_param_name(tp) for tp in getattr(node, "type_params", None) or []
+            ],
+            "param_types": [
+                _type_display(getattr(p, "type_annotation", None))
+                for p in getattr(node, "params", [])
+            ],
+            "return_type": _safe_type_display(getattr(node, "return_type", None)),
+            "where": _where_constraints(node),
         }
     if isinstance(node, fast.EffectDeclaration):
         return {
@@ -104,7 +117,14 @@ def _value_of(node: Any) -> Any | None:
         }
     if isinstance(node, fast.FunctionCall):
         name = getattr(node, "name", None)
-        return {"name": name if isinstance(name, str) or name is None else str(name)}
+        payload: dict[str, Any] = {
+            "name": name if isinstance(name, str) or name is None else str(name)
+        }
+        # Explicit instantiation type args (`identity<Int>(x)`, `Full<Int>(3)`).
+        type_args = getattr(node, "type_args", None) or []
+        if type_args:
+            payload["type_args"] = [_type_display(a) for a in type_args]
+        return payload
     if isinstance(node, fast.Assignment):
         # The assignment target may be a complex expression (field access,
         # indexing); stringify it so the frozen AST stays JSON serializable.
@@ -137,6 +157,9 @@ def _value_of(node: Any) -> Any | None:
     if isinstance(node, fast.EnumDefinition):
         return {
             "name": getattr(node, "name", None),
+            "type_params": [
+                _type_param_name(tp) for tp in getattr(node, "type_params", None) or []
+            ],
             "variants": [
                 {
                     "name": getattr(v, "name", None),
@@ -158,6 +181,13 @@ def _value_of(node: Any) -> Any | None:
         }
     if isinstance(node, fast.StructField):
         return {"name": getattr(node, "name", None)}
+    if isinstance(node, fast.Implementation):
+        # Pre-desugar impl registry info: `implement Trait for Type`.
+        # (Post-desugar the same info lives in the mangled __impl$ names.)
+        return {
+            "trait": _safe_type_display(getattr(node, "interface_name", None)),
+            "type": _safe_type_display(getattr(node, "type_name", None)),
+        }
     if isinstance(node, fast.FieldAccess):
         return {"fields": tuple(getattr(node, "fields", ()) or ())}
     if isinstance(node, fast.QualifiedFunctionCall):
@@ -193,6 +223,72 @@ def _type_display(t: Any) -> str | None:
         args = [_type_display(a) or "?" for a in getattr(t, "type_args", None) or []]
         return f"{base}[{', '.join(args)}]" if args else base
     return str(t)
+
+
+def _safe_type_display(t: Any) -> str | None:
+    """_type_display that also tolerates bare Python classes (e.g. the parser
+    stores the NoneType *class* as the default return type)."""
+    if t is None:
+        return None
+    if isinstance(t, type):
+        return getattr(t, "__name__", None)
+    return _type_display(t)
+
+
+def _type_param_name(tp: Any) -> str | None:
+    """Name of a declared type parameter (TypeParameter or bare string)."""
+    if isinstance(tp, str):
+        return tp
+    name = getattr(tp, "name", None)
+    return name if isinstance(name, str) else None
+
+
+def _flatten_bounds(bound: Any) -> list[str]:
+    """Flatten a type bound expression into trait-name displays.
+
+    Handles a single bound (`T: Display`), compound bounds
+    (`T: Display + Ord`), and legacy list shapes.
+    """
+    if bound is None:
+        return []
+    if isinstance(bound, (list, tuple)):
+        out: list[str] = []
+        for b in bound:
+            out.extend(_flatten_bounds(b))
+        return out
+    left = getattr(bound, "left", None)
+    right = getattr(bound, "right", None)
+    if bound.__class__.__name__ == "CompoundTypeBound" and (left is not None or right is not None):
+        return _flatten_bounds(left) + _flatten_bounds(right)
+    disp = _safe_type_display(bound)
+    return [disp] if disp else []
+
+
+def _where_constraints(node: Any) -> list[dict[str, str]]:
+    """Collect trait-bound constraints for a generic declaration.
+
+    Merges inline bounds on type parameters (`fn f<T: Trait>`) with the
+    where clause (`fn f<T>(..) -> R where T: Trait`). Each entry is
+    {"param": <type param name>, "trait": <trait name>, "kind": <kind>}.
+    """
+    out: list[dict[str, str]] = []
+    for tp in getattr(node, "type_params", None) or []:
+        pname = _type_param_name(tp)
+        if pname is None:
+            continue
+        for trait in _flatten_bounds(getattr(tp, "bounds", None)):
+            out.append({"param": pname, "trait": trait, "kind": "bound"})
+    where = getattr(node, "where_clause", None)
+    for c in getattr(where, "constraints", None) or []:
+        pname = _safe_type_display(getattr(c, "type_param", None))
+        for trait in _flatten_bounds(getattr(c, "bound_type", None)):
+            if pname:
+                out.append({
+                    "param": pname,
+                    "trait": trait,
+                    "kind": str(getattr(c, "kind", "subtype") or "subtype"),
+                })
+    return out
 
 
 def _mode_value(mode: Any) -> Any | None:

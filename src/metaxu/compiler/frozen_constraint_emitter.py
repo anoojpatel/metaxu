@@ -124,6 +124,9 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
     handler_operations: list[list[str]] = []  # Track operations in handler (for stack effect checking)
     struct_defs: dict[str, dict[str, Any]] = {}  # struct name -> frozen payload (fields/type_params)
     enum_defs: dict[str, dict[str, Any]] = {}  # enum name -> frozen payload (variants)
+    fn_defs: dict[str, dict[str, Any]] = {}  # function name -> frozen payload (signature)
+    variant_to_enum: dict[str, str] = {}  # variant name -> enum name
+    impl_pairs: set[tuple[str, str]] = set()  # (trait name, type base name)
     # Variables bound by an explicit `let @global ... = StructName { ... }`:
     # var name -> struct type name. Used for deep ownership checks on later
     # field assignments (global containers cannot store locals).
@@ -175,13 +178,318 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
             return "String"
         return None
 
-    def _check_struct_field_types(node: Any, struct_name: str) -> None:
-        """Check literal field values against the struct's declared field types.
+    _PRIMITIVE_SET = frozenset({"Int", "String", "Bool", "Float"})
 
-        Conservative: only flags a mismatch when the declared type (after
-        substituting the instantiation's type arguments for the struct's
-        type parameters) and the literal's type are both known primitives.
-        Non-literal fields are left to inference.
+    def _base_type_name(display: str) -> str:
+        """Base constructor of a type display: "Vec[Int]" -> "Vec"."""
+        return display.split("[", 1)[0].split("<", 1)[0].strip()
+
+    def _canon_type(display: Any) -> str | None:
+        """Canonical name for a declared/argument type display.
+
+        Primitives normalize to Int/String/Bool/Float; other names reduce
+        to their base constructor. None stays None."""
+        if not isinstance(display, str) or not display:
+            return None
+        base = _base_type_name(display)
+        return _PRIMITIVE_NAMES.get(base, base)
+
+    def _expr_known_type(node: Any) -> str | None:
+        """Concrete type name of an expression when statically KNOWN.
+
+        Covers literals, struct instantiations, enum variant constructions,
+        and calls to non-generic functions with a declared primitive return
+        type. Everything else (variables, field accesses, generic calls...)
+        returns None and is left to the constraint machinery."""
+        kind = getattr(node, "kind", None)
+        if kind == "Literal":
+            return _literal_type_name(getattr(node, "value", None))
+        if kind == "StructInstantiation":
+            name = payload_dict(node).get("name")
+            return name if isinstance(name, str) else None
+        if kind == "FunctionCall":
+            name = payload_dict(node).get("name")
+            if not isinstance(name, str):
+                return None
+            if name in variant_to_enum:
+                return variant_to_enum[name]
+            sig = fn_defs.get(name)
+            if sig and not (sig.get("type_params") or []):
+                ret = _canon_type(sig.get("return_type"))
+                if ret in _PRIMITIVE_SET:
+                    return ret
+        return None
+
+    def _type_error(message: str, node: Any, kind: str = "type-mismatch",
+                    variable: str | None = None) -> None:
+        borrow_checker.errors.append(BorrowError(
+            message=message, node_id=node.node_id, kind=kind, variable=variable,
+        ))
+
+    def _collect_definitions(root: Any) -> None:
+        """Prepass: record struct/enum/function definitions and the trait-impl
+        registry before constraint emission, so instantiation checking works
+        regardless of declaration order (use-before-def is legal)."""
+        def scan(n: Any) -> None:
+            kind = getattr(n, "kind", None)
+            value = getattr(n, "value", None)
+            payload = value if isinstance(value, dict) else {}
+            name = payload.get("name")
+            if kind == "StructDefinition" and isinstance(name, str):
+                struct_defs.setdefault(name, payload)
+            elif kind == "EnumDefinition" and isinstance(name, str):
+                enum_defs.setdefault(name, payload)
+                for v in payload.get("variants", []) or []:
+                    vname = v.get("name") if isinstance(v, dict) else None
+                    if isinstance(vname, str):
+                        variant_to_enum.setdefault(vname, name)
+            elif kind == "FunctionDeclaration" and isinstance(name, str):
+                fn_defs.setdefault(name, payload)
+                # Post-desugar trait impls are functions named
+                # __impl$Trait$Type$method; parse the registry out of them.
+                if name.startswith("__impl$"):
+                    parts = name.split("$")
+                    if len(parts) >= 4:
+                        impl_pairs.add((parts[1], parts[2]))
+            elif kind == "Implementation":
+                # Pre-desugar impl blocks carry {"trait", "type"} payloads.
+                trait = payload.get("trait")
+                type_name = payload.get("type")
+                if isinstance(trait, str) and isinstance(type_name, str):
+                    impl_pairs.add((_base_type_name(trait), _base_type_name(type_name)))
+            for c in getattr(n, "children", ()):
+                scan(c)
+        scan(root)
+
+    def _check_where_clauses(sig: dict[str, Any], fn_name: str,
+                             subst: dict[str, str], node: Any) -> None:
+        """Enforce `where T: Trait` bounds for a resolved instantiation.
+
+        Only fires when the type parameter was instantiated with a KNOWN
+        concrete type; unresolved parameters stay unchecked (advisory-free:
+        dynamic dispatch still enforces at runtime)."""
+        for c in sig.get("where") or []:
+            if not isinstance(c, dict):
+                continue
+            param = c.get("param")
+            trait = c.get("trait")
+            if not isinstance(param, str) or not isinstance(trait, str):
+                continue
+            conc = subst.get(param)
+            if conc is None:
+                continue
+            if (trait, conc) in impl_pairs:
+                continue
+            _type_error(
+                f"no implementation of trait {trait} for {conc}: "
+                f"call of {fn_name} instantiates {param}={conc}, but "
+                f"{param}: {trait} is required by its where clause "
+                f"(missing `implement {trait} for {conc}`)",
+                node, kind="type-missing-impl",
+            )
+
+    def _infer_call_site_subst(
+        type_params: list[str],
+        declared: list[Any],
+        args: list[Any],
+        node: Any,
+        fn_name: str,
+    ) -> dict[str, str]:
+        """Infer a CALL-SITE-LOCAL instantiation for omitted type args.
+
+        Each call site gets its own substitution (let-polymorphism lite):
+        nothing here touches the callee's declared parameter type vars, so
+        `identity(1)` and `identity("s")` coexist. Arguments whose declared
+        type is the same bare type parameter are unified with each other
+        (within this call only) so var-typed args participate in the
+        constraint-graph conflict detection."""
+        subst: dict[str, str] = {}
+        groups: dict[str, list[Any]] = {}
+        for decl, arg in zip(declared, args):
+            if isinstance(decl, str) and decl in type_params:
+                groups.setdefault(decl, []).append(arg)
+        for param, group in groups.items():
+            knowns: dict[str, Any] = {}
+            for arg in group:
+                k = _expr_known_type(arg)
+                if k is not None and k not in knowns:
+                    knowns[k] = arg
+            if len(knowns) > 1:
+                pretty = " and ".join(sorted(knowns))
+                _type_error(
+                    f"conflicting instantiations of type parameter {param} "
+                    f"in call of {fn_name}: arguments require {param} to be "
+                    f"both {pretty}",
+                    node,
+                )
+            elif knowns:
+                subst[param] = next(iter(knowns))
+            # Call-site-local unification: args sharing one type parameter
+            # must agree in type. Fresh per call site — only THIS call's
+            # argument vars are linked, never the callee's param vars.
+            group_tys = [types.get(a.node_id) for a in group]
+            group_tys = [t for t in group_tys if t is not None]
+            for a, b in zip(group_tys, group_tys[1:]):
+                simplesub.add_unify(a, b)
+        return subst
+
+    def _check_call_types(node: Any) -> None:
+        """Parametric instantiation checking for a plain function call.
+
+        Explicit type args (`identity<Int>(x)`) are substituted into the
+        declared parameter types; omitted ones are inferred call-site-
+        locally. Substituted primitive parameter types are enforced both
+        directly (known-typed args) and via class constraints (var-typed
+        args feed the conflict-detection machinery); struct/enum parameter
+        types are enforced for known-typed args. Where clauses are checked
+        against the resolved instantiation."""
+        payload = payload_dict(node)
+        name = payload.get("name")
+        if not isinstance(name, str):
+            return
+        if name in variant_to_enum:
+            _check_variant_construction(node, name)
+            return
+        sig = fn_defs.get(name)
+        if not sig:
+            return
+        type_params = [p for p in sig.get("type_params") or [] if isinstance(p, str)]
+        declared = list(sig.get("param_types") or [])
+        args = list(getattr(node, "children", ()))
+        explicit = [a for a in payload.get("type_args", []) or [] if isinstance(a, str)]
+        subst: dict[str, str] = {}
+        if explicit:
+            if not type_params:
+                _type_error(
+                    f"type arguments given to non-generic function {name}",
+                    node, kind="type-arg-arity",
+                )
+                return
+            if len(explicit) != len(type_params):
+                _type_error(
+                    f"wrong number of type arguments for {name}: expected "
+                    f"{len(type_params)} ({', '.join(type_params)}), got "
+                    f"{len(explicit)}",
+                    node, kind="type-arg-arity",
+                )
+                return
+            subst = {
+                p: c for p, c in zip(type_params, (_canon_type(a) for a in explicit))
+                if c is not None
+            }
+        elif type_params:
+            subst = _infer_call_site_subst(type_params, declared, args, node, name)
+        # Per-argument checks against the (substituted) declared types.
+        for decl, arg in zip(declared, args):
+            if not isinstance(decl, str):
+                continue
+            expected = subst.get(decl, decl) if decl in type_params else decl
+            expected = _canon_type(expected)
+            if expected is None or expected in type_params:
+                continue  # unresolved type parameter: left to inference
+            if expected in _PRIMITIVE_SET:
+                actual = _expr_known_type(arg)
+                if actual is not None and actual != expected:
+                    _type_error(
+                        f"type mismatch in call of {name}: argument has type "
+                        f"{actual}, expected {expected}",
+                        arg,
+                    )
+                arg_ty = types.get(arg.node_id)
+                if arg_ty is not None:
+                    simplesub.add_class_constraint(expected, [arg_ty], arg.node_id)
+            elif expected in struct_defs or expected in enum_defs:
+                actual = _expr_known_type(arg)
+                if actual is not None and _base_type_name(actual) != expected:
+                    _type_error(
+                        f"type mismatch in call of {name}: argument has type "
+                        f"{actual}, expected {expected}",
+                        arg,
+                    )
+        # Result type: a generic function whose declared return type is a
+        # resolved type parameter constrains the call's result var.
+        ret = sig.get("return_type")
+        if isinstance(ret, str) and ret in type_params and ret in subst:
+            ret_canon = subst[ret]
+            node_ty = types.get(node.node_id)
+            if ret_canon in _PRIMITIVE_SET and node_ty is not None:
+                simplesub.add_class_constraint(ret_canon, [node_ty], node.node_id)
+        _check_where_clauses(sig, name, subst, node)
+
+    def _check_variant_construction(node: Any, variant_name: str) -> None:
+        """Check an enum variant construction (`Full(3)`, `Full<Int>(3)`)
+        against the enum's declared payload types, substituting explicit or
+        call-site-inferred type args for the enum's type parameters."""
+        enum_name = variant_to_enum[variant_name]
+        edef = enum_defs.get(enum_name) or {}
+        eparams = [p for p in edef.get("type_params") or [] if isinstance(p, str)]
+        variant = next(
+            (v for v in edef.get("variants", []) or []
+             if isinstance(v, dict) and v.get("name") == variant_name),
+            None,
+        )
+        if variant is None:
+            return
+        declared = [
+            f.get("type") for f in variant.get("fields", []) or []
+            if isinstance(f, dict)
+        ]
+        args = list(getattr(node, "children", ()))
+        payload = payload_dict(node)
+        explicit = [a for a in payload.get("type_args", []) or [] if isinstance(a, str)]
+        subst: dict[str, str] = {}
+        if explicit:
+            if len(explicit) != len(eparams):
+                _type_error(
+                    f"wrong number of type arguments for {enum_name}."
+                    f"{variant_name}: expected {len(eparams)}, got {len(explicit)}",
+                    node, kind="type-arg-arity",
+                )
+                return
+            subst = {
+                p: c for p, c in zip(eparams, (_canon_type(a) for a in explicit))
+                if c is not None
+            }
+        elif eparams:
+            subst = _infer_call_site_subst(eparams, declared, args, node,
+                                           f"{enum_name}.{variant_name}")
+        for decl, arg in zip(declared, args):
+            if not isinstance(decl, str):
+                continue
+            expected = subst.get(decl, decl) if decl in eparams else decl
+            expected = _canon_type(expected)
+            if expected is None or expected in eparams:
+                continue
+            actual = _expr_known_type(arg)
+            if expected in _PRIMITIVE_SET:
+                if actual is not None and actual != expected:
+                    _type_error(
+                        f"type mismatch in {enum_name}.{variant_name}: payload "
+                        f"has type {actual}, expected {expected}",
+                        arg,
+                    )
+                arg_ty = types.get(arg.node_id)
+                if arg_ty is not None:
+                    simplesub.add_class_constraint(expected, [arg_ty], arg.node_id)
+            elif expected in struct_defs or expected in enum_defs:
+                if actual is not None and _base_type_name(actual) != expected:
+                    _type_error(
+                        f"type mismatch in {enum_name}.{variant_name}: payload "
+                        f"has type {actual}, expected {expected}",
+                        arg,
+                    )
+
+    def _check_struct_field_types(node: Any, struct_name: str) -> None:
+        """Check field values against the struct's declared field types.
+
+        The instantiation's explicit type arguments are substituted for the
+        struct's type parameters. A substituted primitive field type is
+        enforced directly against values of KNOWN type (literals, struct
+        instantiations, variant constructions, calls with declared primitive
+        returns) and via class constraints for var-typed values (which feeds
+        the constraint-graph conflict detection). A substituted struct/enum
+        field type is enforced against known-typed values by base name.
+        Values of unknown type are left to inference.
         """
         definition = struct_defs.get(struct_name)
         if not definition:
@@ -193,34 +501,52 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
         }
         params = [p for p in definition.get("type_params", []) or [] if isinstance(p, str)]
         args = [a for a in payload_dict(node).get("type_args", []) or [] if isinstance(a, str)]
-        substitution = dict(zip(params, args))
+        if args and len(args) != len(params):
+            _type_error(
+                f"wrong number of type arguments for {struct_name}: expected "
+                f"{len(params)}, got {len(args)}",
+                node, kind="type-arg-arity",
+            )
+            return
+        substitution = {
+            p: c for p, c in zip(params, (_canon_type(a) for a in args))
+            if c is not None
+        }
         for field in getattr(node, "children", ()):
             if getattr(field, "kind", None) != "StructField":
                 continue
             field_name = payload_dict(field).get("name")
             expected = declared.get(field_name)
-            if isinstance(expected, str):
-                expected = substitution.get(expected, expected)
-            expected = _PRIMITIVE_NAMES.get(expected) if isinstance(expected, str) else None
-            if expected is None:
+            if not isinstance(expected, str):
                 continue
-            literal = next(
-                (c for c in getattr(field, "children", ()) if getattr(c, "kind", None) == "Literal"),
-                None,
-            )
-            if literal is None:
+            if expected in params:
+                expected = substitution.get(expected)
+            expected = _canon_type(expected)
+            if expected is None or expected in params:
+                continue  # unresolved type parameter: left to inference
+            value_children = list(getattr(field, "children", ()))
+            value = value_children[0] if value_children else None
+            if value is None:
                 continue
-            actual = _literal_type_name(getattr(literal, "value", None))
-            if actual is not None and actual != expected:
-                borrow_checker.errors.append(BorrowError(
-                    message=(
+            actual = _expr_known_type(value)
+            fname = field_name if isinstance(field_name, str) else None
+            if expected in _PRIMITIVE_SET:
+                if actual is not None and actual != expected:
+                    _type_error(
                         f"type mismatch for field '{field_name}' of {struct_name}: "
-                        f"expected {expected}, got {actual}"
-                    ),
-                    node_id=field.node_id,
-                    kind="type-mismatch",
-                    variable=field_name if isinstance(field_name, str) else None,
-                ))
+                        f"expected {expected}, got {actual}",
+                        field, variable=fname,
+                    )
+                value_ty = types.get(value.node_id)
+                if value_ty is not None:
+                    simplesub.add_class_constraint(expected, [value_ty], value.node_id)
+            elif expected in struct_defs or expected in enum_defs:
+                if actual is not None and _base_type_name(actual) != expected:
+                    _type_error(
+                        f"type mismatch for field '{field_name}' of {struct_name}: "
+                        f"expected {expected}, got {actual}",
+                        field, variable=fname,
+                    )
 
     def _struct_field_modes(struct_name: str) -> dict[str, tuple[str | None, str | None]]:
         """Registry view of a struct definition: field -> (type_name, locality).
@@ -702,6 +1028,10 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
             # Check variable use in borrow checker
             if isinstance(name, str):
                 borrow_checker.check_variable_use(name, node.node_id)
+        if kind == "FunctionCall":
+            # Parametric instantiation checking: explicit type args are
+            # substituted, omitted ones inferred call-site-locally.
+            _check_call_types(node)
         if kind == "FunctionCall" and node_ty is not None:
             name = payload_name(node)
             callee_ty = lookup(name)
@@ -935,6 +1265,7 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
                     if isinstance(arg_var, str):
                         borrow_checker.release_call_borrow(arg_var, mode)
 
+    _collect_definitions(frozen_root)
     walk(frozen_root)
     # Publish declared effect classes so the constraint checker can
     # distinguish stack-class effects (which do not suspend) from

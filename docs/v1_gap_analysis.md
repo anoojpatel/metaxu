@@ -108,9 +108,25 @@ Known remaining gaps (documented, not v1-blocking):
 
 - `codegen_clif.py` remains a stub; the MIR interpreter is the executable
   backend.
-- Struct-literal field type checking covers literal fields against known
-  primitives (incl. substituted type params); full inference-driven field
-  checking is future work.
+- Generics are parametrically checked (`test_generics.py`): explicit
+  instantiations (`Stack<Int>{...}`, `Full<Int>(x)`, `identity<Int>(x)`)
+  substitute type args into declared field/payload/param types and enforce
+  them for values of known type, feeding var-typed values into the
+  constraint-graph conflict detection; omitted type args are inferred
+  CALL-SITE-LOCALLY (let-polymorphism lite: `identity(1)` and
+  `identity("s")` coexist); `where T: Trait` / `fn f<T: Trait>` bounds are
+  enforced against the impl registry for resolved instantiations, naming
+  the missing impl. Not covered (left to inference/runtime): substitution
+  inside type applications (`Vec[T]`), qualified/method call type args,
+  bracket-form constructor calls (`Full[Int](x)` parses as an index-call),
+  impl where-clauses, variance, higher-kinded params, associated types.
+- An optional monomorphization pass (`compiler/monomorphize.py`, HIR->HIR,
+  pipeline flag `monomorphize=`, default off) clones generic functions per
+  concrete instantiation (`identity$Int`), rewrites call sites (including
+  transitively inside clones), and erases fully-specialized originals —
+  never synthesized `__`-names, which trait dispatch reaches dynamically.
+  Interpreter results are pinned identical with the pass on and off;
+  the specialized names in MIR are groundwork for native codegen.
 - Traits/impls dictionary desugaring and deep field-mode validation remain
   at their pre-branch level.
 
