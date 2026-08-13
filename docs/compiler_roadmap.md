@@ -68,9 +68,18 @@ This document tracks high-level goals, status, and pointers across the new Pytho
   - Example gates: 19/19 pipeline (2 negative fixtures rejected),
     15/19 executing, pinned in pytest with golden outputs
 
-- Pending (Highlights)
-  - Coherence checks at impl load; assoc type concretization
-  - Frame chaining across suspending calls; CLIF-level effect dispatch
+- Completed since (verification round)
+  - Coherence checks: duplicate implement blocks for the same
+    (trait, type, method) raise CoherenceError at desugar time
+  - Unhandled-effect advisory: a perform neither lexically handled nor
+    covered by the enclosing performs clause gets a checker diagnostic
+  - Three adversarial-review rounds over the branch (20+ execution-
+    confirmed bugs found and fixed, each pinned by a regression test)
+
+- Pending (Highlights — each needs a design decision or major ABI work)
+  - Assoc type concretization
+  - Frame chaining across suspending calls (needs a parked-return protocol
+    and frame allocator in the runtime ABI); CLIF-level effect dispatch
   - FFI/threads runtime (unblocks 05_unsafe_and_ffi, effect_mapping)
   - try/catch semantics (undefined in docs; needs a design decision)
   - Full biunification with principal-type coalescing
