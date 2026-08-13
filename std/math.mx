@@ -1,0 +1,89 @@
+# std.math — numeric helpers and constants.
+#
+# Design ported from Ante's stdlib (stdlib/src/Math.an, jfecher/ante),
+# adapted to Metaxu:
+# - Ante binds libm externs (sqrt/sin/cos/...); Metaxu's runtime exposes
+#   sqrt, sin and cos as builtin methods on numbers, wrapped here as
+#   plain functions. The rest of libm (tan/exp/log/floor/...) is
+#   deferred until the runtime grows those builtins.
+# - Ante's pi/tau/e are module-level constants. Metaxu's module system
+#   does not yet resolve module-level `let` bindings across (or even
+#   within) module files — they compile but read back as unit — so the
+#   constants are zero-argument functions.
+# - Ante's checked_* overflow family is deferred (Metaxu ints are
+#   arbitrary-precision in the interpreter; overflow is native-codegen
+#   territory).
+# - abs/min/max/clamp/sign take unannotated parameters and work on both
+#   ints and floats, like Ante's Num-constrained versions.
+
+export {
+    pi,
+    tau,
+    e,
+    abs,
+    min,
+    max,
+    clamp,
+    sign,
+    sqrt,
+    sin,
+    cos,
+    powi
+}
+
+fn pi() -> float { 3.141592653589793 }
+
+fn tau() -> float { 6.283185307179586 }
+
+fn e() -> float { 2.718281828459045 }
+
+# Absolute value (int or float).
+fn abs(x) {
+    if x < 0 { 0 - x } else { x }
+}
+
+# Smaller of a and b.
+fn min(a, b) {
+    if a < b { a } else { b }
+}
+
+# Larger of a and b.
+fn max(a, b) {
+    if a > b { a } else { b }
+}
+
+# x limited to [lo, hi].
+fn clamp(x, lo, hi) {
+    min(max(x, lo), hi)
+}
+
+# -1, 0 or 1 by the sign of x.
+fn sign(x) -> int {
+    if x < 0 { 0 - 1 } else {
+        if x > 0 { 1 } else { 0 }
+    }
+}
+
+# Square root (runtime builtin method, wrapped as a function).
+fn sqrt(x) -> float {
+    x.sqrt()
+}
+
+fn sin(x) -> float {
+    x.sin()
+}
+
+fn cos(x) -> float {
+    x.cos()
+}
+
+# base raised to a non-negative integer power.
+fn powi(base: int, exp: int) -> int {
+    let @mut r = 1;
+    let @mut i = 0;
+    while i < exp {
+        r = r * base;
+        i = i + 1
+    }
+    r
+}

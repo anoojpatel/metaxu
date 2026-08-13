@@ -1,0 +1,28 @@
+# std.prelude — the curated common surface, re-exported.
+#
+# Modeled on Ante's Prelude (stdlib/src/Prelude.an, jfecher/ante), which
+# gathers the everyday names in one import. Metaxu's version re-exports
+# from the sibling std modules via `public from ... import`; names that
+# would collide across modules (map, filter, sum, contains, ...) stay in
+# their home modules — import those directly, or use qualified calls:
+#
+#     import std.option as opt;
+#     opt.map(Some(1), fn(x: int) -> x + 1)
+#
+# Usage:
+#     from std.prelude import Fail, try_opt, fail_if, unwrap_or, clamp;
+
+# effect helpers: failure, errors, early exit
+public from std.fail import Fail, try_opt, on_fail, fail_if, ok_if;
+public from std.throw import Throw, catch_, catch_or, throw_if;
+public from std.early_return import EarlyReturn, with_early_return, return_if;
+
+# streams and loop control
+public from std.stream import Emit, Loop, iter, for_, fold, iota, emit_range, emit_vec, collect;
+
+# option/result essentials (the unambiguous names)
+public from std.option import unwrap_or, is_some, is_none;
+public from std.result import is_ok, is_err;
+
+# numbers
+public from std.math import pi, abs, min, max, clamp;

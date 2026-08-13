@@ -1,0 +1,146 @@
+# std.string — helpers over Metaxu's builtin strings.
+#
+# Design ported from Ante's stdlib (stdlib/src/String.an, jfecher/ante),
+# adapted to what Metaxu strings support today: `+` concatenation,
+# `==` comparison, `len`, and single-character indexing `s[i]` (which
+# yields a one-character string — Metaxu has no separate char type, so
+# Ante's Char-based API becomes string-of-length-1 based here).
+# Byte access, casing, parsing and formatting are deferred to runtime
+# builtins that do not exist yet.
+
+export {
+    is_empty,
+    eq,
+    concat,
+    repeat,
+    join,
+    char_at,
+    contains_char,
+    count_char,
+    index_of_char,
+    starts_with,
+    ends_with,
+    reverse
+}
+
+fn is_empty(s: string) -> bool {
+    len(s) == 0
+}
+
+# String equality as a function (for passing to combinators).
+fn eq(a: string, b: string) -> bool {
+    a == b
+}
+
+fn concat(a: string, b: string) -> string {
+    a + b
+}
+
+# s repeated n times ("" when n <= 0).
+fn repeat(s: string, n: int) -> string {
+    let @mut out = "";
+    let @mut i = 0;
+    while i < n {
+        out = out + s;
+        i = i + 1
+    }
+    out
+}
+
+# The strings in `parts` joined with `sep` between elements.
+fn join(parts: Vec, sep: string) -> string {
+    let @mut out = "";
+    let @mut i = 0;
+    while i < len(parts) {
+        if i > 0 { out = out + sep } else { () };
+        out = out + parts[i];
+        i = i + 1
+    }
+    out
+}
+
+# The one-character string at index i.
+fn char_at(s: string, i: int) -> string {
+    s[i]
+}
+
+# True when the one-character string c occurs in s.
+fn contains_char(s: string, c: string) -> bool {
+    let @mut i = 0;
+    let @mut found = false;
+    while i < len(s) {
+        if s[i] == c { found = true } else { () };
+        i = i + 1
+    }
+    found
+}
+
+# Number of occurrences of the one-character string c in s.
+fn count_char(s: string, c: string) -> int {
+    let @mut i = 0;
+    let @mut n = 0;
+    while i < len(s) {
+        if s[i] == c { n = n + 1 } else { () };
+        i = i + 1
+    }
+    n
+}
+
+# Some(index of the first occurrence of c), else None.
+fn index_of_char(s: string, c: string) {
+    let @mut i = 0;
+    let @mut found = None;
+    while i < len(s) {
+        if s[i] == c {
+            if is_none_priv(found) { found = Some(i) } else { () }
+        } else { () };
+        i = i + 1
+    }
+    found
+}
+
+# True when s begins with prefix.
+fn starts_with(s: string, prefix: string) -> bool {
+    let @mut ok = len(prefix) <= len(s);
+    let @mut i = 0;
+    while i < len(prefix) {
+        if ok {
+            if s[i] == prefix[i] { () } else { ok = false }
+        } else { () };
+        i = i + 1
+    }
+    ok
+}
+
+# True when s ends with suffix.
+fn ends_with(s: string, suffix: string) -> bool {
+    let @mut ok = len(suffix) <= len(s);
+    let off = len(s) - len(suffix);
+    let @mut i = 0;
+    while i < len(suffix) {
+        if ok {
+            if s[off + i] == suffix[i] { () } else { ok = false }
+        } else { () };
+        i = i + 1
+    }
+    ok
+}
+
+# The characters of s in reverse order.
+fn reverse(s: string) -> string {
+    let @mut out = "";
+    let @mut i = len(s);
+    while i > 0 {
+        out = out + s[i - 1];
+        i = i - 1
+    }
+    out
+}
+
+# private helper (not exported)
+fn is_none_priv(o) -> bool {
+    match o {
+        Some(v) => false,
+        None => true
+    }
+}
