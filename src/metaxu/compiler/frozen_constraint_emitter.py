@@ -667,6 +667,137 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
             return "Unit"
         return None
 
+    # ------------------------------------------------------------------
+    # Match exhaustiveness (compile time)
+    # ------------------------------------------------------------------
+    # Frozen MatchExpression payloads carry {"arms": [descriptor, ...]} (see
+    # mutaxu_ast._pattern_descriptor for the shapes). The check is
+    # pattern-driven: ctor arms determine the enum being matched (which is
+    # exactly the case where the scrutinee's enum type is statically known —
+    # a declared enum or the builtin Option/Result constructors), literal
+    # arms determine a literal class. Where neither determines a type (or
+    # any pattern is opaque/unknown), no check is performed: unknown-typed
+    # scrutinees stay permissive with no false positives.
+    #
+    # Coverage rule (kept deliberately shallow): a variant is covered iff
+    # some arm names its ctor with all-irrefutable subpatterns
+    # (wildcards/bindings), OR a wildcard/binding arm exists. Deeper
+    # refinement is NOT attempted: `Some(1) | Some(n)` treats Some as
+    # covered by the binding arm `Some(n)`, while `Some(1)` alone leaves
+    # Some incompletely covered (literal completeness over an infinite
+    # domain is not analyzed).
+
+    _BUILTIN_ENUM_VARIANTS = {"Option": ("Some", "None"), "Result": ("Ok", "Err")}
+    _BUILTIN_VARIANT_ENUM = {"Some": "Option", "None": "Option",
+                             "Ok": "Result", "Err": "Result"}
+
+    def _resolve_pattern(desc: Any) -> dict[str, Any]:
+        """Resolve a frozen pattern descriptor against known enum variants.
+
+        A bare identifier ({"kind": "name"}) is a zero-arg constructor
+        pattern when the name is a known variant (`Point => ...`), and an
+        irrefutable binding otherwise (mirrors HIR pattern conversion)."""
+        if not isinstance(desc, dict):
+            return {"kind": "unknown"}
+        if desc.get("kind") == "name":
+            nm = desc.get("name")
+            enum_name = variant_to_enum.get(nm) or _BUILTIN_VARIANT_ENUM.get(nm)
+            if isinstance(nm, str) and enum_name is not None:
+                return {"kind": "ctor", "name": nm, "enum": enum_name,
+                        "subpatterns": []}
+            return {"kind": "binding", "name": nm}
+        return desc
+
+    def _has_unknown_pattern(desc: Any) -> bool:
+        if not isinstance(desc, dict):
+            return True
+        if desc.get("kind") == "unknown":
+            return True
+        return any(_has_unknown_pattern(s)
+                   for s in desc.get("subpatterns") or [])
+
+    def _check_match_exhaustiveness(node: Any) -> None:
+        arms = payload_dict(node).get("arms")
+        if not isinstance(arms, list) or not arms:
+            return
+        resolved = [_resolve_pattern(d) for d in arms]
+
+        # Redundancy advisory (warning channel, not an error): every arm
+        # after the first wildcard/binding arm is unreachable —
+        # top-to-bottom, first match wins.
+        advisories = getattr(simplesub, "advisories", None)
+        if advisories is not None:
+            for i, d in enumerate(resolved):
+                if d.get("kind") in ("wildcard", "binding"):
+                    if i + 1 < len(resolved):
+                        advisories.append(
+                            f"Unreachable match arm: arm {i + 2} follows an "
+                            f"irrefutable arm (arm {i + 1}) at node {node.node_id}")
+                    break
+
+        if any(d.get("kind") in ("wildcard", "binding") for d in resolved):
+            return  # a catch-all arm makes any match exhaustive
+        if any(_has_unknown_pattern(d) for d in resolved):
+            return  # opaque pattern somewhere: stay permissive
+
+        ctor_arms = [d for d in resolved if d.get("kind") == "ctor"]
+        if ctor_arms:
+            # All ctor arms must resolve to one known enum; otherwise the
+            # scrutinee's enum type is not reliably known here (or the
+            # program has a type error reported elsewhere) — skip.
+            enums: set[str] = set()
+            for d in ctor_arms:
+                enum_name = (d.get("enum") or variant_to_enum.get(d.get("name"))
+                             or _BUILTIN_VARIANT_ENUM.get(d.get("name")))
+                if not isinstance(enum_name, str):
+                    return
+                enums.add(enum_name)
+            if len(enums) != 1:
+                return
+            enum_name = next(iter(enums))
+            edef = enum_defs.get(enum_name)
+            if edef is not None:
+                all_variants = [v.get("name") for v in edef.get("variants") or []
+                                if isinstance(v, dict) and isinstance(v.get("name"), str)]
+            elif enum_name in _BUILTIN_ENUM_VARIANTS:
+                all_variants = list(_BUILTIN_ENUM_VARIANTS[enum_name])
+            else:
+                return
+            covered: set[str] = set()
+            for d in ctor_arms:
+                subs = [_resolve_pattern(s) for s in d.get("subpatterns") or []]
+                if all(s.get("kind") in ("wildcard", "binding") for s in subs):
+                    covered.add(d.get("name"))
+            missing = [v for v in all_variants if v not in covered]
+            if missing:
+                _type_error(
+                    "non-exhaustive match: missing variants "
+                    + ", ".join(missing), node, kind="type-nonexhaustive-match")
+            return
+
+        literal_arms = [d for d in resolved if d.get("kind") == "literal"]
+        if not literal_arms or len(literal_arms) != len(resolved):
+            return
+        classes = {literal_class(d.get("value")) for d in literal_arms}
+        if len(classes) != 1:
+            return  # mixed/unclassifiable literal arms: conflict reported elsewhere
+        cls = next(iter(classes))
+        if cls == "Bool":
+            seen = {d.get("value") for d in literal_arms}
+            missing_bools = [spelling for spelling, v in
+                             (("true", True), ("false", False)) if v not in seen]
+            if missing_bools:
+                _type_error(
+                    "non-exhaustive match: missing cases "
+                    + ", ".join(missing_bools), node,
+                    kind="type-nonexhaustive-match")
+        elif cls in ("Int", "String", "Float"):
+            _type_error(
+                f"non-exhaustive match: {cls} literal patterns can never be "
+                "exhaustive; add a wildcard or binding arm", node,
+                kind="type-nonexhaustive-match")
+        return
+
     # Parallel to push_scope/pop_scope: per-scope saves of
     # global_struct_bindings entries that declarations in the scope popped
     # or overwrote, restored at scope exit (a shadow in an inner block must
@@ -784,6 +915,8 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
             cls = literal_class(getattr(node, "value", None))
             if cls is not None:
                 simplesub.add_class_constraint(cls, [node_ty], node.node_id)
+        if kind == "MatchExpression":
+            _check_match_exhaustiveness(node)
         if kind == "Block":
             push_scope()
             borrow_checker.enter_region()
