@@ -8,7 +8,7 @@ from .infer_tables import InferSideTables
 from .constraints import ClassConstraint
 from . import mutaxu_ast as mast
 import metaxu.metaxu_ast as fast
-from metaxu.unsafe_ast import UnsafeBlock
+from metaxu.unsafe_ast import TypeCast, UnsafeBlock
 
 from .desugar import IMPL_SEP, parse_impl_method_name, type_base_name
 
@@ -236,6 +236,37 @@ class HIRBuilder:
                     pmode = self._extract_modeinfo(getattr(p, 'mode', None))
                     if pname is not None:
                         param_modes[str(pname)] = pmode
+                # Const-generic receiver dimensions (recorded by the impl
+                # desugar): bind e.g. N to the receiver's runtime length at
+                # method entry so scalar-fallback code like `for i in 1..N`
+                # reads the actual vector size. `vector[T,N]` binds N =
+                # __vec_dim(self, 0); `vector[vector[T,N],M]` binds M/N to
+                # dims 0/1.
+                const_dims = getattr(orig, '_const_dims', None) or ()
+                param_names = {str(p0) for (p0, _t) in params}
+                if const_dims and 'self' in param_names:
+                    dim_lets: list[HExpr] = []
+                    for (dim_name, dim_idx) in const_dims:
+                        if dim_name in param_names:
+                            continue  # an explicit param shadows the binding
+                        dim_call = self._mk_hexpr(
+                            n.node_id, "Expr", "int", n.span, op="Call",
+                            callee="__vec_dim",
+                            operands=(self._mk_hexpr(n.node_id, "Expr", "Unknown",
+                                                     n.span, op="Var", var_name="self"),
+                                      self._mk_hexpr(n.node_id, "Expr", "int",
+                                                     n.span, op="Literal",
+                                                     literal=int(dim_idx))))
+                        dim_lets.append(self._mk_hexpr(
+                            n.node_id, "Stmt", "Unit", n.span, op="Let",
+                            bindings=((str(dim_name), dim_call),)))
+                    if dim_lets:
+                        old_ops = (body_hexpr.operands
+                                   if body_hexpr.op == "Block" and body_hexpr.operands is not None
+                                   else (body_hexpr,))
+                        body_hexpr = self._mk_hexpr(
+                            n.node_id, "Block", body_hexpr.ty, n.span,
+                            op="Block", operands=(*dim_lets, *old_ops))
                 hfun = HFun(
                     sym=getattr(orig, 'name', 'fun'),
                     params=params,
@@ -251,6 +282,39 @@ class HIRBuilder:
                 visit(c)
 
         visit(root)
+
+        # Default effect handlers: an effect operation declared as
+        # `op(params) -> T = expr;` compiles its default expression to a
+        # plain function `__effect_default$Effect$op`. The interpreter calls
+        # it when a perform finds NO handler in scope (capability-style
+        # effects: absence answers the default; effects without defaults
+        # still fail loudly). Handlers installed by `handle` always win.
+        seen_effects: set[int] = set()
+        for orig in self.id_map.values():
+            if not isinstance(orig, fast.EffectDeclaration) or id(orig) in seen_effects:
+                continue
+            seen_effects.add(id(orig))
+            eff_name = str(getattr(orig, 'name', '') or '')
+            frozen = self._orig_to_frozen.get(id(orig), root)
+            for op in (getattr(orig, 'operations', []) or []):
+                dexpr = getattr(op, '_default_expr', None)
+                if dexpr is None:
+                    continue
+                body_he = self._from_orig_expr(dexpr, frozen)
+                if body_he is None:
+                    raise NotImplementedError(
+                        f"effect {eff_name}.{op.name}: could not lower the "
+                        "declared default expression — refusing to drop it")
+                dparams: list[tuple[Any, Ty]] = []
+                for p in (getattr(op, 'params', []) or []):
+                    pname = getattr(p, 'name', None)
+                    pty = getattr(p, 'type_annotation', None) or "Unknown"
+                    dparams.append((pname, pty))
+                funcs.append(HFun(
+                    sym=f"__effect_default{IMPL_SEP}{eff_name}{IMPL_SEP}{op.name}",
+                    params=dparams, dict_params=[], ret_ty="Unknown",
+                    where_cls=[], body=body_he))
+
         # Fallback: if no functions found, produce a default wrapper
         if not funcs:
             ty = self.t.apply_tyenv(self.t.types.get(root.node_id, "Unit"))  # type: ignore[union-attr]
@@ -611,6 +675,91 @@ class HIRBuilder:
             return self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span,
                                   op="MakeVariant", enum_name=enum_name,
                                   variant_name=variant_name, operands=tuple(payload))
+
+        # ForStatement: `for x in iterable { body }` — desugared here to the
+        # existing While machinery (no dedicated loop op below HIR):
+        #     let __for_it = iterable; let __for_i = 0; let __for_n = len(it);
+        #     while __for_i < __for_n {
+        #         let x = __index_get(__for_it, __for_i);
+        #         ...body...
+        #         __for_i = __for_i + 1;
+        #     }
+        # Works for every runtime sequence (`0..N` ranges, vectors, Vec).
+        # Unsupported shapes fail loudly instead of dropping the loop — the
+        # historical seam here was for-loops vanishing so scalar fallbacks
+        # returned partial results.
+        if isinstance(orig, fast.ForStatement):
+            loop_var = str(getattr(orig, 'iterator', '') or '')
+            it_node = getattr(orig, 'iterable', None)
+            iter_he = self._from_orig_expr(it_node, ctx_for(it_node))
+            if not loop_var or iter_he is None:
+                raise NotImplementedError(
+                    "for loop: unsupported shape (iterator "
+                    f"{loop_var!r}, iterable {type(it_node).__name__}) — "
+                    "refusing to drop the loop")
+            body_node = getattr(orig, 'body', None)
+            body_he = self._from_orig_expr(body_node, ctx_for(body_node))
+            if body_he is not None and body_he.op == "Block" and body_he.operands is not None:
+                body_ops = body_he.operands
+            elif body_he is not None:
+                body_ops = (body_he,)
+            else:
+                body_ops = tuple()
+            nid = frozen_ctx.node_id
+            span = frozen_ctx.span
+            it_name, i_name, n_name = f"__for_it{nid}", f"__for_i{nid}", f"__for_n{nid}"
+
+            def mk(**kw: Any) -> HExpr:
+                return self._mk_hexpr(nid, "Expr", "Unknown", span, **kw)
+
+            let_it = self._mk_hexpr(nid, "Stmt", "Unit", span, op="Let",
+                                    bindings=((it_name, iter_he),))
+            let_i = self._mk_hexpr(nid, "Stmt", "Unit", span, op="Let",
+                                   bindings=((i_name, mk(op="Literal", literal=0)),))
+            let_n = self._mk_hexpr(
+                nid, "Stmt", "Unit", span, op="Let",
+                bindings=((n_name, mk(op="Call", callee="len",
+                                      operands=(mk(op="Var", var_name=it_name),))),))
+            cond = mk(op="BinOp", binop="<",
+                      left=mk(op="Var", var_name=i_name),
+                      right=mk(op="Var", var_name=n_name))
+            bind_elem = self._mk_hexpr(
+                nid, "Stmt", "Unit", span, op="Let",
+                bindings=((loop_var, mk(op="Call", callee="__index_get",
+                                        operands=(mk(op="Var", var_name=it_name),
+                                                  mk(op="Var", var_name=i_name)))),))
+            incr = self._mk_hexpr(
+                nid, "Stmt", "Unit", span, op="Assign", var_name=i_name,
+                assign_value=mk(op="BinOp", binop="+",
+                                left=mk(op="Var", var_name=i_name),
+                                right=mk(op="Literal", literal=1)))
+            while_he = self._mk_hexpr(nid, "Stmt", "Unit", span, op="While",
+                                      cond=cond,
+                                      loop_body=(bind_elem, *body_ops, incr))
+            return self._mk_hexpr(nid, "Stmt", "Unit", span, op="Block",
+                                  operands=(let_it, let_i, let_n, while_he))
+
+        # TypeCast: `e as T`. Casts are static reinterpretations; at runtime
+        # only numeric targets perform an actual representation conversion
+        # (int <-> float), every other target passes the value through
+        # unchanged (e.g. `f as fn(T,T) -> T`). Lowered to the __cast
+        # builtin, which owns that rule. Previously this node was unhandled:
+        # whole statements containing a cast were silently dropped
+        # (`self.sum() / N as float` degraded to returning unit).
+        if isinstance(orig, TypeCast):
+            inner_node = getattr(orig, 'expr', None)
+            inner_he = self._from_orig_expr(inner_node, ctx_for(inner_node))
+            if inner_he is None:
+                raise NotImplementedError(
+                    "cast: could not lower the operand expression — "
+                    "refusing to drop it")
+            target = type_base_name(getattr(orig, 'target_type', None))
+            ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, "Unknown"))
+            target_he = self._mk_hexpr(frozen_ctx.node_id, "Expr", "Unknown",
+                                       frozen_ctx.span, op="Literal", literal=str(target))
+            return self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span,
+                                  op="Call", callee="__cast",
+                                  operands=(inner_he, target_he))
 
         # WhileStatement: while cond { body }
         if isinstance(orig, fast.WhileStatement):

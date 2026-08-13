@@ -1432,19 +1432,34 @@ class Parser:
                 p[0] = p[1] + [p[2]]
 
     def p_effect_operation(self, p):
-        '''effect_operation : IDENTIFIER type_params_opt LPAREN param_list_opt RPAREN ARROW type_expression effect_with_opt
-                            | FN IDENTIFIER type_params_opt LPAREN param_list_opt RPAREN ARROW type_expression effect_with_opt
-                            | FN IDENTIFIER LBRACKET type_param_seq RBRACKET LPAREN param_list_opt RPAREN ARROW type_expression effect_with_opt'''
-        if len(p) == 9:
-            op = ast.EffectOperation(p[1], p[4], p[7], c_effect=p[8])
+        '''effect_operation : IDENTIFIER type_params_opt LPAREN param_list_opt RPAREN ARROW type_expression effect_op_default_opt effect_with_opt
+                            | FN IDENTIFIER type_params_opt LPAREN param_list_opt RPAREN ARROW type_expression effect_op_default_opt effect_with_opt
+                            | FN IDENTIFIER LBRACKET type_param_seq RBRACKET LPAREN param_list_opt RPAREN ARROW type_expression effect_op_default_opt effect_with_opt'''
+        if len(p) == 10:
+            op = ast.EffectOperation(p[1], p[4], p[7], c_effect=p[9])
             op.type_params = p[2] or []
-        elif len(p) == 10:
-            op = ast.EffectOperation(p[2], p[5], p[8], c_effect=p[9])
+            default = p[8]
+        elif len(p) == 11:
+            op = ast.EffectOperation(p[2], p[5], p[8], c_effect=p[10])
             op.type_params = p[3] or []
+            default = p[9]
         else:
-            op = ast.EffectOperation(p[2], p[7], p[10], c_effect=p[11])
+            op = ast.EffectOperation(p[2], p[7], p[10], c_effect=p[12])
             op.type_params = p[4] or []
+            default = p[11]
+        # Default handler expression: `op(...) -> T = expr;` declares the
+        # value the operation yields when performed with NO handler in
+        # scope (capability-style effects: absence of a handler answers
+        # the default instead of aborting). Stored on an underscored attr
+        # so the generic desugar/freeze walks leave it alone; the HIR
+        # builder compiles it into a __effect_default$Effect$op function.
+        op._default_expr = default
         p[0] = op
+
+    def p_effect_op_default_opt(self, p):
+        '''effect_op_default_opt : EQUALS expression
+                                 | empty'''
+        p[0] = p[2] if len(p) == 3 else None
 
     def p_effect_with_opt(self, p):
         '''effect_with_opt : WITH IDENTIFIER

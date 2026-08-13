@@ -509,6 +509,19 @@ class MirInterpreter:
                 # Remove the binding; any subsequent use raises via _lookup.
                 name = op[1]
                 env.pop(name, None)
+            elif tag == "promote_matrix":
+                # ("promote_matrix", (param_names...)): the named parameters
+                # are declared as matrices (vector[vector[T,N],M]). A flat
+                # vector of scalars passed there is an Mx1 column; promote it
+                # to a real nested vector so downstream matrix code indexes
+                # strictly (e.g. mat.matmul(vec): transpose sees [[1],[2],[3]]).
+                # Already-nested vectors pass through untouched.
+                for pname in op[1]:
+                    val = env.get(pname)
+                    if isinstance(val, MxVector) and val.elements and all(
+                            _is_number(x) for x in val.elements):
+                        env[pname] = MxVector(elements=tuple(
+                            MxVector(elements=(x,)) for x in val.elements))
             elif tag == "match_fail":
                 detail = op[1] if len(op) > 1 else "no pattern matched"
                 raise InterpError(f"match failure in {f.name!r}: {detail}")
@@ -551,6 +564,26 @@ class MirInterpreter:
                 # bind dst to the handler's return and keep running this block.
                 handler = self._effect_handlers.get(effect_name)
                 if handler is None:
+                    # Declared default handler: an effect op with a
+                    # `= expr` default compiles to __effect_default$E$op.
+                    # With no handler in scope the perform evaluates it and
+                    # continues with its value (capability-style effects:
+                    # e.g. SimdOp answers None -> callers take their scalar
+                    # branch). Installed handlers always take precedence
+                    # (checked above); effects with no default still error.
+                    default_fn = self._funcs.get(
+                        f"__effect_default${effect_name}${op_name}")
+                    if default_fn is not None:
+                        n_params = len(default_fn.param_names())
+                        if len(arg_vals) > n_params:
+                            raise InterpError(
+                                f"Effect op {op_name!r} performed with "
+                                f"{len(arg_vals)} argument(s) but its default "
+                                f"handler declares only {n_params} parameter(s)")
+                        default_val = self._call_func(default_fn, arg_vals, {})
+                        env[dst] = default_val
+                        last = default_val
+                        continue
                     raise InterpError(f"No handler for effect {effect_name!r}")
                 handler_result = handler.fn(op_name, arg_vals, k)
                 # For stack effects the handler called k.resume() inline and returned
@@ -968,6 +1001,8 @@ class MirInterpreter:
         self._builtins["__index_get"] = _builtin_index_get
         self._builtins["__slice_get"] = _builtin_slice_get
         self._builtins["__range"] = _builtin_range
+        self._builtins["__vec_dim"] = _builtin_vec_dim
+        self._builtins["__cast"] = _builtin_cast
         self._builtins["__vec_lit"] = _builtin_vec_lit
         self._builtins["__vec_zeros"] = _builtin_vec_zeros
         self._builtins["__vec_filled"] = _builtin_vec_filled
@@ -1396,6 +1431,55 @@ def _builtin_slice_get(base: Any, start: Any, stop: Any, step: Any) -> Any:
     if isinstance(base, str):
         return "".join(out)
     return out
+
+
+def _builtin_vec_dim(v: Any, dim: Any) -> int:
+    """Runtime dimension of a vector receiver for const-generic binding.
+
+    dim 0 is the vector's length. dim 1 is the length of its elements when
+    they are vectors (a matrix's column count); a flat vector of scalars is
+    a column (Mx1 matrix) under the const-generic matrix embedding, so its
+    dim 1 is 1. Anything else errors.
+    """
+    if not isinstance(v, (MxVector, MxVec)):
+        raise InterpError(
+            f"__vec_dim: expected a vector receiver, got {_runtime_type_name(v)!r}")
+    items = v.elements if isinstance(v, MxVector) else v.items
+    if dim == 0:
+        return len(items)
+    if dim == 1:
+        if not items:
+            return 0
+        first = items[0]
+        if isinstance(first, (MxVector, MxVec)):
+            return len(first.elements if isinstance(first, MxVector) else first.items)
+        if _is_number(first):
+            return 1  # flat vector == column matrix
+        raise InterpError(
+            f"__vec_dim: elements of type {_runtime_type_name(first)!r} "
+            "have no second dimension")
+    raise InterpError(f"__vec_dim: unsupported dimension {dim!r}")
+
+
+def _builtin_cast(v: Any, target: Any) -> Any:
+    """Runtime semantics of `e as T`.
+
+    Numeric targets convert the representation (int <-> float); every other
+    target is a static-level reinterpretation with no runtime effect, so the
+    value passes through unchanged (e.g. `f as fn(T,T) -> T`).
+    """
+    t = str(target)
+    if t in ("float", "f32", "f64"):
+        if _is_number(v):
+            return float(v)
+        raise InterpError(
+            f"cast: cannot convert {_runtime_type_name(v)!r} to {t}")
+    if t in ("int", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64"):
+        if _is_number(v):
+            return int(v)
+        raise InterpError(
+            f"cast: cannot convert {_runtime_type_name(v)!r} to {t}")
+    return v
 
 
 def _builtin_range(start: Any, end: Any) -> list:
