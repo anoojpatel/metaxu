@@ -70,6 +70,10 @@ class ModuleInfo:
     nodes: list = field(default_factory=list)   # fast.Module nodes merged into this path
     external: bool = False          # unresolved std.* placeholder
     functions: dict = field(default_factory=dict)   # name -> FunctionDeclaration
+    # module-level `let` bindings (module constants). Like types/traits/
+    # effects they live in ONE global namespace (they are never renamed);
+    # declaring the same constant in two modules is a loud CompileError.
+    constants: set = field(default_factory=set)
     types: set = field(default_factory=set)
     traits: set = field(default_factory=set)
     effects: set = field(default_factory=set)
@@ -85,7 +89,8 @@ class ModuleInfo:
 
     def declares(self, name: str) -> bool:
         return (name in self.functions or name in self.types
-                or name in self.traits or name in self.effects)
+                or name in self.traits or name in self.effects
+                or name in self.constants)
 
     def is_public(self, name: str) -> bool:
         """Effective visibility of a declared symbol.
@@ -173,6 +178,13 @@ class ModuleResolver:
                     raise _module_error(
                         f"duplicate function '{fname}' in module '{path}'")
                 info.functions[fname] = stmt
+            elif isinstance(stmt, fast.LetStatement):
+                # module-level constants (initialized before the entry point
+                # by the synthesized __module_init; see compiler/hir.py)
+                for b in (getattr(stmt, "bindings", None) or []):
+                    cname = getattr(b, "identifier", None)
+                    if cname:
+                        info.constants.add(str(cname))
             elif isinstance(stmt, (fast.StructDefinition, fast.EnumDefinition)):
                 info.types.add(str(getattr(stmt, "name", "") or ""))
             elif isinstance(stmt, fast.InterfaceDefinition):
@@ -385,7 +397,8 @@ class ModuleResolver:
         owner: dict[tuple[str, str], str] = {}
         for info in self.registry.values():
             for (kind, names) in (("type", info.types), ("trait", info.traits),
-                                  ("effect", info.effects)):
+                                  ("effect", info.effects),
+                                  ("constant", info.constants)):
                 for name in names:
                     if not name:
                         continue

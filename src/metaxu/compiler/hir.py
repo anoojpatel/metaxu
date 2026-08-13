@@ -148,6 +148,10 @@ class HFun:
     where_cls: list[ClassConstraint]
     body: HExpr
     param_modes: dict[str, ModeInfo] | None = None
+    # Module-level constants this function initializes (only set on the
+    # synthesized __module_init function): the interpreter runs it before
+    # the entry point and publishes these names as globals.
+    globals_decl: tuple[str, ...] = ()
 
 
 class HIRBuilder:
@@ -217,8 +221,17 @@ class HIRBuilder:
                     self._trait_method_names.add(parsed[2])
                     self._impl_type_names.add(parsed[1])
 
-        def visit(n: mast.AstNode) -> None:
+        # Module-level `let` bindings become module constants: collected (in
+        # program order) into a synthesized __module_init function that the
+        # interpreter runs before the entry point, publishing the bound names
+        # as globals. Before this existed a top-level `let PI = 3;` compiled
+        # and every read of PI misbehaved at run time.
+        module_lets: list[tuple[mast.AstNode, Any]] = []
+
+        def visit(n: mast.AstNode, in_fn: bool = False) -> None:
             orig = self.id_map.get(n.node_id)
+            if not in_fn and isinstance(orig, fast.LetStatement):
+                module_lets.append((n, orig))
             if isinstance(orig, fast.FunctionDeclaration):
                 # Determine return type from side tables for this node or fallback
                 ret = self.t.apply_tyenv(self.t.types.get(n.node_id, "Unit"))  # type: ignore[index]
@@ -290,10 +303,35 @@ class HIRBuilder:
                 )
                 funcs.append(hfun)
             # Recurse
+            inside = in_fn or isinstance(orig, fast.FunctionDeclaration)
             for c in n.children:
-                visit(c)
+                visit(c, inside)
 
         visit(root)
+
+        if module_lets:
+            init_ops: list[HExpr] = []
+            global_names: list[str] = []
+            for (n, orig) in module_lets:
+                for b in getattr(orig, 'bindings', []) or []:
+                    name = getattr(b, 'identifier', None)
+                    init_node = getattr(b, 'initializer', None)
+                    he = self._from_orig_expr(init_node, n)
+                    if name is None or he is None:
+                        raise NotImplementedError(
+                            f"module-level let {name!r}: could not lower its "
+                            "initializer — refusing to drop the binding")
+                    # Assign (not Let) so the MIR slot keeps the source name:
+                    # the interpreter publishes exactly these slots as globals.
+                    init_ops.append(self._mk_hexpr(
+                        n.node_id, "Stmt", "Unit", n.span, op="Assign",
+                        var_name=str(name), assign_value=he))
+                    global_names.append(str(name))
+            body = self._mk_hexpr(root.node_id, "Block", "Unit", root.span,
+                                  op="Block", operands=tuple(init_ops))
+            funcs.append(HFun(sym="__module_init", params=[], dict_params=[],
+                              ret_ty="Unit", where_cls=[], body=body,
+                              globals_decl=tuple(global_names)))
 
         # Default effect handlers: an effect operation declared as
         # `op(params) -> T = expr;` compiles its default expression to a
@@ -413,6 +451,20 @@ class HIRBuilder:
         if isinstance(orig, fast.Literal):
             ty = self.t.apply_tyenv(getattr(orig, 'type_var', None) or self.t.types.get(frozen_ctx.node_id, "Unknown"))
             return self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span, op="Literal", literal=getattr(orig, 'value', None))
+
+        # TupleLiteral: `()` is the unit value (an empty Block lowers to the
+        # unit constant). Non-empty tuples have no runtime representation yet;
+        # dropping them silently (the old None fallback) turned handler arms
+        # like `op() -> ()` into vanished arms, so fail loudly instead.
+        if isinstance(orig, fast.TupleLiteral):
+            elements = getattr(orig, 'elements', []) or []
+            if not elements:
+                ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, "Unit"))
+                return self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span,
+                                      op="Block", operands=())
+            raise NotImplementedError(
+                f"tuple literals are not supported yet (got a {len(elements)}-element "
+                "tuple); only the unit literal `()` lowers")
 
         # Variables
         if isinstance(orig, fast.Variable):
@@ -817,12 +869,106 @@ class HIRBuilder:
             return self._mk_hexpr(frozen_ctx.node_id, "Stmt", ty, frozen_ctx.span,
                                   op="While", cond=c, loop_body=body_ops)
 
-        # Assignment: x = expr (rebinds an existing local/param)
+        # Assignment: x = expr (rebinds an existing local/param),
+        # x.f = expr (field write-back), or v[i] = expr (Vec element store).
         if isinstance(orig, fast.Assignment):
             target = getattr(orig, 'name', None)
             value_node = getattr(orig, 'expression', None)
             val_he = self._from_orig_expr(value_node, ctx_for(value_node))
             ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, "Unit"))
+
+            # `v[i] = x` — a real element store. Two lowerings (both strict;
+            # before this branch existed the target stringified to a garbage
+            # slot name and the store was a silent no-op):
+            # - assignable place base (`v[i] = x`, `buf.data[i] = x`):
+            #   `place = __index_store(place, i, x)` — Vec mutates in place
+            #   (and the rebind is the same object); fixed vector[T,N] gets a
+            #   value-semantics functional update written back to the place,
+            #   exactly like struct field assignment.
+            # - anything else (`m[i][j] = x`, call results): __index_set on
+            #   the indexed object — in-place only, so immutable receivers
+            #   error loudly instead of mutating a temporary.
+            if isinstance(target, fast.IndexExpression):
+                base_node = getattr(target, 'base', None)
+                base_he = self._from_orig_expr(base_node, ctx_for(base_node))
+                idx = getattr(target, 'index', None)
+                idx_list = idx if isinstance(idx, list) else [idx]
+                if (not idx_list or any(i is None for i in idx_list)
+                        or any(isinstance(i, fast.SliceExpression) for i in idx_list)):
+                    raise NotImplementedError(
+                        "cannot assign into a slice (`v[a:b] = x`); assign one "
+                        "element at a time")
+                if base_he is None or val_he is None:
+                    raise NotImplementedError(
+                        "could not lower index assignment target/value — "
+                        "refusing to drop the store")
+                idx_hes = []
+                for i in idx_list:
+                    ih = self._from_orig_expr(i, ctx_for(i))
+                    if ih is None:
+                        raise NotImplementedError(
+                            "could not lower index expression in assignment — "
+                            "refusing to drop the store")
+                    idx_hes.append(ih)
+
+                # Assignable place with a single index -> store-back form.
+                place: str | None = None
+                if len(idx_hes) == 1:
+                    if isinstance(base_node, fast.Variable):
+                        place = str(getattr(base_node, 'name', ''))
+                    elif isinstance(base_node, fast.FieldAccess):
+                        fbase = getattr(base_node, 'base', None)
+                        if isinstance(fbase, fast.Variable):
+                            fbase = getattr(fbase, 'name', None)
+                        if isinstance(fbase, str):
+                            place = ".".join(
+                                [fbase, *[str(ff) for ff in
+                                          getattr(base_node, 'fields', []) or []]])
+                if place:
+                    store = self._mk_hexpr(frozen_ctx.node_id, "Expr", 'Unknown',
+                                           frozen_ctx.span,
+                                           op="Call", callee="__index_store",
+                                           operands=(base_he, idx_hes[0], val_he))
+                    return self._mk_hexpr(frozen_ctx.node_id, "Stmt", ty,
+                                          frozen_ctx.span, op="Assign",
+                                          var_name=place, assign_value=store)
+
+                # m[i][j] = x parses as Index(Index(m,i), j): all but the last
+                # index are reads, the last one is the in-place store.
+                current = base_he
+                for ih in idx_hes[:-1]:
+                    current = self._mk_hexpr(frozen_ctx.node_id, 'Expr', 'Unknown',
+                                             frozen_ctx.span, op='Call',
+                                             callee='__index_get',
+                                             operands=(current, ih))
+                return self._mk_hexpr(frozen_ctx.node_id, "Stmt", ty, frozen_ctx.span,
+                                      op="Call", callee="__index_set",
+                                      operands=(current, idx_hes[-1], val_he))
+
+            # `x.f = v` / `x.f.g = v`: carried as a dotted string; MIR reads
+            # the intermediate structs, sets the innermost field, and writes
+            # back. Only a plain named base supports write-back — anything
+            # else (call results, indexed elements) would mutate a temporary,
+            # so it must error, not silently stringify to garbage.
+            if isinstance(target, fast.FieldAccess):
+                base = getattr(target, 'base', None)
+                if isinstance(base, fast.Variable):
+                    base = getattr(base, 'name', None)
+                if not isinstance(base, str):
+                    raise NotImplementedError(
+                        "unsupported field-assignment target: the base of "
+                        f"`{'.'.join([str(f) for f in getattr(target, 'fields', [])])}` "
+                        f"is a {type(getattr(target, 'base', None)).__name__}, "
+                        "not a named variable — refusing to drop the store")
+                dotted = ".".join([base, *[str(f) for f in getattr(target, 'fields', []) or []]])
+                return self._mk_hexpr(frozen_ctx.node_id, "Stmt", ty, frozen_ctx.span,
+                                      op="Assign", var_name=dotted,
+                                      assign_value=val_he)
+
+            if target is not None and not isinstance(target, str):
+                raise NotImplementedError(
+                    f"unsupported assignment target {type(target).__name__} — "
+                    "refusing to drop the store")
             return self._mk_hexpr(frozen_ctx.node_id, "Stmt", ty, frozen_ctx.span,
                                   op="Assign", var_name=str(target) if target is not None else None,
                                   assign_value=val_he)
@@ -1046,8 +1192,14 @@ class HIRBuilder:
                         raw_params = [c.param_name] if c.param_name is not None else []
                     params = tuple(str(p) for p in raw_params) or ("_",)
                     case_body = self._from_orig_expr(c.body, ctx_for(c.body) if c.body is not None else frozen_ctx)
-                    if case_body is not None:
-                        case_triples.append((op_name, params, case_body))
+                    if case_body is None:
+                        # A dropped arm silently changes runtime behavior (the
+                        # op becomes unhandled): refuse instead of skipping.
+                        raise NotImplementedError(
+                            f"handle {eff_name}: could not lower the body of "
+                            f"handler arm {op_name!r} "
+                            f"({type(c.body).__name__}) — refusing to drop the arm")
+                    case_triples.append((op_name, params, case_body))
             body_he = self._from_orig_expr(cont, ctx_for(cont) if cont is not None else frozen_ctx)
             ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, 'Unknown'))
             return self._mk_hexpr(frozen_ctx.node_id, 'Expr', ty, frozen_ctx.span,
@@ -1239,7 +1391,23 @@ class HIRBuilder:
             comp = elements[0]
             lam = self._comprehension_lambda(comp, frozen_ctx, ctx_for)
             iter_node = getattr(comp, 'iterable', None)
-            iter_he = self._from_orig_expr(iter_node, ctx_for(iter_node))
+            # Zip form: `f(a, b) for (a, b) in (xs, ys)` — a tuple of
+            # sequences iterates them in lockstep. Lowered to the strict
+            # __zip builtin (length mismatch errors at runtime). This used
+            # to fall into the generic None fallback and silently drop the
+            # whole vector literal.
+            if isinstance(iter_node, fast.TupleLiteral):
+                part_nodes = list(getattr(iter_node, 'elements', []) or [])
+                parts = [self._from_orig_expr(el, ctx_for(el)) for el in part_nodes]
+                if not parts or any(p is None for p in parts):
+                    raise NotImplementedError(
+                        "could not lower the tuple iterable of a zip "
+                        "comprehension — refusing to drop it")
+                iter_he = self._mk_hexpr(frozen_ctx.node_id, 'Expr', ty,
+                                         frozen_ctx.span, op='Call',
+                                         callee='__zip', operands=tuple(parts))
+            else:
+                iter_he = self._from_orig_expr(iter_node, ctx_for(iter_node))
             if lam is None or iter_he is None:
                 return None
             return self._mk_hexpr(frozen_ctx.node_id, 'Expr', ty, frozen_ctx.span,
@@ -1323,6 +1491,20 @@ class HIRBuilder:
             base = getattr(node, 'base', None) or getattr(node, 'expression', None)
             if isinstance(base, str):
                 out.add(base)
+        elif isinstance(node, fast.Assignment):
+            # An assignment TARGET references the name too. Without this a
+            # lambda whose body only assigns an enclosing variable (never
+            # reads it) failed to capture it, so the write landed in a
+            # frame-local slot and was silently lost.
+            tname = getattr(node, 'name', None)
+            if isinstance(tname, str):
+                out.add(tname)
+            elif isinstance(tname, fast.FieldAccess):
+                tbase = getattr(tname, 'base', None)
+                if isinstance(tbase, fast.Variable):
+                    tbase = getattr(tbase, 'name', None)
+                if isinstance(tbase, str):
+                    out.add(tbase)
         for attr, value in vars(node).items():
             if attr in ('parent', 'scope', 'location', 'children'):
                 continue
