@@ -57,12 +57,26 @@ def run_one(path: str, stage: str) -> tuple[bool, str]:
             interp = MirInterpreter()
             interp.load(lower_hir_to_mir(hir_funcs))
             interp.register_builtin("print", lambda *a: UNIT)
-            if "main" not in interp._funcs:
+
+            def param_count(fn) -> int:
+                for op in fn.blocks[0].ops if fn.blocks else ():
+                    if op[0] == "params":
+                        return len(op[1])
+                return 0
+
+            # Entry point: main(), falling back to a zero-arg example() for
+            # files that demonstrate a library (e.g. 10_traits_and_structs.mx).
+            entry = None
+            if "main" in interp._funcs:
+                entry = "main"
+            elif "example" in interp._funcs and param_count(interp._funcs["example"]) == 0:
+                entry = "example"
+            if entry is None:
                 return True, "no main (compile-only)"
-            result = interp.call("main", [])
+            result = interp.call(entry, [])
             if expected_error:
-                return False, f"expected a '{expected_error}' diagnostic but main() ran"
-            return True, f"main() = {result!r}"[:60]
+                return False, f"expected a '{expected_error}' diagnostic but {entry}() ran"
+            return True, f"{entry}() = {result!r}"[:60]
         from metaxu.compiler.pipeline import run_pipeline_from_source
 
         _ast, hir, mir, clif = run_pipeline_from_source(source)

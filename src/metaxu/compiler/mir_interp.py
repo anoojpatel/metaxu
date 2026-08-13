@@ -22,6 +22,7 @@ Usage:
 """
 from __future__ import annotations
 
+import math
 import threading
 from dataclasses import dataclass, field
 from queue import SimpleQueue
@@ -114,6 +115,50 @@ class MxClosure:
     """A closure: a named MirFunc plus a captured environment dict."""
     func_name: str
     captured: Dict[str, Any] = field(default_factory=dict)
+
+
+class MxVec:
+    """A growable vector (`Vec<T>`): a MUTABLE runtime object.
+
+    Design choice (documented): unlike structs — which have value semantics in
+    this interpreter (MxStruct.set returns a new struct) — a Vec deliberately
+    has Python-list IDENTITY semantics. `self.elements.push(x)` inside a
+    `&mut self` method mutates the one shared list, so the caller observes the
+    push even though the enclosing struct was passed by value. This matches
+    what programs like examples/10_traits_and_structs.mx expect from Vec.
+    """
+    __slots__ = ("items",)
+
+    def __init__(self, items: Optional[List[Any]] = None) -> None:
+        self.items = items if items is not None else []
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __eq__(self, other: Any) -> bool:
+        return isinstance(other, MxVec) and self.items == other.items
+
+    def __repr__(self) -> str:
+        return f"Vec[{', '.join(repr(i) for i in self.items)}]"
+
+
+@dataclass(frozen=True)
+class MxVector:
+    """A fixed-size vector value `vector[T, N]`.
+
+    Design choice (documented): represented as an immutable tuple of elements
+    with VALUE semantics (like structs) — element-wise arithmetic and slicing
+    produce new vectors; there is no in-place mutation. Slices are honest
+    copies, not aliasing views. Nested MxVector elements model
+    `vector[vector[T,N],M]` matrices.
+    """
+    elements: tuple
+
+    def __len__(self) -> int:
+        return len(self.elements)
+
+    def __repr__(self) -> str:
+        return f"vector[{', '.join(repr(e) for e in self.elements)}]"
 
 
 # ---------------------------------------------------------------------------
@@ -784,8 +829,68 @@ class MirInterpreter:
         self._builtins["not"] = lambda x: not x
         # Builtin methods (receiver passed as first argument by HIR)
         self._builtins["to_string"] = lambda x: "()" if x is UNIT else str(x)
-        self._builtins["len"] = lambda x: len(x)
+        self._builtins["len"] = _builtin_len
         self._builtins["assert"] = _builtin_assert
+        # --- Runtime library: Vec (growable, mutable; see MxVec) ------------
+        self._builtins["Vec.new"] = lambda: MxVec()
+        self._builtins["push"] = _builtin_push
+        self._builtins["pop"] = _builtin_pop
+        # --- Runtime library: math methods on numbers -----------------------
+        self._builtins["sqrt"] = _make_math_method("sqrt", math.sqrt)
+        self._builtins["sin"] = _make_math_method("sin", math.sin)
+        self._builtins["cos"] = _make_math_method("cos", math.cos)
+        # --- Runtime library: indexing / slicing / fixed-size vectors -------
+        self._builtins["__index_get"] = _builtin_index_get
+        self._builtins["__slice_get"] = _builtin_slice_get
+        self._builtins["__range"] = _builtin_range
+        self._builtins["__vec_lit"] = _builtin_vec_lit
+        self._builtins["__vec_zeros"] = _builtin_vec_zeros
+        self._builtins["__vec_filled"] = _builtin_vec_filled
+        # Comprehension needs to call back into the interpreter for closures.
+        self._builtins["__vec_comprehension"] = self._builtin_vec_comprehension
+
+    def _builtin_vec_comprehension(self, n: Any, fn: Any, iterable: Any) -> Any:
+        """Evaluate `vector[T, N](expr for targets in iterable)` at runtime."""
+        if isinstance(iterable, MxVector):
+            items: Sequence[Any] = iterable.elements
+        elif isinstance(iterable, MxVec):
+            items = list(iterable.items)
+        elif isinstance(iterable, (list, tuple)):
+            items = iterable
+        else:
+            raise InterpError(
+                f"vector comprehension: cannot iterate a "
+                f"{_runtime_type_name(iterable)!r} value")
+        if not isinstance(fn, MxClosure):
+            raise InterpError(
+                f"vector comprehension: expected a closure body, got "
+                f"{_runtime_type_name(fn)!r}")
+        target = self._funcs.get(fn.func_name)
+        if target is None:
+            raise InterpError(
+                f"vector comprehension: no func {fn.func_name!r} for closure")
+        n_params = 1
+        if target.blocks:
+            for op in target.blocks[0].ops:
+                if op[0] == "params":
+                    n_params = len(op[1])
+                    break
+        out: List[Any] = []
+        for item in items:
+            if n_params > 1:
+                if not isinstance(item, (tuple, list)) or len(item) != n_params:
+                    raise InterpError(
+                        f"vector comprehension: cannot unpack {item!r} into "
+                        f"{n_params} targets")
+                args = list(item)
+            else:
+                args = [item]
+            out.append(self._call_func(target, args, dict(fn.captured)))
+        if n is not None and len(out) != n:
+            raise InterpError(
+                f"vector comprehension produced {len(out)} elements for a "
+                f"vector of size {n}")
+        return MxVector(elements=tuple(out))
 
 
 # ---------------------------------------------------------------------------
@@ -808,6 +913,12 @@ def _runtime_type_name(v: Any) -> str:
         return "String"
     if isinstance(v, MxUnit):
         return "Unit"
+    if isinstance(v, MxVec):
+        return "Vec"
+    if isinstance(v, MxVector):
+        # Matches the head type constructor name that `implement ... for
+        # vector[T, N]` desugars to, so user impls on vectors dispatch.
+        return "vector"
     return type(v).__name__
 
 
@@ -840,11 +951,35 @@ _BINOPS: Dict[str, Callable[[Any, Any], Any]] = {
 }
 
 
+_VEC_ELEMENTWISE_OPS = frozenset({"+", "-", "*", "/", "%"})
+
+
 def _eval_binop(op: str, lv: Any, rv: Any) -> Any:
+    # Fixed-size vectors: element-wise arithmetic with scalar broadcasting.
+    if op in _VEC_ELEMENTWISE_OPS and (isinstance(lv, MxVector) or isinstance(rv, MxVector)):
+        return _vec_elementwise(op, lv, rv)
     fn = _BINOPS.get(op)
     if fn is None:
         raise InterpError(f"Unknown binary operator: {op!r}")
     return fn(lv, rv)
+
+
+def _vec_elementwise(op: str, lv: Any, rv: Any) -> "MxVector":
+    """Element-wise vector arithmetic; a scalar operand broadcasts.
+
+    Recurses through _eval_binop per element, so nested vectors (matrices)
+    combine element-wise too and int/int division keeps its `//` semantics.
+    """
+    if isinstance(lv, MxVector) and isinstance(rv, MxVector):
+        if len(lv) != len(rv):
+            raise InterpError(
+                f"vector size mismatch for {op!r}: {len(lv)} vs {len(rv)}")
+        pairs = zip(lv.elements, rv.elements)
+    elif isinstance(lv, MxVector):
+        pairs = ((e, rv) for e in lv.elements)
+    else:
+        pairs = ((lv, e) for e in rv.elements)
+    return MxVector(elements=tuple(_eval_binop(op, a, b) for (a, b) in pairs))
 
 
 def _builtin_assert_eq(a: Any, b: Any) -> Any:
@@ -857,3 +992,120 @@ def _builtin_assert(cond: Any, *msg: Any) -> Any:
     if not cond:
         raise AssertionError(f"assert failed{': ' + ' '.join(str(m) for m in msg) if msg else ''}")
     return UNIT
+
+
+# ---------------------------------------------------------------------------
+# Runtime library builtins (Vec, math methods, indexing, fixed-size vectors)
+# ---------------------------------------------------------------------------
+
+def _builtin_len(x: Any) -> int:
+    if isinstance(x, (MxVec, MxVector, str, list, tuple)):
+        return len(x)
+    raise InterpError(f"len: unsupported receiver type {_runtime_type_name(x)!r}")
+
+
+def _builtin_push(recv: Any, *vals: Any) -> Any:
+    if not isinstance(recv, MxVec):
+        raise InterpError(
+            f"push: expected a Vec receiver, got {_runtime_type_name(recv)!r}")
+    if len(vals) != 1:
+        raise InterpError(f"push: expected exactly 1 value, got {len(vals)}")
+    recv.items.append(vals[0])
+    return UNIT
+
+
+def _builtin_pop(recv: Any) -> Any:
+    if not isinstance(recv, MxVec):
+        raise InterpError(
+            f"pop: expected a Vec receiver, got {_runtime_type_name(recv)!r}")
+    if not recv.items:
+        raise InterpError("pop: Vec is empty")
+    return recv.items.pop()
+
+
+def _is_number(x: Any) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool)
+
+
+def _make_math_method(name: str, fn: Callable[[float], float]) -> Callable[[Any], float]:
+    def method(x: Any) -> float:
+        if not _is_number(x):
+            raise InterpError(
+                f"{name}: expected a number, got {_runtime_type_name(x)!r}")
+        try:
+            return fn(x)
+        except ValueError as exc:
+            raise InterpError(f"{name}: domain error for {x!r} ({exc})") from None
+    return method
+
+
+def _index_target(base: Any, what: str) -> Sequence[Any]:
+    if isinstance(base, MxVec):
+        return base.items
+    if isinstance(base, MxVector):
+        return base.elements
+    if isinstance(base, (list, tuple, str)):
+        return base
+    raise InterpError(
+        f"{what}: cannot index a {_runtime_type_name(base)!r} value")
+
+
+def _builtin_index_get(base: Any, idx: Any) -> Any:
+    seq = _index_target(base, "index")
+    if not isinstance(idx, int) or isinstance(idx, bool):
+        raise InterpError(f"index: expected an integer index, got {idx!r}")
+    if idx < 0 or idx >= len(seq):
+        raise InterpError(
+            f"index out of bounds: {idx} (length {len(seq)})")
+    return seq[idx]
+
+
+def _builtin_slice_get(base: Any, start: Any, stop: Any, step: Any) -> Any:
+    seq = _index_target(base, "slice")
+    for part, label in ((start, "start"), (stop, "stop"), (step, "step")):
+        if part is not None and (not isinstance(part, int) or isinstance(part, bool)):
+            raise InterpError(f"slice: {label} must be an integer, got {part!r}")
+    if step == 0:
+        raise InterpError("slice: step must be non-zero")
+    out = list(seq[slice(start, stop, step)])
+    if isinstance(base, MxVec):
+        return MxVec(out)  # honest copy, not an aliasing view
+    if isinstance(base, MxVector):
+        return MxVector(elements=tuple(out))
+    if isinstance(base, str):
+        return "".join(out)
+    return out
+
+
+def _builtin_range(start: Any, end: Any) -> list:
+    for part, label in ((start, "start"), (end, "end")):
+        if not isinstance(part, int) or isinstance(part, bool):
+            raise InterpError(f"range: {label} must be an integer, got {part!r}")
+    return list(range(start, end))
+
+
+def _builtin_vec_lit(n: Any, *elems: Any) -> MxVector:
+    if n is not None and len(elems) != n:
+        raise InterpError(
+            f"vector literal has {len(elems)} elements for a vector of size {n}")
+    return MxVector(elements=tuple(elems))
+
+
+_VEC_ZERO_VALUES = {"float": 0.0, "int": 0}
+
+
+def _builtin_vec_zeros(n: Any, base_name: Any) -> MxVector:
+    if not isinstance(n, int) or isinstance(n, bool):
+        raise InterpError(
+            "vector literal without elements needs a constant integer size")
+    zero = _VEC_ZERO_VALUES.get(str(base_name).lower())
+    if zero is None:
+        raise InterpError(
+            f"cannot zero-initialize a vector of element type {base_name!r}")
+    return MxVector(elements=(zero,) * n)
+
+
+def _builtin_vec_filled(n: Any, value: Any) -> MxVector:
+    if not isinstance(n, int) or isinstance(n, bool):
+        raise InterpError("vector.filled needs a constant integer size")
+    return MxVector(elements=(value,) * n)
