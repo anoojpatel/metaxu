@@ -151,6 +151,12 @@ int64_t mx_str_eq(const char *a, const char *b) {
     return strcmp(a, b) == 0 ? 1 : 0;
 }
 
+void mx_str_free(char *s) {
+    if (s != NULL) {
+        free(s);
+    }
+}
+
 static char *mx_strdup_fresh(const char *s) {
     size_t n = strlen(s) + 1;
     char *out = (char *)mx_rt_malloc(n);
