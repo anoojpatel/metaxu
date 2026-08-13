@@ -2831,13 +2831,19 @@ def test_examples_define_census_does_not_regress():
     # functional index update through a struct-field place), landing at
     # 79; collections.mx's push now demotes on its List<T> field-table
     # gap instead of __index_store, and 06's zip demotions are all
-    # closure-kind conflicts, never __zip itself.
+    # closure-kind conflicts, never __zip itself.  Increment 13 (indirect
+    # closure calls) lifts 06's higher-order shapes whose lambdas agree on
+    # kinds — reduce/sum/product/dot/norm-style drivers over same-kind
+    # lambdas emit through the word-uniform ABI — landing at 88; 06's map
+    # keeps demoting honestly on GENUINE polymorphism (one `map` receives
+    # f64-valued AND str-valued lambdas, so its parameter kinds conflict
+    # for real).
     total_defines = 0
     for path in _example_files():
         ir = llvm_from_source(path.read_text())
         total_defines += len(re.findall(
             r"^define (?:i64|double|ptr|void) @mx_\w+\(", ir, re.M))
-    assert total_defines >= 79
+    assert total_defines >= 88
 
 
 # ---------------------------------------------------------------------------
@@ -4317,16 +4323,7 @@ fn main() -> int {
     assert stdout == ""
 
 
-def test_std_stream_import_emits_cell_counter_handlers():
-    # A program importing std.stream: the cell constructs are LIFTED —
-    # no `cell_wrap` demotion reason survives anywhere, and the counter
-    # handler cases (take/skip's `seen` — the exact shapes the stdlib
-    # documents as relying on shared cells) emit as real defines.  The
-    # consumers themselves (iter/fold/sum/take) still demote HONESTLY on
-    # higher-order shapes (calls through function-valued parameters,
-    # conflicting closure kinds) — a later increment's feature, not a
-    # silent seam.
-    ir = llvm_from_source("""
+_STD_STREAM_SRC = """
 from std.stream import Emit, iota, iter, fold, sum, count, take;
 
 fn main() -> int {
@@ -4337,7 +4334,21 @@ fn main() -> int {
     print(n);
     total + n
 }
-""")
+"""
+
+
+def test_std_stream_import_emits_cell_counter_handlers():
+    # A program importing std.stream: the cell constructs are LIFTED —
+    # no `cell_wrap` demotion reason survives anywhere, and the counter
+    # handler cases (take/skip's `seen` — the exact shapes the stdlib
+    # documents as relying on shared cells) emit as real defines.  Since
+    # increment 13 the USED consumers (fold/sum/count/take + main) emit
+    # too: their function-valued parameters go through the word-uniform
+    # indirect-call ABI.  Drivers this program never calls (iter, map,
+    # filter, ...) still demote honestly — their producer/f parameters
+    # stay at the i64 bottom (no closure ever flows in), so a call
+    # through them cannot be typed.
+    ir = llvm_from_source(_STD_STREAM_SRC)
     # the seam construct itself never demotes anything anymore
     assert "unsupported op 'cell_wrap'" not in ir
     assert not re.search(r"reason:.*cell_wrap", ir)
@@ -4350,9 +4361,21 @@ fn main() -> int {
     assert re.search(
         r"^define i64 @mx___handler_Loop_break__std_stream_for__hs\d+\(",
         ir, re.M)
-    # The remaining demotions are all higher-order, honestly named.
-    assert re.search(r"reason: (unknown external callee 'producer'|"
-                     r"irreconcilable value kinds)", ir)
+    # The whole used pipeline emits: main, fold, sum, count, take, iota,
+    # the take thunk, and fold's handler case (which calls `f` indirectly).
+    # take and iota return closures, so their defines are sret-style.
+    for sym in ("mx_main", "mx_std_stream_fold", "mx_std_stream_sum",
+                "mx_std_stream_count", "mx_std_stream_take",
+                "mx_std_stream_iota", "mx_std_stream_take_lambda1",
+                "mx___handler_Emit_emit_std_stream_fold_hs1"):
+        assert re.search(rf"^define (?:i64|void) @{sym}\(", ir, re.M), sym
+    # fold's f is a dynamic closure (sum/product/count lambdas): the case
+    # calls it indirectly through the word-uniform ABI.
+    assert re.search(r"indirect closure call \(.*sum\$lambda", ir)
+    # Unused drivers demote honestly on their bottom-kinded parameters.
+    assert re.search(
+        r"reason: call through local 'producer' that is not a "
+        r"statically-known closure", ir)
 
 
 def test_ownership_example_now_emits_fully_native():
@@ -4371,3 +4394,351 @@ def test_native_ownership_example_differential(tmp_path):
     ir = llvm_from_source(src)
     exit_code, stdout = compile_and_run(ir, "main", workdir=str(tmp_path))
     assert stdout == expected_out
+
+
+# ---------------------------------------------------------------------------
+# Increment 13: indirect closure calls — dynamic closure kinds, the
+# word-uniform lambda ABI, env-captured closure pairs, std.stream natively
+# ---------------------------------------------------------------------------
+
+_APPLY_TWICE_SRC = """
+fn apply(f: fn(int) -> int, v: int) -> int { f(v) }
+fn twice(f: fn(int) -> int, v: int) -> int { f(f(v)) }
+fn main() -> int {
+    let x = 10;
+    let g = fn(y: int) -> x + y;
+    let h = fn(y: int) -> y * 2;
+    print(apply(g, 7));
+    print(apply(h, 7));
+    print(twice(g, 7));
+    print(twice(h, 7));
+    apply(g, 1)
+}
+"""
+
+
+def test_dynamic_closure_join_instead_of_conflict():
+    # Two different lambdas reach apply/twice's `f`: the kinds JOIN to a
+    # dynamic member set instead of conflicting, and the whole program
+    # emits with zero placeholders.
+    ir = llvm_from_source(_APPLY_TWICE_SRC)
+    assert count_placeholders(ir) == 0
+    assert "irreconcilable value kinds" not in ir
+    # the call site is an indirect word-uniform call naming both members
+    assert re.search(
+        r"%t\d+ = call i64 %t\d+\(ptr %t\d+, i64 [%\w.]+\)"
+        r"  ; indirect closure call \(main\$lambda\d+\|main\$lambda\d+\), "
+        r"word-uniform ABI", ir)
+
+
+def test_word_uniform_lambda_signature_and_typed_locals_untouched():
+    # Participating lambdas carry the word-uniform ABI marker; a lambda
+    # only ever called through its own local binding keeps its typed
+    # signature (no ABI marker, direct typed indirect call).
+    ir = llvm_from_source(_APPLY_TWICE_SRC)
+    assert re.search(
+        r"define i64 @mx_main_lambda\d+\(ptr %cl\.env, i64 %a\.y\) "
+        r"\{  ; word-uniform lambda ABI", ir)
+    local_only = llvm_from_source("""
+fn main() -> int {
+    let g = fn(y: float) -> float { y * 2.0 };
+    print(g(1.5));
+    0
+}
+""")
+    assert count_placeholders(local_only) == 0
+    assert "word-uniform lambda ABI" not in local_only
+    # typed call: double argument straight through the loaded fn pointer
+    assert re.search(r"call double %t\d+\(ptr %t\d+, double", local_only)
+
+
+def test_word_uniform_f64_params_decode_and_encode():
+    # An f64 lambda through an indirect site: parameters arrive as i64
+    # words and are bitcast-decoded in the prelude; the return value is
+    # bitcast-encoded back to a word.
+    ir = llvm_from_source("""
+fn apply(f: fn(float) -> float, v: float) -> float { f(v) }
+fn main() -> int {
+    let a = fn(x: float) -> x * 2.0;
+    let b = fn(x: float) -> x + 0.5;
+    print(apply(a, 1.25));
+    print(apply(b, 1.25));
+    0
+}
+""")
+    assert count_placeholders(ir) == 0
+    assert re.search(
+        r"define i64 @mx_main_lambda\d+\(ptr %cl\.env, i64 %aw\.x\)", ir)
+    assert re.search(
+        r"%a\.x = bitcast i64 %aw\.x to double  ; word-uniform param x: "
+        r"f64 decoded", ir)
+    assert re.search(r"ret i64 %t\d+  ; word-uniform lambda return "
+                     r"\(f64 encoded\)", ir)
+    # the site word-encodes the argument and decodes the result
+    assert re.search(r"bitcast double %a\.v to i64", ir)
+
+
+def test_mismatched_arity_lambdas_at_one_site_demote_loudly():
+    # A 1-arity and a 2-arity lambda joined at one `f`: no sound indirect
+    # call exists (the interpreter's zip-binding would leave the second
+    # parameter unbound) — the join conflicts and demotes with reasons.
+    ir = llvm_from_source("""
+fn pick(c: bool) -> int {
+    let mut f = fn(x: int) -> x + 1;
+    if c { f = fn(x: int, y: int) -> x + y; } else { () };
+    f(3)
+}
+fn main() -> int { pick(true) }
+""")
+    assert count_placeholders(ir) >= 1
+    assert "irreconcilable value kinds for 'f" in ir
+
+
+def test_aggregate_args_through_indirect_call_stay_demoted():
+    # Two lambdas taking a STRUCT parameter reach one site: the word ABI
+    # is scalar-only this increment, so the site demotes with the
+    # scalar-only reason (never wrong code).
+    ir = llvm_from_source("""
+struct P { a: int }
+fn apply(f: fn(P) -> int, p: P) -> int { f(p) }
+fn main() -> int {
+    let g = fn(p: P) -> p.a + 1;
+    let h = fn(p: P) -> p.a * 2;
+    print(apply(g, P { a: 4 }));
+    apply(h, P { a: 4 })
+}
+""")
+    assert count_placeholders(ir) >= 1
+    assert re.search(
+        r"reason: indirect closure call through 'f'.*scalar-only", ir)
+
+
+_COMPREHENSION_DYN_SRC = """
+fn total(f: fn(int) -> int) -> int {
+    let src = vector[int, 3](1, 2, 3);
+    let v = vector[int, 3](f(x) for x in src);
+    v[0] + v[1] + v[2]
+}
+fn main() -> int {
+    print(total(fn(x: int) -> x + 1));
+    print(total(fn(x: int) -> x * 10));
+    0
+}
+"""
+
+
+def test_comprehension_body_calling_dynamic_closure_emits():
+    # The comprehension BODY is always a per-site synthesized lambda (so
+    # the thunk keeps one pinned symbol — source programs cannot make the
+    # body variable itself dynamic), but the body may CAPTURE a dynamic f
+    # and call it indirectly: the typed thunk path and the word-uniform
+    # indirect path compose.
+    ir = llvm_from_source(_COMPREHENSION_DYN_SRC)
+    assert count_placeholders(ir) == 0
+    assert "indirect closure call" in ir
+    assert re.search(r"comprehension via \w+\$lambda\d+", ir)
+
+
+@needs_clang
+def test_native_comprehension_body_calls_dynamic_closure(tmp_path):
+    assert_native_matches_interp(_COMPREHENSION_DYN_SRC, tmp_path)
+
+
+def test_env_captured_closures_marked_heap_env_and_emit():
+    # std.stream's take shape: the returned thunk CAPTURES `producer` (a
+    # closure pair inside another closure's env) and the handle site
+    # captures it again.  Everything emits; iota's lambda is heap-env.
+    ir = llvm_from_source(_STD_STREAM_SRC)
+    # take$lambda1's env inlines a closure pair field
+    assert re.search(
+        r"%env\.std_stream_take_lambda1 = type \{[^}]*%mx\.closure", ir)
+    # the handle-site env of fold holds the dynamic f pair by value
+    assert re.search(r"%henv\.\w*fold\w* = type \{[^}]*%mx\.closure", ir)
+
+
+@needs_clang
+def test_native_apply_twice_two_lambdas_one_site(tmp_path):
+    # THE INCREMENT-13 SHAPE: two different lambdas (one capture-carrying,
+    # one not) through apply's and twice's single call sites.
+    assert_native_matches_interp(_APPLY_TWICE_SRC, tmp_path)
+
+
+@needs_clang
+@needs_asan
+def test_native_apply_twice_fully_leak_checked_under_asan(tmp_path):
+    # Both lambdas keep stack envs (never returned, never env-captured):
+    # the indirect-call machinery allocates nothing — FULL leak check.
+    assert_native_matches_interp_asan("""
+fn apply(f: fn(int) -> int, v: int) -> int { f(v) }
+fn main() -> int {
+    let x = 10;
+    let g = fn(y: int) -> x + y;
+    let h = fn(y: int) -> y * 2;
+    print(apply(g, 7));
+    print(apply(h, 7));
+    0
+}
+""", tmp_path)
+
+
+@needs_clang
+def test_native_f64_lambda_word_roundtrip(tmp_path):
+    # f64 params AND f64 returns through the word ABI: bitcast round trips
+    # must be exact for every value.
+    assert_native_matches_interp("""
+fn apply(f: fn(float) -> float, v: float) -> float { f(v) }
+fn main() -> int {
+    let a = fn(x: float) -> x * 2.0;
+    let b = fn(x: float) -> x + 0.5;
+    print(apply(a, 1.25));
+    print(apply(b, 1.25));
+    print(apply(a, 0.0 - 3.25));
+    0
+}
+""", tmp_path)
+
+
+@needs_clang
+def test_native_merged_closure_variable_dynamic_dispatch(tmp_path):
+    # One VARIABLE holding different lambdas on different paths: the
+    # stored pair decides at runtime which fn pointer runs.
+    assert_native_matches_interp("""
+fn choose(c: bool) -> int {
+    let mut f = fn(x: int) -> x + 1;
+    if c { f = fn(x: int) -> x * 10; } else { () };
+    f(4)
+}
+fn main() -> int {
+    print(choose(true));
+    print(choose(false));
+    0
+}
+""", tmp_path)
+
+
+@needs_clang
+def test_native_capture_carrying_lambdas_through_indirect_site(tmp_path):
+    # Both lambdas CARRY CAPTURES: each pair's env pointer must travel
+    # with its fn pointer through the one indirect site.
+    assert_native_matches_interp("""
+fn apply(f: fn(int) -> int, v: int) -> int { f(v) }
+fn main() -> int {
+    let a = 100;
+    let b = 7;
+    let add_a = fn(y: int) -> y + a;
+    let mul_b = fn(y: int) -> y * b;
+    print(apply(add_a, 1));
+    print(apply(mul_b, 3));
+    0
+}
+""", tmp_path)
+
+
+@needs_clang
+def test_native_std_stream_end_to_end(tmp_path):
+    # THE INCREMENT-13 TARGET: a std.stream program — import, chain
+    # take/sum/count drivers over iota — runs natively end to end, with
+    # the handler cases calling f through the word-uniform ABI on top of
+    # the effects runtime.
+    assert_native_matches_interp(_STD_STREAM_SRC, tmp_path, entry="main")
+
+
+@needs_clang
+def test_native_std_stream_chain_and_transformers(tmp_path):
+    # chain merges two producers; map/filter re-emit through their own
+    # handler scopes with f/pred called indirectly.
+    assert_native_matches_interp("""
+from std.stream import Emit, iota, sum, map, filter, chain;
+fn main() -> int {
+    let doubled = map(iota(10), fn(x: int) -> x * 2);
+    let big = filter(doubled, fn(x: int) -> x > 5);
+    print(sum(big));
+    print(sum(chain(iota(4), iota(3))));
+    0
+}
+""", tmp_path)
+
+
+@needs_clang
+def test_native_std_stream_iter_and_collect(tmp_path):
+    # iter drives print through an indirect f; collect pushes into a
+    # captured Vec (the shared-vector aliasing contract).
+    assert_native_matches_interp("""
+from std.stream import Emit, iota, iter, collect;
+fn main() -> int {
+    iter(iota(4), fn(x) { print(x) });
+    let v = collect(iota(5));
+    print(len(v));
+    print(v[0] + v[4]);
+    0
+}
+""", tmp_path)
+
+
+@needs_clang
+def test_native_std_stream_for_with_break(tmp_path):
+    # for_'s nested Loop handler: break_ aborts the per-element scope and
+    # stops the loop; the body mutates a captured cell across resumes.
+    assert_native_matches_interp("""
+from std.stream import Emit, Loop, iota, for_;
+fn main() -> int {
+    let mut acc = 0;
+    for_(iota(10), fn(x: int) {
+        if x > 4 { perform Loop.break_() } else { () };
+        acc = acc + x
+    });
+    print(acc);
+    0
+}
+""", tmp_path)
+
+
+@needs_asan
+def test_native_std_stream_asan_no_uaf(tmp_path):
+    # Heap closure envs, mutable-capture cells and effect scopes: the
+    # leak-by-design contract (detect_leaks=0) proves no use-after-free /
+    # no double-free across the whole stream pipeline.
+    result, expected_out = interp_run(_STD_STREAM_SRC)
+    ir = llvm_from_source(_STD_STREAM_SRC)
+    exit_code, stdout = compile_and_run(
+        ir, "main", workdir=str(tmp_path),
+        clang_args=("-fsanitize=address",),
+        run_env={"ASAN_OPTIONS": "detect_leaks=0"})
+    assert stdout == expected_out
+    assert exit_code == int(result) % 256
+
+
+@needs_clang
+def test_native_dynamic_returned_closure(tmp_path):
+    # A function returning ONE OF TWO lambdas: the return kind is the
+    # dynamic member set (sret pair copy), both lambdas get heap envs,
+    # and the caller's calls dispatch on the runtime fn pointer.
+    assert_native_matches_interp("""
+fn pick(c: bool) -> fn(int) -> int {
+    let base = 100;
+    if c { fn(x: int) -> x + base } else { fn(x: int) -> x * 2 }
+}
+fn main() -> int {
+    let f = pick(true);
+    let g = pick(false);
+    print(f(5));
+    print(g(5));
+    0
+}
+""", tmp_path)
+
+
+@needs_clang
+def test_native_fold_shape_direct_two_lambdas(tmp_path):
+    # The fold/reduce shape without the stdlib: one higher-order driver,
+    # two different 2-arity lambdas, called at one nested site.
+    assert_native_matches_interp("""
+fn fold3(f: fn(int, int) -> int, a: int, b: int, c: int, init: int) -> int {
+    f(c, f(b, f(a, init)))
+}
+fn main() -> int {
+    print(fold3(fn(x: int, acc: int) -> x + acc, 1, 2, 3, 0));
+    print(fold3(fn(x: int, acc: int) -> x * acc, 1, 2, 3, 1));
+    0
+}
+""", tmp_path)
