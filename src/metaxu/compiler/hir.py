@@ -466,7 +466,13 @@ class HIRBuilder:
                     return h.operands
                 return (h,)
             ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, "Unit"))
-            return self._mk_hexpr(frozen_ctx.node_id, "Stmt", ty, frozen_ctx.span, op="If", cond=c, then_ops=as_ops(tb), else_ops=as_ops(eb) if eb else tuple())
+            # An else-less `if` always evaluates to unit (standard statement
+            # rule): the then-arm runs for its effects only and its value is
+            # discarded. else_ops=None marks the else-less form for lowering;
+            # an if/else keeps a (possibly empty) tuple and merges both arms.
+            if eb is None:
+                ty = "Unit"
+            return self._mk_hexpr(frozen_ctx.node_id, "Stmt", ty, frozen_ctx.span, op="If", cond=c, then_ops=as_ops(tb), else_ops=as_ops(eb) if eb is not None else None)
 
         # IfLetExpression: `if let PAT = expr { then } else { else }`.
         # Desugared to a two-arm Match (PAT => then, _ => else) so the
@@ -497,7 +503,17 @@ class HIRBuilder:
                         "if let: could not lower the else-branch "
                         f"({type(else_node).__name__})")
             else:
-                # No else: the non-matching arm evaluates to unit.
+                # No else: an else-less `if let` is a statement — BOTH arms
+                # evaluate to unit. The then-body runs for its effects only
+                # (early `return` inside it still works via the epilogue),
+                # so wrap it in a block whose tail is unit rather than
+                # letting its value merge with the unit of the miss arm.
+                ty = "Unit"
+                unit_he = self._mk_hexpr(frozen_ctx.node_id, "Block", ty,
+                                         frozen_ctx.span, op="Block", operands=())
+                then_he = self._mk_hexpr(frozen_ctx.node_id, "Block", ty,
+                                         frozen_ctx.span, op="Block",
+                                         operands=(then_he, unit_he))
                 else_he = self._mk_hexpr(frozen_ctx.node_id, "Block", ty,
                                          frozen_ctx.span, op="Block", operands=())
             arms = ((pat, then_he), (HPattern(kind="wildcard"), else_he))
