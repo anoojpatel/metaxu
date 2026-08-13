@@ -89,6 +89,31 @@ completion and abort); programs that also concat strings keep
 detect_leaks=0 per the leak-by-design contract.  Still demoted honestly:
 aggregates (closures included) crossing the effect boundary, resume
 outside its own handler case, same-named ops with conflicting kinds.
+
+Increment 8 (memory reclamation + copy elision) adds:
+  * OWNED STRINGS: a produced string (concat / to_string result — always a
+    fresh malloc, metaxu_rt never returns an input) whose every use is
+    non-retaining (concat operand, ==/!=, print, len) is freed at each
+    redefinition (a concat LOOP no longer grows memory) and at frame exit,
+    via a null-initialized shadow slot; literal defs record null (interned
+    constants are NEVER freed — provenance is static).  Programs in this
+    class run under FULL ASan leak checking.  Anything retained — returned,
+    stored, passed to a call, aliased by to_string-of-str, crossing an
+    effect boundary — still leaks by design.
+  * UNIQUE BOXES: an entry-block make_variant whose enum value (closed
+    over intra-frame copies) is only ever variant_tag/variant_field-read —
+    never returned/passed/stored/captured/re-boxed — solely owns its
+    payload boxes; they are freed on every ret path, FULL-leak-checked.
+    Shared boxes (anything passed to a call, e.g. every recursive list
+    traversal) keep the detect_leaks=0 contract.
+  * COPY ELISION (a): an aggregate param never rebound and never reaching a
+    callee write-back position skips the entry byval copy and reads the
+    caller's storage through the passed pointer.  (b): a variant_field
+    result that is only read becomes a BOX VIEW (a pointer into the
+    write-once box) instead of an aggregate copy; copies of views alias the
+    same box.  `; elide-copy:` comments pin both structurally.  The cases
+    that MUST NOT elide stay pinned: rebound params (byval + write-back)
+    and params passed onward to rebinding callees.
 """
 from __future__ import annotations
 
@@ -422,7 +447,10 @@ fn main() -> int {
     assert localities.count("global") == 1
     assert localities.count("local") == 1
 
-def test_struct_param_passes_ptr_with_callee_byval_copy():
+def test_struct_param_passes_ptr_readonly_callee_elides_byval_copy():
+    # Increment 8: a read-only struct param (never rebound, never reaching a
+    # write-back position) skips the entry byval copy and reads the caller's
+    # aggregate through the passed pointer.  The caller side is unchanged.
     ir = llvm_from_source("""
 struct Point { x: int, y: int }
 fn getx(p: Point) -> int { p.x }
@@ -434,11 +462,61 @@ fn main() -> int {
     assert count_placeholders(ir) == 0
     # callee: struct param arrives as ptr...
     assert "define i64 @mx_getx(ptr %a.p)" in ir
-    # ...and is byval-copied into the callee's own storage in the prelude
-    assert re.search(r"load %struct\.Point, ptr %a\.p", ir)
-    assert re.search(r"store %struct\.Point %t\d+, ptr %sv\.p", ir)
+    # ...and is read THROUGH that pointer: no byval copy, no own storage
+    assert "; elide-copy: param p reads through the caller's pointer" in ir
+    assert not re.search(r"load %struct\.Point, ptr %a\.p", ir)
+    assert not re.search(r"%sv\.p = alloca", ir)
+    assert re.search(
+        r"getelementptr inbounds %struct\.Point, ptr %a\.p", ir)
     # caller passes the storage pointer of its struct variable
     assert re.search(r"call i64 @mx_getx\(ptr %sv\.\w+\)", ir)
+
+
+def test_rebound_struct_param_keeps_byval_copy_and_write_back():
+    # The case that MUST NOT elide: a rebound struct param still byval-copies
+    # on entry and copies back out through the caller's pointer on ret
+    # (interpreter write-back parity).
+    ir = llvm_from_source("""
+struct Counter { n: int }
+fn bump(c: Counter) -> int {
+    c.n = c.n + 1;
+    c.n
+}
+fn main() -> int {
+    let c = Counter { n: 10 };
+    bump(c) + c.n
+}
+""")
+    assert count_placeholders(ir) == 0
+    bump = ir[ir.index("define i64 @mx_bump"):]
+    bump = bump[:bump.index("\n}") + 2]
+    assert "; elide-copy: param" not in bump
+    assert re.search(r"load %struct\.Counter, ptr %a\.c", bump)  # byval in
+    assert "copy-out: rebound struct param" in bump               # write-back
+
+
+def test_param_passed_to_rebinding_callee_keeps_byval_copy():
+    # relay never rebinds c itself, but passes it to bump, which writes back
+    # through the pointer it is given.  relay must keep its own copy so
+    # bump's write-back mutates RELAY's binding (interpreter parity), never
+    # main's storage.
+    ir = llvm_from_source("""
+struct Counter { n: int }
+fn bump(c: Counter) -> int {
+    c.n = c.n + 1;
+    c.n
+}
+fn relay(c: Counter) -> int { bump(c) + c.n }
+fn main() -> int {
+    let c = Counter { n: 5 };
+    relay(c)
+}
+""")
+    assert count_placeholders(ir) == 0
+    relay = ir[ir.index("define i64 @mx_relay"):]
+    relay = relay[:relay.index("\n}") + 2]
+    assert "; elide-copy: param" not in relay
+    assert re.search(r"load %struct\.Counter, ptr %a\.c", relay)
 
 
 def test_struct_return_is_sret_style():
@@ -969,9 +1047,12 @@ def test_enum_pattern_tag_test_compares_integers_not_strings():
     assert '"Some' not in ir and '"None' not in ir
     assert "; tag literal: 'Some' -> 1" in ir
     assert re.search(r"icmp eq i64 %t\d+, 1", ir)  # tag == Some
-    # enum values cross the call boundary as ptr (byval-copy in the callee)
+    # enum values cross the call boundary as ptr; unwrap_or never rebinds
+    # its param, so (increment 8) the byval copy is elided and the tag/
+    # payload reads go through the caller's pointer directly
     assert "define i64 @mx_unwrap_or(ptr %a.o, i64 %a.d)" in ir
-    assert re.search(r"load %enum\.Option, ptr %a\.o", ir)
+    assert "; elide-copy: param o reads through the caller's pointer" in ir
+    assert re.search(r"getelementptr inbounds %enum\.Option, ptr %a\.o", ir)
 
 
 def test_enum_returned_from_function_is_sret_style():
@@ -989,6 +1070,10 @@ fn main() -> int { let o = mk(3); match o { Some(x) -> x, None -> 0 } }
 def test_recursive_enum_payload_is_heap_boxed():
     # Increment 4: a linked-list-style enum lives in flat 8-byte payload
     # slots because the recursive slot holds a heap POINTER to a boxed copy.
+    # Increment 8 refines the free strategy: the OUTER list value is only
+    # ever matched in this frame, so its box is uniquely owned and freed at
+    # frame exit; the INNER Cons box (re-boxed as the outer's payload, its
+    # pointer shallow-copied into the outer box) still leaks by design.
     ir = llvm_from_source("""
 enum IntList { Cons(int, IntList), Nil }
 fn main() -> int {
@@ -999,16 +1084,21 @@ fn main() -> int {
     assert count_placeholders(ir) == 0
     # finite layout: tag + 2 slots (i64 head, boxed-tail ptr as 8 bytes)
     assert "%enum.IntList = type { i64, [2 x i64] }" in ir
-    # make_variant boxes the aggregate payload: malloc(24) = the IntList size
+    # make_variant boxes the aggregate payload: malloc(24) = the IntList
+    # size.  Inner box: shared (leaks); outer box: unique (freed).
     assert re.search(
         r"call ptr @malloc\(i64 24\)  ; boxed enum:IntList payload "
         r"\(leaks by design\)", ir)
+    assert re.search(
+        r"call ptr @malloc\(i64 24\)  ; boxed enum:IntList payload "
+        r"\(unique: freed at frame exit\)", ir)
     # the box is filled with a whole-aggregate copy, then the ptr stored
     assert re.search(r"store %enum\.IntList %t\d+, ptr %t\d+", ir)
     # variant_field on the boxed slot loads the ptr and copies the value out
     assert re.search(r"%t\d+ = load ptr, ptr %t\d+", ir)
-    # no free anywhere: boxes leak by design (see module docstring contract)
-    assert "call void @free" not in ir
+    # exactly the unique box is freed, nothing else
+    assert ir.count("call void @free") == 1
+    assert "; unique box:" in ir
 
 
 def test_per_variant_payload_slots_emit_mixed_variant_kinds():
@@ -2461,6 +2551,169 @@ def test_native_effects_with_string_concat_asan_no_uaf(tmp_path):
     assert stdout == expected_out
 
 
+# ---------------------------------------------------------------------------
+# Increment 8: memory reclamation (owned strings, unique boxes) + copy elision
+# ---------------------------------------------------------------------------
+
+_STR_LOOP_SRC = """
+fn main() -> int {
+    let mut s = "";
+    let mut i = 0;
+    while i < 50 {
+        s = s + "ab";
+        i = i + 1;
+    }
+    print(len(s));
+    0
+}
+"""
+
+
+def test_owned_string_loop_frees_previous_value_each_iteration():
+    # The loop accumulator `s` is an OWNED string: each redefinition frees
+    # the previous concat result through the shadow slot, the initial ""
+    # literal records null (never freed), and frame exit frees the last.
+    ir = llvm_from_source(_STR_LOOP_SRC)
+    assert count_placeholders(ir) == 0
+    assert "declare void @mx_str_free(ptr)" in ir
+    assert re.search(r"%strown\.\w+ = alloca ptr  ; owned string shadow", ir)
+    assert "previous value freed" in ir
+    assert re.search(r"store ptr null, ptr %strown\.\w+"
+                     r"  ; owned string \w+: literal \(never freed\)", ir)
+    assert "freed at frame exit" in ir
+    # the concat itself is documented as owned, not leaked
+    assert re.search(r"@mx_str_concat\(.*\)  ; owned \(freed when dead\)", ir)
+
+
+@needs_clang
+def test_native_owned_string_loop(tmp_path):
+    assert_native_matches_interp(_STR_LOOP_SRC, tmp_path)
+
+
+@needs_clang
+@needs_asan
+def test_native_owned_string_loop_fully_leak_checked_under_asan(tmp_path):
+    # THE INCREMENT-8 STRING PROOF: 50 concats, every fresh malloc freed —
+    # FULL leak checking (no detect_leaks=0), so exit 0 proves the loop no
+    # longer grows memory AND that no free ever hit a live or literal
+    # string (no UAF / double-free / bad-free of rodata).
+    ir = assert_native_matches_interp_asan(_STR_LOOP_SRC, tmp_path)
+    assert "call void @mx_str_free" in ir
+
+
+@needs_clang
+@needs_asan
+def test_native_owned_string_chain_fully_leak_checked_under_asan(tmp_path):
+    # Straight-line concat/to_string chains: producer temps feeding concat
+    # operands and print/len consumers are all owned and freed at frame
+    # exit.  (This is the shape test_native_string_concat_and_to_string
+    # runs without ASan; it now sustains FULL leak checking.)
+    assert_native_matches_interp_asan("""
+fn main() -> int {
+    let a = "answer: " + to_string(41 + 1);
+    print(a);
+    print("x" + "y" + "z");
+    print(len("a" + "bc"));
+    0
+}
+""", tmp_path)
+
+
+@needs_clang
+@needs_asan
+def test_native_owned_string_mixed_literal_produced_paths_asan(tmp_path):
+    # Provenance across branches: some defs re-produce (concat), some reset
+    # to a literal.  The shadow must free exactly the produced values and
+    # never the interned literals, on every interleaving — full leak check.
+    assert_native_matches_interp_asan("""
+fn main() -> int {
+    let mut s = "start";
+    let mut even = 1;
+    let mut i = 0;
+    while i < 10 {
+        if even == 1 { s = s + "e"; even = 0; } else { s = "odd"; even = 1; }
+        i = i + 1;
+    }
+    print(s);
+    print(len(s));
+    let mut d = "x";
+    let mut j = 0;
+    while j < 4 { d = d + d; j = j + 1; }
+    print(len(d));
+    0
+}
+""", tmp_path)
+
+
+def test_returned_concat_string_still_leaks_by_design():
+    # A concat result that RETURNS has no ownership proof: no shadow, no
+    # free — the leak-by-design contract is unchanged for escaping strings.
+    ir = llvm_from_source("""
+fn shout(s: str) -> str { s + "!" }
+fn main() -> int { print(shout("hi")); 0 }
+""")
+    assert count_placeholders(ir) == 0
+    assert "mx_str_free" not in ir
+    assert re.search(r"@mx_str_concat\(.*\)  ; leaks by design", ir)
+
+
+_UNIQUE_BOX_SRC = """
+struct Pair { a: int, b: int }
+enum Wrap { W(Pair), E }
+fn main() -> int {
+    let w = W(Pair { a: 30, b: 12 });
+    match w { W(p) -> print(p.a + p.b), E -> print(0) }
+    0
+}
+"""
+
+
+def test_unique_box_freed_at_frame_exit_and_boxview_elides_extraction():
+    # `w` is only ever matched in its own frame: its payload box is uniquely
+    # owned and freed on the ret path.  The extracted `p` is only read, so
+    # it becomes a BOX VIEW (GEP reads through the box pointer) instead of
+    # an aggregate copied out.
+    ir = llvm_from_source(_UNIQUE_BOX_SRC)
+    assert count_placeholders(ir) == 0
+    assert re.search(
+        r"call ptr @malloc\(i64 16\)  ; boxed struct:Pair payload "
+        r"\(unique: freed at frame exit\)", ir)
+    assert re.search(r"call void @free\(ptr %t\d+\)  ; unique box:", ir)
+    assert "; elide-copy: variant_field" in ir
+    # the view really skips the copy: no %struct.Pair load feeds a %sv slot
+    assert not re.search(r"store %struct\.Pair %t\d+, ptr %sv\.", ir)
+
+
+@needs_clang
+@needs_asan
+def test_native_unique_box_fully_leak_checked_under_asan(tmp_path):
+    # THE INCREMENT-8 BOX PROOF: full leak checking — exit 0 proves the
+    # unique box is freed exactly once, after its last (box-view) read.
+    ir = assert_native_matches_interp_asan(_UNIQUE_BOX_SRC, tmp_path)
+    assert "; unique box:" in ir
+
+
+def test_shared_box_still_leaks_by_design():
+    # The list is PASSED to sum(): a callee could retain its copy (e.g. in
+    # a heap closure env), so uniqueness is unprovable and every box stays
+    # leaked — the honest boundary of the conservative class.
+    ir = llvm_from_source(_CONS_SUM_SRC)
+    assert count_placeholders(ir) == 0
+    assert "unique: freed at frame exit" not in ir
+    assert "call void @free" not in ir
+
+
+def test_examples_elision_census_does_not_regress():
+    # Elided copies across the accepted examples, pinned via the
+    # `; elide-copy:` IR markers: 11 param byval copies + 11 variant_field
+    # extraction copies (linked_list.mx dominates) at increment 8.
+    total = 0
+    for path in _example_files():
+        ir = llvm_from_source(path.read_text())
+        total += len(re.findall(r"; elide-copy:", ir))
+    assert total >= 22
+
+
 def test_examples_define_census_does_not_regress():
     # Aggregate emission census across all accepted examples: the number of
     # real defines must not regress below the increment-6 level (increment 3
@@ -2476,7 +2729,8 @@ def test_examples_define_census_does_not_regress():
     # 7's native effects lifted every suspending function that stays in
     # word kinds — all of 02_effects_and_handlers (except the generic
     # `map` helper) and effects.mx, plus effectful helpers elsewhere —
-    # landing at 61.
+    # landing at 61.  Increment 8 (reclamation + copy elision) changes
+    # memory behavior only, never coverage: still 61.
     total_defines = 0
     for path in _example_files():
         ir = llvm_from_source(path.read_text())
