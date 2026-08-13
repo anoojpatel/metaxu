@@ -4693,6 +4693,60 @@ fn main() -> int {
 """, tmp_path)
 
 
+_STD_STREAM_FULL_SRC = """
+from std.stream import Emit, Loop, iota, emit_vec, iter, for_, fold, sum,
+    product, count, collect, all_of, any_of, map, filter, take, skip, chain;
+fn main() -> int {
+    let s = filter(map(chain(iota(6), take(iota(9), 3)), fn(x: int) -> x * 2),
+                   fn(x: int) -> x > 4);
+    print(sum(s));
+    print(product(take(iota(5), 3)));
+    print(count(skip(iota(9), 5)));
+    iter(iota(3), fn(x) { print(x) });
+    let v = collect(iota(4));
+    print(len(v));
+    print(sum(emit_vec(v)));
+    if all_of(iota(4), fn(x: int) -> x < 9) { print(1) } else { print(0) };
+    if any_of(iota(4), fn(x: int) -> x > 2) { print(1) } else { print(0) };
+    let mut acc = 0;
+    for_(iota(10), fn(x: int) {
+        if x > 4 { perform Loop.break_() } else { () };
+        acc = acc + x
+    });
+    print(acc);
+    0
+}
+"""
+
+
+def test_std_stream_full_surface_census():
+    # When a program exercises the whole stdlib surface, EVERY std.stream
+    # function emits except `find` (its Option handle value is an enum
+    # crossing the effect boundary — aggregate boxing across scopes stays
+    # honestly demoted).
+    ir = llvm_from_source(_STD_STREAM_FULL_SRC)
+    for fn in ("iota", "emit_range", "emit_vec", "iter", "for_", "fold",
+               "sum", "product", "count", "collect", "all_of", "any_of",
+               "map", "filter", "take", "skip", "chain"):
+        assert re.search(
+            rf"^define (?:i64|void|ptr|double) @mx_std_stream_{fn}\(",
+            ir, re.M), fn
+    # The module carries every std.stream function; the only placeholders
+    # are find + its two handle subfunctions (Option across the boundary).
+    assert count_placeholders(ir) == 3
+    assert re.search(r"@mx_std_stream_find: placeholder", ir)
+    assert re.search(
+        r"handle value .* of kind enum:Option.* cannot cross the effect "
+        r"boundary", ir)
+
+
+@needs_clang
+def test_native_std_stream_full_surface_differential(tmp_path):
+    # The capstone: chain/map/filter/take/skip feeding sum/product/count/
+    # iter/collect/emit_vec/all_of/any_of/for_, all natively, one binary.
+    assert_native_matches_interp(_STD_STREAM_FULL_SRC, tmp_path)
+
+
 @needs_asan
 def test_native_std_stream_asan_no_uaf(tmp_path):
     # Heap closure envs, mutable-capture cells and effect scopes: the
