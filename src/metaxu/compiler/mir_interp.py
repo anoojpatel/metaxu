@@ -28,6 +28,8 @@ from queue import SimpleQueue
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from .mir import MirBlock, MirFunc
+from .desugar import IMPL_SEP, parse_impl_method_name
+from .hir import STATIC_CALL_PREFIX, TRAIT_CALL_PREFIX
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +224,12 @@ class MirInterpreter:
         # each is {"id", "effect", "cases": {op: (param, fn_name)}, "captured"}
         self._mir_handler_frames: List[Dict[str, Any]] = []
         self._next_frame_id: int = 1
+        # Trait impl index built from mangled function names at load():
+        # method -> type_name -> {trait_name: func_name}. Dispatch is on the
+        # receiver's RUNTIME type name (MxStruct.name / MxVariant.enum_name /
+        # scalar type names) — the documented v1 choice: no static receiver
+        # types needed, generics dispatch on the head type constructor.
+        self._impl_index: Dict[str, Dict[str, Dict[str, str]]] = {}
         self._register_builtins()
 
     # ------------------------------------------------------------------
@@ -231,6 +239,11 @@ class MirInterpreter:
     def load(self, funcs: Sequence[MirFunc]) -> None:
         for f in funcs:
             self._funcs[f.name] = f
+            parsed = parse_impl_method_name(f.name)
+            if parsed is not None:
+                trait_name, type_name, method = parsed
+                by_type = self._impl_index.setdefault(method, {})
+                by_type.setdefault(type_name, {})[trait_name] = f.name
 
     def register_effect_handler(self, effect_name: str, effect_class: str,
                                   fn: Callable[[str, list[Any], MxContinuation], Any]) -> None:
@@ -468,6 +481,15 @@ class MirInterpreter:
         elif kind == "call":
             callee_name: str = rhs[1]
             arg_vals = [self._lookup(a, env, f) for a in args]
+            # Trait method call: dispatch on the receiver's runtime type.
+            if callee_name.startswith(TRAIT_CALL_PREFIX):
+                return self._dispatch_trait_call(
+                    callee_name[len(TRAIT_CALL_PREFIX):], arg_vals)
+            # Static impl-method call: `Type.method(args)` — resolved by the
+            # (type, method) pair, no receiver involved.
+            if callee_name.startswith(STATIC_CALL_PREFIX):
+                type_name, _, method = callee_name[len(STATIC_CALL_PREFIX):].partition(IMPL_SEP)
+                return self._dispatch_static_call(type_name, method, arg_vals)
             # A local bound to a closure value (`let g = fn(y) ...; g(2)`, or a
             # closure received as a parameter) shadows funcs/builtins: call the
             # closure's MirFunc with its captured env seeding the frame.
@@ -684,6 +706,72 @@ class MirInterpreter:
             raise InterpError(f"Unknown rhs kind: {kind!r}")
 
     # ------------------------------------------------------------------
+    # Trait method dispatch (runtime, on the receiver's type name)
+    # ------------------------------------------------------------------
+
+    def _dispatch_trait_call(self, method: str, arg_vals: List[Any]) -> Any:
+        """Resolve `recv.method(args)` against loaded __impl$Trait$Type$method
+        functions using the receiver's runtime type name.
+
+        Resolution order:
+          1. impl function for the receiver's exact type name (then a
+             case-insensitive match, so `implement Show for string` finds
+             String receivers);
+          2. builtin of the same name (to_string/len keep working for types
+             without a user impl);
+          3. plain user function of the same name;
+          4. clear InterpError (unimplemented / ambiguous).
+        """
+        by_type = self._impl_index.get(method)
+        recv_ty: Optional[str] = None
+        if arg_vals:
+            recv_ty = _runtime_type_name(arg_vals[0])
+            if by_type is not None:
+                traits = by_type.get(recv_ty)
+                if traits is None:
+                    low = recv_ty.lower()
+                    traits = next(
+                        (t for k, t in by_type.items() if k.lower() == low), None)
+                if traits:
+                    if len(traits) > 1:
+                        opts = ", ".join(
+                            f"{tr} ({fn})" for tr, fn in sorted(traits.items()))
+                        raise InterpError(
+                            f"Ambiguous trait method call: {method!r} on type "
+                            f"{recv_ty!r} is implemented by multiple traits: {opts}")
+                    fname = next(iter(traits.values()))
+                    return self._call_func(self._funcs[fname], arg_vals, {})
+        # Fallbacks: builtin method, then a plain function of the same name.
+        if method in self._builtins:
+            return self._builtins[method](*arg_vals)
+        target = self._funcs.get(method)
+        if target is not None:
+            return self._call_func(target, arg_vals, {})
+        if by_type:
+            impl_types = ", ".join(sorted(by_type))
+            raise InterpError(
+                f"Trait method {method!r} is not implemented for type "
+                f"{recv_ty!r} (implementations exist for: {impl_types})")
+        raise InterpError(
+            f"Trait method {method!r} has no implementation for any type "
+            f"(receiver type: {recv_ty!r})")
+
+    def _dispatch_static_call(self, type_name: str, method: str,
+                              arg_vals: List[Any]) -> Any:
+        """Resolve `Type.method(args)` against __impl$Trait$Type$method funcs."""
+        traits = self._impl_index.get(method, {}).get(type_name)
+        if traits:
+            if len(traits) > 1:
+                opts = ", ".join(f"{tr} ({fn})" for tr, fn in sorted(traits.items()))
+                raise InterpError(
+                    f"Ambiguous static method call: {method!r} on type "
+                    f"{type_name!r} is implemented by multiple traits: {opts}")
+            fname = next(iter(traits.values()))
+            return self._call_func(self._funcs[fname], arg_vals, {})
+        raise InterpError(
+            f"No implementation of method {method!r} for type {type_name!r}")
+
+    # ------------------------------------------------------------------
     # Builtins
     # ------------------------------------------------------------------
 
@@ -703,6 +791,25 @@ class MirInterpreter:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _runtime_type_name(v: Any) -> str:
+    """Type name of a runtime value, as used for trait impl dispatch."""
+    if isinstance(v, MxStruct):
+        return v.name
+    if isinstance(v, MxVariant):
+        return v.enum_name
+    if isinstance(v, bool):
+        return "Bool"
+    if isinstance(v, int):
+        return "Int"
+    if isinstance(v, float):
+        return "Float"
+    if isinstance(v, str):
+        return "String"
+    if isinstance(v, MxUnit):
+        return "Unit"
+    return type(v).__name__
+
 
 def _is_truthy(val: Any) -> bool:
     if isinstance(val, bool):

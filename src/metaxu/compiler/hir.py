@@ -9,9 +9,22 @@ from .constraints import ClassConstraint
 from . import mutaxu_ast as mast
 import metaxu.metaxu_ast as fast
 
+from .desugar import IMPL_SEP, parse_impl_method_name
+
 # Methods that are dispatched as interpreter builtins with the receiver as
 # first argument (`x.to_string()` -> to_string(x)).
 _BUILTIN_METHODS = frozenset({"to_string", "len"})
+
+# Callee-name prefix marking a runtime-dispatched trait method call:
+# `recv.m(args)` lowers to Call(callee="__trait$m", operands=(recv, *args))
+# and the MIR interpreter picks the impl function matching the receiver's
+# runtime type name (falling back to builtins, then plain functions).
+TRAIT_CALL_PREFIX = f"__trait{IMPL_SEP}"
+
+# Callee-name prefix for a static impl-method call `Type.m(args)` (no
+# receiver): "__static$Type$m". The interpreter resolves it against the
+# loaded __impl$Trait$Type$m functions for that type name.
+STATIC_CALL_PREFIX = f"__static{IMPL_SEP}"
 
 
 @dataclass(slots=True)
@@ -119,6 +132,12 @@ class HIRBuilder:
         self._effect_op_names: set[str] = set()
         # Enum variant constructors: variant_name -> enum_name
         self._variant_to_enum: dict[str, str] = {}
+        # Trait method names: declared in traits (InterfaceDefinition) or
+        # provided by an implement block (mangled __impl$... function names).
+        self._trait_method_names: set[str] = set()
+        # Type names with impl methods (targets of implement blocks), used to
+        # recognize static calls `Type.method(args)`.
+        self._impl_type_names: set[str] = set()
 
     def build(self, root: mast.AstNode) -> list[HFun]:
         funcs: list[HFun] = []
@@ -134,6 +153,7 @@ class HIRBuilder:
 
         # Collect effect operation names so bare FunctionCall(name=op) can be identified as Perform
         self._effect_op_names: set[str] = set()
+        self._trait_method_names = set()
         for orig in self.id_map.values():
             if isinstance(orig, fast.EffectDeclaration):
                 for op in (getattr(orig, 'operations', []) or []):
@@ -145,6 +165,19 @@ class HIRBuilder:
                     vname = getattr(v, 'name', None)
                     if vname is not None:
                         self._variant_to_enum[str(vname)] = ename
+            # Trait method names: from trait declarations...
+            if isinstance(orig, fast.InterfaceDefinition):
+                for m in (getattr(orig, 'methods', []) or []):
+                    mname = getattr(m, 'name', None)
+                    if mname is not None:
+                        self._trait_method_names.add(str(mname))
+            # ...and from desugared implement-block functions (__impl$T$Ty$m),
+            # so impl-only methods dispatch even without a trait declaration.
+            if isinstance(orig, fast.FunctionDeclaration):
+                parsed = parse_impl_method_name(str(getattr(orig, 'name', '') or ''))
+                if parsed is not None:
+                    self._trait_method_names.add(parsed[2])
+                    self._impl_type_names.add(parsed[1])
 
         def visit(n: mast.AstNode) -> None:
             orig = self.id_map.get(n.node_id)
@@ -535,9 +568,22 @@ class HIRBuilder:
                 return self._mk_hexpr(frozen_ctx.node_id, 'Expr', ty, frozen_ctx.span,
                                       op='MakeVariant', enum_name=str(parts[0]),
                                       variant_name=str(parts[1]), operands=tuple(arg_exprs))
+            # Trait method call on a named receiver: `d.speak()` (dispatch on
+            # the receiver's runtime type; checked BEFORE builtin methods so a
+            # user impl of e.g. to_string wins for its receiver type, with the
+            # builtin as runtime fallback for everything else).
             # Builtin method call on a value: `x.to_string()` — lower to a
             # call with the receiver (Var or chained FieldGet) as first arg.
-            if len(parts) >= 2 and str(parts[-1]) in _BUILTIN_METHODS:
+            last = str(parts[-1])
+            # Static impl-method call on the type itself: `Buffer.new(1024)`.
+            if (len(parts) == 2 and str(parts[0]) in self._impl_type_names
+                    and last in self._trait_method_names):
+                return self._mk_hexpr(frozen_ctx.node_id, 'Expr', ty, frozen_ctx.span,
+                                      op='Call',
+                                      callee=f"{STATIC_CALL_PREFIX}{parts[0]}{IMPL_SEP}{last}",
+                                      operands=tuple(arg_exprs))
+            if len(parts) >= 2 and (last in self._trait_method_names
+                                    or last in _BUILTIN_METHODS):
                 recv: HExpr = self._mk_hexpr(frozen_ctx.node_id, 'Expr', ty,
                                              frozen_ctx.span, op='Var',
                                              var_name=str(parts[0]))
@@ -545,8 +591,10 @@ class HIRBuilder:
                     recv = self._mk_hexpr(frozen_ctx.node_id, 'Expr', ty,
                                           frozen_ctx.span, op='FieldGet',
                                           base=recv, field_name=str(fname))
+                callee = (TRAIT_CALL_PREFIX + last
+                          if last in self._trait_method_names else last)
                 return self._mk_hexpr(frozen_ctx.node_id, 'Expr', ty, frozen_ctx.span,
-                                      op='Call', callee=str(parts[-1]),
+                                      op='Call', callee=callee,
                                       operands=(recv, *arg_exprs))
             # Treat as a plain call with dotted callee name
             callee = '.'.join(str(p) for p in parts)
@@ -564,12 +612,14 @@ class HIRBuilder:
                 if he is not None:
                     arg_exprs.append(he)
             ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, 'Unknown'))
+            callee = (TRAIT_CALL_PREFIX + method
+                      if method in self._trait_method_names else method)
             if recv_he is not None:
                 return self._mk_hexpr(frozen_ctx.node_id, 'Expr', ty, frozen_ctx.span,
-                                      op='Call', callee=method,
+                                      op='Call', callee=callee,
                                       operands=(recv_he, *arg_exprs))
             return self._mk_hexpr(frozen_ctx.node_id, 'Expr', ty, frozen_ctx.span,
-                                  op='Call', callee=method, operands=tuple(arg_exprs))
+                                  op='Call', callee=callee, operands=tuple(arg_exprs))
 
         # PerformEffect: perform effect_name(args)
         if isinstance(orig, fast.PerformEffect):
