@@ -57,6 +57,19 @@ to it:
   * sqrt/sin/cos remain plain libm externs (documented choice, see
     llvm_run) — no wrappers, no intrinsics.
 
+Increment 6 replaces the per-(enum, slot) payload kind model with
+PER-VARIANT, PER-VALUE payload typing so one enum can hold different
+payload types in the same slot index — across variants (Leaf(int) |
+Fork(Tree, Tree)) and across generic instantiations of one variant
+(Some(3) and Some(node) in one module, linked_list.mx's reality).  See the
+REFINED ENUM KINDS section below.  The MIR ``variant_field`` op now
+carries the pattern's ctor name as a third element (lower_hir_to_mir;
+interpreter and CLIF ignore it) so the backend knows WHICH variant's slot
+a read refers to — chosen over recovering the variant from the dominating
+tag test because compile_pattern interleaves nested sub-pattern blocks
+between the tag branch and later slot reads, making a dominator trace
+fragile exactly where it matters (nested ctor patterns).
+
 Everything else — suspending functions (perform/resume/handle_scope: the
 CPS lowering lives in codegen_clif for now), try_scope,
 fixed-size vector literals/comprehensions/slices — is emitted as a
@@ -172,18 +185,56 @@ ENUM VARIANTS (increment 3) are tagged unions:
     "tag literal" and is emitted as its integer tag — the string never
     reaches native code.  A tag-vs-string comparison that does not fit
     that shape demotes via kind conflict rather than guessing.
-  * payload slot kinds are unified per (enum, slot index) across ALL
-    variants, and deliberately one-way (stores accumulate into the cell,
-    reads take the cell's kind): unlike function params, the type system
-    allows two variants of one enum to put genuinely different types in
-    the same slot, so a store whose final kind differs from the cell kind
-    demotes ("heterogeneous payload slot") instead of coercing.
   * variant values are aggregates with the same value semantics as
     structs: entry-block alloca per variant-kinded variable, aggregate
     copies, ptr + callee byval-copy across calls, sret-style returns.
     There is no @global form (make_variant carries no locality).
 
-BOXED AGGREGATE PAYLOADS (increment 4): a payload slot whose unified kind
+REFINED ENUM KINDS (increment 6) type payload slots per variant and per
+VALUE, replacing the old module-wide per-(enum, slot) cells:
+  * an enum value's kind carries a payload REFINEMENT recording the actual
+    representation of every variant any flow into it can construct:
+    ``enum:Option{None:;Some:struct:Node}`` (canonical form: variants
+    sorted, slots comma-separated).  make_variant refines its destination
+    with its own arg kinds; refinements join pointwise per (variant, slot)
+    along every dataflow edge (copies, params/returns, struct fields,
+    captures) — the same monotone fixpoint as all other kinds.  Slot kinds
+    inside a refinement are NAME-ONLY (a nested enum appears as ``enum:F``
+    with no braces), which keeps refinement strings finite for recursive
+    enums.
+  * ``variant_field`` reads its variant's slot kind out of the BASE
+    VALUE's refinement (the op names its variant, see above).  Different
+    variants — or different instantiations of one variant in different
+    values — can now disagree about a slot index; each value knows its own
+    representation.  Reading a variant absent from the refinement is a
+    dead arm (the refinement lists every constructible variant, so the
+    guarding tag test can never pass): scalar results emit a typed zero,
+    never a bogus aggregate read.
+  * SOUNDNESS: every dataflow edge except enum-in-enum nesting unifies
+    kinds two-way, so a reader's refinement is exactly the join over its
+    writers; the post-fixpoint make_variant check demotes any site whose
+    stored kind differs from that join ("heterogeneous payload slot ...
+    no coercion"), which now fires only for genuinely MERGED mixed flows
+    (e.g. one variable holding both Some(3) and Some(node)), not for
+    disjoint uses.
+  * enum-in-enum nesting is the one boundary where a value's refinement is
+    stripped (slot kinds are name-only): extraction therefore assumes the
+    CANONICAL representation — module-wide per-(enum, variant, slot) cells
+    joining every make_variant store — and demotes when any store
+    disagrees with the join (`mixed` cells: the nested enum's slot
+    representation is instantiation-dependent and was lost at the boxing
+    boundary).
+  * the union layout is unchanged and instantiation-independent:
+    ``%enum.E = { i64 tag, [N x i64] }`` with N the max payload arity over
+    all variants; every slot is an 8-byte cell (scalars inline, aggregates
+    as boxed pointers), so all refinements of one enum share one LLVM
+    type.  Boxing decisions are per (variant, slot) refinement kind.  The
+    emitted type comment documents each variant's canonical slot kinds and
+    flags mixed slots.
+
+BOXED AGGREGATE PAYLOADS (increment 4; since increment 6 decided per
+variant and per value, see REFINED ENUM KINDS below): a payload slot whose
+kind
 is itself a struct or enum stores a HEAP POINTER to a boxed copy of the
 aggregate (the 8-byte slot holds the ptr), which makes recursive enums
 (linked lists, trees) representable with a finite layout:
@@ -386,6 +437,11 @@ _HEADER = (
     ";   enums -> %enum.E = { i64 tag, [N x i64] payload } tagged unions,\n"
     ";   variant names mapped to dense integer tags (module-wide table in a\n"
     ";   comment below); pattern tag tests compare integers, never strings;\n"
+    ";   payload slots are typed PER VARIANT and PER VALUE (each enum\n"
+    ";   value's kind carries a refinement recording its constructible\n"
+    ";   variants' slot representations), so one slot index may hold\n"
+    ";   different types in different variants or instantiations; merged\n"
+    ";   flows that mix representations inside one value still demote;\n"
     ";   closures -> %mx.closure = { ptr fn, ptr env } pairs over per-lambda\n"
     ";   stack %env.L structs; lambdas take env as a leading param;\n"
     ";   escaping closures (returned / created in a loop) malloc their env\n"
@@ -457,7 +513,49 @@ def _is_enum(kind: str) -> bool:
 
 
 def _enum_name(kind: str) -> str:
-    return kind[len(_ENUM_PREFIX):]
+    """The enum's name, with any payload refinement suffix stripped
+    ('enum:Option{None:;Some:i64}' -> 'Option')."""
+    base = kind[len(_ENUM_PREFIX):]
+    brace = base.find("{")
+    return base if brace < 0 else base[:brace]
+
+
+def _strip_refinement(kind: str) -> str:
+    """The name-only form of a kind, as stored in module-wide variant cells
+    and inside refinement strings: refined enum kinds drop their refinement;
+    every other kind is unchanged.  Keeping nested enum references name-only
+    is what keeps refinement strings finite for recursive enums."""
+    if _is_enum(kind):
+        return _ENUM_PREFIX + _enum_name(kind)
+    return kind
+
+
+def _enum_refinement(kind: str) -> Optional[Dict[str, Tuple[str, ...]]]:
+    """Parse an enum kind's per-variant payload refinement, or None when the
+    kind is name-only.  Format (canonical, variants sorted):
+    'enum:E{VarA:kind0,kind1;VarB:}' — slot kinds are themselves name-only
+    (no nested braces), so plain ;/,-splitting is exact."""
+    if not _is_enum(kind):
+        return None
+    base = kind[len(_ENUM_PREFIX):]
+    brace = base.find("{")
+    if brace < 0:
+        return None
+    body = base[brace + 1:-1]
+    ref: Dict[str, Tuple[str, ...]] = {}
+    if not body:
+        return ref
+    for part in body.split(";"):
+        vname, _, slots = part.partition(":")
+        ref[vname] = tuple(s for s in slots.split(",") if s)
+    return ref
+
+
+def _format_enum_kind(ename: str, ref: Dict[str, Tuple[str, ...]]) -> str:
+    """The canonical refined enum kind string (variants sorted by name), so
+    kind-string equality is representation equality."""
+    body = ";".join(f"{v}:{','.join(ref[v])}" for v in sorted(ref))
+    return f"{_ENUM_PREFIX}{ename}{{{body}}}"
 
 
 def _is_closure(kind: str) -> bool:
@@ -515,7 +613,14 @@ def _llcell(kind: str) -> str:
 def _join(a: str, b: str) -> str:
     """Kind lattice: i64 is bottom; f64/str/struct:T are incomparable tops.
     Vec kinds join pointwise on their element kind (vec:i64 is the vec
-    bottom: a fresh Vec.new before any push)."""
+    bottom: a fresh Vec.new before any push).  Refined enum kinds of the
+    same enum join their refinements pointwise per (variant, slot): the
+    refinement records the value's actual payload REPRESENTATION, so a
+    per-slot conflict (or a variant-arity mismatch) conflicts the whole
+    kind.  A name-only enum kind meeting a refined one is a CONFLICT, not a
+    bottom: name-only enum kinds never arise as value kinds in well-formed
+    flows (make_variant and variant_field always produce refined kinds), so
+    treating one as 'no information' could let two representations alias."""
     if a == b:
         return a
     if a == I64:
@@ -525,6 +630,26 @@ def _join(a: str, b: str) -> str:
     if _is_vec(a) and _is_vec(b):
         e = _join(_vec_elem(a), _vec_elem(b))
         return CONFLICT if e == CONFLICT else _vec_of(e)
+    if _is_enum(a) and _is_enum(b):
+        ename = _enum_name(a)
+        if ename != _enum_name(b):
+            return CONFLICT
+        ra, rb = _enum_refinement(a), _enum_refinement(b)
+        if ra is None or rb is None:
+            return CONFLICT
+        merged: Dict[str, Tuple[str, ...]] = dict(ra)
+        for v, slots in rb.items():
+            cur = merged.get(v)
+            if cur is None:
+                merged[v] = slots
+                continue
+            if len(cur) != len(slots):
+                return CONFLICT
+            js = tuple(_join(x, y) for x, y in zip(cur, slots))
+            if CONFLICT in js:
+                return CONFLICT
+            merged[v] = js
+        return _format_enum_kind(ename, merged)
     return CONFLICT
 
 
@@ -978,25 +1103,53 @@ class _VariantTable:
     tags: Dict[str, int] = field(default_factory=dict)
     # enum name ('' = anon) -> payload slot count (max over its variants).
     payload_max: Dict[str, int] = field(default_factory=dict)
-    # (enum name, slot index) -> scalar kind.  One-way cells: stores
-    # accumulate in, reads take the cell kind; a store whose final kind
-    # differs from the cell demotes instead of coercing (two variants of one
-    # enum may legally put different types in the same slot).
-    cells: Dict[Tuple[str, int], str] = field(default_factory=dict)
-    # enum name -> variant names seen in make_variant ops (for the doc line).
+    # (enum name, variant name, slot index) -> NAME-ONLY kind: the join of
+    # every make_variant store into that variant's slot module-wide.  These
+    # cells are the CANONICAL representation used when a value crosses a
+    # nesting boundary (an enum boxed inside another enum's payload slot
+    # loses its per-value refinement); they are only sound to read through
+    # when no store disagrees with the join (see `mixed`).
+    cells: Dict[Tuple[str, str, int], str] = field(default_factory=dict)
+    # enum name -> variant names seen in make_variant ops.
     variants_of: Dict[str, Set[str]] = field(default_factory=dict)
+    # (enum name, variant name) -> payload arity from make_variant sites.
+    arity: Dict[Tuple[str, str], int] = field(default_factory=dict)
+    # enum name -> reason (inconsistent construction arity etc.).
+    bad: Dict[str, str] = field(default_factory=dict)
+    # (enum, variant, slot) cells where some post-fixpoint make_variant
+    # store kind differs from the joined cell kind: the slot's native
+    # representation is per-value (instantiation-dependent), so reading it
+    # through the canonical cells would guess.  Filled by the module driver
+    # after the kind fixpoint.
+    mixed: Set[Tuple[str, str, int]] = field(default_factory=set)
 
-    def cell_kind(self, ename: str, idx: int) -> str:
-        return self.cells.get((ename, idx), I64)
+    def cell_kind(self, ename: str, vname: str, idx: int) -> str:
+        return self.cells.get((ename, vname, idx), I64)
 
-    def mark_cell(self, ename: str, idx: int, kind: str) -> bool:
-        key = (ename, idx)
+    def mark_cell(self, ename: str, vname: str, idx: int, kind: str) -> bool:
+        key = (ename, vname, idx)
         cur = self.cells.get(key, I64)
         nk = _join(cur, kind)
         if nk != cur:
             self.cells[key] = nk
             return True
         return False
+
+    def canon(self, ename: str) -> Dict[str, Tuple[str, ...]]:
+        """The canonical refinement of an enum: every constructed variant,
+        each slot at its module-wide cell kind.  Monotone over the fixpoint
+        (variants_of/arity are fixed at table build; cells only promote)."""
+        ref: Dict[str, Tuple[str, ...]] = {}
+        for v in self.variants_of.get(ename, ()):
+            n = self.arity.get((ename, v), 0)
+            ref[v] = tuple(self.cell_kind(ename, v, i) for i in range(n))
+        return ref
+
+    def canon_kind(self, ename: str) -> str:
+        return _format_enum_kind(ename, self.canon(ename))
+
+    def mixed_slots_of(self, ename: str) -> List[Tuple[str, str, int]]:
+        return sorted(k for k in self.mixed if k[0] == ename)
 
 
 def _build_variant_table(funcs: Sequence[MirFunc],
@@ -1013,6 +1166,15 @@ def _build_variant_table(funcs: Sequence[MirFunc],
                 table.variants_of.setdefault(ename, set()).add(vname)
                 table.payload_max[ename] = max(
                     table.payload_max.get(ename, 0), len(op[3]))
+                key = (ename, vname)
+                if key not in table.arity:
+                    table.arity[key] = len(op[3])
+                elif table.arity[key] != len(op[3]):
+                    table.bad.setdefault(
+                        ename,
+                        f"variant {vname!r} of enum {ename or 'anon'!r} "
+                        f"constructed with inconsistent payload arities "
+                        f"({table.arity[key]} vs {len(op[3])})")
     for info in infos:
         names.update(info.tag_consts.values())
     table.tags = {n: i for i, n in enumerate(sorted(names))}
@@ -1462,20 +1624,44 @@ def _infer_kinds(info: _Info, sigs: Dict[str, _Sig], structs: _StructTable,
                                 changed = mark(a, pk) or changed
                             changed = mark(dst, sig.ret) or changed
                 elif rk == "make_variant":
-                    changed = mark(dst, _ENUM_PREFIX + rhs[1]) or changed
-                    # One-way: store kinds accumulate into the payload cell;
-                    # the post-fixpoint check demotes on store/cell mismatch
-                    # rather than coercing the store.
+                    ename, vname = rhs[1], rhs[2]
+                    # The dst kind carries this site's refinement: the actual
+                    # per-slot representation of the value built here (nested
+                    # enum payloads are recorded name-only; their contents go
+                    # through the canonical module cells instead).
+                    site_ref = {vname: tuple(_strip_refinement(get(a))
+                                             for a in args)}
+                    changed = mark(
+                        dst, _format_enum_kind(ename, site_ref)) or changed
+                    # One-way: store kinds also accumulate into the
+                    # module-wide per-(variant, slot) cells backing canon();
+                    # the driver marks cells `mixed` post-fixpoint when a
+                    # store disagrees with the join.
                     for i, a in enumerate(args):
-                        if variants.mark_cell(rhs[1], i, get(a)):
+                        if variants.mark_cell(ename, vname, i,
+                                              _strip_refinement(get(a))):
                             changed = global_changed = True
                 elif rk == "variant_tag":
                     pass  # dst is the integer tag: i64 (the default)
                 elif rk == "variant_field":
                     bk = get(args[0])
-                    if _is_enum(bk):
-                        changed = mark(
-                            dst, variants.cell_kind(_enum_name(bk), rhs[1])) or changed
+                    vname = rhs[2] if len(rhs) > 2 else None
+                    if _is_enum(bk) and vname is not None:
+                        ref = _enum_refinement(bk) or {}
+                        slots = ref.get(vname)
+                        if slots is not None and rhs[1] < len(slots):
+                            sk = slots[rhs[1]]
+                            if _is_enum(sk):
+                                # Nested enum extraction crosses a boxing
+                                # boundary: the boxed value's own refinement
+                                # was stripped, so the result assumes the
+                                # canonical module-wide representation (the
+                                # consistency check demotes if any store
+                                # disagrees with it).
+                                sk = variants.canon_kind(_enum_name(sk))
+                            changed = mark(dst, sk) or changed
+                        # variant absent from the refinement: the arm is
+                        # dead (no flow constructs it); dst stays at bottom.
                 elif rk == "make_closure":
                     changed = mark(dst, _CLOSURE_PREFIX + rhs[1]) or changed
                     for (cn, vn) in args:
@@ -1767,15 +1953,42 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                     elif rhs[1] not in structs.fields.get(sname, ()):
                         probs.append(f"struct {sname!r} has no field {rhs[1]!r}")
             elif rk == "make_variant":
-                ename = rhs[1]
+                ename, vname = rhs[1], rhs[2]
+                if ename in variants.bad:
+                    probs.append(variants.bad[ename])
+                    continue
+                dk = ty(dst)
+                ref = _enum_refinement(dk) if _is_enum(dk) else None
+                if ref is None or vname not in ref \
+                        or len(ref[vname]) != len(args):
+                    if dst in info.dead_results:
+                        continue
+                    probs.append(
+                        f"make_variant {vname!r} of enum {ename or 'anon'!r}: "
+                        f"destination kind {dk} lacks the variant's refinement")
+                    continue
                 for i, a in enumerate(args):
-                    ck = variants.cell_kind(ename, i)
-                    if ty(a) != ck and (ck in _SCALARS or _is_agg(ck)):
+                    sk = ref[vname][i]
+                    store_k = _strip_refinement(ty(a))
+                    if sk == CONFLICT or store_k == CONFLICT:
+                        probs.append(
+                            f"payload slot {i} of enum {ename or 'anon'!r} "
+                            f"variant {vname!r} has conflicting kinds")
+                    elif store_k != sk:
                         probs.append(
                             f"heterogeneous payload slot {i} of enum "
-                            f"{ename or 'anon'!r}: variant {rhs[2]!r} stores "
-                            f"{ty(a)}, the unified slot is {ck} (no coercion "
-                            "through tagged-union storage)")
+                            f"{ename or 'anon'!r}: variant {vname!r} stores "
+                            f"{store_k} where merged flows require {sk} (no "
+                            "coercion through tagged-union storage)")
+                    elif _is_closure(sk):
+                        probs.append(
+                            f"enum {ename or 'anon'!r} payload slot {i} holds "
+                            f"a closure ({sk}) (its env pointer may outlive "
+                            "the creating frame)")
+                    elif _is_agg(sk) and _kind_size(sk, structs, variants) is None:
+                        probs.append(
+                            f"enum {ename or 'anon'!r} payload slot {i} boxes "
+                            f"a value of {sk} whose layout is infinite")
             elif rk == "variant_tag":
                 if not _is_enum(ty(args[0])):
                     probs.append(
@@ -1787,18 +2000,74 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                 if not _is_enum(bk):
                     probs.append(
                         f"cannot determine enum type of {args[0]!r} for variant_field")
-                else:
-                    ename = _enum_name(bk)
-                    idx = rhs[1]
-                    # Patterns can name a payload slot no constructor fills
-                    # (dead arm); grow the union so the GEP stays in bounds.
-                    variants.payload_max[ename] = max(
-                        variants.payload_max.get(ename, 0), idx + 1)
-                    ck = variants.cell_kind(ename, idx)
-                    if ty(dst) != ck:
+                    continue
+                ename = _enum_name(bk)
+                idx = rhs[1]
+                vname = rhs[2] if len(rhs) > 2 else None
+                # Patterns can name a payload slot no constructor fills
+                # (dead arm); grow the union so the GEP stays in bounds.
+                variants.payload_max[ename] = max(
+                    variants.payload_max.get(ename, 0), idx + 1)
+                if ename in variants.bad:
+                    probs.append(variants.bad[ename])
+                    continue
+                if vname is None:
+                    probs.append(
+                        f"variant_field {idx} of enum {ename or 'anon'!r} "
+                        "carries no variant name (legacy MIR shape; payload "
+                        "slot kinds are per-variant)")
+                    continue
+                ref = _enum_refinement(bk)
+                if ref is None:
+                    probs.append(
+                        f"variant_field on enum value {args[0]!r} whose kind "
+                        f"{bk} has no payload refinement")
+                    continue
+                if vname not in ref or idx >= len(ref[vname]):
+                    # Dead arm: the refinement lists every variant any flow
+                    # into this value can construct, so this variant's tag
+                    # test can never pass here.  A scalar-shaped result is
+                    # emitted as a typed zero (never executed); an aggregate
+                    # result would need storage semantics we refuse to fake.
+                    if _is_agg(ty(dst)) and dst not in info.dead_results:
                         probs.append(
-                            f"variant_field {idx} of enum {ename or 'anon'!r}: "
-                            f"result {dst!r} is {ty(dst)}, slot is {ck}")
+                            f"variant_field {idx} of enum {ename or 'anon'!r} "
+                            f"variant {vname!r} reads an unconstructed "
+                            f"variant into aggregate kind {ty(dst)}")
+                    continue
+                sk = ref[vname][idx]
+                if _is_enum(sk):
+                    # Nested extraction reads through the canonical cells:
+                    # sound only when every store into the nested enum agrees
+                    # with them (otherwise the representation is per-value
+                    # and was lost at the boxing boundary).
+                    nested = _enum_name(sk)
+                    mixed = variants.mixed_slots_of(nested)
+                    if mixed:
+                        descr = ", ".join(
+                            f"{v}[{i}]" for (_e, v, i) in mixed)
+                        probs.append(
+                            f"variant_field {idx} of enum {ename or 'anon'!r} "
+                            f"variant {vname!r} extracts nested enum "
+                            f"{nested or 'anon'!r} whose payload slots "
+                            f"({descr}) have instantiation-dependent "
+                            "representations (lost at the boxing boundary)")
+                        continue
+                    sk = variants.canon_kind(nested)
+                if sk == CONFLICT:
+                    probs.append(
+                        f"variant_field {idx} of enum {ename or 'anon'!r} "
+                        f"variant {vname!r} has a conflicting slot kind")
+                elif _is_closure(sk):
+                    probs.append(
+                        f"enum {ename or 'anon'!r} payload slot {idx} holds "
+                        f"a closure ({sk}) (its env pointer may outlive the "
+                        "creating frame)")
+                elif ty(dst) != sk:
+                    probs.append(
+                        f"variant_field {idx} of enum {ename or 'anon'!r} "
+                        f"variant {vname!r}: result {dst!r} is {ty(dst)}, "
+                        f"slot is {sk}")
             elif rk == "make_closure":
                 lname = rhs[1]
                 for (cn, _vn) in args:
@@ -1845,23 +2114,35 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                     f"({fk}) (its env pointer may outlive the creating frame)")
             elif fk == CONFLICT:
                 probs.append(f"struct {sname!r} field {fn_!r} has conflicting kinds")
-    used_enums = {_enum_name(k) for k in kinds.values() if _is_enum(k)}
-    for ename in sorted(used_enums):
-        for i in range(variants.payload_max.get(ename, 0)):
-            ck = variants.cell_kind(ename, i)
-            if _is_closure(ck):
-                probs.append(
-                    f"enum {ename or 'anon'!r} payload slot {i} holds a "
-                    f"closure ({ck}) (its env pointer may outlive the "
-                    "creating frame)")
-            elif ck == CONFLICT:
-                probs.append(
-                    f"enum {ename or 'anon'!r} payload slot {i} has "
-                    "conflicting kinds")
-            elif _is_agg(ck) and _kind_size(ck, structs, variants) is None:
-                probs.append(
-                    f"enum {ename or 'anon'!r} payload slot {i} boxes a "
-                    f"value of {ck} whose layout is infinite")
+    # Enum payload slot validity (closures, conflicts, infinite layouts) is
+    # checked per-site above: at make_variant against the destination's
+    # refinement and at variant_field against the base's refinement / the
+    # canonical cells — module-wide cells no longer demote functions that
+    # only ever touch well-refined values of the enum.  Refined enum kinds
+    # reaching THIS function through its own values still need every slot of
+    # every refinement to be emittable (a refined kind can arrive through a
+    # signature without any local variant op).
+    for k in sorted(set(kinds.values())):
+        ref = _enum_refinement(k)
+        if not ref:
+            continue
+        ename = _enum_name(k)
+        for v in sorted(ref):
+            for i, sk in enumerate(ref[v]):
+                if _is_closure(sk):
+                    probs.append(
+                        f"enum {ename or 'anon'!r} payload slot {i} holds a "
+                        f"closure ({sk}) (its env pointer may outlive the "
+                        "creating frame)")
+                elif sk == CONFLICT:
+                    probs.append(
+                        f"enum {ename or 'anon'!r} variant {v!r} payload "
+                        f"slot {i} has conflicting kinds")
+                elif _is_agg(sk) and _kind_size(sk, structs, variants) is None:
+                    probs.append(
+                        f"enum {ename or 'anon'!r} variant {v!r} payload "
+                        f"slot {i} boxes a value of {sk} whose layout is "
+                        "infinite")
     # Captures this function loads from its own env must be liftable too.
     if info.is_lambda:
         for cap in info.env_captures:
@@ -2653,7 +2934,10 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                     lines.append(
                         f"  store {_llscalar(fk)} {use(opargs[1], lines)}, ptr {p}")
             elif rk == "make_variant":
-                # Tagged union: store the integer tag, then the payload slots.
+                # Tagged union: store the integer tag, then the payload slots
+                # at THIS variant's refined slot kinds (different variants —
+                # and different instantiations of one variant — may disagree
+                # about what a slot index holds).
                 ename, vname = rhs[1], rhs[2]
                 if dst not in aggset or not _is_enum(kind(dst)):
                     raise _Unsupported(
@@ -2661,12 +2945,18 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                 tagv = variants.tags.get(vname)
                 if tagv is None:
                     raise _Unsupported(f"no tag assigned for variant {vname!r}")
+                vref = _enum_refinement(kind(dst)) or {}
+                vslots = vref.get(vname)
+                if vslots is None or len(vslots) != len(opargs):
+                    raise _Unsupported(
+                        f"make_variant {vname!r} destination kind lacks the "
+                        "variant's refinement")
                 mod.used_enums.add(ename)
                 p = enum_gep(ename, struct_ref(dst), lines)
                 lines.append(
                     f"  store i64 {tagv}, ptr {p}  ; tag {vname}={tagv}")
                 for i, fv in enumerate(opargs):
-                    ck = variants.cell_kind(ename, i)
+                    ck = vslots[i]
                     p = enum_gep(ename, struct_ref(dst), lines, payload=i)
                     if _is_agg(ck):
                         # Boxed aggregate payload: malloc a write-once box,
@@ -2704,7 +2994,45 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                     raise _Unsupported(
                         f"variant_field of non-enum value {opargs[0]!r}")
                 ename = _enum_name(bk)
-                ck = variants.cell_kind(ename, rhs[1])
+                vname = rhs[2] if len(rhs) > 2 else None
+                vref = _enum_refinement(bk)
+                if vname is None or vref is None:
+                    raise _Unsupported(
+                        f"variant_field {rhs[1]} of enum {ename or 'anon'!r} "
+                        "without a variant refinement (legacy MIR shape)")
+                if vname not in vref or rhs[1] >= len(vref[vname]):
+                    # Dead arm: no flow into this value constructs vname (the
+                    # refinement lists every constructible variant), so the
+                    # guarding tag test can never pass and this read never
+                    # executes.  Emit a typed zero for scalar results;
+                    # aggregate results keep their (never-read) storage.
+                    if dst in aggset:
+                        lines.append(
+                            f"  ; dead arm: variant {vname!r} never "
+                            f"constructed for this value; {dst} left "
+                            "uninitialized (unreachable)")
+                    else:
+                        zk = kind(dst)
+                        if zk == F64:
+                            zv = _fmt_f64(0.0)
+                        elif zk == STR:
+                            zv = mod.intern_string("")
+                        elif _is_vec(zk):
+                            zv = "null"
+                        else:
+                            zv = "0"
+                        lines.append(
+                            f"  ; dead arm: variant {vname!r} never "
+                            "constructed for this value (unreachable)")
+                        setval(dst, zv, lines)
+                    continue
+                ck = vref[vname][rhs[1]]
+                if _is_enum(ck):
+                    # Nested extraction: the boxed value carries the
+                    # canonical module-wide representation (consistency
+                    # demoted any mixed slots), and kind(dst) is the
+                    # canonical refined kind of the same enum.
+                    ck = kind(dst) if _is_enum(kind(dst)) else ck
                 base = use(opargs[0], lines)
                 p = enum_gep(ename, base, lines, payload=rhs[1])
                 if _is_agg(ck):
@@ -2959,7 +3287,9 @@ def _emit_struct_types(structs: _StructTable, used: Set[str]) -> Optional[str]:
 
 
 def _emit_enum_types(variants: _VariantTable, used: Set[str]) -> Optional[str]:
-    """%enum.E tagged-union types plus the documented tag mapping."""
+    """%enum.E tagged-union types plus the documented tag mapping and the
+    per-variant payload slot kinds (canonical module-wide cells; slots whose
+    stores disagree across instantiations are flagged 'mixed per value')."""
     lines: List[str] = []
     if used and variants.tags:
         pairs = ", ".join(f"{n}={i}" for n, i in sorted(
@@ -2973,6 +3303,17 @@ def _emit_enum_types(variants: _VariantTable, used: Set[str]) -> Optional[str]:
         lines.append(
             f"{_enum_llname(ename)} = type {{ i64, [{n} x i64] }}"
             f"  ; tag + {n} payload slots" + (f"; tags: {tag_doc}" if tag_doc else ""))
+        for v in vnames:
+            arity = variants.arity.get((ename, v), 0)
+            slot_docs = []
+            for i in range(arity):
+                ck = variants.cell_kind(ename, v, i)
+                doc = f"boxed {ck}" if _is_agg(ck) else ck
+                if (ename, v, i) in variants.mixed:
+                    doc += " (mixed per value)"
+                slot_docs.append(doc)
+            lines.append(
+                f";   variant {v}({', '.join(slot_docs)})")
     return "\n".join(lines) if lines else None
 
 
@@ -3119,6 +3460,24 @@ def emit_llvm(funcs: Sequence[MirFunc]) -> str:
         if _is_closure(sig.ret):
             closures.heap_env.add(_closure_lambda(sig.ret))
 
+    # Mark module-wide variant cells whose stores disagree post-fixpoint:
+    # the joined cell kind is then NOT the representation every writer used
+    # (multi-instantiation slots like a generic Option holding ints in one
+    # use and structs in another), so nested extraction through the
+    # canonical cells must demote rather than guess.  Per-value refinements
+    # are unaffected — each value still knows its own representation.
+    for info in candidates:
+        kinds = kind_sets.get(info.f.name, {})
+        for b in info.f.blocks:
+            for op in b.ops:
+                if op[0] != "let" or len(op) != 4 or op[2][0] != "make_variant":
+                    continue
+                ename, vname = op[2][1], op[2][2]
+                for i, a in enumerate(op[3]):
+                    if _strip_refinement(kinds.get(a, I64)) != \
+                            variants.cell_kind(ename, vname, i):
+                        variants.mixed.add((ename, vname, i))
+
     # Post-fixpoint consistency; anything wrong becomes a placeholder reason.
     for info in candidates:
         kinds = kind_sets.get(info.f.name, {})
@@ -3208,8 +3567,9 @@ def emit_llvm(funcs: Sequence[MirFunc]) -> str:
                 elif _is_enum(fk):
                     more_enums.add(_enum_name(fk))
         for ename in mod.used_enums:
-            for i in range(variants.payload_max.get(ename, 0)):
-                ck = variants.cell_kind(ename, i)
+            for (e2, _v2, _i2), ck in variants.cells.items():
+                if e2 != ename:
+                    continue
                 if _kind_size(ck, structs, variants) is None:
                     continue
                 if _is_struct(ck):
