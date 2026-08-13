@@ -716,6 +716,26 @@ class HIRBuilder:
                                   handle_cases=tuple(case_triples),
                                   handle_body=body_he)
 
+        # TryCatch: try { body } catch e { handler } — delimited dynamic
+        # error recovery (docs/try_catch.md). Reuses the Handle field slots:
+        # handle_body is the try body, handle_cases holds the single catch
+        # arm as ("catch", (param,), body).
+        if isinstance(orig, fast.TryCatch):
+            body_node = getattr(orig, 'body', None)
+            catch_node = getattr(orig, 'catch_body', None)
+            body_he = self._from_orig_expr(body_node, ctx_for(body_node) if body_node is not None else frozen_ctx)
+            catch_he = self._from_orig_expr(catch_node, ctx_for(catch_node) if catch_node is not None else frozen_ctx)
+            param = str(getattr(orig, 'catch_name', None) or '_')
+            ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, 'Unknown'))
+            if body_he is None:
+                raise ValueError("try expression with no body")
+            if catch_he is None:
+                raise ValueError("catch block with no body")
+            return self._mk_hexpr(frozen_ctx.node_id, 'Expr', ty, frozen_ctx.span,
+                                  op='Try',
+                                  handle_cases=(("catch", (param,), catch_he),),
+                                  handle_body=body_he)
+
         # FieldAccess
         if isinstance(orig, fast.FieldAccess):
             base_node = getattr(orig, 'base', None) or getattr(orig, 'expression', None)

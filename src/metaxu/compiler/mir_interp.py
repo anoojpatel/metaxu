@@ -583,6 +583,27 @@ class MirInterpreter:
             if idx >= len(v.fields):
                 raise InterpError(f"variant_field: index {idx} out of range for {v!r}")
             return v.fields[idx]
+        elif kind == "try_scope":
+            # ("try_scope", body_fn, catch_fn) — delimited dynamic error
+            # recovery (docs/try_catch.md): run body; on InterpError anywhere
+            # in its extent, the catch subfunction receives the failure
+            # message and its value becomes the try expression's value.
+            # Scope-teardown control exceptions (_ScopeAbort) pass through.
+            body_fn = self._funcs.get(rhs[1])
+            catch_fn = self._funcs.get(rhs[2])
+            if body_fn is None or catch_fn is None:
+                raise InterpError(f"Missing try/catch function {rhs[1]!r}/{rhs[2]!r}")
+            captured: Dict[str, Any] = {}
+            for (cname, cval) in args:
+                if isinstance(cval, str):
+                    if cval in env:
+                        captured[cname] = env[cval]
+                else:
+                    captured[cname] = cval
+            try:
+                return self._call_func(body_fn, [], captured)
+            except InterpError as exc:
+                return self._call_func(catch_fn, [str(exc)], captured)
         elif kind == "handle_scope":
             # ("handle_scope", body_fn, effect_name, ((op, param, handler_fn), ...)),
             # args = ((name, val_name), ...) captured environment

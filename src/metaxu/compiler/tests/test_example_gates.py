@@ -36,6 +36,7 @@ MUST_RUN = [
     "examples/01_modes_and_references.mx",
     "examples/02_effects_and_handlers.mx",
     "examples/03_modules_and_imports.mx",
+    "examples/04_advanced_types.mx",
     "examples/10_traits_and_structs.mx",
     "examples/effects.mx",
     "examples/hello.mx",
