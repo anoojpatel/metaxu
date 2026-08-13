@@ -33,68 +33,111 @@ class DesugarContext:
 
 
 class DesugarPass:
-    """Base class for desugaring passes.
-    
+    """Base class for desugaring passes over the *mutable* parser AST.
+
     Each desugaring pass should inherit from this class and implement
-    the `apply` method to transform the AST.
+    the `apply` method to transform a single node. `apply_recursive`
+    walks the whole tree generically: every attribute of every node that
+    holds a Node (directly, or inside a list/tuple/dict) is rewritten,
+    and shared references (e.g. a statement present both in
+    `Block.statements` and `Block.children`) are replaced consistently.
+
+    Desugaring runs before freezing; frozen AST nodes are never mutated.
     """
-    
+
+    # Bookkeeping attributes that must not be traversed: `parent` points
+    # upward (would re-walk ancestors), `scope`/`location` are metadata.
+    _SKIP_FIELDS = frozenset({"parent", "scope", "location"})
+
     def apply(self, node: fast.Node, ctx: DesugarContext) -> fast.Node:
         """Apply desugaring transformation to a node.
-        
+
         Arguments:
             node: The AST node to transform
             ctx: Desugaring context
-            
+
         Returns:
             The transformed node (may be the same node if no transformation needed)
         """
         return node
-    
-    def apply_recursive(self, node: fast.Node, ctx: DesugarContext) -> fast.Node:
-        """Apply desugaring recursively to all child nodes."""
-        # Transform this node
-        node = self.apply(node, ctx)
-        
-        # Recursively transform children
-        # Note: frozen AST nodes are immutable, so we create new nodes
-        if hasattr(node, 'children') and node.children:
-            new_children = tuple(self.apply_recursive(child, ctx) for child in node.children)
-            # Create a new node with transformed children
-            # For frozen AST, we need to reconstruct the node
-            if hasattr(node, 'node_id') and hasattr(node, 'kind'):
-                # This is a frozen AST node - can't modify in place
-                # Just return the node as-is for now
-                # Full implementation would reconstruct the node
-                pass
-        
-        # Handle specific child attributes
-        if isinstance(node, fast.MatchExpression):
-            node.expression = self.apply_recursive(node.expression, ctx)
-            node.cases = [
-                (self.apply_recursive(pattern, ctx), self.apply_recursive(expr, ctx))
-                for pattern, expr in node.cases
-            ]
-        elif isinstance(node, fast.Block):
-            node.statements = [self.apply_recursive(stmt, ctx) for stmt in node.statements]
-        elif isinstance(node, fast.FunctionDeclaration):
-            node.params = [self.apply_recursive(param, ctx) for param in node.params]
-            node.body = self.apply_recursive(node.body, ctx)
-        
-        return node
+
+    def apply_recursive(
+        self,
+        node: fast.Node,
+        ctx: DesugarContext,
+        _memo: dict[int, Any] | None = None,
+    ) -> fast.Node:
+        """Apply desugaring recursively to a node and its entire subtree."""
+        if not isinstance(node, fast.Node):
+            return node
+        if _memo is None:
+            _memo = {}
+        key = id(node)
+        if key in _memo:
+            return _memo[key]
+
+        result = self.apply(node, ctx)
+        # Memoize both the original and the replacement so every reference to
+        # this node (attribute fields and `children` lists alike) resolves to
+        # the same transformed object, and so cycles (via any stray backrefs)
+        # terminate.
+        _memo[key] = result
+        _memo[id(result)] = result
+
+        self._recurse_fields(result, ctx, _memo)
+        return result
+
+    def _recurse_fields(self, node: fast.Node, ctx: DesugarContext, memo: dict[int, Any]) -> None:
+        """Generically rewrite all child-bearing fields of a node in place."""
+        for attr, value in list(vars(node).items()):
+            if attr in self._SKIP_FIELDS:
+                continue
+            new_value = self._rewrite_value(value, ctx, memo)
+            if new_value is not value:
+                # Write back via object.__setattr__-compatible plain setattr;
+                # name-mangled/underscored storage attrs (e.g. _body behind the
+                # FunctionDeclaration.body property) are updated directly.
+                setattr(node, attr, new_value)
+
+    def _rewrite_value(self, value: Any, ctx: DesugarContext, memo: dict[int, Any]) -> Any:
+        """Rewrite a field value, recursing through containers to find Nodes."""
+        if isinstance(value, fast.Node):
+            return self.apply_recursive(value, ctx, memo)
+        if isinstance(value, list):
+            new_items = [self._rewrite_value(item, ctx, memo) for item in value]
+            if any(new is not old for new, old in zip(new_items, value)):
+                return new_items
+            return value
+        if isinstance(value, tuple):
+            new_items = tuple(self._rewrite_value(item, ctx, memo) for item in value)
+            if any(new is not old for new, old in zip(new_items, value)):
+                return new_items
+            return value
+        if isinstance(value, dict):
+            new_map = {k: self._rewrite_value(v, ctx, memo) for k, v in value.items()}
+            if any(new_map[k] is not value[k] for k in value):
+                return new_map
+            return value
+        return value
 
 
 class IfDesugarPass(DesugarPass):
-    """Desugar if/else statements to pattern matching on Bool type.
-    
+    """Desugar if/else expressions to pattern matching on Bool type.
+
     Transforms:
         if condition { then_expr } else { else_expr }
-    
+
     Into:
         match condition {
             true => then_expr,
             false => else_expr
         }
+
+    NOTE: This pass is intentionally NOT part of run_default_desugaring.
+    If/IfExpression have a direct HIR ("If") and MIR (br_if + phi-merge)
+    lowering path which produces better control flow than routing every
+    conditional through match lowering. The pass is kept for opt-in use by
+    pipelines that want a match-only core language.
     """
     
     def apply(self, node: fast.Node, ctx: DesugarContext) -> fast.Node:
@@ -221,7 +264,8 @@ def run_default_desugaring(ast_root: fast.Node, ctx: DesugarContext | None = Non
     """
     passes = [
         TraitDictionaryDesugarPass(),  # Desugar trait method calls to dictionary lookups
-        IfDesugarPass(),  # Desugar if statements to pattern matching
+        # IfDesugarPass is deliberately omitted: if/else keeps its native
+        # HIR/MIR lowering (see IfDesugarPass docstring).
     ]
-    
+
     return run_desugaring_passes(ast_root, passes, ctx)
