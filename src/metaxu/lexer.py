@@ -83,7 +83,7 @@ class Lexer:
     # List of token names
     tokens = [
         'IDENTIFIER', 'NUMBER', 'FLOAT', 'STRING', 'FSTRING',
-        'PLUS', 'MINUS', 'TIMES', 'DIVIDE',
+        'PLUS', 'MINUS', 'TIMES', 'DIVIDE', 'MOD',
         'LPAREN', 'RPAREN', 'LBRACE', 'RBRACE', 'LBRACKET', 'RBRACKET',
         'EQUALS', 'SEMICOLON', 'COLON', 'COMMA', 'DOT', 'DOTDOT', 'TRIPLE_DOT',
         'DOUBLECOLON', 'ARROW', 'FATARROW', 'BACKSLASH', 'AT', 'AMPERSAND',
@@ -100,6 +100,7 @@ class Lexer:
     t_MINUS = r'-'
     t_TIMES = r'\*'
     t_DIVIDE = r'/'
+    t_MOD = r'%'
     t_EQUALS = r'='
     t_EQUALEQUAL = r'=='
     t_NOTEQUAL = r'!='

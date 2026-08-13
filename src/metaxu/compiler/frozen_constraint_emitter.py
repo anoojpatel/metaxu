@@ -1416,7 +1416,7 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
                         simplesub.add_class_constraint("Ord", [left_ty], node.node_id)
                     if payload_operator(node) in {"==", "!="}:
                         simplesub.add_class_constraint("Eq", [left_ty], node.node_id)
-                if kind == "BinaryOperation" and payload_operator(node) in {"+", "-", "*", "/"}:
+                if kind == "BinaryOperation" and payload_operator(node) in {"+", "-", "*", "/", "%"}:
                     simplesub.add_class_constraint("Number", [node_ty], node.node_id)
         if kind in {"IfStatement", "IfExpression"} and node_ty is not None and children:
             cond_ty = types.get(children[0].node_id)

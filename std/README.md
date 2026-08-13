@@ -39,7 +39,7 @@ keep compiling unchanged.
 | `std.stream` | `Stream.an` | implemented (core) | `effect Emit`, `effect Loop`; producers `iota`/`emit_range`/`emit_vec`; consumers `iter`/`for_`/`fold`/`sum`/`product`/`count`/`collect`/`all_of`/`any_of`/`find`; transformers `map`/`filter`/`take`/`skip`/`chain` |
 | `std.option` | Maybe surface (`Prelude.an`) | implemented | `map`, `and_then`, `filter`, `or_else`, `unwrap_or(_else)`, `is_some`, `is_none`, `contains`, `ok_or`, `flatten` |
 | `std.result` | Result (`Throw.an`) | implemented | `map`, `map_err`, `and_then`, `unwrap_or(_else)`, `is_ok`, `is_err`, `ok`, `err` |
-| `std.math` | `Math.an` | partial | `pi`/`tau`/`e` (as functions), `abs`, `min`, `max`, `clamp`, `sign`, `sqrt`, `sin`, `cos`, `powi` |
+| `std.math` | `Math.an` | partial | `pi`/`tau`/`e` (module constants), `abs`, `min`, `max`, `clamp`, `sign`, `sqrt`, `sin`, `cos`, `powi` |
 | `std.vec` | `Vec.an` | implemented | `of1..of3`, `range_vec`, `sum`, `product`, `contains`, `index_of`, `first`, `last`, `is_empty`, `map`, `filter`, `reverse`, `concat`, `max_of`, `min_of` |
 | `std.string` | `String.an` | partial | `is_empty`, `eq`, `concat`, `repeat`, `join`, `char_at`, `contains_char`, `count_char`, `index_of_char`, `starts_with`, `ends_with`, `reverse` |
 | `std.map` | `HashMap.an` | placeholder (by design) | assoc-list `Map` struct; `empty`, `size`, `is_empty`, `contains_key`, `get`, `get_or`, `put`, `remove`, `keys`, `values` — **every op is O(n)**; API shaped so a real hash map can replace the representation |
@@ -83,8 +83,11 @@ Not ported (no Metaxu runtime surface yet): `IO.an`, `Env.an`,
   accept an unannotated parameter, which the checker treats permissively.
   One program can throw ints and strings; a generic-effects pass can
   tighten this later without changing callers.
-- Constants (`pi`, `tau`, `e`) are zero-argument functions: module-level
-  `let` bindings do not resolve across module boundaries yet (see gaps).
+- Constants (`pi`, `tau`, `e`) are real module-level `let` bindings,
+  read as plain names (`pi`, not `pi()`). Module constants live in one
+  global namespace (like types/traits/effects): a duplicate constant
+  name in two modules is a loud compile error, and initializers run in
+  module-load order before the entry point.
 - No `Stream` trait / implicit impls: producers are explicitly thunks.
 - `panic_on_fail`, `or_panic`, `retry_until_success` (Fail.an),
   `enumerate`, `zip`, `map2`, `intersperse` (Stream.an) are deferred —
@@ -109,35 +112,52 @@ while building it (status as of this port):
    declaring module's symbol. Import checks are now deferred until all
    modules load, and bindings chase re-export chains. `std.prelude`
    depends on this.
-3. **A handler arm of the form `op() -> ()` is silently dropped** by the
-   parser's arm list (comma-separated arms with a unit-literal body eat
-   the following arm too). Workaround used throughout: block bodies
-   (`op() -> { () }`) and newline-separated arms.
-4. **Closure captures of scalars are by value**: mutating a captured
-   `int`/`bool` inside a closure or handler case does not write back
-   (silently). Vec captures alias the shared runtime vector, so the
-   library uses Vec cells where cross-frame mutation is needed
-   (`for_`'s `broke` flag, `take`/`skip` counters).
-5. **Module-level `let` bindings do not resolve**: a top-level
-   `let PI = 3.14;` compiles, but a function in the same module file
-   reading it gets unit back (silent). Constants are functions for now.
-6. **No modulo operator**: `%` is not a lexer token (the MIR interpreter
-   supports the binop; the surface syntax cannot produce it). Parity in
-   library/test code is `x - (x / 2) * 2`.
-7. **`v[i] = x` (Vec index assignment) is a silent no-op**: the parse
-   succeeds but no store happens. `std.map.remove` rebuilds its vectors
-   through pop/push instead of writing in place.
+3. **FIXED — `op() -> ()` handler arms are no longer dropped.** The
+   unit-literal body failed to lower (it had no HIR representation) and
+   the arm was silently skipped downstream of the parser. `()` now
+   lowers as the unit value — `op() -> ()` is a valid ABORT-style arm
+   (returns unit without resuming) — and an arm whose body cannot lower
+   is a loud compile error instead of a vanished arm. Non-empty tuple
+   literals are a loud error too (still no tuple runtime).
+4. **FIXED — mutations of captured scalars write back.** A binding that
+   a closure, handler arm, or delimited handle body assigns to is boxed
+   into one shared cell, so the write is visible in every frame that
+   captured it (and writes made outside are visible inside).
+   `std.stream`'s Vec-as-cell workarounds (`for_`'s `broke` flag,
+   `take`/`skip`'s counters) are now plain mutable scalars.
+5. **FIXED — module-level `let` bindings are real constants.** They are
+   initialized before the entry point (in module-load order, via a
+   synthesized `__module_init`) and are readable from any function.
+   Like types/traits/effects they share ONE global namespace: declaring
+   the same constant name in two modules is a loud compile error.
+   `std.math`'s `pi`/`tau`/`e` are real constants now (read `pi`, not
+   `pi()`). Qualified reads (`math.pi`) and import aliases
+   (`import ... as`) of constants are not resolved yet — those fail
+   loudly at run time, they do not read back as unit.
+6. **FIXED — `%` is a real modulo operator** (lexer token, grammar rule
+   at multiplicative precedence, `Number` typing constraint; the MIR
+   binop and native `srem` already existed).
+7. **FIXED — `v[i] = x` stores through to the Vec** (`__index_set` /
+   `__index_store`, mirroring `__index_get`), including nested
+   `m[i][j] = x`. A fixed `vector[T,N]` in an assignable place
+   (`v[0] = 9`, `buf.data[0] = 42`) gets a value-semantics functional
+   update written back to the place, like struct field assignment;
+   an immutable receiver with no place to write back to (a vector
+   reached through another index, a string, a slice target) is a loud
+   error, never a no-op. `std.map.remove` now shifts elements in place
+   instead of rebuilding through pop/push (still O(n), as documented).
 8. **No tuple destructuring** (`let (a, b) = p` is a parse error), which
-   is what defers `enumerate`/`zip`: they would emit pairs no consumer
-   could take apart.
+   is what defers `enumerate`/`zip` in `std.stream`: they would emit
+   pairs no consumer could take apart. (Zip *comprehensions* do work:
+   `f(a, b) for (a, b) in (xs, ys)` iterates two vectors in lockstep.)
 9. **Unqualified keywords**: `try`, `catch`, `some`, `none`, `option`
    are reserved and unusable as function names, even where the grammar
    would be unambiguous (contextual-keyword handling already exists for
    the `x.keyword` position).
 
-Items 3, 4, 5 and 7 are *silent* — code compiles and runs with the
-wrong meaning. They are the ones most worth fixing next; the library
-deliberately avoids them rather than depending on today's behavior.
+Items 3, 4, 5, 6 and 7 are fixed (regression tests:
+`src/metaxu/compiler/tests/test_silent_seams.py`); the remaining gaps
+(8, 9) are parse-time-loud, not silent.
 
 ## Testing
 

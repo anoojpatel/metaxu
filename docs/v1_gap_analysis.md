@@ -112,6 +112,17 @@ branch diff and fixed with regression tests (`test_parsed_source_semantics.py`,
 - `&mut` in argument position is an exclusive borrow released after the call,
   per `ownership_and_borrowing.md` — not an ownership transfer.
 - Lambda closures capture by slot name and let-bound closures are callable.
+- Captured scalars a closure/handler arm ASSIGNS to are shared cells
+  (MIR `cell_wrap`): the mutation writes back to the enclosing binding
+  instead of silently vanishing in a by-value env copy.
+- `v[i] = x` is a real store (`__index_set`/`__index_store`): Vec mutates in
+  place, a fixed vector in an assignable place gets a value-semantics update
+  written back, and unsupported targets are loud errors, never no-ops.
+- Module-level `let` bindings are constants initialized before the entry
+  point (synthesized `__module_init`, one global constant namespace with
+  loud cross-module collisions); `%` is a real modulo operator; `op() -> ()`
+  handler arms lower as abort-with-unit arms instead of being dropped.
+  (Regression tests: `tests/test_silent_seams.py`.)
 - `f(a < b, c > d)` lexes as comparisons (generic-angle follow-set check).
 - `resume(v)` returns the value of the WHOLE delimited handle body (the
   interpreter parks the body on its own thread per handle scope), so

@@ -326,7 +326,7 @@ fn main() -> int {
     let c = clamp(100, 0, 10) + clamp(0 - 5, 0, 10) + clamp(7, 0, 10);
     let d = sign(0 - 9) + sign(0) + sign(9);
     let p = powi(2, 10);
-    let consts = if pi() > 3.14 { if tau() > 6.28 { if e() > 2.71 { 1 } else { 0 } } else { 0 } } else { 0 };
+    let consts = if pi > 3.14 { if tau > 6.28 { if e > 2.71 { 1 } else { 0 } } else { 0 } } else { 0 };
     let s = if sqrt(4.0) > 1.99 { 1 } else { 0 };
     let fs = if fl > 2.49 { 1 } else { 0 };
     let trig = if sin(0.0) < 0.001 { if cos(0.0) > 0.999 { 1 } else { 0 } } else { 0 };
@@ -463,7 +463,7 @@ fn main() -> int {
     let d = fold(iota(4), 0, fn(x, acc) -> x + acc);
     let f = if is_some(Some(1)) { 1 } else { 0 };
     let g = abs(0 - 2) + clamp(50, 0, 9);
-    let h = if pi() > 3.0 { 1 } else { 0 };
+    let h = if pi > 3.0 { 1 } else { 0 };
     a + b + c + d + f + g + h
 }
 """)
