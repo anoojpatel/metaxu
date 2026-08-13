@@ -70,6 +70,25 @@ variant's slot they touch.  Still demoted honestly: ONE value merging two
 representations of the same variant (heterogeneous ... no coercion),
 nested enums extracted through a boxing boundary when their slots are
 instantiation-dependent, and legacy two-element variant_field ops.
+
+Increment 7 (native algebraic effects) adds: handle_scope / perform /
+resume lower to the C effects runtime metaxu_effects.c (ucontext
+coroutines; linked into every native binary next to metaxu_rt.o) with the
+interpreter's exact semantics — deep handlers (resume returns the WHOLE
+delimited body's value), single-shot continuations, abort when a case
+returns without resuming, dynamic innermost-first routing with busy
+scopes skipped (handler self-performs route outward).  Handle sites get a
+shared `%henv.<site>` env struct + body-thunk/dispatcher shims; boundary
+values travel as opaque 8-byte words with kinds unified through
+module-wide per-op-name cells.  Suspending functions no longer demote.
+The differential catalogue below replays test_effect_continuations.py's
+shapes natively (8/42/10/99/103/300/42-nested/224/101/2/42-args) and runs
+examples 02 and effects.mx end-to-end.  Pure-effect programs are FULLY
+leak-checked under ASan (the runtime frees stacks/scopes/continuations on
+completion and abort); programs that also concat strings keep
+detect_leaks=0 per the leak-by-design contract.  Still demoted honestly:
+aggregates (closures included) crossing the effect boundary, resume
+outside its own handler case, same-named ops with conflicting kinds.
 """
 from __future__ import annotations
 
@@ -346,7 +365,10 @@ def test_match_fail_calls_abort():
 # Placeholder honesty
 # ---------------------------------------------------------------------------
 
-def test_suspending_function_is_placeholder():
+def test_suspending_function_emits_mx_perform():
+    # Increment 7: suspending functions are no longer demoted — a perform
+    # lowers to mx_perform against the native effects runtime (the
+    # coroutine stack is the continuation; no CPS transform needed).
     f = make_func("worker", [
         block([
             ("params", ("x",)),
@@ -355,12 +377,12 @@ def test_suspending_function_is_placeholder():
         block([], ("ret", "pv1")),
     ], suspending=True)
     ir = emit_llvm([f])
-    assert count_placeholders(ir) == 1
-    assert "suspending function" in ir
-    assert "define" not in ir
-    # every non-empty line of the placeholder chunk is a comment
-    chunk = [c for c in ir.split("\n\n") if "worker" in c][0]
-    assert all(line.startswith(";") for line in chunk.splitlines() if line.strip())
+    assert count_placeholders(ir) == 0
+    assert "define i64 @mx_worker(i64 %a.x)" in ir
+    assert "declare i64 @mx_perform(ptr, ptr, ptr, i64)" in ir
+    assert "call i64 @mx_perform(" in ir
+    # the perform scratch array is materialized in the entry block
+    assert "%perform.args = alloca [8 x i64]" in ir
 
 
 def test_unknown_locality_is_placeholder():
@@ -1407,20 +1429,17 @@ def test_linked_list_example_emits_all_real_bodies():
     # Increment 6: per-value payload refinements let pop_front/remove_next/
     # get/get_mut — whose REAL bodies put both ints (Some(node.data)) and
     # Nodes (Some(next_node)) into Option's slot 0 — emit natively: each
-    # Option VALUE knows its own instantiation's representation.  Only main
-    # still demotes, on a pre-existing front-end seam unrelated to enums:
-    # its trailing statement-position `if let` merges a unit constant with
-    # a struct:Node into the function's return value (the interpreter
-    # really does return either), which has no scalar native encoding.
+    # Option VALUE knows its own instantiation's representation.  Since the
+    # front-end statement-rule fix (else-less if/if-let is unit-valued),
+    # main's trailing if-let no longer merges unit with struct:Node, so the
+    # whole example is fully native: zero placeholders.
     ir = llvm_from_source(
         (REPO_ROOT / "examples" / "linked_list.mx").read_text())
     for fname in ("new_list", "push_front", "pop_front", "remove_next",
-                  "get", "get_mut", "take_node"):
+                  "get", "get_mut", "take_node", "main"):
         assert re.search(rf"^define (?:i64|double|ptr|void) @mx_{fname}\(",
                          ir, re.M), f"{fname} did not emit"
-    assert count_placeholders(ir) == 1
-    assert "; function @mx_main: placeholder" in ir
-    assert "promoted to aggregate kind struct:Node" in ir
+    assert count_placeholders(ir) == 0
     # the IR documents the per-value nature of the shared Some slot
     assert ";   variant Some(boxed struct:Node (mixed per value))" in ir
 
@@ -2046,6 +2065,402 @@ fn main() -> int {
     assert "call void @mx_vec_free" not in ir
 
 
+# ---------------------------------------------------------------------------
+# Increment 7: native algebraic effects
+# ---------------------------------------------------------------------------
+
+_FX_ROUNDTRIP = """
+effect Ask { ask() -> int }
+fn main() -> int {
+    handle Ask with { ask() -> resume(7) } in { perform Ask.ask() + 1 }
+}
+"""
+
+
+def test_handle_scope_emits_runtime_call_and_shims():
+    ir = llvm_from_source(_FX_ROUNDTRIP)
+    assert count_placeholders(ir) == 0
+    # runtime declares
+    assert "declare i64 @mx_handle(ptr, ptr, ptr, ptr, ptr, ptr, ptr, i64)" in ir
+    assert "declare i64 @mx_perform(ptr, ptr, ptr, i64)" in ir
+    assert "declare i64 @mx_resume(ptr, i64)" in ir
+    # per-site artifacts: env type, op-name/arity tables, thunk + dispatcher
+    assert re.search(r"%henv\.\w+ = type \{", ir)
+    assert re.search(r"@mxfx\.ops\.\w+ = private unnamed_addr constant "
+                     r"\[1 x ptr\]", ir)
+    assert re.search(r"@mxfx\.np\.\w+ = private unnamed_addr constant "
+                     r"\[1 x i64\] \[i64 1\]", ir)
+    assert re.search(r"define internal i64 @mxfx\.body\.\w+\(ptr %env\)", ir)
+    assert re.search(r"define internal i64 @mxfx\.disp\.\w+"
+                     r"\(ptr %env, i64 %op, ptr %args, ptr %k\)", ir)
+    # the dispatcher documents its dense op index order
+    assert "op index order ['ask']" in ir
+    # subfunctions take the leading env param; the case gets __k as a ptr
+    assert re.search(r"define i64 @mx___handler_Ask_ask_\w+"
+                     r"\(ptr %cl\.env, i64 %a\._, ptr %a\.__k\)", ir)
+    assert "call i64 @mx_resume(ptr %a.__k, i64 7)" in ir
+
+
+def test_resume_outside_its_handler_case_demotes():
+    # A resume op whose continuation is not the containing case's own __k
+    # param would pump the scope from a foreign stack: demote honestly.
+    f = make_func("rogue", [
+        block([
+            ("params", ("v",)),
+            ("let", "r", ("resume",), ("__k", "v")),
+        ], ("ret", "r")),
+    ])
+    ir = emit_llvm([f])
+    assert count_placeholders(ir) == 1
+    assert "resume outside its own handler case" in ir
+
+
+def test_closure_crossing_effect_boundary_demotes():
+    # effect_mapping.mx's shape: performing with a closure argument has no
+    # sound word encoding (the handler side would need the pair + env).
+    ir = llvm_from_source("""
+effect Apply { app(f: fn(int) -> int) -> int }
+fn main() -> int {
+    handle Apply with { app(f) -> resume(f(2)) } in {
+        let double = fn(x: int) -> int { x * 2 };
+        perform Apply.app(double)
+    }
+}
+""")
+    assert "cannot cross the effect boundary" in ir
+
+
+@needs_clang
+def test_native_effect_resume_value_becomes_perform_value(tmp_path):
+    assert_native_matches_interp(_FX_ROUNDTRIP, tmp_path)
+
+
+@needs_clang
+def test_native_effect_deep_handler_across_calls_42(tmp_path):
+    assert_native_matches_interp("""
+effect Ask { ask() -> int }
+fn helper() performs Ask -> int { let x = perform Ask.ask(); x * 10 }
+fn main() -> int {
+    handle Ask with { ask() -> resume(4) } in { helper() + 2 }
+}
+""", tmp_path)
+
+
+@needs_clang
+def test_native_effect_multiple_performs(tmp_path):
+    assert_native_matches_interp("""
+effect Ask { ask() -> int }
+fn main() -> int {
+    handle Ask with { ask() -> resume(5) } in {
+        let a = perform Ask.ask();
+        let b = perform Ask.ask();
+        a + b
+    }
+}
+""", tmp_path)
+
+
+@needs_clang
+def test_native_effect_abort_skips_rest_99(tmp_path):
+    # The handler declines to resume: 99 is the handle value and the print
+    # after the perform never runs (native stdout must equal interpreter's).
+    assert_native_matches_interp("""
+effect Fail { fail() -> int }
+fn main() -> int {
+    handle Fail with { fail() -> 99 } in {
+        let x = perform Fail.fail();
+        print("unreachable");
+        x + 1
+    }
+}
+""", tmp_path)
+
+
+@needs_clang
+def test_native_effect_abort_inside_called_function(tmp_path):
+    assert_native_matches_interp("""
+effect Fail { fail() -> int }
+fn helper() performs Fail -> int {
+    let x = perform Fail.fail();
+    print("unreachable-helper");
+    x
+}
+fn main() -> int {
+    handle Fail with { fail() -> 7 } in {
+        let y = helper();
+        print("unreachable-main");
+        y
+    }
+}
+""", tmp_path)
+
+
+@needs_clang
+def test_native_effect_post_resume_handler_code_103(tmp_path):
+    assert_native_matches_interp("""
+effect Ask { ask() -> int }
+fn main() -> int {
+    handle Ask with {
+        ask() -> { let rest = resume(1); rest + 100 }
+    } in { perform Ask.ask() + 2 }
+}
+""", tmp_path)
+
+
+@needs_clang
+def test_native_effect_resume_returns_whole_body_300(tmp_path):
+    assert_native_matches_interp("""
+effect Ask { ask() -> int }
+fn helper() performs Ask -> int { perform Ask.ask() }
+fn main() -> int {
+    handle Ask with {
+        ask() -> { let rest = resume(1); rest * 100 }
+    } in { helper() + 2 }
+}
+""", tmp_path)
+
+
+@needs_clang
+def test_native_effect_nested_two_effects_42(tmp_path):
+    assert_native_matches_interp("""
+effect State { get() -> int }
+effect Logger { log(message: string) -> Unit }
+fn body() performs State, Logger -> int {
+    let v = perform State.get();
+    perform Logger.log("got it");
+    v + 1
+}
+fn main() -> int {
+    handle State with { get() -> resume(41) } in {
+        handle Logger with {
+            log(message) -> { print(message); resume(()) }
+        } in { body() }
+    }
+}
+""", tmp_path)
+
+
+@needs_clang
+def test_native_effect_nested_post_resume_224(tmp_path):
+    assert_native_matches_interp("""
+effect State { get() -> int }
+effect Logger { log(message: string) -> Unit }
+fn body() performs State, Logger -> int {
+    let v = perform State.get();
+    perform Logger.log("hi");
+    v + 1
+}
+fn main() -> int {
+    handle State with {
+        get() -> { let rest = resume(10); rest * 2 }
+    } in {
+        handle Logger with {
+            log(message) -> { let r = resume(()); r + 1 }
+        } in { body() + 100 }
+    }
+}
+""", tmp_path)
+
+
+@needs_clang
+def test_native_effect_handler_self_perform_routes_outward(tmp_path):
+    assert_native_matches_interp("""
+effect Ask { ask() -> int }
+fn main() -> int {
+    handle Ask with { ask() -> resume(100) } in {
+        handle Ask with {
+            ask() -> { let outer = perform Ask.ask(); resume(outer + 1) }
+        } in { perform Ask.ask() }
+    }
+}
+""", tmp_path)
+
+
+@needs_clang
+def test_native_effect_rearming_reaches_inner_handler(tmp_path):
+    assert_native_matches_interp("""
+effect Ask { ask() -> int }
+fn main() -> int {
+    handle Ask with { ask() -> resume(1000) } in {
+        handle Ask with { ask() -> resume(1) } in {
+            perform Ask.ask() + perform Ask.ask()
+        }
+    }
+}
+""", tmp_path)
+
+
+@needs_clang
+def test_native_effect_multi_argument_op(tmp_path):
+    assert_native_matches_interp("""
+effect Math { add(a: int, b: int) -> int }
+fn main() -> int {
+    handle Math with { add(a, b) -> resume(a + b) } in {
+        perform Math.add(40, 2)
+    }
+}
+""", tmp_path)
+
+
+@needs_clang
+def test_native_effect_string_crosses_boundary(tmp_path):
+    # op-name kind cells: the resume value is a string, so the perform's
+    # result decodes as a str word; concat + print must match.
+    assert_native_matches_interp("""
+effect Ask { name() -> string }
+fn main() -> int {
+    handle Ask with { name() -> resume("world") } in {
+        let s = perform Ask.name();
+        print("hello " + s);
+        0
+    }
+}
+""", tmp_path)
+
+
+@needs_clang
+def test_native_effect_float_crosses_boundary(tmp_path):
+    # f64 boundary words bitcast losslessly (compared via branches, not
+    # printed: %g formatting diverges from the interpreter).
+    assert_native_matches_interp("""
+effect M { pi() -> float }
+fn main() -> int {
+    handle M with { pi() -> resume(3.5) } in {
+        let x = perform M.pi() + 0.25;
+        if x == 3.75 { 1 } else { 0 }
+    }
+}
+""", tmp_path)
+
+
+@needs_clang
+def test_native_effect_handle_inside_loop(tmp_path):
+    # The site env alloca is refilled per iteration; each mx_handle
+    # completes within its iteration, so a stack env stays safe.
+    assert_native_matches_interp("""
+effect Ask { ask() -> int }
+fn main() -> int {
+    let mut total = 0;
+    let mut i = 0;
+    while i < 3 {
+        let bonus = i * 10;
+        let r = handle Ask with { ask() -> resume(bonus) } in {
+            perform Ask.ask() + 1
+        };
+        total = total + r;
+        i = i + 1;
+    };
+    print(total);
+    total
+}
+""", tmp_path)
+
+
+@needs_clang
+def test_native_effect_captures_through_shared_env(tmp_path):
+    # Body AND case read enclosing locals through the site's shared env.
+    assert_native_matches_interp("""
+effect Ask { ask() -> int }
+fn main() -> int {
+    let base = 30;
+    let inc = 4;
+    handle Ask with { ask() -> resume(base + inc) } in {
+        perform Ask.ask() + base
+    }
+}
+""", tmp_path)
+
+
+@needs_clang
+def test_native_effect_vec_identity_across_boundary(tmp_path):
+    # A Vec captured into the handler case keeps identity semantics: the
+    # case pushes into the same vector main reads afterwards, while the
+    # performs come from a called function.
+    assert_native_matches_interp("""
+effect Sink { emit(x: int) -> Unit }
+fn pump(n: int) performs Sink {
+    let mut i = 0;
+    while i < n {
+        perform Sink.emit(i * i);
+        i = i + 1;
+    }
+}
+fn main() -> int {
+    let v = Vec.new();
+    handle Sink with { emit(x) -> { v.push(x); resume(()) } } in {
+        pump(4)
+    };
+    print(v.len());
+    print(v[3]);
+    0
+}
+""", tmp_path)
+
+
+@needs_clang
+def test_native_example_02_effects_and_handlers(tmp_path):
+    # The flagship effects example runs natively end-to-end: nested
+    # State/Logger handles, performs in a called function, to_string +
+    # string concat crossing the boundary.  stdout must equal the
+    # interpreter's exactly.
+    src = (REPO_ROOT / "examples" / "02_effects_and_handlers.mx").read_text()
+    ir = assert_native_matches_interp(src, tmp_path)
+    # only the generic list-pattern `map` helper demotes (unbound generic
+    # env — unrelated to effects); everything effectful is native
+    assert count_placeholders(ir) == 1
+    assert "; function @mx_map: placeholder" in ir
+
+
+@needs_clang
+def test_native_example_effects_mx(tmp_path):
+    # effects.mx is fully native: zero placeholders.
+    src = (REPO_ROOT / "examples" / "effects.mx").read_text()
+    ir = assert_native_matches_interp(src, tmp_path)
+    assert count_placeholders(ir) == 0
+
+
+@needs_asan
+def test_native_effects_fully_leak_checked_under_asan(tmp_path):
+    # Pure-int effects: the machinery itself (coroutine stacks, scope
+    # records, continuations) must be LEAK-CLEAN — full leak checking on,
+    # exercising nested scopes, post-resume code and an abort.
+    assert_native_matches_interp_asan("""
+effect State { get() -> int }
+effect Fail { fail() -> int }
+fn body() performs State, Fail -> int {
+    let v = perform State.get();
+    let w = perform Fail.fail();
+    print(v + w);
+    0
+}
+fn main() -> int {
+    let a = handle State with {
+        get() -> { let rest = resume(20); rest }
+    } in {
+        handle Fail with { fail() -> 5 } in { body() }
+    };
+    print(a);
+    0
+}
+""", tmp_path)
+
+
+@needs_asan
+def test_native_effects_with_string_concat_asan_no_uaf(tmp_path):
+    # Example-02-shaped traffic under ASan: concat/to_string results leak
+    # by design, so detect_leaks=0 — this proves no UAF / no double-free
+    # across coroutine switches (fiber annotations active).
+    src = (REPO_ROOT / "examples" / "02_effects_and_handlers.mx").read_text()
+    result, expected_out = interp_run(src)
+    ir = llvm_from_source(src)
+    exit_code, stdout = compile_and_run(
+        ir, "main", workdir=str(tmp_path),
+        clang_args=("-fsanitize=address",),
+        run_env={"ASAN_OPTIONS": "detect_leaks=0"})
+    assert exit_code == 0
+    assert stdout == expected_out
+
+
 def test_examples_define_census_does_not_regress():
     # Aggregate emission census across all accepted examples: the number of
     # real defines must not regress below the increment-6 level (increment 3
@@ -2056,11 +2471,15 @@ def test_examples_define_census_does_not_regress():
     # (heterogeneous Option slots: 4 honest demotions + main) and
     # test_operations.mx a real `assert` call (1 more), landing at 39;
     # increment 6's per-variant/per-value payload typing un-demoted those
-    # four linked_list bodies, landing at 43 — only linked_list's main still
-    # demotes there, on its trailing unit/Node statement-position merge).
+    # four linked_list bodies, landing at 43; the front-end statement-rule
+    # fix (else-less if is unit) gave linked_list its main (44); increment
+    # 7's native effects lifted every suspending function that stays in
+    # word kinds — all of 02_effects_and_handlers (except the generic
+    # `map` helper) and effects.mx, plus effectful helpers elsewhere —
+    # landing at 61.
     total_defines = 0
     for path in _example_files():
         ir = llvm_from_source(path.read_text())
         total_defines += len(re.findall(
             r"^define (?:i64|double|ptr|void) @mx_\w+\(", ir, re.M))
-    assert total_defines >= 43
+    assert total_defines >= 61
