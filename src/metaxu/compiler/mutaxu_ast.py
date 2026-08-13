@@ -61,6 +61,124 @@ def _span_of(node: Any) -> Span:
     return Span(file=file, start=start, end=end)
 
 
+def _pattern_descriptor(p: Any) -> dict[str, Any]:
+    """JSON-serializable summary of a match-arm pattern.
+
+    The frozen AST does not traverse MatchExpression.cases (they are plain
+    (pattern, body) tuples, and the patterns are parsed as *expressions* by
+    the arm grammar), so the constraint emitter cannot see arm patterns
+    through children. This mirrors hir.HIRBuilder._convert_pattern just far
+    enough for compile-time exhaustiveness checking. Descriptor kinds:
+
+      {"kind": "wildcard"}                      `_` / explicit wildcard
+      {"kind": "binding", "name": n}            always-a-binding (VariablePattern,
+                                                borrow/move-annotated bindings)
+      {"kind": "name", "name": n}               bare identifier: a zero-arg
+                                                variant ctor iff the checker
+                                                knows n as a variant, else a
+                                                binding (resolved by the
+                                                emitter, which has
+                                                variant_to_enum)
+      {"kind": "literal", "value": v}           literal pattern
+      {"kind": "ctor", "name": v, "enum": e|None, "subpatterns": [...]}
+      {"kind": "unknown"}                       anything unclassified (list
+                                                patterns, lambdas, ...) — the
+                                                checker skips matches
+                                                containing these entirely
+    """
+    if p is None:
+        # _convert_pattern lowers a missing pattern to a wildcard; mirror it.
+        return {"kind": "wildcard"}
+    cls_name = type(p).__name__
+    if cls_name == "WildcardPattern":
+        return {"kind": "wildcard"}
+    if isinstance(p, fast.VariablePattern):
+        return {"kind": "binding", "name": str(getattr(p, "name", "_"))}
+    if isinstance(p, fast.LiteralPattern):
+        v = getattr(p, "value", None)
+        if isinstance(v, fast.Literal):
+            v = getattr(v, "value", None)
+        return {"kind": "literal", "value": v}
+    if isinstance(p, fast.VariantPattern):
+        enum_name = getattr(p, "enum_name", None)
+        return {
+            "kind": "ctor",
+            "name": str(getattr(p, "variant_name", "")),
+            "enum": str(enum_name) if enum_name is not None else None,
+            "subpatterns": [_pattern_descriptor(sp)
+                            for sp in (getattr(p, "patterns", None) or [])],
+        }
+    if isinstance(p, (bool, int, float, str)):
+        return {"kind": "literal", "value": p}
+    # The arm grammar is `expression => body`: patterns arrive as
+    # expression nodes. Classify the pattern-like expression forms.
+    if isinstance(p, fast.Literal):
+        return {"kind": "literal", "value": getattr(p, "value", None)}
+    if isinstance(p, fast.Variable):
+        name = str(getattr(p, "name", "_") or "_")
+        if name == "_":
+            return {"kind": "wildcard"}
+        return {"kind": "name", "name": name}
+    if isinstance(p, fast.UnaryOperation) and getattr(p, "operator", None) == "-":
+        operand = getattr(p, "operand", None)
+        if isinstance(operand, fast.Literal):
+            v = getattr(operand, "value", None)
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                return {"kind": "literal", "value": -v}
+        return {"kind": "unknown"}
+    if isinstance(p, fast.NoneExpression):
+        return {"kind": "ctor", "name": "None", "enum": "Option", "subpatterns": []}
+    if isinstance(p, fast.SomeExpression):
+        inner = getattr(p, "value", None)
+        subs = [_pattern_descriptor(inner)] if inner is not None else []
+        return {"kind": "ctor", "name": "Some", "enum": "Option", "subpatterns": subs}
+    if isinstance(p, (fast.BorrowShared, fast.BorrowUnique, fast.Move)):
+        var = getattr(p, "variable", None)
+        if isinstance(var, str):
+            return {"kind": "binding", "name": var}
+        return _pattern_descriptor(var)
+    if isinstance(p, fast.ModeExpression):
+        return _pattern_descriptor(getattr(p, "expression", None))
+    if isinstance(p, fast.FunctionCall):
+        callee = getattr(p, "name", None)
+        if isinstance(callee, str) and callee:
+            return {
+                "kind": "ctor",
+                "name": callee,
+                "enum": None,
+                "subpatterns": [_pattern_descriptor(a)
+                                for a in (getattr(p, "arguments", None) or [])],
+            }
+        return {"kind": "unknown"}
+    if isinstance(p, fast.QualifiedFunctionCall):
+        parts = list(getattr(p, "parts", None) or [])
+        if len(parts) >= 2:
+            return {
+                "kind": "ctor",
+                "name": str(parts[-1]),
+                "enum": str(parts[-2]),
+                "subpatterns": [_pattern_descriptor(a)
+                                for a in (getattr(p, "arguments", None) or [])],
+            }
+        return {"kind": "unknown"}
+    return {"kind": "unknown"}
+
+
+def _arm_descriptor(case: Any) -> dict[str, Any]:
+    """Descriptor for one match case: (pattern, body) tuples plus the legacy
+    Option sugar shapes ('some', var, body) / ('none', None, body)."""
+    if isinstance(case, (list, tuple)):
+        if len(case) == 3 and case[0] in ("some", "none"):
+            if case[0] == "some":
+                return {"kind": "ctor", "name": "Some", "enum": "Option",
+                        "subpatterns": [{"kind": "binding", "name": str(case[1])}]}
+            return {"kind": "ctor", "name": "None", "enum": "Option",
+                    "subpatterns": []}
+        if len(case) == 2:
+            return _pattern_descriptor(case[0])
+    return {"kind": "unknown"}
+
+
 def _value_of(node: Any) -> Any | None:
     if isinstance(node, fast.Literal):
         return getattr(node, "value", None)
@@ -188,6 +306,11 @@ def _value_of(node: Any) -> Any | None:
             "trait": _safe_type_display(getattr(node, "interface_name", None)),
             "type": _safe_type_display(getattr(node, "type_name", None)),
         }
+    if isinstance(node, fast.MatchExpression):
+        # Arm-pattern summaries for compile-time exhaustiveness checking:
+        # cases are not frozen as children (they are plain tuples), so the
+        # payload is the only window the constraint emitter has onto them.
+        return {"arms": [_arm_descriptor(c) for c in getattr(node, "cases", None) or []]}
     if isinstance(node, fast.FieldAccess):
         return {"fields": tuple(getattr(node, "fields", ()) or ())}
     if isinstance(node, fast.QualifiedFunctionCall):

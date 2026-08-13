@@ -93,6 +93,19 @@ branch diff and fixed with regression tests (`test_parsed_source_semantics.py`,
 
 - Parsed match arms carry expression nodes as patterns; they now convert to
   real patterns instead of silently degrading to wildcards.
+- Non-exhaustive matches are compile-time errors (`test_exhaustiveness.py`,
+  kind `type-nonexhaustive-match`), not runtime `match_fail` traps: enum
+  matches (declared enums plus builtin Option/Result) must cover every
+  variant or have a wildcard/binding arm; bool matches need true+false or a
+  catch-all; int/string/float literal arms always need a catch-all. The
+  coverage rule is deliberately shallow — a ctor arm covers its variant only
+  when its subpatterns are all irrefutable, so `Some(1)` alone does not
+  cover `Some` while `Some(1) | Some(n)` is covered by the binding arm
+  (literal-completeness refinement is not analyzed). Matches whose
+  scrutinee type the patterns cannot determine, or containing opaque
+  pattern forms, are not checked (no false positives). An arm after a
+  wildcard/binding arm gets a warning-level unreachable-arm advisory on the
+  -1 diagnostics channel.
 - `Some(x)`/`None` in argument position were silently dropped at HIR.
 - Mode annotations survive freezing, so `@local` escape is actually rejected.
 - Borrow/move state is per-function; moves no longer poison other functions.
