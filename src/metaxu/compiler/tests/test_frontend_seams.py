@@ -396,5 +396,29 @@ def test_linked_list_pop_front_is_not_unit():
     # @mut write-back: main's env isn't in play here, so re-fetch by running
     # the example's own main to exercise push/pop/get/take end-to-end.
     result = interp.call("main", [])
-    # main's last statement takes node index 1 (data 2) and sets data=42.
-    assert str(result) != "()"
+    # main ends in a trailing else-less `if let` — a statement, so main is
+    # unit-valued. (The old assertion `str(result) != "()"` pinned the
+    # accidental leak of the taken arm's Node value into main's result.)
+    assert str(result) == "()"
+    # The real seam check — the example's bodies execute for real (push,
+    # take) rather than degrading to unit — is asserted through an
+    # in-language probe, since @mut write-back only applies to calls made
+    # from inside the language, not host-level interp.call arguments:
+    probe_src = source + """
+fn probe() -> int {
+    let @mut list = new_list();
+    push_front(list, 3);
+    push_front(list, 2);
+    push_front(list, 1);
+    if let Some(node) = take_node(list, 1) {
+        return node.data
+    }
+    0 - 1
+}
+"""
+    ctx2 = build_context_from_source(probe_src)
+    hir2 = HIRBuilder(ctx2.tables, id_map=ctx2.id_map).build(ctx2.frozen_root)
+    interp2 = MirInterpreter()
+    interp2.load(lower_hir_to_mir(hir2))
+    interp2.register_builtin("print", lambda *a: UNIT)
+    assert interp2.call("probe", []) == 2
