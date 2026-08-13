@@ -165,6 +165,172 @@ class IfDesugarPass(DesugarPass):
         return node
 
 
+# Separator used in mangled impl-method names. "$" cannot appear in Metaxu
+# identifiers, so splitting on it is unambiguous even when trait/type/method
+# names themselves contain underscores.
+IMPL_SEP = "$"
+IMPL_PREFIX = f"__impl{IMPL_SEP}"
+
+
+def type_base_name(t: Any) -> str:
+    """Best-effort base name of a type expression node.
+
+    `Dog` -> "Dog"; `Stack<E>` -> "Stack" (type arguments are erased — v1
+    trait dispatch is on the head type constructor only).
+    """
+    if t is None:
+        return ""
+    if isinstance(t, str):
+        return t
+    if isinstance(t, fast.TypeReference):
+        return type_base_name(t.name)
+    if isinstance(t, fast.TypeApplication):
+        return type_base_name(t.type_constructor)
+    if isinstance(t, fast.GenericInstance):
+        return type_base_name(t.base)
+    name = getattr(t, "name", None)
+    if name is not None:
+        return type_base_name(name)
+    return str(t)
+
+
+def mangle_impl_method(trait_name: str, type_name: str, method_name: str) -> str:
+    """Mangled top-level function name for one impl-block method."""
+    return f"{IMPL_PREFIX}{trait_name}{IMPL_SEP}{type_name}{IMPL_SEP}{method_name}"
+
+
+def parse_impl_method_name(fn_name: str) -> tuple[str, str, str] | None:
+    """Inverse of mangle_impl_method; None when fn_name is not a mangled impl."""
+    if not fn_name.startswith(IMPL_PREFIX):
+        return None
+    parts = fn_name.split(IMPL_SEP)
+    # ["__impl", trait, type, method]
+    if len(parts) != 4:
+        return None
+    return parts[1], parts[2], parts[3]
+
+
+class TraitImplDesugarPass(DesugarPass):
+    """Rewrite `implement Trait for Type { fn m(self, ...) {...} }` blocks into
+    plain top-level FunctionDeclarations with mangled names.
+
+    Each impl method becomes `__impl$Trait$Type$method` with `self` as its
+    first parameter (prepended when the method body uses `self` without
+    declaring it, as in the `implements Type: Trait` legacy syntax). When
+    `self` carries no type annotation, the impl's target type is attached so
+    inference sees the receiver type.
+
+    Dispatch itself happens at RUNTIME in the MIR interpreter: a method call
+    `recv.m(args)` on a trait method lowers to a `__trait$m` call whose first
+    operand is the receiver, and the interpreter picks the mangled function
+    matching the receiver's runtime type name (MxStruct.name /
+    MxVariant.enum_name). This static-name-erased, runtime-dispatched scheme
+    is the documented v1 choice: it needs no reliable static receiver types
+    and generic impls dispatch on the head type constructor.
+    """
+
+    def __init__(self) -> None:
+        # Replacements memoized per Implementation object so that the same
+        # impl referenced from multiple lists (`statements` and `children`)
+        # expands to the same FunctionDeclaration objects.
+        self._expanded: dict[int, list[fast.Node]] = {}
+
+    def apply(self, node: fast.Node, ctx: DesugarContext) -> fast.Node:
+        # Splice Implementation items out of any list-valued field
+        # (ModuleBody.statements, Block.statements, children lists, ...).
+        for attr, value in list(vars(node).items()):
+            if attr in self._SKIP_FIELDS or not isinstance(value, list):
+                continue
+            if not any(isinstance(item, fast.Implementation) for item in value):
+                continue
+            new_items: list[Any] = []
+            for item in value:
+                if isinstance(item, fast.Implementation):
+                    new_items.extend(self._expand_impl(item))
+                else:
+                    new_items.append(item)
+            setattr(node, attr, new_items)
+        return node
+
+    def _expand_impl(self, impl: fast.Implementation) -> list[fast.Node]:
+        cached = self._expanded.get(id(impl))
+        if cached is not None:
+            return cached
+        trait_name = type_base_name(impl.interface_name)
+        type_name = type_base_name(impl.type_name)
+        out: list[fast.Node] = []
+        for m in impl.methods or []:
+            if not isinstance(m, (fast.FunctionDeclaration, fast.MethodImplementation)):
+                continue
+            fn = self._method_to_function(m, trait_name, type_name)
+            if fn is not None:
+                out.append(fn)
+        self._expanded[id(impl)] = out
+        return out
+
+    def _method_to_function(
+        self, m: fast.Node, trait_name: str, type_name: str
+    ) -> fast.Node | None:
+        method_name = str(getattr(m, "name", "") or "")
+        if not method_name:
+            return None
+        params = list(getattr(m, "params", None) or [])
+        self_param = next(
+            (p for p in params if str(getattr(p, "name", "")) == "self"), None)
+        if self_param is None and _mentions_self(getattr(m, "body", None)):
+            # `implements Type: Trait` methods use `self` without declaring it.
+            self_param = fast.Parameter("self")
+            params.insert(0, self_param)
+        # A method that neither declares nor uses `self` stays parameter-less:
+        # it is a static method (e.g. `fn new(...)` in an inherent impl),
+        # callable as `Type.method(args)`.
+        if self_param is not None and getattr(self_param, "type_annotation", None) is None:
+            self_param.type_annotation = fast.TypeReference(type_name)
+        mangled = mangle_impl_method(trait_name, type_name, method_name)
+        if isinstance(m, fast.FunctionDeclaration):
+            # Reuse the node (body/children bookkeeping stays intact); only
+            # the name and parameter list change.
+            m.name = mangled
+            m.params = params
+            return m
+        # MethodImplementation -> fresh FunctionDeclaration
+        return fast.FunctionDeclaration(
+            mangled, params, list(getattr(m, "body", None) or []),
+            return_type=getattr(m, "return_type", None))
+
+
+def _mentions_self(node: Any, _seen: set[int] | None = None) -> bool:
+    """True when any node in the subtree references the identifier `self`.
+
+    Detects `self` stored as a bare string in any AST field (Variable.name,
+    FieldAccess.base, Assignment targets, ...). String literal VALUES are
+    excluded so a `"self"` string constant does not count as a use.
+    """
+    if _seen is None:
+        _seen = set()
+    if isinstance(node, (list, tuple)):
+        return any(_mentions_self(item, _seen) for item in node)
+    if not isinstance(node, fast.Node):
+        return False
+    if id(node) in _seen:
+        return False
+    _seen.add(id(node))
+    for attr, value in vars(node).items():
+        if attr in DesugarPass._SKIP_FIELDS:
+            continue
+        if isinstance(node, fast.Literal) and attr == "value":
+            continue
+        if value == "self":
+            return True
+        if isinstance(value, (fast.Node, list, tuple)):
+            if _mentions_self(value, _seen):
+                return True
+        elif isinstance(value, dict):
+            if any(_mentions_self(v, _seen) for v in value.values()):
+                return True
+    return False
+
+
 class TraitDictionaryDesugarPass(DesugarPass):
     """Desugar trait method calls to dictionary lookups.
     
@@ -263,7 +429,12 @@ def run_default_desugaring(ast_root: fast.Node, ctx: DesugarContext | None = Non
         The desugared AST
     """
     passes = [
-        TraitDictionaryDesugarPass(),  # Desugar trait method calls to dictionary lookups
+        # Rewrite implement-blocks into mangled top-level functions; method
+        # calls dispatch on the receiver's runtime type in the MIR interpreter.
+        TraitImplDesugarPass(),
+        # TraitDictionaryDesugarPass (dictionary-passing dispatch) is not part
+        # of the default pipeline: v1 uses TraitImplDesugarPass + runtime
+        # dispatch instead. The class is kept for opt-in/experimental use.
         # IfDesugarPass is deliberately omitted: if/else keeps its native
         # HIR/MIR lowering (see IfDesugarPass docstring).
     ]
