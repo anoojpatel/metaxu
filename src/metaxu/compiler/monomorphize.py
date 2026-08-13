@@ -32,10 +32,16 @@ the interpreter dispatches dynamically either way. Correctness contract:
 interpreting monomorphized MIR must produce results identical to
 interpreting the unmonomorphized MIR (pinned by tests).
 
+Module-qualified generic calls (``mod.f<Int>(x)``) resolve like plain ones:
+the module system renames them to dotted callee names, which are collected
+in the signature map, and the HIR call preserves their explicit type args.
+Bracket-form instantiations (``Full[Int](x)``) are rewritten to the angle
+form by desugaring before HIR exists, so they also specialize for free.
+
 Out of scope (groundwork, documented): substitution inside type
 applications (``Vec[T]``), method/trait-dispatch callees (``__trait$m``),
-qualified calls, and higher-order flow of generic functions as values —
-such call sites simply stay generic.
+and higher-order flow of generic functions as values — such call sites
+simply stay generic.
 """
 from __future__ import annotations
 

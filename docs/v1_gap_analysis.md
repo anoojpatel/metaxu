@@ -129,10 +129,31 @@ Known remaining gaps (documented, not v1-blocking):
   CALL-SITE-LOCALLY (let-polymorphism lite: `identity(1)` and
   `identity("s")` coexist); `where T: Trait` / `fn f<T: Trait>` bounds are
   enforced against the impl registry for resolved instantiations, naming
-  the missing impl. Not covered (left to inference/runtime): substitution
-  inside type applications (`Vec[T]`), qualified/method call type args,
-  bracket-form constructor calls (`Full[Int](x)` parses as an index-call),
-  impl where-clauses, variance, higher-kinded params, associated types.
+  the missing impl. Since first writing, four caveats have closed:
+  substitution INSIDE type applications (a field/param declared `Vec[T]` /
+  `Pair[T]` / nested `Pair[Pair[T]]` checks against the substituted
+  application — base constructors must match, and argument positions
+  recurse where the value's own type args are known, e.g. an explicit
+  `Pair<String>{...}`; unknown element types keep base-name-only checking,
+  no false positives); bracket-form explicit instantiations
+  (`Full[Int](x)` parses as an index-call — a desugar pass,
+  `BracketCtorCallDesugarPass`, recognizes the shape when the base is a
+  known generic variant/function and every index is a type display, and
+  rewrites it to the angle-form FunctionCall, so checking, HIR lowering
+  and monomorphization all treat both spellings identically; value
+  indexes like `arr[i](x)` are untouched); impl-block where clauses
+  (carried through trait-impl desugaring onto the mangled `__impl$` fns
+  and enforced at coherence-load time against the impl registry where
+  decidable — i.e. constraints over concrete types like
+  `implement Show for P where Q: Eq`; conditional impls,
+  `implement Show for Pair[T] where T: Show`, depend on per-instantiation
+  type args the base-name registry cannot see and stay permissive with
+  runtime dispatch enforcing); and module-qualified generic calls
+  (`mod.f<Int>(x)` — type args survive the module system's rename into
+  the frozen QualifiedFunctionCall payload and the HIR call, so they are
+  checked and monomorphized like plain calls). Still not covered (left to
+  inference/runtime): method-call type args, variance, higher-kinded
+  params, associated types.
 - An optional monomorphization pass (`compiler/monomorphize.py`, HIR->HIR,
   pipeline flag `monomorphize=`, default off) clones generic functions per
   concrete instantiation (`identity$Int`), rewrites call sites (including

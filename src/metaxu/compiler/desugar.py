@@ -267,11 +267,20 @@ class TraitImplDesugarPass(DesugarPass):
         trait_name = type_base_name(impl.interface_name)
         type_name = type_base_name(impl.type_name)
         const_dims = _const_generic_dims(impl)
+        # Impl-level where clause + type parameters: attached to each mangled
+        # function (underscored attrs, frozen into the FunctionDeclaration
+        # payload as impl_where/impl_params) so the constraint emitter can
+        # enforce decidable impl where clauses at coherence-load time.
+        impl_where = getattr(impl, "where_clause", None)
+        impl_tparams = _impl_type_param_names(impl)
         out: list[fast.Node] = []
         for m in impl.methods or []:
             if not isinstance(m, (fast.FunctionDeclaration, fast.MethodImplementation)):
                 continue
             fn = self._method_to_function(m, trait_name, type_name)
+            if fn is not None and impl_where is not None:
+                fn._impl_where_clause = impl_where
+                fn._impl_type_params = impl_tparams
             if fn is not None and const_dims:
                 # Record which const-generic size parameters of the impl's
                 # receiver type map to which runtime dimension of `self`
@@ -339,6 +348,26 @@ def _type_arg_name(t: Any) -> str | None:
     if isinstance(t, fast.TypeParameter):
         return str(getattr(t, "name", "") or "") or None
     return None
+
+
+def _impl_type_param_names(impl: fast.Implementation) -> list[str]:
+    """Type-parameter names an implement block binds: its declared
+    `implement<T, ...>` parameters plus bare type arguments of its target
+    type application (`implement Show for Pair[T]` binds T). Used to
+    distinguish decidable (concrete-type) impl where constraints from
+    instantiation-dependent ones."""
+    names: list[str] = []
+    for tp in getattr(impl, "type_params", None) or []:
+        n = _type_arg_name(tp) if not isinstance(tp, str) else tp
+        if n:
+            names.append(str(n))
+    target = getattr(impl, "type_name", None)
+    if isinstance(target, fast.TypeApplication):
+        for a in getattr(target, "type_args", None) or []:
+            n = _type_arg_name(a)
+            if n:
+                names.append(n)
+    return names
 
 
 def _const_generic_dims(impl: fast.Implementation) -> tuple[tuple[str, int], ...]:
@@ -410,6 +439,134 @@ def _mentions_self(node: Any, _seen: set[int] | None = None) -> bool:
             if any(_mentions_self(v, _seen) for v in value.values()):
                 return True
     return False
+
+
+_BRACKET_PRIMITIVES = frozenset({
+    "Int", "int", "String", "str", "string", "Bool", "bool", "Float", "float",
+})
+
+
+class BracketCtorCallDesugarPass(DesugarPass):
+    """Rewrite bracket-form explicit instantiations in call position.
+
+    `Full[Int](x)` parses as CallExpression(IndexExpression(Full, Int), [x])
+    because `[...]` in expression position is indexing — so bracket-form
+    constructor/function instantiations used to bypass instantiation
+    checking entirely (and HIR had no lowering for them). This pass
+    recognizes the shape where it is decidable:
+
+      - the indexed base is a bare name that is a KNOWN generic enum
+        variant or a KNOWN generic function (declared with type params), and
+      - every index entry is a type display: a primitive name, a declared
+        struct/enum name, or a declared type-parameter name
+
+    and rewrites it to the equivalent FunctionCall with explicit type_args,
+    i.e. exactly the node `Full<Int>(x)` produces. Downstream phases
+    (constraint emitter, HIR lowering, monomorphization) then treat both
+    spellings identically. Any other indexed call (`arr[i](x)`, unknown
+    names, value indexes) is left untouched.
+    """
+
+    def __init__(self) -> None:
+        self._generic_callables: set[str] = set()
+        self._type_names: set[str] = set(_BRACKET_PRIMITIVES)
+
+    # -- definition scan ---------------------------------------------------
+
+    def _scan(self, node: Any, _seen: set[int] | None = None) -> None:
+        if _seen is None:
+            _seen = set()
+        if isinstance(node, (list, tuple)):
+            for item in node:
+                self._scan(item, _seen)
+            return
+        if isinstance(node, dict):
+            for item in node.values():
+                self._scan(item, _seen)
+            return
+        if not isinstance(node, fast.Node) or id(node) in _seen:
+            return
+        _seen.add(id(node))
+        if isinstance(node, fast.EnumDefinition):
+            name = str(getattr(node, "name", "") or "")
+            if name:
+                self._type_names.add(name)
+            tparams = getattr(node, "type_params", None) or []
+            for tp in tparams:
+                n = tp if isinstance(tp, str) else _type_arg_name(tp)
+                if n:
+                    self._type_names.add(str(n))
+            if tparams:
+                for v in getattr(node, "variants", None) or []:
+                    vname = str(getattr(v, "name", "") or "")
+                    if vname:
+                        self._generic_callables.add(vname)
+        elif isinstance(node, fast.StructDefinition):
+            name = str(getattr(node, "name", "") or "")
+            if name:
+                self._type_names.add(name)
+            for tp in getattr(node, "type_params", None) or []:
+                n = tp if isinstance(tp, str) else _type_arg_name(tp)
+                if n:
+                    self._type_names.add(str(n))
+        elif isinstance(node, fast.FunctionDeclaration):
+            tparams = getattr(node, "type_params", None) or []
+            for tp in tparams:
+                n = tp if isinstance(tp, str) else _type_arg_name(tp)
+                if n:
+                    self._type_names.add(str(n))
+            if tparams:
+                name = str(getattr(node, "name", "") or "")
+                if name:
+                    self._generic_callables.add(name)
+        for attr, value in list(vars(node).items()):
+            if attr in self._SKIP_FIELDS:
+                continue
+            if isinstance(value, (fast.Node, list, tuple, dict)):
+                self._scan(value, _seen)
+
+    # -- rewrite -----------------------------------------------------------
+
+    @staticmethod
+    def _display_name(node: Any) -> str | None:
+        if isinstance(node, fast.Variable):
+            n = getattr(node, "name", None)
+            return str(n) if isinstance(n, str) else None
+        if isinstance(node, (fast.TypeReference, fast.TypeParameter)):
+            n = getattr(node, "name", None)
+            return str(n) if isinstance(n, str) else None
+        return None
+
+    def apply_recursive(self, node, ctx, _memo=None):
+        if _memo is None:
+            # First call is the program root: collect definitions before
+            # rewriting so recognition is declaration-order independent.
+            self._scan(node)
+        return super().apply_recursive(node, ctx, _memo)
+
+    def apply(self, node: fast.Node, ctx: DesugarContext) -> fast.Node:
+        if not isinstance(node, fast.CallExpression):
+            return node
+        callee = getattr(node, "callee", None)
+        if not isinstance(callee, fast.IndexExpression):
+            return node
+        base_name = self._display_name(getattr(callee, "base", None))
+        if base_name is None or base_name not in self._generic_callables:
+            return node
+        idx = getattr(callee, "index", None)
+        idx_list = idx if isinstance(idx, list) else [idx]
+        targ_names: list[str] = []
+        for entry in idx_list:
+            n = self._display_name(entry)
+            if n is None or n not in self._type_names:
+                return node          # not a type display: a real index
+            targ_names.append(n)
+        if not targ_names:
+            return node
+        call = fast.FunctionCall(base_name, list(getattr(node, "arguments", None) or []))
+        call.type_args = [fast.TypeReference(n) for n in targ_names]
+        call.location = getattr(node, "location", None)
+        return call
 
 
 class TraitDictionaryDesugarPass(DesugarPass):
@@ -510,6 +667,9 @@ def run_default_desugaring(ast_root: fast.Node, ctx: DesugarContext | None = Non
         The desugared AST
     """
     passes = [
+        # Bracket-form explicit instantiations (`Full[Int](x)`) become plain
+        # FunctionCalls with type_args, identical to `Full<Int>(x)`.
+        BracketCtorCallDesugarPass(),
         # Rewrite implement-blocks into mangled top-level functions; method
         # calls dispatch on the receiver's runtime type in the MIR interpreter.
         TraitImplDesugarPass(),
