@@ -123,6 +123,22 @@ def run_pipeline_ctx(ctx: PhaseContext, strict: bool = True) -> tuple[str, str, 
     return ast_json, hir_txt, mir_txt, clif_txt
 
 
+def emit_llvm_from_source(source: str, strict: bool = True) -> str:
+    """Parse, check, lower to MIR and emit an LLVM IR module (text).
+
+    Separate entry point from run_pipeline_from_source (whose CLIF-returning
+    signature is unchanged).  Raises BorrowCheckError / TypeCheckError in
+    strict mode exactly like the main pipeline.
+    """
+    from .codegen_llvm import emit_llvm
+
+    ctx = build_context_from_source(source)
+    run_pipeline_ctx(ctx, strict=strict)  # strict type/borrow gate
+    hir_funcs = HIRBuilder(ctx.tables, id_map=ctx.id_map).build(ctx.frozen_root)
+    mir_funcs = lower_hir_to_mir(hir_funcs)
+    return emit_llvm(mir_funcs)
+
+
 def run_pipeline_from_source(source: str, strict: bool = True) -> tuple[str, str, str, str]:
     """Parse, desugar, type/borrow check, and run the pipeline from source.
 
