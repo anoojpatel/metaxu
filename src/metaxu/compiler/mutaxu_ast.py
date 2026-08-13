@@ -199,7 +199,7 @@ def _value_of(node: Any) -> Any | None:
             "mode": _mode_value(getattr(node, "mode", None)),
         }
     if isinstance(node, fast.FunctionDeclaration):
-        return {
+        payload = {
             "name": getattr(node, "name", None),
             "params": [getattr(p, "name", None) for p in getattr(node, "params", [])],
             "performs": [_effect_name(e) for e in getattr(node, "performs", []) or []],
@@ -217,6 +217,17 @@ def _value_of(node: Any) -> Any | None:
             "return_type": _safe_type_display(getattr(node, "return_type", None)),
             "where": _where_constraints(node),
         }
+        # Mangled impl methods (__impl$Trait$Type$m) carry their implement
+        # block's where clause and type parameters, attached by the trait
+        # impl desugar pass, so the constraint emitter can enforce impl
+        # where clauses at coherence-load time.
+        impl_where = getattr(node, "_impl_where_clause", None)
+        if impl_where is not None:
+            payload["impl_where"] = _where_clause_constraints(impl_where)
+        impl_params = getattr(node, "_impl_type_params", None)
+        if impl_params is not None:
+            payload["impl_params"] = [str(p) for p in impl_params]
+        return payload
     if isinstance(node, fast.EffectDeclaration):
         return {
             "name": getattr(node, "name", None),
@@ -301,10 +312,15 @@ def _value_of(node: Any) -> Any | None:
         return {"name": getattr(node, "name", None)}
     if isinstance(node, fast.Implementation):
         # Pre-desugar impl registry info: `implement Trait for Type`.
-        # (Post-desugar the same info lives in the mangled __impl$ names.)
+        # (Post-desugar the same info lives in the mangled __impl$ names,
+        # which also carry impl_where/impl_params — see FunctionDeclaration.)
         return {
             "trait": _safe_type_display(getattr(node, "interface_name", None)),
             "type": _safe_type_display(getattr(node, "type_name", None)),
+            "where": _where_clause_constraints(getattr(node, "where_clause", None)),
+            "type_params": [
+                _type_param_name(tp) for tp in getattr(node, "type_params", None) or []
+            ],
         }
     if isinstance(node, fast.MatchExpression):
         # Arm-pattern summaries for compile-time exhaustiveness checking:
@@ -314,7 +330,15 @@ def _value_of(node: Any) -> Any | None:
     if isinstance(node, fast.FieldAccess):
         return {"fields": tuple(getattr(node, "fields", ()) or ())}
     if isinstance(node, fast.QualifiedFunctionCall):
-        return {"name": ".".join(getattr(node, "parts", ()) or ())}
+        payload = {"name": ".".join(getattr(node, "parts", ()) or ())}
+        # Module-qualified generic calls (`mod.f<Int>(x)`) carry their
+        # explicit type args exactly like plain FunctionCalls, so
+        # instantiation checking survives the module system's rename of
+        # `mod.f` to a dotted callee name.
+        type_args = getattr(node, "type_args", None) or []
+        if type_args:
+            payload["type_args"] = [_type_display(a) for a in type_args]
+        return payload
     if isinstance(node, fast.BorrowShared):
         return {"variable": getattr(node, "variable", None)}
     if isinstance(node, fast.BorrowUnique):
@@ -387,6 +411,22 @@ def _flatten_bounds(bound: Any) -> list[str]:
     return [disp] if disp else []
 
 
+def _where_clause_constraints(where: Any) -> list[dict[str, str]]:
+    """Flatten one WhereClause node into constraint entries
+    [{"param": <name>, "trait": <trait name>, "kind": <kind>}]."""
+    out: list[dict[str, str]] = []
+    for c in getattr(where, "constraints", None) or []:
+        pname = _safe_type_display(getattr(c, "type_param", None))
+        for trait in _flatten_bounds(getattr(c, "bound_type", None)):
+            if pname:
+                out.append({
+                    "param": pname,
+                    "trait": trait,
+                    "kind": str(getattr(c, "kind", "subtype") or "subtype"),
+                })
+    return out
+
+
 def _where_constraints(node: Any) -> list[dict[str, str]]:
     """Collect trait-bound constraints for a generic declaration.
 
@@ -401,16 +441,7 @@ def _where_constraints(node: Any) -> list[dict[str, str]]:
             continue
         for trait in _flatten_bounds(getattr(tp, "bounds", None)):
             out.append({"param": pname, "trait": trait, "kind": "bound"})
-    where = getattr(node, "where_clause", None)
-    for c in getattr(where, "constraints", None) or []:
-        pname = _safe_type_display(getattr(c, "type_param", None))
-        for trait in _flatten_bounds(getattr(c, "bound_type", None)):
-            if pname:
-                out.append({
-                    "param": pname,
-                    "trait": trait,
-                    "kind": str(getattr(c, "kind", "subtype") or "subtype"),
-                })
+    out.extend(_where_clause_constraints(getattr(node, "where_clause", None)))
     return out
 
 
