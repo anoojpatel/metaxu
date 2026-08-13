@@ -117,7 +117,8 @@ def compile_and_run(llvm_ir: str, entry: str = "main", *,
                     workdir: str | None = None,
                     timeout: float = 60.0,
                     clang_args: tuple[str, ...] = (),
-                    run_env: dict[str, str] | None = None) -> tuple[int, str]:
+                    run_env: dict[str, str] | None = None,
+                    run_cwd: str | None = None) -> tuple[int, str]:
     """Compile ``llvm_ir`` with clang and run it; return (exit_code, stdout).
 
     ``entry`` is the metaxu function name (unmangled).  ``workdir`` keeps the
@@ -127,7 +128,9 @@ def compile_and_run(llvm_ir: str, entry: str = "main", *,
     ``run_env`` entries are overlaid on the inherited environment for the
     binary's execution — e.g. {"ASAN_OPTIONS": "detect_leaks=0"} for programs
     whose payload boxes / heap closure envs leak BY DESIGN, where ASan should
-    prove only no-UAF/no-double-free, not leak-freedom.
+    prove only no-UAF/no-double-free, not leak-freedom.  ``run_cwd`` pins the
+    binary's working directory (FFI differentials resolve relative fopen
+    paths against it; default: inherit the caller's cwd).
     """
     sym = mangle(entry)
     m = re.search(
@@ -164,5 +167,6 @@ def compile_and_run(llvm_ir: str, entry: str = "main", *,
         env = dict(os.environ)
         env.update(run_env)
     run_proc = subprocess.run(
-        [bin_path], capture_output=True, text=True, timeout=timeout, env=env)
+        [bin_path], capture_output=True, text=True, timeout=timeout, env=env,
+        cwd=run_cwd)
     return run_proc.returncode, run_proc.stdout

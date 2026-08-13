@@ -30,6 +30,7 @@
  * | mx_f64_to_str    | char* (double)                             | fresh malloc'd string, Python str(float) format |
  * | mx_str_eq        | int64_t (const char*, const char*)         | 1 if contents equal, else 0 |
  * | mx_str_free      | void (char*)                               | frees a produced string; NULL is a no-op |
+ * | mx_vec_as_bytes  | unsigned char* (const mx_vec*)             | fresh malloc'd byte SNAPSHOT of the elements |
  *
  * Vec semantics (mirrors MxVec in mir_interp.py)
  * ----------------------------------------------
@@ -64,6 +65,15 @@
  *     (never interned literal constants — the backend distinguishes
  *     provenance statically).
  *   - mx_str_len / mx_str_eq allocate nothing.
+ *   - mx_vec_as_bytes (`vec.as_ptr()`) returns a fresh malloc'd BYTE
+ *     SNAPSHOT of the vector's current elements (len bytes, one byte per
+ *     element, NO NUL terminator), mirroring the interpreter's _ffi_as_ptr
+ *     exactly: the snapshot is an independent allocation that never
+ *     aliases the vector's own word buffer, so later pushes/growth cannot
+ *     invalidate it and freeing the vector leaves it intact.  The caller
+ *     owns the snapshot (plain free()); the LLVM backend currently leaks
+ *     it by design.  An element outside 0..255 aborts (the interpreter's
+ *     "as_ptr: element ... is not a byte" strictness), never truncates.
  *
  * Float formatting
  * ----------------
@@ -95,6 +105,7 @@ int64_t mx_vec_len(const mx_vec *v);
 int64_t mx_vec_get(const mx_vec *v, int64_t idx);
 void    mx_vec_set(mx_vec *v, int64_t idx, int64_t value);
 void    mx_vec_free(mx_vec *v);
+unsigned char *mx_vec_as_bytes(const mx_vec *v);
 
 /* --- Strings ------------------------------------------------------------ */
 char   *mx_str_concat(const char *a, const char *b);

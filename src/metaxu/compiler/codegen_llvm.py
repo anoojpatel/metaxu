@@ -106,8 +106,58 @@ soundness bar is unchanged — a leak is acceptable, a UAF/double-free never:
     same read-only conditions.  Both elisions are marked with
     `; elide-copy:` comments in the IR.
 
+Increment 9 makes native FFI real — extern C calls, a raw-pointer kind,
+vector literals and static method calls (05_unsafe_and_ffi.mx emits and
+runs natively):
+  * RAW POINTERS: a new scalar kind ``rawptr`` (8-byte ``ptr``, shallow
+    copies — C semantics exactly).  ``null`` (MIR ``const None``) stays at
+    the i64 bottom until unification with a rawptr flow promotes it, then
+    emits as the ``null`` ptr constant; ==/!= on two rawptrs is ``icmp``
+    pointer equality.  rawptr is deliberately NOT a word kind: it cannot
+    enter Vec elements or cross effect boundaries (demotes honestly).
+  * EXTERN C CALLS: MIR calls to the extern-declared libc names the
+    interpreter shims (malloc/free/memcpy/realloc/fopen/fclose) emit as
+    DIRECT calls to the real C symbols with their C signatures (fclose's
+    C ``int`` is declared i32 and sext'd).  The interpreter runs these
+    against a simulated, bounds-checked heap; natively they hit the real
+    allocator, so programs the interpreter ACCEPTS behave identically
+    while programs it rejects (overrun/UAF/double free) are real UB
+    natively — the same strict-error-vs-UB contract as division by zero
+    (ASan differentials pin the accepted side).  Like the interpreter's
+    resolution order, these builtin names win over same-named module
+    functions.
+  * ``as_ptr``: on a string, IDENTITY (native strings already are
+    NUL-terminated byte pointers; the interpreter's fresh readonly
+    snapshot is observationally identical for every accepted program —
+    writes through it are interpreter errors).  On a vec, a fresh
+    malloc'd byte SNAPSHOT via mx_vec_as_bytes (interpreter parity:
+    never a view into the vec's word buffer — elements are 8-byte words
+    natively, so a raw data-pointer alias would have the WRONG layout;
+    the snapshot also survives vec growth/free).  Snapshots leak by
+    design.  Non-byte elements abort (interpreter strictness).
+  * ``ptr_read``/``ptr_write``: inline i8 load (zext) / store (trunc)
+    through a byte GEP.  The interpreter bounds-checks and rejects
+    non-byte values; natively out-of-range is UB (same contract as above).
+  * ``__vec_lit`` (fixed-size ``vector[T,N](...)`` literals) lowers to
+    mx_vec_new + one mx_vec_push per element.  CAVEAT (documented): the
+    interpreter's MxVector has immutable VALUE semantics; natively the
+    value is an mx_vec with identity semantics.  For every program the
+    interpreter accepts these are indistinguishable (MxVector supports no
+    mutation — push/pop on it are interpreter errors), but a rejected
+    program could mutate natively instead of erroring.  len /
+    __index_get / as_ptr work uniformly; elementwise vector arithmetic
+    and __vec_dim/__slice_get/... still demote.
+  * ``__static$Type$method`` calls resolve at COMPILE TIME exactly like
+    the interpreter's _dispatch_static_call: the unique __impl$*$Type$
+    method fn, else the plain dotted module function ``Type.method``,
+    else the dotted builtin (``Vec.new``); multiple candidate traits
+    demote (ambiguity is an interpreter error).
+  * ``assert(cond, ...)`` lowers to an inline branch-to-@abort on a
+    falsy i64 condition (message arguments are evaluated but not
+    rendered natively; a failing assert aborts instead of raising).
+
 Everything else — try_scope,
-fixed-size vector literals/comprehensions/slices — is emitted as a
+fixed-size vector comprehensions/slices/dims — is emitted as a
 clearly marked, comment-only placeholder carrying the reasons, never as
 silently wrong code.  Functions that call a placeholder function are
 themselves demoted (the module must link), with an explicit reason.
@@ -411,8 +461,8 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from .mir import MirFunc
 from .cps_frames import is_suspending
-from .desugar import parse_impl_method_name
-from .hir import TRAIT_CALL_PREFIX
+from .desugar import IMPL_SEP, parse_impl_method_name
+from .hir import STATIC_CALL_PREFIX, TRAIT_CALL_PREFIX
 
 # Value kinds -----------------------------------------------------------------
 
@@ -423,6 +473,14 @@ STR = "str"
 # a handler-case subfunction.  A pointer, but NOT a word kind — it may only
 # flow from the case's own param into its resume ops; anywhere else demotes.
 KONT = "kont"
+# A raw C pointer (increment 9): 8-byte scalar `ptr` storage, shallow
+# copies — exactly C semantics.  Produced by the extern FFI calls
+# (malloc/realloc/memcpy/fopen) and `as_ptr`; `null` (MIR `const None`)
+# emits as the `null` ptr constant once unification promotes its variable
+# to this kind; ==/!= compare pointer identity.  Deliberately NOT a word
+# kind: rawptr values may not enter Vec elements or cross the effect
+# boundary (those flows demote honestly).
+PTR = "rawptr"
 CONFLICT = "conflict"
 _STRUCT_PREFIX = "struct:"
 _ENUM_PREFIX = "enum:"
@@ -463,18 +521,41 @@ _INLINE_BUILTINS = {"neg", "not"}
 # shadow them.
 #   Vec.new      -> mx_vec_new          push  -> mx_vec_push
 #   pop          -> mx_vec_pop          len   -> mx_vec_len / mx_str_len
-#   __index_get  -> mx_vec_get
+#   __index_get  -> mx_vec_get          __vec_lit -> mx_vec_new + pushes
 #   to_string / int_to_str -> mx_i64_to_str / mx_f64_to_str / identity(str)
 _NATIVE_RT_CALLS = {"Vec.new", "push", "pop", "len", "to_string",
-                    "int_to_str", "__index_get"}
+                    "int_to_str", "__index_get", "__vec_lit"}
+
+# Extern C symbols the interpreter shims over its simulated heap
+# (mir_interp._ffi_*): natively these are DIRECT calls to the real libc
+# functions with their C signatures — (param kinds, result kind).  free
+# and fclose "return" unit/int into an i64 destination.
+_EXTERN_C_SIGS = {
+    "malloc": ((I64,), PTR),
+    "free": ((PTR,), I64),          # C void; dst is unit 0
+    "memcpy": ((PTR, PTR, I64), PTR),
+    "realloc": ((PTR, I64), PTR),
+    "fopen": ((PTR, PTR), PTR),
+    "fclose": ((PTR,), I64),        # C int: declared i32, sext'd to i64
+}
+# Interpreter FFI shims with dedicated inline lowerings (no C symbol):
+# as_ptr (identity on str / mx_vec_as_bytes snapshot on vec), ptr_read /
+# ptr_write (inline i8 loads/stores).
+_FFI_SHIMS = {"as_ptr", "ptr_read", "ptr_write"}
+_FFI_CALLS = set(_EXTERN_C_SIGS) | _FFI_SHIMS
 
 # Interpreter builtins that trait dispatch can fall back to when no user
 # impl matches the receiver type (mir_interp._dispatch_trait_call step 2).
+# The FFI names are included because they ARE interpreter builtins: a trait
+# call falling through to them must never resolve to a same-named plain
+# module function instead (the interpreter would pick the builtin).
 _TRAIT_BUILTIN_FALLBACK = {"to_string", "int_to_str", "len", "push", "pop",
-                           "sqrt", "sin", "cos"}
+                           "sqrt", "sin", "cos", "assert"} | _FFI_CALLS
 
 # Callees still implemented only by the interpreter runtime (demote).
-_RUNTIME_PREFIXES = ("__vec_", "__index_", "__slice_", "__range", "__static$")
+# `__vec_lit` is native since increment 9 (checked before these prefixes);
+# `__static$` calls resolve statically (see _resolve_static_call).
+_RUNTIME_PREFIXES = ("__vec_", "__index_", "__slice_", "__range")
 _RUNTIME_NAMES = {"type_of", "assert_eq"}
 
 # Native runtime symbol signatures (metaxu_rt.h ABI): name -> (ret, params).
@@ -492,6 +573,7 @@ _RT_SIGS = {
     "mx_f64_to_str": ("ptr", ("double",)),
     "mx_str_eq": ("i64", ("ptr", "ptr")),
     "mx_str_free": ("void", ("ptr",)),
+    "mx_vec_as_bytes": ("ptr", ("ptr",)),
     # Algebraic effects runtime (metaxu_effects.c).
     "mx_handle": ("i64", ("ptr", "ptr", "ptr", "ptr", "ptr", "ptr", "ptr",
                           "i64")),
@@ -576,21 +658,34 @@ _HEADER = (
     ";   never-rebound aggregate params skip the byval copy (read the\n"
     ";   caller's storage); read-only variant_field results read through\n"
     ";   the write-once box pointer ('; elide-copy:' comments mark both);\n"
+    ";   NATIVE FFI (increment 9): rawptr values are raw C `ptr` scalars\n"
+    ";   (null -> the null constant; ==/!= -> ptr icmp); extern calls\n"
+    ";   (malloc/free/memcpy/realloc/fopen/fclose) hit the REAL libc\n"
+    ";   symbols with C signatures (interpreter's simulated-heap checks\n"
+    ";   become native UB on rejected programs, like division by zero);\n"
+    ";   as_ptr is identity on strings and an mx_vec_as_bytes snapshot on\n"
+    ";   vecs (leaks by design); ptr_read/ptr_write are inline i8 ops;\n"
+    ";   __vec_lit -> mx_vec_new + pushes (identity semantics stand in\n"
+    ";   for the interpreter's immutable vector values -- no accepted\n"
+    ";   program can tell); __static$Type$m calls resolve at compile time\n"
+    ";   (impl fn -> dotted module fn -> dotted builtin, the\n"
+    ";   interpreter's order); assert -> inline branch to @abort;\n"
     "; functions outside the subset appear as comment-only placeholders."
 )
 
 
 def _llparam(kind: str) -> str:
     """The LLVM parameter/return-slot type for a value kind (aggregates -> ptr)."""
-    if _is_agg(kind) or _is_vec(kind) or kind == KONT:
+    if _is_agg(kind) or _is_vec(kind) or kind in (KONT, PTR):
         return "ptr"
     return _LLTY.get(kind, "i64")
 
 
 def _llscalar(kind: str) -> str:
     """The LLVM type of a non-aggregate (register-sized) value kind.
-    Vec values are opaque `mx_vec*` pointers; kont is an opaque `mx_k*`."""
-    if _is_vec(kind) or kind == KONT:
+    Vec values are opaque `mx_vec*` pointers; kont is an opaque `mx_k*`;
+    rawptr is a raw C `ptr`."""
+    if _is_vec(kind) or kind in (KONT, PTR):
         return "ptr"
     return _LLTY.get(kind, "i64")
 
@@ -961,17 +1056,18 @@ def _blocks_in_cycles(f: MirFunc) -> Set[int]:
 
 
 def _analyze(f: MirFunc, module_names: Set[str], closures: "_ClosureTable",
-             scopes: "_ScopeTable") -> _Info:
+             scopes: "_ScopeTable", traits: "_TraitTable") -> _Info:
     info = _Info(f=f)
     try:
-        _analyze_inner(info, module_names, closures, scopes)
+        _analyze_inner(info, module_names, closures, scopes, traits)
     except Exception as exc:  # defensive: malformed MIR must never crash codegen
         info.add_reason(f"analysis error: {type(exc).__name__}: {exc}")
     return info
 
 
 def _analyze_inner(info: _Info, module_names: Set[str],
-                   closures: "_ClosureTable", scopes: "_ScopeTable") -> None:
+                   closures: "_ClosureTable", scopes: "_ScopeTable",
+                   traits: "_TraitTable") -> None:
     f = info.f
     if not f.blocks:
         info.add_reason("function has no blocks")
@@ -1211,7 +1307,21 @@ def _analyze_inner(info: _Info, module_names: Set[str],
                     f"trait method call {method!r} with no receiver")
             else:
                 info.trait_calls.append((dst, method, cargs))
-        elif callee in _NATIVE_RT_CALLS:
+        elif callee.startswith(STATIC_CALL_PREFIX):
+            # `Type.method(args)` resolves at compile time exactly like the
+            # interpreter's _dispatch_static_call (see _resolve_static_call);
+            # the ORIGINAL callee name is kept — every later phase re-runs
+            # the (purely static) resolution.
+            res, target = _resolve_static_call(callee, traits, module_names)
+            if res == "demote":
+                info.add_reason(target)
+            else:
+                direct_calls.append((dst, callee, cargs))
+        elif callee in _NATIVE_RT_CALLS or callee in _FFI_CALLS \
+                or callee == "assert":
+            # Native runtime builtins, the extern-C/FFI names, and assert:
+            # like the interpreter's "builtins first" order these win over
+            # same-named module functions.
             direct_calls.append((dst, callee, cargs))
         elif callee in closures.targets:
             # Lambdas are only callable through their closure value: a direct
@@ -1713,6 +1823,39 @@ def _build_trait_table(module_names: Set[str]) -> _TraitTable:
     return table
 
 
+def _resolve_static_call(callee: str, traits: _TraitTable,
+                         module_names: Set[str]) -> Tuple[str, str]:
+    """Statically resolve a `__static$Type$method` call (no receiver).
+
+    Mirrors mir_interp._dispatch_static_call exactly:
+      1. the unique __impl$Trait$Type$method function (EXACT type-name
+         match — the interpreter's impl index does not case-fold here);
+         multiple candidate traits are an interpreter error -> demote;
+      2. the plain dotted module function "Type.method";
+      3. the dotted builtin ("Vec.new").
+    Returns ("func", fname) | ("builtin", name) | ("demote", reason).
+    Purely static — resolution needs no value kinds, so it never changes
+    across the fixpoint."""
+    rest = callee[len(STATIC_CALL_PREFIX):]
+    type_name, _, method = rest.partition(IMPL_SEP)
+    tm = traits.by_method.get(method, {}).get(type_name)
+    if tm:
+        if len(tm) > 1:
+            opts = ", ".join(sorted(tm))
+            return ("demote",
+                    f"ambiguous static method {method!r} on type "
+                    f"{type_name!r} (implemented by traits: {opts})")
+        return ("func", next(iter(tm.values())))
+    dotted = f"{type_name}.{method}"
+    if dotted in module_names:
+        return ("func", dotted)
+    if dotted in _NATIVE_RT_CALLS:
+        return ("builtin", dotted)
+    return ("demote",
+            f"static method {method!r} on type {type_name!r} has no impl "
+            "and no native dotted fallback")
+
+
 # Scalar type names the interpreter reports for kind-erased i64 receivers.
 _I64_RUNTIME_TYPE_NAMES = {"int", "bool", "unit"}
 
@@ -1929,6 +2072,22 @@ def _infer_kinds(info: _Info, sigs: Dict[str, _Sig], structs: _StructTable,
                         ch = mark(other, nk) or ch
                     else:
                         ch = mark(args[0], CONFLICT) or ch
+        elif name == "__vec_lit":
+            # ("__vec_lit", size, e0, e1, ...): the literal builds a fresh
+            # vector; elements unify two-way with the element kind exactly
+            # like push (the size argument stays i64).
+            ch = mark(dst, _vec_of(I64)) or ch
+            rk = get(dst)
+            if _is_vec(rk):
+                ek = _vec_elem(rk)
+                for e in args[1:]:
+                    ek = _join(ek, get(e))
+                if ek != CONFLICT:
+                    ch = mark(dst, _vec_of(ek)) or ch
+                    for e in args[1:]:
+                        ch = mark(e, ek) or ch
+                else:
+                    ch = mark(dst, CONFLICT) or ch
         elif name == "len":
             pass  # receiver may be vec or str; dst stays i64
         elif name in ("to_string", "int_to_str"):
@@ -2056,11 +2215,39 @@ def _infer_kinds(info: _Info, sigs: Dict[str, _Sig], structs: _StructTable,
                             elif res == "builtin":
                                 changed = apply_builtin(
                                     target, dst, args, plain_call=False) or changed
+                    elif callee.startswith(STATIC_CALL_PREFIX):
+                        sres, starget = _resolve_static_call(
+                            callee, traits, module_names)
+                        if sres == "func":
+                            sig = sigs.get(starget)
+                            if sig is not None and len(sig.params) == len(args):
+                                for a, pk in zip(args, sig.params):
+                                    changed = mark(a, pk) or changed
+                                changed = mark(dst, sig.ret) or changed
+                        elif sres == "builtin":
+                            changed = apply_builtin(
+                                starget, dst, args, plain_call=True) or changed
                     elif callee in _NATIVE_RT_CALLS:
                         # Interpreter resolution order: builtins first, so
                         # these win over same-named module functions.
                         changed = apply_builtin(
                             callee, dst, args, plain_call=True) or changed
+                    elif callee in _EXTERN_C_SIGS:
+                        pks, rk_ = _EXTERN_C_SIGS[callee]
+                        if len(args) == len(pks):
+                            for a, pk in zip(args, pks):
+                                changed = mark(a, pk) or changed
+                            changed = mark(dst, rk_) or changed
+                    elif callee == "as_ptr":
+                        # Receiver stays free (str or vec, like len); the
+                        # result is always a raw pointer.
+                        changed = mark(dst, PTR) or changed
+                    elif callee in ("ptr_read", "ptr_write"):
+                        if args:
+                            changed = mark(args[0], PTR) or changed
+                        # offset/value/result are i64 (the default)
+                    elif callee == "assert":
+                        pass  # cond is i64 (checked); dst is unit -> i64
                     elif callee in _MATH_EXTERNS:
                         for a in args:
                             changed = mark(a, F64) or changed
@@ -2272,6 +2459,24 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                 probs.append(
                     f"{name} result {dst!r} is {ty(dst)}, Vec elements are "
                     f"{_vec_elem(ty(args[0]))}")
+        elif name == "__vec_lit":
+            if not args:
+                probs.append("__vec_lit with no size argument")
+            elif not _is_vec(ty(dst)):
+                probs.append(
+                    f"__vec_lit result {dst!r} has kind {ty(dst)}, not a Vec")
+            elif ty(args[0]) != I64:
+                probs.append(f"__vec_lit size {args[0]!r} is {ty(args[0])}")
+            elif not _is_word_kind(_vec_elem(ty(dst))):
+                probs.append(
+                    f"Vec of {_vec_elem(ty(dst))} elements (only 8-byte "
+                    "word kinds fit native Vec slots)")
+            else:
+                for e in args[1:]:
+                    if ty(e) != _vec_elem(ty(dst)):
+                        probs.append(
+                            f"__vec_lit element {e!r} is {ty(e)} in a vector "
+                            f"of {_vec_elem(ty(dst))}")
         elif name == "len":
             if len(args) != 1:
                 probs.append(f"len with {len(args)} arguments (expects 1)")
@@ -2355,6 +2560,11 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                     probs.append(
                         f"constant {dst!r} promoted to Vec kind {ty(dst)} "
                         "(no literal Vec values)")
+                elif ty(dst) == PTR and dst not in info.dead_results \
+                        and not (rk == "const" and rhs[1] is None):
+                    probs.append(
+                        f"constant {dst!r} promoted to rawptr kind "
+                        "(only `null` is a pointer literal)")
             elif rk == "binop":
                 o = rhs[1]
                 if any(_is_vec(ty(x)) for x in (dst, *args)):
@@ -2374,6 +2584,14 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                             probs.append(
                                 f"string ordering comparison {o!r} (only "
                                 "==/!= lower to mx_str_eq)")
+                    elif ty(args[0]) == PTR and ty(args[1]) == PTR:
+                        # ==/!= on raw pointers -> ptr icmp (identity,
+                        # exactly the interpreter's structural MxPtr/None
+                        # comparison).  Pointer ordering stays demoted.
+                        if o not in ("==", "!="):
+                            probs.append(
+                                f"pointer ordering comparison {o!r} (only "
+                                "==/!= lower to ptr icmp)")
                     elif ty(args[0]) not in (I64, F64) or ty(args[1]) not in (I64, F64):
                         probs.append(f"comparison {o!r} on non-numeric operands")
                 elif o in _LOGIC:
@@ -2458,8 +2676,98 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                     else:  # demote (or a pending that survived assume_final)
                         probs.append(target or
                                      f"trait method {method!r} cannot be resolved")
+                elif callee.startswith(STATIC_CALL_PREFIX):
+                    sres, starget = _resolve_static_call(
+                        callee, traits, module_names)
+                    if sres == "builtin":
+                        check_builtin(starget, dst, args)
+                    elif sres == "func":
+                        sig = sigs.get(starget)
+                        if sig is None or starget not in module_names:
+                            probs.append(
+                                f"static call {callee!r} resolves to unknown "
+                                f"function {starget!r}")
+                        elif len(sig.params) != len(args):
+                            probs.append(
+                                f"static call {callee!r} -> {starget!r} with "
+                                "wrong arity")
+                        else:
+                            for a, pk in zip(args, sig.params):
+                                if ty(a) != pk:
+                                    probs.append(
+                                        f"static call {callee!r} -> "
+                                        f"{starget!r}: arg {a!r} is {ty(a)}, "
+                                        f"expects {pk}")
+                            if ty(dst) != sig.ret:
+                                probs.append(
+                                    f"static call {callee!r} -> {starget!r}: "
+                                    f"result {dst!r} is {ty(dst)}, returns "
+                                    f"{sig.ret}")
+                    else:
+                        probs.append(starget)
                 elif callee in _NATIVE_RT_CALLS:
                     check_builtin(callee, dst, args)
+                elif callee in _EXTERN_C_SIGS:
+                    pks, rk_ = _EXTERN_C_SIGS[callee]
+                    if len(args) != len(pks):
+                        probs.append(
+                            f"extern call {callee!r} with {len(args)} "
+                            f"arguments (expects {len(pks)})")
+                    else:
+                        for a, pk in zip(args, pks):
+                            if ty(a) != pk:
+                                probs.append(
+                                    f"extern call {callee!r}: arg {a!r} is "
+                                    f"{ty(a)}, C signature expects {pk}")
+                        if ty(dst) != rk_:
+                            probs.append(
+                                f"extern call {callee!r}: result {dst!r} is "
+                                f"{ty(dst)}, C signature returns {rk_}")
+                elif callee == "as_ptr":
+                    if len(args) != 1:
+                        probs.append(
+                            f"as_ptr with {len(args)} arguments (expects 1)")
+                    elif ty(args[0]) == STR:
+                        pass  # identity: native strings are byte pointers
+                    elif _is_vec(ty(args[0])):
+                        if _vec_elem(ty(args[0])) != I64:
+                            probs.append(
+                                f"as_ptr of a Vec of {_vec_elem(ty(args[0]))} "
+                                "elements (byte snapshots need i64 elements)")
+                    else:
+                        probs.append(
+                            f"as_ptr receiver {args[0]!r} has kind "
+                            f"{ty(args[0])} (only str and Vec lower natively)")
+                    if ty(dst) != PTR:
+                        probs.append(
+                            f"as_ptr result {dst!r} is {ty(dst)}, not rawptr")
+                elif callee in ("ptr_read", "ptr_write"):
+                    want = 2 if callee == "ptr_read" else 3
+                    if len(args) != want:
+                        probs.append(
+                            f"{callee} with {len(args)} arguments "
+                            f"(expects {want})")
+                    else:
+                        if ty(args[0]) != PTR:
+                            probs.append(
+                                f"{callee} base {args[0]!r} is {ty(args[0])}, "
+                                "not rawptr")
+                        for a in args[1:]:
+                            if ty(a) != I64:
+                                probs.append(
+                                    f"{callee} operand {a!r} is {ty(a)}, "
+                                    "not i64")
+                        if ty(dst) != I64:
+                            probs.append(
+                                f"{callee} result {dst!r} promoted to "
+                                f"{ty(dst)}")
+                elif callee == "assert":
+                    if not args:
+                        probs.append("assert with no condition")
+                    elif ty(args[0]) != I64:
+                        probs.append(
+                            f"assert condition {args[0]!r} is {ty(args[0])} "
+                            "(native truthiness is i64-only)")
                 elif callee in _PRINT_BUILTINS:
                     for a in args:
                         if ty(a) not in (I64, F64, STR):
@@ -2750,7 +3058,9 @@ def _compute_slots(info: _Info, kinds: Dict[str, str]) -> List[str]:
 
 # Native runtime calls that only READ or MUTATE a Vec through its receiver
 # argument without retaining the pointer (metaxu_rt.c stores no receiver).
-_VEC_SAFE_RECEIVER_BUILTINS = {"push", "pop", "len", "__index_get"}
+# as_ptr qualifies: mx_vec_as_bytes returns an INDEPENDENT byte snapshot
+# that never aliases the vec's buffer, so freeing the vec leaves it intact.
+_VEC_SAFE_RECEIVER_BUILTINS = {"push", "pop", "len", "__index_get", "as_ptr"}
 
 
 def _provably_dead_vecs(f: MirFunc, kinds: Dict[str, str],
@@ -2781,7 +3091,8 @@ def _provably_dead_vecs(f: MirFunc, kinds: Dict[str, str],
     entry_ops = f.blocks[0].ops
     candidates = [op[1] for op in entry_ops
                   if op[0] == "let" and len(op) == 4
-                  and op[2][0] == "call" and op[2][1] == "Vec.new"
+                  and op[2][0] == "call"
+                  and op[2][1] in ("Vec.new", "__vec_lit")
                   and _is_vec(kinds.get(op[1], I64))]
     if not candidates:
         return []
@@ -2807,18 +3118,21 @@ def _provably_dead_vecs(f: MirFunc, kinds: Dict[str, str],
                             and op[1] not in group:
                         group.add(op[1])
                         changed = True
-        # Every group member's every def must be the site's Vec.new (for the
-        # site itself, exactly once) or a copy from within the group.
+        # Every group member's every def must be the site's producing call
+        # (Vec.new / __vec_lit, for the site itself, exactly once) or a copy
+        # from within the group.
         ok = True
         for m in group:
             for (rhs, dargs) in defs.get(m, []):
-                if m == site and rhs[0] == "call" and rhs[1] == "Vec.new":
+                if m == site and rhs[0] == "call" \
+                        and rhs[1] in ("Vec.new", "__vec_lit"):
                     continue
                 if rhs[0] == "copy" and dargs and dargs[0] in group:
                     continue
                 ok = False
         if len([1 for (rhs, _a) in defs.get(site, [])
-                if rhs[0] == "call" and rhs[1] == "Vec.new"]) != 1:
+                if rhs[0] == "call"
+                and rhs[1] in ("Vec.new", "__vec_lit")]) != 1:
             ok = False
         # Every use of every member must be a whitelisted, non-escaping one.
         if ok:
@@ -3199,6 +3513,9 @@ class _ModuleState:
         self.uses_malloc = False   # @global structs: malloc/free declares
         self.uses_printf = False   # direct variadic printf (multi-arg print)
         self.runtime_syms: Set[str] = set()  # mx_* native runtime declares
+        # extern C FFI declares beyond malloc/free (memcpy/realloc/fopen/
+        # fclose), emitted with their real C signatures.
+        self.extern_c_syms: Set[str] = set()
         self.used_enums: Set[str] = set()      # enum names needing %enum types
         self.uses_closure_pair = False         # %mx.closure type needed
         # lambda name -> ((capture name, kind), ...) for %env.L emission
@@ -3425,6 +3742,10 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
             if value is None:
                 return "null"  # an uninitialized Vec slot (const None)
             raise _Unsupported(f"non-None constant for Vec value {name!r}")
+        if k == PTR:
+            if value is None:
+                return "null"  # the `null` pointer literal
+            raise _Unsupported(f"non-null constant for rawptr value {name!r}")
         if k == F64:
             if value is None:
                 value = 0.0
@@ -3484,7 +3805,10 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                 callee[len(TRAIT_CALL_PREFIX):], kind(cargs[0]), traits,
                 module_names, assume_final=True)
             return target if res == "builtin" else None
-        if callee in _NATIVE_RT_CALLS:
+        if callee.startswith(STATIC_CALL_PREFIX):
+            res, target = _resolve_static_call(callee, traits, module_names)
+            return target if res == "builtin" else None
+        if callee in _NATIVE_RT_CALLS or callee == "as_ptr":
             return callee
         return None
 
@@ -3537,6 +3861,10 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                         callee2[len(TRAIT_CALL_PREFIX):],
                         kind(cargs[0]) if cargs else I64, traits,
                         module_names, assume_final=True)
+                    target = tgt2 if res2 == "func" else None
+                elif callee2.startswith(STATIC_CALL_PREFIX):
+                    res2, tgt2 = _resolve_static_call(
+                        callee2, traits, module_names)
                     target = tgt2 if res2 == "func" else None
                 else:
                     target = callee2
@@ -3759,6 +4087,26 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
             w = fresh()
             lines.append(f"  {w} = call i64 @mx_vec_get(ptr {recv}, i64 {idx})")
             setval(dst, from_word(elem, w, lines), lines)
+        elif name == "__vec_lit":
+            # Fixed-size vector literal: a fresh native vector filled with
+            # one push per element (the size argument is implied by the
+            # element count; the front end already checked the arity).
+            # Identity semantics stand in for the interpreter's immutable
+            # MxVector — indistinguishable for every accepted program (see
+            # module docstring).
+            mod.runtime_syms.add("mx_vec_new")
+            v = fresh()
+            note = ("freed on ret paths (provably non-escaping)"
+                    if dst in vec_free_set else "leaks by design (may escape)")
+            lines.append(
+                f"  {v} = call ptr @mx_vec_new()  ; vector literal: {note}")
+            elem = _vec_elem(kind(dst))
+            if opargs[1:]:
+                mod.runtime_syms.add("mx_vec_push")
+            for e in opargs[1:]:
+                w = to_word(elem, use(e, lines), lines)
+                lines.append(f"  call void @mx_vec_push(ptr {v}, i64 {w})")
+            setval(dst, v, lines)
         elif name == "len":
             recv = use(opargs[0], lines)
             sym = "mx_vec_len" if _is_vec(kind(opargs[0])) else "mx_str_len"
@@ -3790,6 +4138,36 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
             setval(dst, v, lines)
         else:  # unreachable given resolution + consistency
             raise _Unsupported(f"builtin {name!r} has no native lowering")
+
+    def emit_extern_call(name: str, dst: str, opargs: Tuple[str, ...],
+                         lines: List[str]) -> None:
+        """A direct call to a real extern C symbol (increment 9): the
+        interpreter shims these over its simulated checked heap; natively
+        they are the actual libc functions with their C signatures."""
+        pks, rk_ = _EXTERN_C_SIGS[name]
+        avals = [f"{_llscalar(pk)} {use(a, lines)}"
+                 for a, pk in zip(opargs, pks)]
+        if name in ("malloc", "free"):
+            mod.uses_malloc = True  # shares the malloc/free declares
+        else:
+            mod.extern_c_syms.add(name)
+        if name == "free":
+            lines.append(f"  call void @free({', '.join(avals)})"
+                         "  ; extern C free (program-managed)")
+            setval(dst, "0", lines)  # C void -> unit
+        elif name == "fclose":
+            c = fresh()
+            lines.append(f"  {c} = call i32 @fclose({', '.join(avals)})"
+                         "  ; extern C")
+            v = fresh()
+            lines.append(f"  {v} = sext i32 {c} to i64")
+            setval(dst, v, lines)
+        else:
+            v = fresh()
+            lines.append(
+                f"  {v} = call {_llscalar(rk_)} @{name}({', '.join(avals)})"
+                "  ; extern C")
+            setval(dst, v, lines)
 
     # Params are visible from the entry block on: SSA args directly, spilled
     # params through their slot (the store happens in the entry prelude);
@@ -3960,6 +4338,10 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                     c = fresh()
                     if is_flt:
                         lines.append(f"  {c} = fcmp {_CMP_FLT[o]} double {l}, {r}")
+                    elif kind(opargs[0]) == PTR:
+                        # raw pointer ==/!=: identity comparison, exactly
+                        # the interpreter's structural MxPtr/None equality.
+                        lines.append(f"  {c} = icmp {_CMP_INT[o]} ptr {l}, {r}")
                     else:
                         lines.append(f"  {c} = icmp {_CMP_INT[o]} i64 {l}, {r}")
                     v = fresh()
@@ -4054,8 +4436,75 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                     else:
                         raise _Unsupported(
                             target or f"unresolved trait method call {method!r}")
+                elif callee.startswith(STATIC_CALL_PREFIX):
+                    # Compile-time static method resolution (the
+                    # interpreter's _dispatch_static_call order).
+                    sres, starget = _resolve_static_call(
+                        callee, traits, module_names)
+                    if sres == "builtin":
+                        emit_rt_builtin(starget, dst, opargs, lines)
+                    elif sres == "func":
+                        emit_direct_call(dst, starget, opargs, lines)
+                    else:
+                        raise _Unsupported(starget)
                 elif callee in _NATIVE_RT_CALLS:
                     emit_rt_builtin(callee, dst, opargs, lines)
+                elif callee in _EXTERN_C_SIGS:
+                    emit_extern_call(callee, dst, opargs, lines)
+                elif callee == "as_ptr":
+                    a = use(opargs[0], lines)
+                    if kind(opargs[0]) == STR:
+                        # Native strings already ARE NUL-terminated byte
+                        # pointers, so as_ptr is identity (the interpreter's
+                        # fresh readonly snapshot is observationally the
+                        # same for every accepted program).
+                        lines.append(f"  ; as_ptr: identity on a native "
+                                     "string (already NUL-terminated bytes)")
+                        setval(dst, a, lines)
+                    else:  # vec receiver (consistency validated the kind)
+                        mod.runtime_syms.add("mx_vec_as_bytes")
+                        v = fresh()
+                        lines.append(
+                            f"  {v} = call ptr @mx_vec_as_bytes(ptr {a})"
+                            "  ; fresh byte snapshot (leaks by design)")
+                        setval(dst, v, lines)
+                elif callee == "ptr_read":
+                    base = use(opargs[0], lines)
+                    off = use(opargs[1], lines)
+                    p, b8, v = fresh(), fresh(), fresh()
+                    lines.append(
+                        f"  {p} = getelementptr inbounds i8, ptr {base}, "
+                        f"i64 {off}")
+                    lines.append(f"  {b8} = load i8, ptr {p}")
+                    lines.append(f"  {v} = zext i8 {b8} to i64")
+                    setval(dst, v, lines)
+                elif callee == "ptr_write":
+                    base = use(opargs[0], lines)
+                    off = use(opargs[1], lines)
+                    val = use(opargs[2], lines)
+                    t8, p = fresh(), fresh()
+                    lines.append(f"  {t8} = trunc i64 {val} to i8")
+                    lines.append(
+                        f"  {p} = getelementptr inbounds i8, ptr {base}, "
+                        f"i64 {off}")
+                    lines.append(f"  store i8 {t8}, ptr {p}")
+                    setval(dst, "0", lines)  # unit
+                elif callee == "assert":
+                    # Inline branch-to-abort on a falsy condition (message
+                    # arguments are evaluated by their own MIR ops but not
+                    # rendered natively; the interpreter raises instead).
+                    c = use(opargs[0], lines)
+                    cb = fresh()
+                    n = cb[1:]  # unique per-site label suffix
+                    lines.append(f"  {cb} = icmp ne i64 {c}, 0")
+                    lines.append(f"  br i1 {cb}, label %assert.ok.{n}, "
+                                 f"label %assert.fail.{n}")
+                    lines.append(f"assert.fail.{n}:")
+                    mod.uses_abort = True
+                    lines.append("  call void @abort()  ; assert failed")
+                    lines.append("  unreachable")
+                    lines.append(f"assert.ok.{n}:")
+                    setval(dst, "0", lines)  # unit
                 elif callee in _PRINT_BUILTINS:
                     if len(opargs) == 1:
                         a = use(opargs[0], lines)
@@ -4236,7 +4685,7 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                             zv = _fmt_f64(0.0)
                         elif zk == STR:
                             zv = mod.intern_string("")
-                        elif _is_vec(zk):
+                        elif _is_vec(zk) or zk == PTR:
                             zv = "null"
                         else:
                             zv = "0"
@@ -4579,6 +5028,15 @@ def _emit_runtime(mod: _ModuleState) -> List[str]:
     if mod.uses_malloc:
         decls.append("declare noalias ptr @malloc(i64)")
         decls.append("declare void @free(ptr)")
+    # Extern C FFI symbols (real libc, C signatures; fclose returns C int).
+    _EXTERN_C_DECLS = {
+        "memcpy": "declare ptr @memcpy(ptr, ptr, i64)",
+        "realloc": "declare ptr @realloc(ptr, i64)",
+        "fopen": "declare noalias ptr @fopen(ptr, ptr)",
+        "fclose": "declare i32 @fclose(ptr)",
+    }
+    for name in sorted(mod.extern_c_syms):
+        decls.append(_EXTERN_C_DECLS[name])
     for name in sorted(mod.math_used):
         decls.append(f"declare double @{name}(double)")
     # Native metaxu runtime symbols (metaxu_rt.c, linked by llvm_run).
@@ -4682,7 +5140,8 @@ def emit_llvm(funcs: Sequence[MirFunc]) -> str:
     closures = _build_closure_table(funcs)
     traits = _build_trait_table(module_names)
     scopes = _build_scope_table(funcs)
-    infos = [_analyze(f, module_names, closures, scopes) for f in funcs]
+    infos = [_analyze(f, module_names, closures, scopes, traits)
+             for f in funcs]
     variants = _build_variant_table(funcs, infos)
 
     def dep_names(info: _Info, kinds: Dict[str, str]) -> Set[str]:
@@ -4692,7 +5151,15 @@ def emit_llvm(funcs: Sequence[MirFunc]) -> str:
         names never count, even when a module function shares the name (the
         builtin wins, mirroring the interpreter's resolution order)."""
         deps = {callee for (_d, callee, _a) in info.calls
-                if callee in module_names and callee not in _NATIVE_RT_CALLS}
+                if callee in module_names and callee not in _NATIVE_RT_CALLS
+                and callee not in _FFI_CALLS}
+        # Statically-resolved __static$ calls depend on their target fn.
+        for (_d, callee, _a) in info.calls:
+            if callee.startswith(STATIC_CALL_PREFIX):
+                sres, starget = _resolve_static_call(
+                    callee, traits, module_names)
+                if sres == "func" and starget in module_names:
+                    deps.add(starget)
         deps |= {lname for (_d, lname, _c) in info.closure_defs
                  if lname in module_names}
         # A handle site's owner cannot link without its body/case
@@ -4757,9 +5224,18 @@ def emit_llvm(funcs: Sequence[MirFunc]) -> str:
                     if nk != own.ret:
                         own.ret = nk
                         changed = True
-                resolved_calls = [
-                    (dst, callee, args) for (dst, callee, args) in info.calls
-                    if callee not in _NATIVE_RT_CALLS]
+                resolved_calls = []
+                for (dst, callee, args) in info.calls:
+                    if callee in _NATIVE_RT_CALLS or callee in _FFI_CALLS \
+                            or callee == "assert":
+                        continue
+                    if callee.startswith(STATIC_CALL_PREFIX):
+                        sres, starget = _resolve_static_call(
+                            callee, traits, module_names)
+                        if sres == "func":
+                            resolved_calls.append((dst, starget, args))
+                        continue
+                    resolved_calls.append((dst, callee, args))
                 for (dst, cvar, args) in info.closure_calls:
                     ck = kinds.get(cvar, I64)
                     if _is_closure(ck):
