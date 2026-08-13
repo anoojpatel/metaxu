@@ -300,7 +300,13 @@ class _FuncLowerer:
             # name the body actually references — capture (slot, slot) pairs,
             # same convention as handle_scope below.
             cap_names: List[tuple] = []
-            for (cname, _cmode) in (e.captures or ()):
+            for (cname, cmode) in (e.captures or ()):
+                # 'auto' captures come from comprehension free-name analysis
+                # (hir._comprehension_lambda): only names actually bound in
+                # the enclosing scope are captured — the rest are globals or
+                # builtins that resolve by name at call time.
+                if cmode == 'auto' and cname not in self.state.env:
+                    continue
                 slot = self.state.env.get(cname, cname)
                 cap_names.append((slot, slot))
             dst = self.state.fresh("cl")

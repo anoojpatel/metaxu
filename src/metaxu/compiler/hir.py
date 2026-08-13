@@ -9,11 +9,22 @@ from .constraints import ClassConstraint
 from . import mutaxu_ast as mast
 import metaxu.metaxu_ast as fast
 
-from .desugar import IMPL_SEP, parse_impl_method_name
+from .desugar import IMPL_SEP, parse_impl_method_name, type_base_name
 
 # Methods that are dispatched as interpreter builtins with the receiver as
 # first argument (`x.to_string()` -> to_string(x)).
-_BUILTIN_METHODS = frozenset({"to_string", "len"})
+# Note: when a method of the same name is provided by a user trait/impl block,
+# the call lowers to a __trait$ dispatch instead (see the QualifiedFunctionCall
+# and MethodCall paths below), so user impls win over these builtins; the
+# interpreter's trait dispatch falls back to the builtin for receiver types
+# without an impl.
+_BUILTIN_METHODS = frozenset({
+    "to_string", "len",
+    # Vec methods (runtime library)
+    "push", "pop",
+    # math methods on numbers (runtime library)
+    "sqrt", "sin", "cos",
+})
 
 # Callee-name prefix marking a runtime-dispatched trait method call:
 # `recv.m(args)` lowers to Call(callee="__trait$m", operands=(recv, *args))
@@ -605,6 +616,21 @@ class HIRBuilder:
         if isinstance(orig, fast.MethodCall):
             recv_node = getattr(orig, 'receiver', None)
             method = str(getattr(orig, 'method', '') or '')
+            # Static method on the vector TYPE itself:
+            # `vector[float,4].filled(1.0)` — no runtime receiver.
+            if isinstance(recv_node, fast.VectorTypeExpression) and method == "filled":
+                n = self._const_int_of(getattr(recv_node, 'size', None))
+                ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, 'Unknown'))
+                n_he = self._mk_hexpr(frozen_ctx.node_id, 'Expr', ty, frozen_ctx.span,
+                                      op='Literal', literal=n)
+                arg_exprs = []
+                for a in getattr(orig, 'arguments', []) or []:
+                    he = self._from_orig_expr(a, ctx_for(a))
+                    if he is not None:
+                        arg_exprs.append(he)
+                return self._mk_hexpr(frozen_ctx.node_id, 'Expr', ty, frozen_ctx.span,
+                                      op='Call', callee='__vec_filled',
+                                      operands=(n_he, *arg_exprs))
             recv_he = self._from_orig_expr(recv_node, ctx_for(recv_node)) if recv_node is not None else None
             arg_exprs = []
             for a in getattr(orig, 'arguments', []) or []:
@@ -685,6 +711,80 @@ class HIRBuilder:
                                              op="FieldGet", base=current, field_name=str(fname))
             return current
 
+        # IndexExpression: `base[i]` (plain index) or `base[a:b:c]` (slice).
+        # Lowered to strict runtime-library builtin calls: __index_get /
+        # __slice_get (absent slice parts become literal None).
+        if isinstance(orig, fast.IndexExpression):
+            base_node = getattr(orig, 'base', None)
+            base_he = self._from_orig_expr(base_node, ctx_for(base_node))
+            if base_he is None:
+                return None
+            ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, 'Unknown'))
+            idx = getattr(orig, 'index', None)
+            idx_list = idx if isinstance(idx, list) else [idx]
+            current = base_he
+            for i in idx_list:
+                if i is None:
+                    continue
+                if isinstance(i, fast.SliceExpression):
+                    parts = []
+                    for part in (getattr(i, 'start', None), getattr(i, 'stop', None),
+                                 getattr(i, 'step', None)):
+                        if part is None:
+                            parts.append(self._mk_hexpr(
+                                frozen_ctx.node_id, 'Expr', ty, frozen_ctx.span,
+                                op='Literal', literal=None))
+                        else:
+                            he = self._from_orig_expr(part, ctx_for(part))
+                            if he is None:
+                                return None
+                            parts.append(he)
+                    current = self._mk_hexpr(frozen_ctx.node_id, 'Expr', ty,
+                                             frozen_ctx.span, op='Call',
+                                             callee='__slice_get',
+                                             operands=(current, *parts))
+                else:
+                    ih = self._from_orig_expr(i, ctx_for(i))
+                    if ih is None:
+                        return None
+                    current = self._mk_hexpr(frozen_ctx.node_id, 'Expr', ty,
+                                             frozen_ctx.span, op='Call',
+                                             callee='__index_get',
+                                             operands=(current, ih))
+            return current
+
+        # UnaryOperation: `-x` / `!x` — lowered to the neg/not builtins.
+        if isinstance(orig, fast.UnaryOperation):
+            operand = getattr(orig, 'operand', None)
+            operand_he = self._from_orig_expr(operand, ctx_for(operand))
+            if operand_he is None:
+                return None
+            op_sym = str(getattr(orig, 'operator', '') or '')
+            callee = {'-': 'neg', '!': 'not', 'not': 'not'}.get(op_sym)
+            if callee is None:
+                return None
+            ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, 'Unknown'))
+            return self._mk_hexpr(frozen_ctx.node_id, 'Expr', ty, frozen_ctx.span,
+                                  op='Call', callee=callee, operands=(operand_he,))
+
+        # RangeExpression: `start..end` — lowered to the __range builtin.
+        if isinstance(orig, fast.RangeExpression):
+            s_node = getattr(orig, 'start', None)
+            e_node = getattr(orig, 'end', None)
+            s_he = self._from_orig_expr(s_node, ctx_for(s_node))
+            e_he = self._from_orig_expr(e_node, ctx_for(e_node))
+            if s_he is None or e_he is None:
+                return None
+            ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, 'Unknown'))
+            return self._mk_hexpr(frozen_ctx.node_id, 'Expr', ty, frozen_ctx.span,
+                                  op='Call', callee='__range',
+                                  operands=(s_he, e_he))
+
+        # VectorLiteral: `vector[T, N](elems...)`, `vector[T, N]()` (zeros),
+        # or `vector[T, N](expr for x in iterable)` (comprehension).
+        if isinstance(orig, fast.VectorLiteral):
+            return self._convert_vector_literal(orig, frozen_ctx, ctx_for)
+
         # LambdaExpression
         if isinstance(orig, fast.LambdaExpression):
             params = getattr(orig, 'params', []) or []
@@ -703,6 +803,133 @@ class HIRBuilder:
 
         # Fallback: None
         return None
+
+    # ------------------------------------------------------------------
+    # Vector literal / comprehension helpers
+    # ------------------------------------------------------------------
+
+    def _const_int_of(self, node: Any) -> int | None:
+        """Best-effort compile-time integer of a size expression node.
+
+        `vector[float, 4]` carries its size as a TypeReference("4") (or a
+        Literal). Returns None when the size is not a literal integer (e.g. a
+        const generic `N`), in which case runtime checks that need it fail
+        with a clear error instead of guessing.
+        """
+        if node is None:
+            return None
+        if isinstance(node, int) and not isinstance(node, bool):
+            return node
+        if isinstance(node, str):
+            return int(node) if node.lstrip("-").isdigit() else None
+        if isinstance(node, fast.Literal):
+            v = getattr(node, 'value', None)
+            return v if isinstance(v, int) and not isinstance(v, bool) else None
+        if isinstance(node, fast.TypeReference):
+            return self._const_int_of(getattr(node, 'name', None))
+        return None
+
+    def _convert_vector_literal(self, orig: Any, frozen_ctx: mast.AstNode,
+                                ctx_for: Any) -> HExpr | None:
+        n = self._const_int_of(getattr(orig, 'size', None))
+        ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, 'Unknown'))
+        n_he = self._mk_hexpr(frozen_ctx.node_id, 'Expr', ty, frozen_ctx.span,
+                              op='Literal', literal=n)
+        elements = list(getattr(orig, 'elements', []) or [])
+        # Comprehension form: vector[T, N](f(x) for x in iterable)
+        if len(elements) == 1 and isinstance(elements[0], fast.Comprehension):
+            comp = elements[0]
+            lam = self._comprehension_lambda(comp, frozen_ctx, ctx_for)
+            iter_node = getattr(comp, 'iterable', None)
+            iter_he = self._from_orig_expr(iter_node, ctx_for(iter_node))
+            if lam is None or iter_he is None:
+                return None
+            return self._mk_hexpr(frozen_ctx.node_id, 'Expr', ty, frozen_ctx.span,
+                                  op='Call', callee='__vec_comprehension',
+                                  operands=(n_he, lam, iter_he))
+        # Empty form: vector[T, N]() — zero-initialized
+        if not elements:
+            base_name = type_base_name(getattr(orig, 'base_type', None))
+            base_he = self._mk_hexpr(frozen_ctx.node_id, 'Expr', ty, frozen_ctx.span,
+                                     op='Literal', literal=base_name)
+            return self._mk_hexpr(frozen_ctx.node_id, 'Expr', ty, frozen_ctx.span,
+                                  op='Call', callee='__vec_zeros',
+                                  operands=(n_he, base_he))
+        # Explicit elements
+        elem_hes: list[HExpr] = []
+        for el in elements:
+            he = self._from_orig_expr(el, ctx_for(el))
+            if he is None:
+                return None
+            elem_hes.append(he)
+        return self._mk_hexpr(frozen_ctx.node_id, 'Expr', ty, frozen_ctx.span,
+                              op='Call', callee='__vec_lit',
+                              operands=(n_he, *elem_hes))
+
+    def _comprehension_lambda(self, comp: Any, frozen_ctx: mast.AstNode,
+                              ctx_for: Any) -> HExpr | None:
+        """Compile a comprehension body into a Lambda HExpr.
+
+        The comprehension targets become the lambda parameters. Free names in
+        the body are captured with mode 'auto': the MIR lowering only actually
+        captures the ones bound in the enclosing scope (globals/builtins
+        resolve by name at call time).
+        """
+        targets = tuple(str(t) for t in (getattr(comp, 'targets', []) or []))
+        if not targets:
+            return None
+        body_node = getattr(comp, 'expression', None)
+        body_he = self._from_orig_expr(body_node, ctx_for(body_node))
+        if body_he is None:
+            return None
+        free = self._free_names(body_node) - set(targets)
+        captures = tuple((name, 'auto') for name in sorted(free))
+        ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, 'Unknown'))
+        return self._mk_hexpr(frozen_ctx.node_id, 'Expr', ty, frozen_ctx.span,
+                              op='Lambda', lambda_params=targets,
+                              lambda_body=body_he, captures=captures)
+
+    def _free_names(self, node: Any, _seen: set[int] | None = None) -> set[str]:
+        """Names referenced by an expression subtree (variables, call heads)."""
+        if _seen is None:
+            _seen = set()
+        out: set[str] = set()
+        if isinstance(node, (list, tuple)):
+            for item in node:
+                out |= self._free_names(item, _seen)
+            return out
+        if isinstance(node, dict):
+            for v in node.values():
+                out |= self._free_names(v, _seen)
+            return out
+        if not isinstance(node, fast.Node) or id(node) in _seen:
+            return out
+        _seen.add(id(node))
+        if isinstance(node, fast.Variable):
+            name = getattr(node, 'name', None)
+            if isinstance(name, str):
+                out.add(name)
+        elif isinstance(node, fast.QualifiedName):
+            parts = list(getattr(node, 'parts', []) or [])
+            if parts:
+                out.add(str(parts[0]))
+        elif isinstance(node, fast.QualifiedFunctionCall):
+            parts = list(getattr(node, 'parts', []) or [])
+            if parts:
+                out.add(str(parts[0]))
+        elif isinstance(node, fast.FunctionCall):
+            name = getattr(node, 'name', None)
+            if isinstance(name, str):
+                out.add(name)
+        elif isinstance(node, fast.FieldAccess):
+            base = getattr(node, 'base', None) or getattr(node, 'expression', None)
+            if isinstance(base, str):
+                out.add(base)
+        for attr, value in vars(node).items():
+            if attr in ('parent', 'scope', 'location', 'children'):
+                continue
+            out |= self._free_names(value, _seen)
+        return out
 
     def _convert_pattern(self, p: Any) -> HPattern:
         """Convert a frozen-AST pattern node into an HPattern.
@@ -754,11 +981,14 @@ class HIRBuilder:
                             enum_name=self._variant_to_enum.get("Some"), subpatterns=subs)
         if isinstance(p, fast.FunctionCall):
             callee = str(getattr(p, 'name', '') or '')
-            if callee in self._variant_to_enum:
+            # Builtin Option constructors match even without a user enum
+            # declaring them (mirrors the expression-position fallback).
+            if callee in self._variant_to_enum or callee in ("Some", "None"):
                 subs = tuple(self._convert_pattern(a)
                              for a in getattr(p, 'arguments', []) or [])
                 return HPattern(kind="ctor", name=callee,
-                                enum_name=self._variant_to_enum[callee], subpatterns=subs)
+                                enum_name=self._variant_to_enum.get(callee, "Option"),
+                                subpatterns=subs)
         if isinstance(p, fast.QualifiedFunctionCall):
             parts = list(getattr(p, 'parts', []) or [])
             if len(parts) >= 2:
