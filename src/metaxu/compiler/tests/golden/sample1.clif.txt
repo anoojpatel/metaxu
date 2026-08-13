@@ -1,7 +1,11 @@
-; CLIF emitted by metaxu codegen_clif (direct subset)
+; CLIF emitted by metaxu codegen_clif (direct subset + selective CPS)
 ; conventions: ints/bools/unit -> i64 (unit = 0); floats -> f64;
 ;   icmp/fcmp results are uextend-ed to i64; brif takes the i64 condition.
-; functions outside the direct subset appear as comment-only placeholders.
+; suspending functions in the i64 direct subset are CPS-lowered:
+;   %run_<f>(frame) br_tables on frame.state, parks at performs via
+;   enqueue/sched_read, and %resume_<f>_<k> shims deliver resumed values;
+;   effect dispatch itself stays in the interpreter (mechanical shape only).
+; functions outside these subsets appear as comment-only placeholders.
 
 function %main() -> i64 {
 block0:

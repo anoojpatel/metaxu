@@ -112,21 +112,21 @@ This document tracks high-level goals, status, and pointers across the new Pytho
   - Add tests (e.g., MixedTree, GlobalContainer) to exercise rules
 
 ### 6) CPS (Selective; Suspensions)
-- Files: `lower_hir_to_mir.py` (CPS phase TBD), `codegen_clif.py`, runtime stubs
+- Files: `cps_frames.py` (frame layouts), `codegen_clif.py`, runtime stubs
 - Inputs
   - Suspensions from side tables (effects) and call graph
 - Tasks
-  - Mark suspending functions; keep non-suspending functions direct
-  - Defunctionalize: generate `Frame` struct layouts, `enum State`
-  - Emit `run_<fn>` with `br_table` on state, and `resume_*` shims
-  - Insert `sched_read`, `enqueue` calls at park/wake sites
-  - CLIF for CPS: frame loads/stores using layout tables
+  - Mark suspending functions; keep non-suspending functions direct (done: `MirFunc.suspending` flag, plus any function containing perform/resume/handle_scope ops)
+  - Defunctionalize: generate `Frame` struct layouts, `enum State` (done: `cps_frames.compute_frame_layouts` — state/result discriminant slots plus live-across-suspension variables; emitted as `; frame %f: ...` comment tables in the CLIF)
+  - Emit `run_<fn>` with `br_table` on state, and `resume_*` shims (done for suspending functions in the i64 direct subset; others stay honest placeholders)
+  - Insert `sched_read`, `enqueue` calls at park/wake sites (done: performs park via `enqueue(frame)`, read-shaped ops via `sched_read(fd, buf, len, k, frame)` with the resume shim as `k`; general effect dispatch stays in the interpreter — CLIF has the mechanical park/wake shape only)
+  - CLIF for CPS: frame loads/stores using layout tables (done at park sites / resume prologues; frame chaining across calls to other suspending functions pending)
 
 ### 7) CLIF Codegen
 - Files: `codegen_clif.py`
 - Tasks
   - Direct SSA functions with multi-blocks (pending expansion)
-  - CPS functions with `br_table` and frame layout helpers (pending)
+  - CPS functions with `br_table` and frame layout helpers (done; see 6)
 
 ### 8) Golden Tests & Examples
 - Files: `src/metaxu/compiler/tests/`
