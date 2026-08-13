@@ -67,6 +67,31 @@ def _split_mode(value: dict) -> tuple[str, str, str | None]:
     return uniqueness or "shared", locality or "global", linearity
 
 
+def _explicit_locality(raw: Any) -> str | None:
+    """Extract an *explicitly annotated* locality mode from a frozen mode payload.
+
+    Unlike _split_mode this does NOT default: it returns "local"/"global" only
+    when the annotation actually spells it out, and None otherwise. Deep
+    ownership validation must distinguish "declared @global" from the
+    permissive unannotated default (structs default to local allocation)."""
+    def scan(token: Any) -> str | None:
+        if isinstance(token, str):
+            tok = token.lower().lstrip("@")
+            if tok in _LOCALITY_MODES:
+                return tok
+        return None
+
+    if isinstance(raw, dict):
+        return scan(raw.get("locality"))
+    if isinstance(raw, (list, tuple)):
+        for token in raw:
+            found = scan(token)
+            if found is not None:
+                return found
+        return None
+    return scan(raw)
+
+
 _BORROW_NODE_MODES = {
     "BorrowShared": "shared",
     "BorrowUnique": "unique",
@@ -97,6 +122,11 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
     handler_locals: list[set[str]] = []  # Track variables assigned in handler contexts
     handler_operations: list[list[str]] = []  # Track operations in handler (for stack effect checking)
     struct_defs: dict[str, dict[str, Any]] = {}  # struct name -> frozen payload (fields/type_params)
+    enum_defs: dict[str, dict[str, Any]] = {}  # enum name -> frozen payload (variants)
+    # Variables bound by an explicit `let @global ... = StructName { ... }`:
+    # var name -> struct type name. Used for deep ownership checks on later
+    # field assignments (global containers cannot store locals).
+    global_struct_bindings: dict[str, str] = {}
 
     def bind(name: Any, ty: Any) -> None:
         if isinstance(name, str):
@@ -190,6 +220,106 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
                     kind="type-mismatch",
                     variable=field_name if isinstance(field_name, str) else None,
                 ))
+
+    def _struct_field_modes(struct_name: str) -> dict[str, tuple[str | None, str | None]]:
+        """Registry view of a struct definition: field -> (type_name, locality).
+
+        Locality is the field's *declared* locality mode (None when the field
+        carries no @local/@global annotation)."""
+        definition = struct_defs.get(struct_name)
+        if not definition:
+            return {}
+        registry: dict[str, tuple[str | None, str | None]] = {}
+        for f in definition.get("fields", []) or []:
+            if not isinstance(f, dict):
+                continue
+            fname = f.get("name")
+            if isinstance(fname, str):
+                ftype = f.get("type")
+                registry[fname] = (
+                    ftype if isinstance(ftype, str) else None,
+                    _explicit_locality(f.get("mode")),
+                )
+        return registry
+
+    def _find_local_field_path(type_name: str, visited: frozenset[str] = frozenset()) -> list[str] | None:
+        """Find a path to a transitively @local-declared field of `type_name`.
+
+        Recurses through nested struct types (and enum variant payload types)
+        recorded in the frozen definitions. Returns a list of path segments
+        like ["Outer.inner", "Inner.temp"], or None when no @local field is
+        reachable."""
+        if type_name in visited:
+            return None
+        visited = visited | {type_name}
+        if type_name in struct_defs:
+            for fname, (ftype, flocality) in _struct_field_modes(type_name).items():
+                if flocality == "local":
+                    return [f"{type_name}.{fname}"]
+                if isinstance(ftype, str):
+                    sub = _find_local_field_path(ftype, visited)
+                    if sub is not None:
+                        return [f"{type_name}.{fname}"] + sub
+            return None
+        enum_definition = enum_defs.get(type_name)
+        if enum_definition:
+            for variant in enum_definition.get("variants", []) or []:
+                if not isinstance(variant, dict):
+                    continue
+                for f in variant.get("fields", []) or []:
+                    ftype = f.get("type") if isinstance(f, dict) else None
+                    if isinstance(ftype, str):
+                        sub = _find_local_field_path(ftype, visited)
+                        if sub is not None:
+                            return [f"{type_name}.{variant.get('name')}"] + sub
+        return None
+
+    def _is_local_variable(name: Any) -> bool:
+        if not isinstance(name, str):
+            return False
+        info = borrow_checker.variables.get(name)
+        return info is not None and info.locality == "local"
+
+    def _check_global_struct_binding(var_name: str, inst_node: Any) -> None:
+        """Deep ownership rules for `let @global v = S { ... }`.
+
+        - S must not (transitively) declare any @local field.
+        - The initializer must not store @local-bound values in fields."""
+        struct_name = payload_dict(inst_node).get("name")
+        if not isinstance(struct_name, str):
+            return
+        global_struct_bindings[var_name] = struct_name
+        path = _find_local_field_path(struct_name)
+        if path is not None:
+            borrow_checker.errors.append(BorrowError(
+                message=(
+                    f"@global binding '{var_name}' of struct {struct_name} "
+                    f"contains @local field {' -> '.join(path)}; a @global "
+                    f"value must not contain (transitively) any @local field"
+                ),
+                node_id=inst_node.node_id,
+                kind="deep-locality",
+                variable=var_name,
+            ))
+        for field in getattr(inst_node, "children", ()):
+            if getattr(field, "kind", None) != "StructField":
+                continue
+            field_name = payload_dict(field).get("name")
+            for child in getattr(field, "children", ()):
+                if getattr(child, "kind", None) != "Variable":
+                    continue
+                value_name = payload_dict(child).get("name")
+                if _is_local_variable(value_name):
+                    borrow_checker.errors.append(BorrowError(
+                        message=(
+                            f"cannot store @local value '{value_name}' in field "
+                            f"'{field_name}' of @global {struct_name} binding "
+                            f"'{var_name}'; global containers cannot store locals"
+                        ),
+                        node_id=child.node_id,
+                        kind="deep-locality",
+                        variable=value_name,
+                    ))
 
     def param_nodes(children: Any) -> list[Any]:
         return [child for child in children if getattr(child, "kind", None) == "Parameter"]
@@ -483,6 +613,14 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
             uniqueness, locality, linearity = _split_mode(let_payload)
             if isinstance(var_name, str):
                 borrow_checker.declare_variable(var_name, uniqueness, locality, node.node_id)
+                # Deep ownership: an *explicitly* @global struct binding must
+                # not (transitively) contain @local fields nor store @local
+                # values in its initializer. Structs default to local
+                # allocation, so only spelled-out @global bindings are gated.
+                if _explicit_locality(let_payload.get("mode")) == "global":
+                    for child in children:
+                        if child.kind == "StructInstantiation":
+                            _check_global_struct_binding(var_name, child)
                 # Register callable linearity when binding a lambda so calls can
                 # enforce once/separate semantics by name.
                 for child in children:
@@ -618,6 +756,29 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
                 simplesub.add_class_constraint("Unit", [return_types[-1]], node.node_id)
         if kind == "Assignment" and node_ty is not None:
             target_name = payload_name(node)
+            # Deep ownership: assigning a @local-bound value into a field of a
+            # @global-bound struct is an error (global containers cannot store
+            # locals). Dotted targets arrive stringified, e.g. "g.field".
+            if isinstance(target_name, str) and "." in target_name:
+                base_name, _dot, field_path = target_name.partition(".")
+                container_struct = global_struct_bindings.get(base_name)
+                if container_struct is not None:
+                    for child in children:
+                        if getattr(child, "kind", None) != "Variable":
+                            continue
+                        value_name = payload_dict(child).get("name")
+                        if _is_local_variable(value_name):
+                            borrow_checker.errors.append(BorrowError(
+                                message=(
+                                    f"cannot store @local value '{value_name}' in "
+                                    f"field '{field_path}' of @global {container_struct} "
+                                    f"binding '{base_name}'; global containers cannot "
+                                    f"store locals"
+                                ),
+                                node_id=child.node_id,
+                                kind="deep-locality",
+                                variable=value_name,
+                            ))
             binding_ty = lookup(target_name)
             if binding_ty is not None:
                 simplesub.add_unify(node_ty, binding_ty)
@@ -684,6 +845,10 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
             name = payload_name(node)
             if isinstance(name, str):
                 struct_defs[name] = payload_dict(node)
+        if kind == "EnumDefinition":
+            name = payload_name(node)
+            if isinstance(name, str):
+                enum_defs[name] = payload_dict(node)
         if kind == "StructInstantiation" and node_ty is not None:
             simplesub.add_class_constraint("Struct", [node_ty], node.node_id)
             name = payload_name(node)
