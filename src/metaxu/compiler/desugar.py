@@ -266,11 +266,21 @@ class TraitImplDesugarPass(DesugarPass):
             return cached
         trait_name = type_base_name(impl.interface_name)
         type_name = type_base_name(impl.type_name)
+        const_dims = _const_generic_dims(impl)
         out: list[fast.Node] = []
         for m in impl.methods or []:
             if not isinstance(m, (fast.FunctionDeclaration, fast.MethodImplementation)):
                 continue
             fn = self._method_to_function(m, trait_name, type_name)
+            if fn is not None and const_dims:
+                # Record which const-generic size parameters of the impl's
+                # receiver type map to which runtime dimension of `self`
+                # (e.g. `vector[T,N]` -> N is dim 0; `vector[vector[T,N],M]`
+                # -> M is dim 0, N is dim 1). The HIR builder turns these
+                # into entry bindings so the method body's uses of N/M read
+                # the receiver's actual runtime shape. Underscored attr:
+                # invisible to the generic desugar walk and to freezing.
+                fn._const_dims = const_dims
             if fn is not None:
                 key = (trait_name, type_name, str(fn.name))
                 method = key[2].split(IMPL_SEP)[-1]
@@ -320,6 +330,50 @@ class TraitImplDesugarPass(DesugarPass):
         return fast.FunctionDeclaration(
             mangled, params, list(getattr(m, "body", None) or []),
             return_type=getattr(m, "return_type", None))
+
+
+def _type_arg_name(t: Any) -> str | None:
+    """Name of a type argument when it is a bare reference (else None)."""
+    if isinstance(t, fast.TypeReference):
+        return str(getattr(t, "name", "") or "") or None
+    if isinstance(t, fast.TypeParameter):
+        return str(getattr(t, "name", "") or "") or None
+    return None
+
+
+def _const_generic_dims(impl: fast.Implementation) -> tuple[tuple[str, int], ...]:
+    """Map the impl receiver's const-generic size names to runtime dims.
+
+    For `implement<..., const N: int> ... for vector[T, N]` the size name N
+    is dimension 0 of the receiver (its length); for a matrix receiver
+    `vector[vector[T, N], M]`, M is dimension 0 (rows) and N dimension 1
+    (columns). Only names that are declared type parameters of the impl are
+    mapped — literal sizes (vector[float, 4]) produce no binding.
+    """
+    recv = getattr(impl, "type_name", None)
+    args = None
+    if isinstance(recv, fast.TypeApplication) and str(recv.type_constructor) == "vector":
+        args = list(recv.type_args or [])
+    elif isinstance(recv, fast.VectorTypeExpression):
+        args = [getattr(recv, "base_type", None), getattr(recv, "size", None)]
+    if not args or len(args) < 2:
+        return ()
+    param_names = {
+        str(getattr(tp, "name", "") or "")
+        for tp in (getattr(impl, "type_params", None) or [])
+    }
+    out: list[tuple[str, int]] = []
+    size0 = _type_arg_name(args[1])
+    if size0 and not size0.lstrip("-").isdigit() and size0 in param_names:
+        out.append((size0, 0))
+    elem = args[0]
+    if isinstance(elem, fast.TypeApplication) and str(elem.type_constructor) == "vector":
+        eargs = list(elem.type_args or [])
+        if len(eargs) >= 2:
+            size1 = _type_arg_name(eargs[1])
+            if size1 and not size1.lstrip("-").isdigit() and size1 in param_names:
+                out.append((size1, 1))
+    return tuple(out)
 
 
 def _mentions_self(node: Any, _seen: set[int] | None = None) -> bool:

@@ -647,7 +647,7 @@ fn main() -> int {
     assert count_placeholders(ir) == 0
     # the closure return is sret-style: pair copied into the caller's slot
     assert "define void @mx_make_adder(ptr %agg.ret, i64 %a.x)" in ir
-    assert re.search(r"call ptr @malloc\(i64 8\)  ; heap env for \w+ -> lambda\d+", ir)
+    assert re.search(r"call ptr @malloc\(i64 8\)  ; heap env for \w+ -> [\w$]*lambda\d+", ir)
     # no free of the env anywhere: it leaks by design
     assert "call void @free" not in ir
 
@@ -1205,13 +1205,13 @@ def test_closure_pair_env_struct_and_leading_env_param():
     # closure value representation: the {fn, env} pair type
     assert "%mx.closure = type { ptr, ptr }" in ir
     # per-lambda env struct holding the captured value
-    assert re.search(r"%env\.lambda\d+ = type \{ i64 \}", ir)
+    assert re.search(r"%env\.[\w$]*lambda\d+ = type \{ i64 \}", ir)
     # site: env alloca, capture store, then fn+env stored into the pair
-    assert re.search(r"%env\.site0\.\w+ = alloca %env\.lambda\d+", ir)
-    assert re.search(r"store ptr @mx_lambda\d+, ptr %t\d+", ir)
-    assert re.search(r"store ptr %env\.site0\.\w+, ptr %t\d+", ir)
+    assert re.search(r"%env\.site0\.[\w$.]+ = alloca %env\.[\w$]*lambda\d+", ir)
+    assert re.search(r"store ptr @mx_[\w$]*lambda\d+, ptr %t\d+", ir)
+    assert re.search(r"store ptr %env\.site0\.[\w$.]+, ptr %t\d+", ir)
     # the lambda takes env as a leading param and reloads the capture
-    assert re.search(r"define i64 @mx_lambda\d+\(ptr %cl\.env, i64 %a\.y\)", ir)
+    assert re.search(r"define i64 @mx_[\w$]*lambda\d+\(ptr %cl\.env, i64 %a\.y\)", ir)
     assert re.search(r"%cap\.\w+ = load i64, ptr %capp\.\w+", ir)
 
 
@@ -1249,7 +1249,7 @@ def test_loop_lambda_captures_compile():
     ir = llvm_from_source(_LOOP_LAMBDA_SRC)
     assert count_placeholders(ir) == 0
     assert re.search(r"call ptr @malloc\(i64 8\)  ; heap env", ir)
-    assert re.search(r"define i64 @mx_lambda\d+\(ptr %cl\.env, i64 %a\.\w+\)", ir)
+    assert re.search(r"define i64 @mx_[\w$]*lambda\d+\(ptr %cl\.env, i64 %a\.\w+\)", ir)
 
 
 @needs_clang

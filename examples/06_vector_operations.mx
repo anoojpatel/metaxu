@@ -8,10 +8,14 @@ from std.effects import Effect, handle, perform, resume;
 from std.math import sqrt, sin, cos;
 
 # Define SIMD effect
+# SimdOp is a capability: each operation ASKS whether a vectorized form is
+# available. With no SIMD handler installed the answer defaults to None and
+# the caller's match takes its scalar-fallback branch (see the `None ->`
+# arms below and "Non-SIMD operations fall back to scalar" in main).
 effect SimdOp {
     # Core vector operations with SIMD support
-    try_vectorize<T,U,const N: int>(v: vector[T,N], f: fn(T) -> U) -> Option<vector[U,N]>;
-    try_horizontal<T,const N: int>(v: vector[T,N], f: fn(T,T) -> T) -> Option<T>;
+    try_vectorize<T,U,const N: int>(v: vector[T,N], f: fn(T) -> U) -> Option<vector[U,N]> = None;
+    try_horizontal<T,const N: int>(v: vector[T,N], f: fn(T,T) -> T) -> Option<T> = None;
 }
 
 # Define vector traits
