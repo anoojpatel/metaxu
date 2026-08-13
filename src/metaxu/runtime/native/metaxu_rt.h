@@ -86,6 +86,69 @@
  * decimal point; a host program that calls setlocale() with a ','-based
  * locale changes printf/strtod behavior and thus the output.
  */
+/* Fixed-size vectors (mx_fvec; mirrors MxVector in mir_interp.py)
+ * ---------------------------------------------------------------
+ * A fixed vector `vector[T, N]` is a length-prefixed heap block
+ * { int64_t len; int64_t elems[len]; } of opaque 8-byte element words
+ * (i64 as-is, doubles bit-cast, str/vector pointers) — IMMUTABLE after
+ * construction.  The interpreter's MxVector has VALUE semantics; because
+ * no operation mutates a filled block, sharing the pointer shallowly is
+ * observationally identical to copying the value, exactly the write-once
+ * payload-box argument in codegen_llvm.  Construction protocol: the
+ * compiler calls mx_fvec_new (zeroed) and fills the block with
+ * mx_fvec_init before the pointer is shared; nothing writes it afterwards.
+ * Blocks are never freed (leak by design — shallow sharing makes
+ * ownership non-unique; a leak is provably sound where a free is not).
+ *
+ * | symbol           | signature                                        |
+ * |------------------|--------------------------------------------------|
+ * | mx_fvec_new      | mx_fvec* (int64_t len)          zero-filled      |
+ * | mx_fvec_len      | int64_t (const mx_fvec*)                         |
+ * | mx_fvec_get      | int64_t (const mx_fvec*, int64_t) aborts on OOB  |
+ * | mx_fvec_init     | void (mx_fvec*, int64_t, int64_t) fill-only store|
+ * | mx_fvec_filled   | mx_fvec* (int64_t n, int64_t word)               |
+ * | mx_fvec_range    | mx_fvec* (int64_t start, int64_t end)            |
+ * | mx_fvec_dim      | int64_t (const mx_fvec*, int64_t dim,            |
+ * |                  |          int64_t elems_are_vecs)                 |
+ * | mx_fvec_slice    | mx_fvec* (v, start, stop, step, mask)            |
+ * | mx_fvec_binop    | mx_fvec* (op, base, depth, mode, lhs, rhs)       |
+ * | mx_fvec_promote  | mx_fvec* (const mx_fvec*)  flat -> Mx1 matrix    |
+ * | mx_fvec_map      | mx_fvec* (v, fn, env, expected_n)  comprehension |
+ * | mx_fvec_to_str   | char* (v, base, depth)  Python repr, fresh malloc|
+ * | mx_fvec_as_bytes | unsigned char* (const mx_fvec*)  byte snapshot   |
+ *
+ * Conventions shared by the mx_fvec entry points:
+ *   - `mask` (mx_fvec_slice): bit 0 = start given, bit 1 = stop given,
+ *     bit 2 = step given; omitted parts take Python's slice defaults and
+ *     the index arithmetic is exactly CPython's slice.indices() (negative
+ *     indices wrap, everything clamps, step 0 aborts with the
+ *     interpreter's "slice: step must be non-zero").  The result is a
+ *     fresh copy, never an aliasing view (interpreter parity).
+ *   - mx_fvec_binop: op 0..4 = + - * / %, `base` 0 = int64 / 1 = double
+ *     (the LEAF element type), `depth` = how many nesting levels the
+ *     elements are still vectors (0 = scalar elements), `mode` 0 =
+ *     vec(+)vec / 1 = vec(+)scalar / 2 = scalar(+)vec (lhs/rhs are element
+ *     words; vector operands pass the mx_fvec* as a word).  Element-wise
+ *     with scalar broadcasting, recursing through nested vectors — the
+ *     interpreter's _vec_elementwise.  Length mismatch aborts with the
+ *     interpreter's "vector size mismatch for '+': N vs M"; integer ops
+ *     use C truncating /,% (the backend's documented scalar convention;
+ *     the interpreter floors) and integer division by zero aborts.
+ *     Float % aborts (it would need libm's fmod and this object stays
+ *     libm-free; the compiler demotes float vector % instead).
+ *   - mx_fvec_dim mirrors __vec_dim: dim 0 -> len; dim 1 -> 0 when empty,
+ *     the first element's length when elems_are_vecs, else 1 (a flat
+ *     numeric vector is a column matrix).
+ *   - mx_fvec_map applies fn(env, word) to each element word in order
+ *     (the compiled comprehension-body closure) and aborts when
+ *     expected_n >= 0 differs from the length (the interpreter's
+ *     "vector comprehension produced N elements ..." check).
+ *   - mx_fvec_to_str reproduces repr(MxVector): "vector[e0, e1, ...]"
+ *     with elements rendered like mx_i64_to_str / mx_f64_to_str
+ *     (base 0 / 1), recursing while depth > 0.
+ *   - mx_fvec_as_bytes matches mx_vec_as_bytes (fresh snapshot, byte
+ *     range checked).
+ */
 #ifndef METAXU_RT_H
 #define METAXU_RT_H
 
@@ -96,6 +159,10 @@ extern "C" {
 #endif
 
 typedef struct mx_vec mx_vec;
+typedef struct mx_fvec mx_fvec;
+
+/* Comprehension body: compiled closure thunk (env, element word) -> word. */
+typedef int64_t (*mx_fvec_map_fn)(void *env, int64_t word);
 
 /* --- Vec ---------------------------------------------------------------- */
 mx_vec *mx_vec_new(void);
@@ -106,6 +173,24 @@ int64_t mx_vec_get(const mx_vec *v, int64_t idx);
 void    mx_vec_set(mx_vec *v, int64_t idx, int64_t value);
 void    mx_vec_free(mx_vec *v);
 unsigned char *mx_vec_as_bytes(const mx_vec *v);
+
+/* --- Fixed-size vectors (immutable, write-once fill) --------------------- */
+mx_fvec *mx_fvec_new(int64_t len);
+int64_t  mx_fvec_len(const mx_fvec *v);
+int64_t  mx_fvec_get(const mx_fvec *v, int64_t idx);
+void     mx_fvec_init(mx_fvec *v, int64_t idx, int64_t word);
+mx_fvec *mx_fvec_filled(int64_t len, int64_t word);
+mx_fvec *mx_fvec_range(int64_t start, int64_t end);
+int64_t  mx_fvec_dim(const mx_fvec *v, int64_t dim, int64_t elems_are_vecs);
+mx_fvec *mx_fvec_slice(const mx_fvec *v, int64_t start, int64_t stop,
+                       int64_t step, int64_t mask);
+mx_fvec *mx_fvec_binop(int64_t op, int64_t base, int64_t depth, int64_t mode,
+                       int64_t lhs, int64_t rhs);
+mx_fvec *mx_fvec_promote(const mx_fvec *v);
+mx_fvec *mx_fvec_map(const mx_fvec *v, mx_fvec_map_fn fn, void *env,
+                     int64_t expected_n);
+char    *mx_fvec_to_str(const mx_fvec *v, int64_t base, int64_t depth);
+unsigned char *mx_fvec_as_bytes(const mx_fvec *v);
 
 /* --- Strings ------------------------------------------------------------ */
 char   *mx_str_concat(const char *a, const char *b);
