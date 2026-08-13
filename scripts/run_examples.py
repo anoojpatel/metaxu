@@ -45,31 +45,26 @@ def run_one(path: str, stage: str) -> tuple[bool, str]:
         if stage == "run":
             from metaxu.compiler.pipeline import (
                 build_context_from_source,
-                run_pipeline_from_source,
+                run_pipeline_ctx,
             )
             from metaxu.compiler.hir import HIRBuilder
             from metaxu.compiler.lower_hir_to_mir import lower_hir_to_mir
             from metaxu.compiler.mir_interp import MirInterpreter, UNIT
 
-            run_pipeline_from_source(source)  # strict checks (raises on negative fixtures)
             ctx = build_context_from_source(source)
+            run_pipeline_ctx(ctx)  # strict checks (raises on negative fixtures)
             hir_funcs = HIRBuilder(ctx.tables, id_map=ctx.id_map).build(ctx.frozen_root)
             interp = MirInterpreter()
             interp.load(lower_hir_to_mir(hir_funcs))
             interp.register_builtin("print", lambda *a: UNIT)
-
-            def param_count(fn) -> int:
-                for op in fn.blocks[0].ops if fn.blocks else ():
-                    if op[0] == "params":
-                        return len(op[1])
-                return 0
 
             # Entry point: main(), falling back to a zero-arg example() for
             # files that demonstrate a library (e.g. 10_traits_and_structs.mx).
             entry = None
             if "main" in interp._funcs:
                 entry = "main"
-            elif "example" in interp._funcs and param_count(interp._funcs["example"]) == 0:
+            elif ("example" in interp._funcs
+                  and not interp._funcs["example"].param_names()):
                 entry = "example"
             if entry is None:
                 return True, "no main (compile-only)"

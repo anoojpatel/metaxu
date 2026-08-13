@@ -489,6 +489,9 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
             # same-named bindings in another.
             push_scope()
             fn_state = borrow_checker.enter_function_state()
+            # @global-container gating is per-function: bindings recorded in
+            # one function must not poison same-named locals in another.
+            saved_global_bindings = dict(global_struct_bindings)
             borrow_checker.enter_region()
             function_region_stack.append(borrow_checker.current_region())
 
@@ -531,6 +534,8 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
             # an outer let that holds a reference).
             pop_scope()
             borrow_checker.exit_function_state(fn_state)
+            global_struct_bindings.clear()
+            global_struct_bindings.update(saved_global_bindings)
             return None
         if kind == "LambdaExpression" and node_ty is not None:
             outer_bindings = {name: lookup(name) for name in payload_dict(node).get("captures", {})}
@@ -618,6 +623,9 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
             uniqueness, locality, linearity = _split_mode(let_payload)
             if isinstance(var_name, str):
                 borrow_checker.declare_variable(var_name, uniqueness, locality, node.node_id)
+                # A rebinding of the name is a fresh binding: it must not
+                # inherit @global-container gating from an earlier binding.
+                global_struct_bindings.pop(var_name, None)
                 # Deep ownership: an *explicitly* @global struct binding must
                 # not (transitively) contain @local fields nor store @local
                 # values in its initializer. Structs default to local

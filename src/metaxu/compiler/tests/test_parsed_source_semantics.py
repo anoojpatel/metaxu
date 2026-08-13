@@ -399,3 +399,110 @@ fn f() -> int {
 }
 """
     run_pipeline_from_source(src)  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# Third adversarial-review round regressions
+# ---------------------------------------------------------------------------
+
+def test_vec_builtin_survives_unrelated_new_impl():
+    """An impl defining `new` somewhere must not hijack `Vec.new()`."""
+    src = """
+struct Widget { id: int }
+
+trait Ctor { fn make_default(self) -> int }
+
+implement Ctor for Widget {
+    fn new(self) -> int { self.id }
+}
+
+fn main() -> int {
+    let v = Vec<int>::new();
+    v.push(7);
+    v.len()
+}
+"""
+    assert call(src, "main", []) == 1
+
+
+def test_generic_type_followed_by_dot_parses():
+    """`Stack<Int>.make()` — DOT must be in the generic follow set."""
+    from metaxu.parser import Parser
+    Parser().parse("fn f() -> Int { let s = Stack<Int>.make(); return 1; }")
+
+
+def test_legacy_implements_self_method_call():
+    """`implements Type: Trait` methods whose only self-use is a self METHOD
+    call must still get the self parameter prepended."""
+    src = """
+struct Counter { value: int }
+
+trait Bumpable { fn bump(self) -> int }
+
+implement Bumpable for Counter {
+    fn incr(self) -> int { self.value + 1 }
+    fn bump(self) -> int { self.incr() }
+}
+
+fn main() -> int {
+    let c = Counter { value: 41 };
+    c.bump()
+}
+"""
+    assert call(src, "main", []) == 42
+
+
+def test_global_binding_gate_is_per_function():
+    """A @global struct binding in one function must not poison a local of
+    the same name in another function."""
+    src = """
+struct S { f: int }
+
+fn a() {
+    let @global g = S { f: 1 };
+}
+
+fn b() -> int {
+    let g = S { f: 1 };
+    let @local t = 2;
+    g.f = t;
+    g.f
+}
+"""
+    run_pipeline_from_source(src)  # must not raise
+
+
+def test_handler_arity_mismatch_errors():
+    """A perform with the wrong number of args for its handler case must
+    raise, not silently truncate."""
+    from metaxu.compiler.mir_interp import InterpError
+    src = """
+effect Logger {
+    log(message: string) -> Unit
+}
+
+fn main() -> int {
+    handle Logger with {
+        log(message) -> resume(())
+    } in {
+        perform Logger.log("a", 5);
+        0
+    }
+}
+"""
+    with pytest.raises(InterpError, match="argument"):
+        call(src, "main", [])
+
+
+def test_redeclared_reference_holder_keeps_declared_mode():
+    """Redeclaring a name that held a reference must record the NEW declared
+    mode, not the old reference's borrow mode."""
+    from metaxu.compiler.frozen_borrow_checker import FrozenBorrowChecker
+    bc = FrozenBorrowChecker()
+    bc.enter_scope()
+    bc.declare_variable("x", "shared", "global", 1)
+    bc.declare_variable("r", "shared", "global", 2)
+    bc.reference_graph["r"] = [("x", "shared")]
+    bc.referenced_by["x"] = [("r", "shared")]
+    bc.declare_variable("r", "unique", "global", 3)
+    assert bc.variables["r"].mode == "unique"

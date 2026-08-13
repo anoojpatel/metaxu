@@ -209,8 +209,8 @@ class Lexer:
     #: and is virtually always followed by ``(`` or ``{``.
     _GENERIC_FOLLOW = frozenset({
         'LPAREN', 'LBRACE', 'LBRACE_STRUCT', 'RPAREN', 'RBRACKET',
-        'COMMA', 'SEMICOLON', 'COLON', 'DOUBLECOLON', 'EQUALS', 'ARROW',
-        'GREATER', 'RGENERIC', 'WHERE', 'WITH', 'FOR',
+        'COMMA', 'SEMICOLON', 'COLON', 'DOT', 'DOUBLECOLON', 'EQUALS',
+        'ARROW', 'GREATER', 'RGENERIC', 'WHERE', 'WITH', 'FOR',
     })
 
     _GENERIC_SCAN_LIMIT = 80

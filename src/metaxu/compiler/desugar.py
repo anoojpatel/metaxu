@@ -308,6 +308,10 @@ def _mentions_self(node: Any, _seen: set[int] | None = None) -> bool:
     """
     if _seen is None:
         _seen = set()
+    # `self` inside list-valued attributes: QualifiedFunctionCall/QualifiedName
+    # store name parts as plain strings (e.g. parts=["self", "incr"]).
+    if node == "self":
+        return True
     if isinstance(node, (list, tuple)):
         return any(_mentions_self(item, _seen) for item in node)
     if not isinstance(node, fast.Node):

@@ -314,14 +314,7 @@ class MirInterpreter:
 
     def _call_func(self, f: MirFunc, args: List[Any], outer_env: Dict[str, Any]) -> Any:
         env: Dict[str, Any] = dict(outer_env)
-        # Bind parameters from first block's params op
-        param_names: List[str] = []
-        if f.blocks:
-            for op in f.blocks[0].ops:
-                if op[0] == "params":
-                    param_names = list(op[1])
-                    break
-        for name, val in zip(param_names, args):
+        for name, val in zip(f.param_names(), args):
             env[name] = val
         return self._run_blocks(f, 0, env)
 
@@ -397,9 +390,16 @@ class MirInterpreter:
         if target is None:
             raise InterpError(f"Missing handler function {handler_fn_name!r}")
         handler_env = dict(frame["captured"])
-        # Bind the op's arguments positionally to the case parameters,
-        # padding with UNIT when the perform supplied fewer.
-        handler_args = list(arg_vals[:len(case_params)])
+        # Bind the op's arguments positionally to the case parameters.
+        # Zero-arg ops carry a synthesized case parameter, so FEWER args than
+        # params is legitimate (pad with UNIT) — but MORE args than params is
+        # a program bug that must error, not silently truncate.
+        if len(arg_vals) > len(case_params):
+            raise InterpError(
+                f"Effect op {op_name!r} performed with {len(arg_vals)} "
+                f"argument(s) but its handler case declares only "
+                f"{len(case_params)} parameter(s)")
+        handler_args = list(arg_vals)
         handler_args += [UNIT] * (len(case_params) - len(handler_args))
         frame["busy"] = True
         try:
@@ -813,6 +813,14 @@ class MirInterpreter:
                     f"{type_name!r} is implemented by multiple traits: {opts}")
             fname = next(iter(traits.values()))
             return self._call_func(self._funcs[fname], arg_vals, {})
+        # No impl provides it: fall back to a plain dotted function or
+        # builtin (`Vec.new`) before giving up, so a type with impls keeps
+        # access to same-named non-impl entry points.
+        dotted = f"{type_name}.{method}"
+        if dotted in self._funcs:
+            return self._call_func(self._funcs[dotted], arg_vals, {})
+        if dotted in self._builtins:
+            return self._builtins[dotted](*arg_vals)
         raise InterpError(
             f"No implementation of method {method!r} for type {type_name!r}")
 
@@ -869,12 +877,7 @@ class MirInterpreter:
         if target is None:
             raise InterpError(
                 f"vector comprehension: no func {fn.func_name!r} for closure")
-        n_params = 1
-        if target.blocks:
-            for op in target.blocks[0].ops:
-                if op[0] == "params":
-                    n_params = len(op[1])
-                    break
+        n_params = len(target.param_names()) or 1
         out: List[Any] = []
         for item in items:
             if n_params > 1:
