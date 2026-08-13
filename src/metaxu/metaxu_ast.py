@@ -1340,3 +1340,170 @@ class PrintStatement(Statement):
     def __init__(self, arguments=None):
         super().__init__()
         self.arguments = [self.add_child(arg) for arg in (arguments or [])]
+
+
+# --- Additional expression / statement nodes used by the parser ---
+
+class NoneExpression(Expression):
+    """The `None` option literal"""
+    def __init__(self):
+        super().__init__()
+
+
+class SomeExpression(Expression):
+    """The `Some(expr)` option constructor"""
+    def __init__(self, value):
+        super().__init__()
+        self.value = self.add_child(value) if value is not None else None
+
+
+class MethodCall(Expression):
+    """A method call on a computed receiver: `expr.method(args)`"""
+    def __init__(self, receiver, method, arguments=None):
+        super().__init__()
+        self.receiver = self.add_child(receiver) if receiver is not None else None
+        self.method = method
+        self.arguments = [self.add_child(arg) for arg in (arguments or [])]
+
+
+class CallExpression(Expression):
+    """A call whose callee is an arbitrary expression"""
+    def __init__(self, callee, arguments=None):
+        super().__init__()
+        self.callee = self.add_child(callee) if callee is not None else None
+        self.arguments = [self.add_child(arg) for arg in (arguments or [])]
+
+
+class IndexExpression(Expression):
+    """Indexing: `expr[index]`"""
+    def __init__(self, base, index):
+        super().__init__()
+        self.base = self.add_child(base) if base is not None else None
+        if isinstance(index, list):
+            self.index = [self.add_child(i) for i in index if i is not None]
+        else:
+            self.index = self.add_child(index) if index is not None else None
+
+
+class SliceExpression(Expression):
+    """Slice used inside an index: `expr[start:stop:step]`"""
+    def __init__(self, start, stop, step):
+        super().__init__()
+        self.start = self.add_child(start) if start is not None else None
+        self.stop = self.add_child(stop) if stop is not None else None
+        self.step = self.add_child(step) if step is not None else None
+
+
+class TupleLiteral(Expression):
+    """Tuple literal `(a, b, ...)`; the empty tuple is the unit value `()`"""
+    def __init__(self, elements=None):
+        super().__init__()
+        self.elements = [self.add_child(e) for e in (elements or [])]
+
+
+class ListLiteral(Expression):
+    """List literal `[a, b, ...]`"""
+    def __init__(self, elements=None):
+        super().__init__()
+        self.elements = [self.add_child(e) for e in (elements or [])]
+
+
+class SpreadElement(Expression):
+    """A `...expr` element inside a list literal or pattern"""
+    def __init__(self, expression):
+        super().__init__()
+        self.expression = self.add_child(expression) if expression is not None else None
+
+
+class RangeExpression(Expression):
+    """A range: `start..end`"""
+    def __init__(self, start, end):
+        super().__init__()
+        self.start = self.add_child(start) if start is not None else None
+        self.end = self.add_child(end) if end is not None else None
+
+
+class Comprehension(Expression):
+    """A comprehension: `expr for target in iterable`"""
+    def __init__(self, expression, targets, iterable):
+        super().__init__()
+        self.expression = self.add_child(expression) if expression is not None else None
+        self.targets = targets  # list of identifier strings
+        self.iterable = self.add_child(iterable) if iterable is not None else None
+
+
+class GenericInstance(Expression):
+    """A generic instantiation in expression position: `base<T, ...>`"""
+    def __init__(self, base, type_args):
+        super().__init__()
+        self.base = self.add_child(base) if base is not None else None
+        self.type_args = type_args or []
+
+
+class UnaryOperation(Expression):
+    """A unary operation such as negation"""
+    def __init__(self, operator, operand):
+        super().__init__()
+        self.operator = operator
+        self.operand = self.add_child(operand) if operand is not None else None
+
+
+class ModeExpression(Expression):
+    """A mode-annotated expression such as `@const expr`"""
+    def __init__(self, mode, expression):
+        super().__init__()
+        self.mode = mode
+        self.expression = self.add_child(expression) if expression is not None else None
+
+
+class IfLetExpression(Expression):
+    """`if let PATTERN = expr { ... } else { ... }`"""
+    def __init__(self, pattern, value, then_branch, else_branch=None):
+        super().__init__()
+        self.pattern = self.add_child(pattern) if pattern is not None else None
+        self.value = self.add_child(value) if value is not None else None
+        self.then_branch = self.add_child(then_branch) if then_branch is not None else None
+        self.else_branch = self.add_child(else_branch) if else_branch is not None else None
+
+
+class WhileLetStatement(Statement):
+    """`while let PATTERN = expr { ... }`"""
+    def __init__(self, pattern, value, body):
+        super().__init__()
+        self.pattern = self.add_child(pattern) if pattern is not None else None
+        self.value = self.add_child(value) if value is not None else None
+        self.body = self.add_child(body) if body is not None else None
+
+
+class TryCatch(Expression):
+    """`try { ... } catch name { ... }`"""
+    def __init__(self, body, catch_name, catch_body):
+        super().__init__()
+        self.body = self.add_child(body) if body is not None else None
+        self.catch_name = catch_name
+        self.catch_body = self.add_child(catch_body) if catch_body is not None else None
+
+
+class HandleBlock(Expression):
+    """`handle expr { perform Op(...) => body ... }` (inline handler form)"""
+    def __init__(self, subject, arms):
+        super().__init__()
+        self.subject = self.add_child(subject) if subject is not None else None
+        self.arms = arms  # list of (pattern, body) tuples
+
+
+class VectorTypeExpression(Expression):
+    """`vector[T, N]` in expression position (may be called to build a literal)"""
+    def __init__(self, base_type, size, type_args=None):
+        super().__init__()
+        self.base_type = base_type
+        self.size = size
+        self.type_args = type_args or []
+
+
+class CompoundTypeBound(Node):
+    """A `+`-joined type bound, e.g. `Display + Ord`"""
+    def __init__(self, left, right):
+        super().__init__()
+        self.left = left
+        self.right = right
