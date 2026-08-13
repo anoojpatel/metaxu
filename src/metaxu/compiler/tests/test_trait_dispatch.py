@@ -209,3 +209,67 @@ def test_builtin_len_still_works_without_user_impl():
         }
     ''')
     assert result == 5
+
+
+# ---------------------------------------------------------------------------
+# Coherence: duplicate impls are rejected at desugar time
+# ---------------------------------------------------------------------------
+
+def test_duplicate_impl_rejected():
+    from metaxu.compiler.desugar import CoherenceError
+    src = """
+struct Dog { name: string }
+
+trait Speak { fn speak(self) -> string }
+
+implement Speak for Dog {
+    fn speak(self) -> string { "woof" }
+}
+
+implement Speak for Dog {
+    fn speak(self) -> string { "WOOF" }
+}
+
+fn main() -> string {
+    let d = Dog { name: "rex" };
+    d.speak()
+}
+"""
+    with pytest.raises(CoherenceError, match="more than one implement block"):
+        build_context_from_source(src)
+
+
+def test_same_trait_different_types_coherent():
+    src = """
+struct Dog { name: string }
+struct Cat { name: string }
+
+trait Speak { fn speak(self) -> string }
+
+implement Speak for Dog { fn speak(self) -> string { "woof" } }
+implement Speak for Cat { fn speak(self) -> string { "meow" } }
+
+fn main() -> string {
+    let d = Dog { name: "a" };
+    d.speak()
+}
+"""
+    assert run_main(src) == "woof"
+
+
+def test_different_traits_same_method_name_coherent():
+    src = """
+struct Dog { name: string }
+
+trait Speak { fn talk(self) -> string }
+trait Shout { fn yell(self) -> string }
+
+implement Speak for Dog { fn talk(self) -> string { "woof" } }
+implement Shout for Dog { fn yell(self) -> string { "WOOF" } }
+
+fn main() -> string {
+    let d = Dog { name: "a" };
+    d.talk() + d.yell()
+}
+"""
+    assert run_main(src) == "woofWOOF"
