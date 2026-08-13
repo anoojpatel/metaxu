@@ -243,9 +243,9 @@ class ModuleResolver:
         if candidate in self.loaded_files:
             # Same file already loaded under another module path: alias it.
             return self._info(self.loaded_files[candidate])
-        from metaxu.parser import Parser
+        from .shared_parser import shared_parser
         source = open(candidate).read()
-        parsed = Parser().parse(source, file_path=candidate)
+        parsed = shared_parser().parse(source, file_path=candidate)
         if not isinstance(parsed, fast.Module):
             raise _module_error(
                 f"module file {candidate} did not parse to a module")

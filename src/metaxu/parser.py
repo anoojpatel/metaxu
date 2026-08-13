@@ -44,6 +44,15 @@ class Parser:
         """Parse source code into an AST"""
         try:
             self.logger.debug("=== Starting Parse (%s) ===", file_path)
+            # Reset per-parse state so one Parser instance is reusable
+            # across files (PLY table construction costs ~430ms, so the
+            # pipeline shares an instance; see compiler/shared_parser.py).
+            self.deferred_processing = []
+            self.module_names = set()
+            self.parse_stack = []
+            self.current_scope = None
+            self.scope_stack = []
+            self.current_module = None
             # Initialize lexer with source
             self.lexer.source_file = file_path
             self.lexer.input(source)
