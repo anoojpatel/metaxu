@@ -250,6 +250,10 @@ class _FuncLowerer:
         if e.op == "If" and e.cond is not None:
             cond_val = self.lower_expr(e.cond)
             res_var = self.state.fresh("if")
+            # else_ops=None marks an else-less if: it always evaluates to
+            # unit (statement rule), so the then-arm runs for effects only
+            # and its value is discarded instead of merging with unit.
+            has_else = e.else_ops is not None
             then_bb = self.new_block()
             else_bb = self.new_block()
             join_bb = self.new_block()
@@ -260,7 +264,7 @@ class _FuncLowerer:
             then_result: str | None = None
             for sub in (e.then_ops or ()):
                 then_result = self.lower_expr(sub)
-            if then_result is None:
+            if then_result is None or not has_else:
                 then_result = self.unit_value()
             self.emit(("let", res_var, ("copy",), (then_result,)))
             self.terminate(("br", join_bb))

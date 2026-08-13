@@ -38,8 +38,11 @@ def binop(op: str, l: HExpr, r: HExpr) -> HExpr:
     return hx("BinOp", binop=op, left=l, right=r)
 
 
-def if_(cond: HExpr, then_ops, else_ops=()) -> HExpr:
-    return hx("If", cond=cond, then_ops=tuple(then_ops), else_ops=tuple(else_ops))
+def if_(cond: HExpr, then_ops, else_ops=None) -> HExpr:
+    # else_ops=None builds an else-less if (unit-valued statement form);
+    # pass a tuple/list (even empty) for the merging if/else form.
+    return hx("If", cond=cond, then_ops=tuple(then_ops),
+              else_ops=tuple(else_ops) if else_ops is not None else None)
 
 
 def fn(name: str, params: list[str], body: HExpr) -> HFun:
@@ -157,11 +160,15 @@ def test_sequential_ifs_first_feeds_second():
     assert run(f, [0]) == 22
 
 
-def test_if_without_else_returns_unit_on_false():
+def test_if_without_else_is_unit_on_both_paths():
+    # An else-less if is a statement: it evaluates to unit whether or not
+    # the condition holds. (The old assertion `run(f, [1]) == 1` pinned the
+    # accidental behavior where the then-arm's value leaked out and merged
+    # with unit; that merge is exactly what this change removes.)
     from metaxu.compiler.mir_interp import MxUnit
     body = if_(var("a"), [lit(1)])
     f = fn("f", ["a"], body)
-    assert run(f, [1]) == 1
+    assert isinstance(run(f, [1]), MxUnit)
     assert isinstance(run(f, [0]), MxUnit)
 
 
