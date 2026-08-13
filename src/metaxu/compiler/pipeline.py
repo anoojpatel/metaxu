@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 from .mutaxu_ast import AstNode, Span, dump_ast_json, build_frozen_ast_with_map
 from .infer_tables import InferSideTables
-from .frozen_borrow_checker import BorrowCheckError
+from .frozen_borrow_checker import BorrowCheckError, TypeCheckError
 from .hir import HIRBuilder, dump_hir
 from .lower_hir_to_mir import lower_hir_to_mir
 from .mir import dump_mir
@@ -24,8 +24,14 @@ def run_pipeline(
     instead of silently compiling the broken program. Pass strict=False to
     lower anyway (e.g. for diagnostics tooling).
     """
-    # Borrow errors from the frozen borrow checker are stored under key -2
-    borrow_errors = list(tables.constraints.get(-2, []))
+    # Structured diagnostics from the frozen checker are stored under key -2.
+    # Type errors (kind "type-*") surface as TypeCheckError; the rest are
+    # borrow/locality/effect errors and surface as BorrowCheckError.
+    all_errors = list(tables.constraints.get(-2, []))
+    type_errors = [e for e in all_errors if getattr(e, "kind", "").startswith("type-")]
+    borrow_errors = [e for e in all_errors if e not in type_errors]
+    if strict and type_errors:
+        raise TypeCheckError(type_errors)
     if strict and borrow_errors:
         raise BorrowCheckError(borrow_errors)
     hir_funcs = HIRBuilder(tables, id_map=id_map).build(ast_root)

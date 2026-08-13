@@ -25,8 +25,17 @@ def default_targets() -> list[str]:
     )
 
 
+# Negative fixtures: the pipeline must REJECT these files, with a diagnostic
+# containing the given substring. (Parsing must still succeed.)
+EXPECTED_PIPELINE_ERROR = {
+    "test_borrow_check.mx": "borrow",
+    "test_type_error.mx": "type",
+}
+
+
 def run_one(path: str, stage: str) -> tuple[bool, str]:
     source = open(path).read()
+    expected_error = EXPECTED_PIPELINE_ERROR.get(os.path.basename(path)) if stage != "parse" else None
     try:
         if stage == "parse":
             from metaxu.parser import Parser
@@ -36,8 +45,12 @@ def run_one(path: str, stage: str) -> tuple[bool, str]:
         from metaxu.compiler.pipeline import run_pipeline_from_source
 
         _ast, hir, mir, clif = run_pipeline_from_source(source)
+        if expected_error:
+            return False, f"expected a '{expected_error}' diagnostic but the pipeline accepted the file"
         return True, f"hir={len(hir)}b mir={len(mir)}b clif={len(clif)}b"
     except Exception as exc:  # noqa: BLE001 - report every failure uniformly
+        if expected_error and expected_error in str(exc).lower():
+            return True, f"rejected as expected: {type(exc).__name__}"
         last = traceback.format_exc().strip().splitlines()[-1]
         return False, f"{type(exc).__name__}: {str(exc).splitlines()[0][:120]} ({last[:80]})"
 

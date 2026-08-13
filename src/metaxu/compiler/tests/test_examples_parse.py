@@ -25,6 +25,17 @@ REPO_ROOT = Path(__file__).parent.parent.parent.parent.parent
 # Currently empty: all example files pass the full pipeline.
 KNOWN_BAD_PIPELINE: set[str] = set()
 
+# Files that are *negative* fixtures: they parse, but the pipeline must
+# REJECT them with a diagnostic (that is the behavior they exist to test).
+EXPECTED_PIPELINE_ERROR: dict[str, str] = {
+    # `let @mut ref2 = @mut node` after `let @mut ref1 = @mut node`:
+    # overlapping exclusive borrows, per docs/ownership_and_borrowing.md.
+    "test_borrow_check.mx": "borrow",
+    # `Node[Int] { data: "string" }`: field type must unify with the
+    # instantiated type argument.
+    "test_type_error.mx": "type",
+}
+
 
 def _collect_mx_files():
     files = sorted((REPO_ROOT / "examples").glob("*.mx"))
@@ -51,5 +62,14 @@ def test_example_full_pipeline(path):
     if path.name in KNOWN_BAD_PIPELINE:
         pytest.skip("known-bad full-pipeline case (parse-only guaranteed)")
     source = path.read_text()
+    if path.name in EXPECTED_PIPELINE_ERROR:
+        with pytest.raises(Exception) as excinfo:
+            run_pipeline_from_source(source)
+        expected = EXPECTED_PIPELINE_ERROR[path.name]
+        assert expected in str(excinfo.value).lower(), (
+            f"{path.name} was rejected, but not with the expected "
+            f"'{expected}' diagnostic: {excinfo.value}"
+        )
+        return
     ast_json, hir_txt, mir_txt, clif_txt = run_pipeline_from_source(source)
     assert ast_json
