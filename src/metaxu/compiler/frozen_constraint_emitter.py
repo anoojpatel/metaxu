@@ -524,8 +524,13 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
             return_types.pop()
             function_region_stack.pop()
             borrow_checker.exit_region()
-            borrow_checker.exit_function_state(fn_state)
+            # Pop the function's scope BEFORE restoring the enclosing borrow
+            # state: exit_scope releases borrows for names declared in the
+            # function, and doing that after the restore would erase live
+            # outer borrows of same-named variables (e.g. a param named like
+            # an outer let that holds a reference).
             pop_scope()
+            borrow_checker.exit_function_state(fn_state)
             return None
         if kind == "LambdaExpression" and node_ty is not None:
             outer_bindings = {name: lookup(name) for name in payload_dict(node).get("captures", {})}

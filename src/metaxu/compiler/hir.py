@@ -304,7 +304,15 @@ class HIRBuilder:
         # Variables
         if isinstance(orig, fast.Variable):
             ty = self.t.apply_tyenv(getattr(orig, 'type_var', None) or self.t.types.get(frozen_ctx.node_id, "Unknown"))
-            return self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span, op="Var", var_name=getattr(orig, 'name', None))
+            vname = getattr(orig, 'name', None)
+            # A bare zero-arg enum variant name in expression position
+            # (`Point`) constructs the variant, it is not a variable read.
+            if isinstance(vname, str) and vname in self._variant_to_enum:
+                return self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span,
+                                      op="MakeVariant",
+                                      enum_name=self._variant_to_enum[vname],
+                                      variant_name=vname, operands=())
+            return self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span, op="Var", var_name=vname)
 
         # QualifiedName: `a` → Var; `a.b.c` → chained FieldGet
         if isinstance(orig, fast.QualifiedName):
@@ -970,7 +978,19 @@ class HIRBuilder:
             name = str(getattr(p, 'name', '_') or '_')
             if name == "_":
                 return HPattern(kind="wildcard")
+            # A bare zero-arg variant name (`Point => ...`) is a constructor
+            # pattern, not a catch-all binding.
+            if name in self._variant_to_enum:
+                return HPattern(kind="ctor", name=name,
+                                enum_name=self._variant_to_enum[name], subpatterns=())
             return HPattern(kind="var", name=name)
+        # Negative number literal pattern: `-1 => ...` parses as UnaryOperation.
+        if isinstance(p, fast.UnaryOperation) and getattr(p, 'operator', None) == '-':
+            operand = getattr(p, 'operand', None)
+            if isinstance(operand, fast.Literal):
+                v = getattr(operand, 'value', None)
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    return HPattern(kind="literal", value=-v)
         if isinstance(p, fast.NoneExpression):
             return HPattern(kind="ctor", name="None",
                             enum_name=self._variant_to_enum.get("None"), subpatterns=())

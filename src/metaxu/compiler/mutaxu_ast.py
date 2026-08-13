@@ -205,12 +205,12 @@ def _mode_value(mode: Any) -> Any | None:
     if isinstance(mode, str):
         return mode
     if isinstance(mode, (list, tuple)):
-        values = [v for v in (_mode_value(m) for m in mode) if v is not None]
         flat: list[str] = []
-        for v in values:
+        for m in mode:
+            v = _mode_value(m)
             if isinstance(v, list):
                 flat.extend(v)
-            else:
+            elif v is not None:
                 flat.append(v)
         return flat or None
     inner = getattr(mode, "mode_type", None)

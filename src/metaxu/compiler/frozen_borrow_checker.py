@@ -91,6 +91,9 @@ class FrozenBorrowChecker:
     def __init__(self):
         self.borrow_state = BorrowState()
         self.scope_stack: List[Set[str]] = []
+        # Parallel to scope_stack: per-scope saves of outer-binding state that
+        # shadowing declarations cleared (restored by exit_scope).
+        self.shadow_saves: List[Dict[str, dict]] = []
         self.region_stack: List[int] = []
         self.variables: Dict[str, VariableInfo] = {}  # variable_name -> VariableInfo
         self.reference_graph: Dict[str, List[Tuple[str, str]]] = {}  # holder -> [(referenced_var, mode)]
@@ -104,12 +107,64 @@ class FrozenBorrowChecker:
     def enter_scope(self):
         """Enter a new scope."""
         self.scope_stack.append(set())
-    
+        self.shadow_saves.append({})
+
     def exit_scope(self):
-        """Exit the current scope, releasing borrows."""
+        """Exit the current scope: release its borrows, then restore any
+        outer-binding state that declarations in this scope shadowed."""
         scope = self.scope_stack.pop()
         for var_name in scope:
             self.release_borrows(var_name)
+        saves = self.shadow_saves.pop() if self.shadow_saves else {}
+        for var_name, save in saves.items():
+            if save["invalidated"]:
+                self.borrow_state.invalidated.add(var_name)
+            else:
+                self.borrow_state.invalidated.discard(var_name)
+            if save["shared"] is not None:
+                self.borrow_state.shared_borrows[var_name] = save["shared"]
+            else:
+                self.borrow_state.shared_borrows.pop(var_name, None)
+            for attr, present in (("unique_borrows", save["unique"]),
+                                  ("exclusive_borrows", save["exclusive"]),
+                                  ("mutable_borrows", save["mutable"])):
+                bucket = getattr(self.borrow_state, attr)
+                (bucket.add if present else bucket.discard)(var_name)
+            if save["varinfo"] is not None:
+                self.variables[var_name] = save["varinfo"]
+            else:
+                self.variables.pop(var_name, None)
+            if save["referenced_by"]:
+                self.referenced_by[var_name] = list(save["referenced_by"])
+            else:
+                self.referenced_by.pop(var_name, None)
+            if save["holds"]:
+                self.reference_graph[var_name] = list(save["holds"])
+                for (target, mode) in save["holds"]:
+                    holders = self.referenced_by.setdefault(target, [])
+                    if (var_name, mode) not in holders:
+                        holders.append((var_name, mode))
+            else:
+                self.reference_graph.pop(var_name, None)
+
+    def _save_shadowed_state(self, var_name: str) -> None:
+        """Before a (re)declaration clears a name's state, save the outer
+        binding's state so exit_scope can restore it (shadowing must not
+        permanently erase an outer move/borrow)."""
+        if not self.shadow_saves or not self.scope_stack:
+            return
+        if var_name in self.scope_stack[-1]:
+            return  # same-scope redeclare: genuine rebinding, nothing to restore
+        self.shadow_saves[-1].setdefault(var_name, {
+            "invalidated": var_name in self.borrow_state.invalidated,
+            "shared": self.borrow_state.shared_borrows.get(var_name),
+            "unique": var_name in self.borrow_state.unique_borrows,
+            "exclusive": var_name in self.borrow_state.exclusive_borrows,
+            "mutable": var_name in self.borrow_state.mutable_borrows,
+            "varinfo": self.variables.get(var_name),
+            "referenced_by": list(self.referenced_by.get(var_name, [])),
+            "holds": list(self.reference_graph.get(var_name, [])),
+        })
     
     def enter_function_state(self) -> tuple:
         """Snapshot per-function borrow/alias state on function entry.
@@ -319,9 +374,21 @@ class FrozenBorrowChecker:
             node_id: Node ID for error reporting
         """
         # A (re)declaration is a fresh binding: clear any stale move/borrow
-        # state a same-named earlier binding (shadowing, other scope) left.
+        # state a same-named earlier binding (shadowing, other scope) left —
+        # after saving the outer binding's state for restore at scope exit.
+        self._save_shadowed_state(var_name)
         self.borrow_state.invalidated.discard(var_name)
         self.release_borrows(var_name)
+        # Stale alias entries for the old binding must not leak into the new
+        # one: drop who referenced the old value, and drop the old binding's
+        # own outgoing references (removing it from targets' holder lists).
+        self.referenced_by.pop(var_name, None)
+        for (target, mode) in self.reference_graph.pop(var_name, []):
+            holders = self.referenced_by.get(target)
+            if holders:
+                self.referenced_by[target] = [
+                    h for h in holders if h != (var_name, mode)
+                ]
         self.variables[var_name] = VariableInfo(
             name=var_name,
             mode=mode,

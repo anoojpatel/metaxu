@@ -142,20 +142,34 @@ fn f() -> int {
 # ---------------------------------------------------------------------------
 
 def test_if_expression_emits_bool_constraint():
+    """The emitter must emit a Bool class constraint for if-expression
+    conditions (spied directly — compiling successfully is not evidence,
+    since the branch was silently dead before)."""
+    from unittest.mock import patch
+    from metaxu.compiler.simplesub_adapter import SimpleSubFacade
+
     src = """
 fn f(c: bool) -> int {
     if c { 1 } else { 2 }
 }
 """
-    ctx = build_context_from_source(src)
+    recorded: list[str] = []
+    original = SimpleSubFacade.add_class_constraint
+
+    def spy(self, cls, args, node_id=None):
+        recorded.append(cls)
+        return original(self, cls, args, node_id)
+
+    with patch.object(SimpleSubFacade, "add_class_constraint", spy):
+        ctx = build_context_from_source(src)
     kinds = set()
     def walk(n):
         kinds.add(n.kind)
         for ch in n.children:
             walk(ch)
     walk(ctx.frozen_root)
-    assert "IfExpression" in kinds  # the emitter's condition branch must cover this kind
-    run_pipeline_from_source(src)
+    assert "IfExpression" in kinds  # parser emits IfExpression, not IfStatement
+    assert "Bool" in recorded, "no Bool constraint emitted for the if condition"
 
 
 # ---------------------------------------------------------------------------
@@ -237,3 +251,92 @@ fn main() -> string {
 }
 """
     assert call(src, "main", []) == "ok"
+
+
+# ---------------------------------------------------------------------------
+# Second adversarial-review round regressions
+# ---------------------------------------------------------------------------
+
+def test_bare_variant_pattern_is_ctor_not_binding():
+    """`Point => ...` must match only the Point variant, not everything."""
+    src = """
+enum Shape { Point, Circle(r: int) }
+
+fn f(s: Shape) -> int {
+    match s {
+        Point => 0,
+        Circle(r) => r
+    }
+}
+
+fn main() -> int {
+    f(Circle(5)) + f(Point)
+}
+"""
+    assert call(src, "main", []) == 5
+
+
+def test_negative_literal_pattern():
+    src = """
+fn f(x: int) -> int {
+    match x {
+        -1 => 10,
+        _ => 0
+    }
+}
+"""
+    assert call(src, "f", [-1]) == 10
+    assert call(src, "f", [5]) == 0
+
+
+def test_shadow_in_nested_block_does_not_unmove_outer():
+    """An inner-scope `let x` must not clear the outer x's moved flag."""
+    src = """
+fn f() -> int {
+    let x = 1;
+    let y = move(x);
+    {
+        let x = 2;
+        x
+    };
+    x
+}
+"""
+    with pytest.raises(BorrowCheckError, match="moved"):
+        run_pipeline_from_source(src)
+
+
+def test_function_decl_between_borrows_keeps_outer_borrow():
+    """Walking a nested fn whose param shares a name with an outer borrowed
+    variable must not erase the outer borrow."""
+    src = """
+fn main() -> int {
+    let @mut x = 1;
+    let r = @mut x;
+    let r2 = @mut x;
+    0
+}
+
+fn f(x: int) -> int { x }
+"""
+    with pytest.raises(BorrowCheckError):
+        run_pipeline_from_source(src)
+
+
+def test_shadowed_reference_holder_does_not_block_new_binding():
+    """After `let x = 2` shadows x, the old named reference to the old x must
+    not make call-site borrows of the NEW x unreleasable."""
+    src = """
+fn f(@const p: int) -> int { p }
+fn g(@mut p: int) -> int { p }
+
+fn main() -> int {
+    let x = 1;
+    let r = &x;
+    let x = 2;
+    f(&x);
+    g(@mut x);
+    0
+}
+"""
+    run_pipeline_from_source(src)  # must not raise
