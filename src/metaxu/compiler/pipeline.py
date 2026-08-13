@@ -80,10 +80,16 @@ def build_context_from_source(source: str, file_path: str = "<mem>") -> PhaseCon
     import metaxu.metaxu_ast as fast
     from .infer_tables import build_tables_from_frozen_via_simplesub
     from .desugar import run_default_desugaring, DesugarContext
+    from .module_loader import resolve_modules
 
     parser = Parser()
     module = parser.parse(source, file_path=file_path)
     program = fast.Program([module]) if not isinstance(module, fast.Program) else module
+
+    # Module resolution: load imported files, enforce visibility, namespace
+    # module functions, rewrite references. Programs that use no module
+    # constructs are returned untouched (single-file backward compatibility).
+    program = resolve_modules(program, file_path=file_path)
 
     # Preliminary analysis over the un-desugared program so desugaring passes
     # can consult traits/trait_impls/types.
@@ -139,14 +145,17 @@ def emit_llvm_from_source(source: str, strict: bool = True) -> str:
     return emit_llvm(mir_funcs)
 
 
-def run_pipeline_from_source(source: str, strict: bool = True) -> tuple[str, str, str, str]:
+def run_pipeline_from_source(source: str, strict: bool = True,
+                             file_path: str = "<mem>") -> tuple[str, str, str, str]:
     """Parse, desugar, type/borrow check, and run the pipeline from source.
 
     Thin wrapper over build_context_from_source + run_pipeline_ctx so that
-    both front doors run the identical phase sequence.
+    both front doors run the identical phase sequence. Pass `file_path` when
+    the source lives on disk so multi-file imports can resolve relative to
+    its directory.
 
     Returns (ast_json, hir_txt, mir_txt, clif_txt). Raises BorrowCheckError
     when strict (default) and the program failed borrow checking.
     """
-    ctx = build_context_from_source(source)
+    ctx = build_context_from_source(source, file_path=file_path)
     return run_pipeline_ctx(ctx, strict=strict)
