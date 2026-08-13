@@ -26,6 +26,11 @@ class SimpleSubFacade:
         # Placeholder constraint buffer if we want to capture and replay later
         self._constraints: list[tuple] = []
         self.errors: list[str] = []
+        # Warning-level advisories (plain strings) surfaced through the same
+        # -1 diagnostics channel as "Unresolved ..." messages. They carry no
+        # `kind` attribute, so the pipeline never promotes them to hard
+        # TypeCheckErrors (only kind == "type-conflict" items are promoted).
+        self.advisories: list[str] = []
         self.effect_info: Any = None
         self.function_types: Dict[int, Any] = {}  # Store CompactType function types by node_id
         self._apply_solution = False  # Flag to control whether to apply SimpleSub's solution
@@ -183,7 +188,8 @@ class SimpleSubFacade:
         from .frozen_constraint_checker import check_constraints
 
         self.errors, self.effect_info = check_constraints(self._constraints, self.function_types)
-        self.errors = list(self.errors) + self._detect_class_conflicts()
+        self.errors = (list(self.errors) + self._detect_class_conflicts()
+                       + list(self.advisories))
 
         # If real TypeInferencer is available, translate buffered constraints
         if self._ss is not None and _Polarity is not None:
