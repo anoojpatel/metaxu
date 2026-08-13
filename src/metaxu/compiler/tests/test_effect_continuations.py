@@ -392,3 +392,49 @@ fn main() -> int {
 }
 """)
     assert result == 42
+
+
+# ---------------------------------------------------------------------------
+# Static advisory: performs must be handled or declared
+# ---------------------------------------------------------------------------
+
+def _advisories(src: str) -> list[str]:
+    ctx = build_context_from_source(src)
+    return [str(e) for e in ctx.tables.constraints.get(-1, ())]
+
+
+def test_undeclared_unhandled_perform_gets_advisory():
+    msgs = _advisories("""
+effect Ask { ask() -> int }
+
+fn f() -> int {
+    perform Ask.ask()
+}
+""")
+    assert any("Ask" in m and "performed without" in m for m in msgs)
+
+
+def test_declared_perform_no_advisory():
+    msgs = _advisories("""
+effect Ask { ask() -> int }
+
+fn f() performs Ask -> int {
+    perform Ask.ask()
+}
+""")
+    assert not any("performed without" in m for m in msgs)
+
+
+def test_handled_perform_no_advisory():
+    msgs = _advisories("""
+effect Ask { ask() -> int }
+
+fn main() -> int {
+    handle Ask with {
+        ask() -> resume(7)
+    } in {
+        perform Ask.ask()
+    }
+}
+""")
+    assert not any("performed without" in m for m in msgs)
