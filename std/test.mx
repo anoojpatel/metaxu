@@ -1,18 +1,52 @@
-# std.test — in-language test assertions with reporting as an effect.
+# std.test — in-language test assertions, with reporting as an effect.
 #
-# `check`/`check_eq` perform a Report effect; the defaults print ok/FAIL
-# lines, and `run_suite` installs a counting handler so a suite returns
-# its failure count (0 = success — usable as a process exit code).
-# Handlers-over-globals: a CI harness can install its own Report handler
-# without touching the assertions.
+# Assertions do not abort and do not own a sink: they perform a `Report`
+# operation and let a handler decide what that means. Unhandled, the
+# declared defaults print `ok`/`FAIL` lines; `run_suite` and `run_tests`
+# install counting handlers so a whole suite runs to completion and
+# answers its failure count (0 = success, usable as a process exit code);
+# `collect_failures` answers the failing tests' descriptions instead.
+#
+# That is the difference from the `assert_eq` interpreter builtin, which
+# aborts the program on the first mismatch and tells you nothing about
+# the tests after it. `std.test`'s `assert_eq` deliberately SHADOWS that
+# builtin (plain calls prefer a user function — docs/name_precedence.md):
+# importing this module upgrades assertions from fatal to tallied.
+#
+# Ante has no test module; this one is Metaxu's own.
 
-export { Report, check, check_eq, run_suite };
+export {
+    Report,
+    TestReport,
+    check,
+    check_eq,
+    assert_true,
+    assert_false,
+    assert_eq,
+    assert_ne,
+    run_suite,
+    run_tests,
+    collect_failures
+};
 
+# Unhandled, assertions print their outcome.
 effect Report {
     fn passed(name: string) -> () = print("ok", name)
     fn failed(name: string) -> () = print("FAIL", name)
 }
 
+# Totals from `run_tests`.
+struct TestReport {
+    total: int,
+    failed: int,
+    failures: Vec
+}
+
+# ---------------------------------------------------------------------
+# Assertions
+# ---------------------------------------------------------------------
+
+# Report `name` as passed when `cond` holds, failed otherwise.
 fn check(cond: bool, name: string) -> () {
     if cond {
         perform Report.passed(name);
@@ -21,21 +55,64 @@ fn check(cond: bool, name: string) -> () {
     }
 }
 
-fn check_eq(actual: int, expected: int, name: string) -> () {
+# `check` under the name a test suite reads better with.
+fn assert_true(cond: bool, name: string) -> () {
+    check(cond, name)
+}
+
+fn assert_false(cond: bool, name: string) -> () {
+    check(!cond, name)
+}
+
+# Report equality, describing the mismatch in the failure text. Both
+# values are unannotated, so ints, strings and bools all work.
+fn assert_eq(actual, expected, name: string) -> () {
     if actual == expected {
         perform Report.passed(name);
     } else {
-        print("  expected", expected, "got", actual);
-        perform Report.failed(name);
+        perform Report.failed(
+            name + ": expected " + to_string(expected)
+                 + ", got " + to_string(actual));
     }
 }
 
-# Run a test body counting failures; prints a summary and returns the
-# failure count. Passing tests stay quiet (summaries only) — install no
-# handler (use the defaults) to see per-test ok lines instead.
-fn run_suite(name: string, body: fn() -> ()) -> int {
-    let @mut failures = 0;
+fn assert_ne(actual, unexpected, name: string) -> () {
+    if actual == unexpected {
+        perform Report.failed(
+            name + ": expected anything but " + to_string(unexpected));
+    } else {
+        perform Report.passed(name);
+    }
+}
+
+# The int-only assertion kept from the first cut of this module.
+fn check_eq(actual: int, expected: int, name: string) -> () {
+    assert_eq(actual, expected, name)
+}
+
+# ---------------------------------------------------------------------
+# Runners
+# ---------------------------------------------------------------------
+
+# Run `body` counting outcomes; prints a summary line and answers the
+# failure count. Passing tests stay quiet — install no handler (use the
+# effect defaults) to see per-test `ok` lines instead.
+fn run_suite(name: string, body) -> int {
+    let report = run_tests(name, body);
+    let @mut i = 0;
+    while i < len(report.failures) {
+        print("FAIL", report.failures[i]);
+        i = i + 1
+    }
+    print(name, ":", report.total - report.failed, "passed,", report.failed, "failed");
+    report.failed
+}
+
+# Run `body` answering totals plus the failing tests' descriptions.
+# Prints nothing: a CI harness formats the report however it likes.
+fn run_tests(name: string, body) -> TestReport {
     let @mut total = 0;
+    let @mut failures = Vec.new();
     handle Report with {
         passed(t) -> {
             total = total + 1;
@@ -43,13 +120,17 @@ fn run_suite(name: string, body: fn() -> ()) -> int {
         },
         failed(t) -> {
             total = total + 1;
-            failures = failures + 1;
-            print("FAIL", t);
+            failures.push(t);
             resume(())
         }
     } in {
-        body();
-        print(name, ":", total - failures, "passed,", failures, "failed");
-        failures
-    }
+        body()
+    };
+    TestReport { total: total, failed: len(failures), failures: failures }
+}
+
+# Run `body` answering just the failing tests' descriptions — the whole
+# report a passing suite needs (an empty Vec).
+fn collect_failures(body) -> Vec {
+    run_tests("", body).failures
 }

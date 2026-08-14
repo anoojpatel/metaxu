@@ -45,9 +45,82 @@ keep compiling unchanged.
 | `std.map` | `HashMap.an` | placeholder (by design) | assoc-list `Map` struct; `empty`, `size`, `is_empty`, `contains_key`, `get`, `get_or`, `put`, `remove`, `keys`, `values` — **every op is O(n)**; API shaped so a real hash map can replace the representation |
 | `std.prelude` | `Prelude.an` | implemented | curated re-exports (`public from ... import`) of the unambiguous names |
 
+### Round 2 — the effect-shaped modules Ante does not have
+
+Round 1 ported Ante's design. These six are Metaxu's own: each one exists
+because *handlers* are a better answer than the usual global (a logger
+object, a seeded RNG singleton, an aborting `assert`).
+
+| Module | Status | Contents |
+| --- | --- | --- |
+| `std.state` | implemented | `effect State { get, put }`; `eval_state`/`with_state` (result), `exec_state` (final state), `run_state` (both, via `StateResult`), `modify`, `gets`, `update`, `increment` |
+| `std.log` | implemented | `effect Log { debug, info, warn, error }` with stdout defaults; `log_*` wrappers; `level_*` constants; handlers `with_stdout_logging`, `quietly`, `collect_logs`, `with_collected_logs`, `run_collected` (`LogRun`), `with_min_level` |
+| `std.random` | implemented (seeded only) | `effect Random { next }` with **no default** (see below); `with_seed` (LCG), `with_sequence` (scripted draws); `next_below`, `next_range`, `next_bool`, `next_sign`, `choose`, `take_random`, `shuffle` |
+| `std.parse` | implemented | `parse_int` (Option) / `parse_int_or` / `parse_int_or_fail` (Fail), `parse_bool`, `digit_value`, `is_digit`, `is_space`, `trim`, `split_on`, `parse_int_vec` |
+| `std.test` | implemented | `effect Report { passed, failed }`; `assert_true`/`assert_false`/`assert_eq`/`assert_ne`/`check`/`check_eq`; runners `run_suite` (failure count), `run_tests` (`TestReport`), `collect_failures` |
+| `std.iter` | implemented | the adapters `std.stream` defers, over a real `Pair` struct: `enumerate`, `zip`, `zip_with`, `take_while`, `drop_while`, `step_by`, `windows`, `chunks` |
+
+Design notes worth knowing before using them:
+
+- **`std.state` reads its final state out of the handler's own capture
+  cell.** `exec_state`/`run_state` install the handler, run the block,
+  and then read `current` — the same shared cell both arms write. That
+  is the whole trick behind `execState`/`runState` without a second
+  effect or a mutable out-parameter.
+- **`std.log`'s `with_min_level` RE-PERFORMS.** A handler arm evaluates
+  outside its own delimitation, so a `perform Log.warn(...)` inside an
+  arm routes to the *next* enclosing `Log` handler (or to the stdout
+  default). Filters therefore compose with collectors:
+  `with_collected_logs(fn() -> with_min_level(level_warn, body))`
+  collects only warnings and errors. Same idiom as `std.throw.map_err`.
+- **`std.random` ships NO real-entropy default, deliberately.** The
+  `with SYMBOL` runtime-mapping mechanism
+  (`examples/effect_mapping.mx`) is how one would be declared, but the
+  interpreter's shim table only has `EFFECT_MUTEX_*`/`EFFECT_SPAWN`/
+  `EFFECT_JOIN` — there is no entropy shim, and a mapped symbol with no
+  shim fails loudly. So `Random.next` has no default clause at all:
+  performing it unhandled is a loud unhandled-effect error, never a
+  silently constant "random" number. Adding an `EFFECT_RANDOM_SEED` shim
+  later is a one-line change in `std/random.mx`.
+  The generator is an ANSI-C LCG (modulus 2^31), two 15-bit high-bit
+  draws concatenated per `next()`. A xorshift would be better but needs
+  `^`/`<<` — Metaxu has **no bitwise operators** (gap 13 below). Not
+  cryptographic.
+- **`std.test.assert_eq` deliberately shadows the `assert_eq`
+  builtin.** The builtin aborts the program on the first mismatch; the
+  module's version reports through `Report`, so a suite runs to the end
+  and `run_tests` answers totals plus every failure's description. Plain
+  calls prefer a user function (`docs/name_precedence.md`), so importing
+  the module is all it takes.
+- **`std.iter` uses a `Pair` struct where a tuple would go.** Metaxu has
+  no tuple type or tuple destructuring (gap 8), which is exactly why
+  `std.stream` defers `enumerate`/`zip`. `p.first` / `p.second` is what
+  `let (a, b) = p` would have been, and it is a plain value closures,
+  Vecs and handlers already carry.
+- **`std.iter.zip`/`zip_with` realize their SECOND stream eagerly** (into
+  a Vec) before pulling the first. Metaxu's continuations are single-shot
+  and delimited, so two producers cannot be stepped in lockstep without
+  one being materialized. The module says so rather than hiding it —
+  never pass an unbounded stream as `second`.
+
 Not ported (no Metaxu runtime surface yet): `IO.an`, `Env.an`,
 `Time.an`, `Rc.an`, `Sync.an`, `C.an`, `Char.an`, `Hash.an`, `Seq.an`,
 `Slice.an`.
+
+Deferred inside the round-2 modules, with the blocker:
+
+- `std.random`: real entropy (no runtime shim, above); a float
+  `next_float()` (no int→float conversion builtin); weighted sampling
+  (wants floats).
+- `std.parse`: floats (no string→float builtin, and accumulating digits
+  would lose precision), radix prefixes, digit separators, and overflow
+  detection (no checked arithmetic — accumulation wraps natively and
+  grows unbounded in the interpreter; documented in the module header).
+- `std.iter`: `unzip` and `flat_map` (both want a stream of streams or a
+  multi-value return); `intersperse` (expressible, but only useful with
+  `join`-style consumers that `std.string` already covers).
+- `std.test`: a `#[test]`-style registry (no attributes/macros); test
+  names are strings passed to each assertion.
 
 ## The effect idioms (what makes this Ante's design)
 
@@ -73,6 +146,15 @@ Not ported (no Metaxu runtime surface yet): `IO.an`, `Env.an`,
 - **`map_err` re-throws from inside a handler case**: a case evaluates
   outside its own delimitation, so its `perform Throw.throw(...)` routes
   to the next enclosing handler, exactly like Ante's version.
+  `std.log`'s `with_min_level` is the same idiom used as a *filter*.
+- **State is a capture cell shared by the handler's arms** (`std.state`):
+  `get` resumes with it, `put` writes it, and the runner reads it back
+  after the handled block ends — which is how `exec_state`/`run_state`
+  answer the final state without a second effect.
+- **The sink is a handler choice, not a global** (`std.log`, `std.test`,
+  `std.random`): the same computation prints, is silent, is collected
+  into a Vec, is filtered by level, is tallied, or draws from a scripted
+  sequence, depending only on which handler is lexically in scope.
 
 ## Deviations from Ante, and why
 
@@ -89,9 +171,11 @@ Not ported (no Metaxu runtime surface yet): `IO.an`, `Env.an`,
   name in two modules is a loud compile error, and initializers run in
   module-load order before the entry point.
 - No `Stream` trait / implicit impls: producers are explicitly thunks.
-- `panic_on_fail`, `or_panic`, `retry_until_success` (Fail.an),
-  `enumerate`, `zip`, `map2`, `intersperse` (Stream.an) are deferred —
-  see gaps below for the specific blockers.
+- `panic_on_fail`, `or_panic`, `retry_until_success` (Fail.an) are
+  deferred — see gaps below for the specific blockers.
+- `enumerate`, `zip`, `map2` (Stream.an) live in **`std.iter`**, over a
+  `Pair` struct standing in for the tuple Metaxu does not have.
+  `intersperse` is still deferred (see the round-2 deferrals above).
 
 ## Language gaps this library exposed
 
@@ -164,10 +248,89 @@ Items 3, 4, 5, 6 and 7 are fixed (regression tests:
     writing `std/state.mx`'s nested-scope test (worked around with named
     helper functions). Parse-time-loud, not silent.
 
+### Found in round 2 (state / log / random / parse / test / iter)
+
+All five of these were found by writing the modules above, and all five
+are fixed; the regression tests are at the bottom of
+`src/metaxu/compiler/tests/test_silent_seams.py`.
+
+11. **FIXED — `!e` silently compiled as `e`.** `!` was not a lexer token
+    at all, and `t_error` merely *logged a warning and skipped* the
+    character, so `!cond` lost the `!` and computed the opposite answer
+    with no diagnostic — even though `hir` has always lowered
+    `UnaryOperation('!')` to `__builtin$not` and
+    `docs/name_precedence.md` documents `!x`. Found by
+    `std/test.mx`'s `assert_false`, which reported passing tests as
+    failures. `!` is a token and a `unary_expression` rule now, and an
+    unlexable character is a loud `LexError` instead of vanishing.
+
+12. **FIXED — `&&` and `||` did not exist in the grammar.** The MIR
+    interpreter and both backends have always had `&&`/`||` binops;
+    nothing could produce them. They now parse at a level between
+    `expression` and `comparison_expression`, and they **short-circuit**:
+    `a && b` is `if a { b } else { false }` and `a || b` is
+    `if a { true } else { b }`. Desugaring to `if` (rather than a MIR
+    binop, which would take two already-evaluated operands) is what makes
+    guards like `i < len(s) && s[i] == c` safe, and it inherits
+    `IfExpression`'s typing, so `1 && 2` is a loud type error. `||` is
+    still the empty-parameter lambda opener; the two uses never collide
+    because one is at expression start.
+
+13. **No bitwise operators** (`^`, `<<`, `>>`, `|`, `&` as binary and).
+    `&` is borrow syntax and `|` is a pattern separator, so these need
+    real design work, not just a token. This is what keeps
+    `std/random.mx` on an LCG instead of a xorshift. Parse-time-loud.
+
+14. **FIXED — string literals kept their backslashes verbatim.** `"a\nb"`
+    was the four characters `a \ n b` and printed that way, and
+    `"say \"hi\""` could not be written at all (the old `"[^"]*"` pattern
+    stopped at the escaped quote). Found by `std/parse.mx`'s `is_space`,
+    which compared a one-character string against the two-character
+    `"\t"` and so never matched. String and f-string literals now decode
+    `\n \t \r \0 \\ \" \'`, and an **unknown escape is a loud
+    `LexError`** rather than a silently-kept backslash.
+
+15. **FIXED — an `if`/`else` whose branches assign differently-typed
+    variables was a spurious type error.** An `Assignment` node's own
+    type was unified with the assigned *variable's* type, so
+    `if c { flag = false } else { n = n + 1 }` demanded `Bool ~ Int`
+    ("one value is required to be Bool and Int") on a perfectly
+    well-typed program. An assignment is a statement: its type is `Unit`
+    now. The value still has to match the binding, which is the real
+    check. Found writing `std/parse.mx`'s `parse_int`; it is also why
+    older modules write `if c { x = ... } else { () }` everywhere.
+
+16. **FIXED — `/` and `%` disagreed between the interpreter and the
+    backends on negative operands.** The interpreter used Python's
+    flooring `//`/`%` (`-7 / 2 == -4`, `-7 % 5 == 3`) while
+    `codegen_llvm` and `codegen_clif` emit `sdiv`/`srem`, which truncate
+    toward zero (`-3`, `-2`). The same program had two answers and no
+    diagnostic — it was even documented as a known divergence in
+    `codegen_llvm`'s header comment. The interpreter is the semantics
+    reference, so it must not be the odd one out: `mir_interp` now
+    truncates toward zero and takes the sign of the dividend, and
+    `(a / b) * b + a % b == a` holds on both sides. (The two stale
+    "interpreter floors" comments inside `codegen_llvm.py` still need
+    updating; that file is owned elsewhere.) Found writing
+    `std/random.mx`'s seed normalization.
+
 ## Testing
 
-`src/metaxu/compiler/tests/test_stdlib.py` exercises every module
+`src/metaxu/compiler/tests/test_stdlib.py` exercises every round-1 module
 through the full pipeline (parse → module resolution → strict
 infer/borrow-check → HIR → MIR → interpreter), plus the loader's
 placeholder fallback, the `METAXU_STD_PATH` override, and regressions
 for gaps 1–2.
+
+`src/metaxu/compiler/tests/test_stdlib_effects.py` does the same for the
+round-2 modules — state threading through `resume`, a collector handler
+answering the lines a computation logged, a filter re-performing into an
+enclosing collector, `with_seed` reproducible across two runs (and
+seed-dependent), `parse_int` on good and bad input, assertions tallying
+instead of aborting, and adapters that stop pulling their source —
+alongside `test_std_state.py`, `test_std_log.py` and `test_std_test.py`,
+which pin the first cut of those three.
+
+Every `std/*.mx` file is additionally walked by
+`test_hir_coverage.py`, which parametrizes over `std/*.mx`, so a new
+module is compiled by the suite the moment it lands.
