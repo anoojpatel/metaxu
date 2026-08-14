@@ -99,11 +99,14 @@ class Lexer:
         'DOUBLECOLON', 'ARROW', 'FATARROW', 'BACKSLASH', 'AT', 'AMPERSAND',
         'PIPE', 'OROR', 'ANDAND',
         'LESS', 'GREATER', 'LESSEQUAL', 'GREATEREQUAL', 'EQUALEQUAL', 'NOTEQUAL',
-        'NOT',
+        'NOT', 'CARET', 'TILDE',
         # Synthesized by the token-stream disambiguation filter (never produced
-        # directly by a regex): generic type argument brackets and the opening
-        # brace of a struct literal.
-        'LGENERIC', 'RGENERIC', 'LBRACE_STRUCT',
+        # directly by a regex): generic type argument brackets, the opening
+        # brace of a struct literal, and the two shift operators (Pass D
+        # merges an ADJACENT pair of LESS/GREATER that Pass B did not claim
+        # for a generic argument list — a `>>` regex would have eaten the
+        # closing brackets of `Vec<Vec<int>>`).
+        'LGENERIC', 'RGENERIC', 'LBRACE_STRUCT', 'SHL', 'SHR',
     ] + list(set(reserved.values()))
 
     # Regular expression rules for simple tokens
@@ -150,6 +153,12 @@ class Lexer:
     t_AMPERSAND = r'&'
     t_OROR = r'\|\|'
     t_PIPE = r'\|'
+    # Bitwise xor and complement.  Both characters were ILLEGAL until now
+    # (t_error rejects them), so adding the tokens cannot change the meaning
+    # of any program that compiles today.  `<<`/`>>` are NOT regex rules —
+    # see SHL/SHR in `tokens` and `_transform`'s Pass D.
+    t_CARET = r'\^'
+    t_TILDE = r'~'
 
     # Comments: both '#' and '//' styles
     def t_COMMENT(self, t):
@@ -437,6 +446,8 @@ class Lexer:
         Pass C: a '{' that opens a struct literal (previous token is a name
                 or a closing type-argument bracket and the next tokens look
                 like `field :`) becomes LBRACE_STRUCT.
+        Pass D: an ADJACENT pair of LESS/LESS or GREATER/GREATER that Pass B
+                did not claim for a generic argument list becomes SHL/SHR.
         """
         # --- Pass A: contextual keywords -------------------------------
         import_span = self._import_statement_spans(toks)
@@ -477,7 +488,15 @@ class Lexer:
         n = len(toks)
         while i < n:
             tok = toks[i]
-            if tok.type == 'LESS' and i > 0 and toks[i - 1].type in self._GENERIC_PREV:
+            if tok.type == 'LESS' and i > 0 and toks[i - 1].type in self._GENERIC_PREV \
+                    and not self._adjacent(toks, i, 'LESS'):
+                # A generic argument list can never OPEN with another `<`
+                # (no type is spelled starting with an angle bracket), so an
+                # adjacent `<<` is always the shift operator.  Refusing to
+                # start the scan here is what keeps `a << b >> (c)` from
+                # being retagged as `a<<b>>` generic arguments: the angle
+                # counts are balanced and `(` is in _GENERIC_FOLLOW, so the
+                # scan would otherwise have "matched".
                 depth = 1
                 angle_positions = [i]
                 j = i + 1
@@ -523,7 +542,43 @@ class Lexer:
                     and n2 is not None and n2.type == 'COLON':
                 tok.type = 'LBRACE_STRUCT'
 
-        return toks
+        # --- Pass D: shift operators -----------------------------------
+        # `<<` and `>>` are deliberately NOT lexer regexes.  A `>>` rule
+        # would swallow the two closing brackets of `Vec<Vec<int>>` before
+        # Pass B ever saw them — the classic C++ nested-generics bug, and
+        # exactly the kind of silent misparse docs/token_reachability.md
+        # exists to prevent.  By the time this pass runs, every angle
+        # bracket Pass B recognised as a type argument is LGENERIC/RGENERIC,
+        # so the only LESS/GREATER pairs left are operators.
+        #
+        # ADJACENCY IS REQUIRED: `a > > b` keeps two GREATER tokens and
+        # stays the syntax error it is today, so the spelling of a shift is
+        # exactly the two-character one.
+        merged: list = []
+        i = 0
+        n = len(toks)
+        while i < n:
+            tok = toks[i]
+            if tok.type in ('LESS', 'GREATER') and self._adjacent(toks, i, tok.type):
+                nxt = toks[i + 1]
+                tok.type = 'SHL' if tok.type == 'LESS' else 'SHR'
+                tok.value = '<<' if tok.type == 'SHL' else '>>'
+                tok.endlexpos = getattr(nxt, 'endlexpos', nxt.lexpos + 1)
+                merged.append(tok)
+                i += 2
+                continue
+            merged.append(tok)
+            i += 1
+        return merged
+
+    @staticmethod
+    def _adjacent(toks, i: int, ttype: str) -> bool:
+        """True when toks[i+1] has type `ttype` and touches toks[i] in the
+        source text (no whitespace or comment between them)."""
+        if i + 1 >= len(toks):
+            return False
+        nxt = toks[i + 1]
+        return nxt.type == ttype and nxt.lexpos == toks[i].lexpos + 1
 
     # Build the lexer
     def __init__(self):
@@ -617,7 +672,8 @@ CONTEXTUAL = "contextual"
 RESERVED_ONLY = "reserved-only"
 
 #: Tokens no regex rule produces — the `_transform` passes synthesize them.
-SYNTHESIZED_TOKENS = frozenset({'LGENERIC', 'RGENERIC', 'LBRACE_STRUCT'})
+SYNTHESIZED_TOKENS = frozenset({'LGENERIC', 'RGENERIC', 'LBRACE_STRUCT',
+                                'SHL', 'SHR'})
 
 TOKEN_TRIAGE: dict[str, tuple[str, str]] = {
     # -- literals and names --------------------------------------------
@@ -636,8 +692,12 @@ TOKEN_TRIAGE: dict[str, tuple[str, str]] = {
     'NOT': (GRAMMAR, "logical negation `!e` (unary_expression)"),
     'ANDAND': (GRAMMAR, "short-circuit `&&`"),
     'OROR': (GRAMMAR, "short-circuit `||`; also the empty-parameter lambda"),
-    'AMPERSAND': (GRAMMAR, "address-of `&x` and reference types"),
-    'PIPE': (GRAMMAR, "effect-set union `E | F`"),
+    'AMPERSAND': (GRAMMAR, "address-of `&x`, reference types, and bitwise "
+                           "and `a & b` (bitand_expression)"),
+    'PIPE': (GRAMMAR, "effect-set union `E | F` and bitwise or `a | b` "
+                      "(bitor_expression)"),
+    'CARET': (GRAMMAR, "bitwise xor `a ^ b` (bitxor_expression)"),
+    'TILDE': (GRAMMAR, "bitwise complement `~e` (unary_expression)"),
     'LESS': (GRAMMAR, "`<` comparison (generic `<` is retagged LGENERIC)"),
     'GREATER': (GRAMMAR, "`>` comparison (generic `>` is retagged RGENERIC)"),
     'LESSEQUAL': (GRAMMAR, "`<=` comparison"),
@@ -669,6 +729,10 @@ TOKEN_TRIAGE: dict[str, tuple[str, str]] = {
     'LGENERIC': (GRAMMAR, "synthesized `<` of a type argument list (Pass B)"),
     'RGENERIC': (GRAMMAR, "synthesized `>` of a type argument list (Pass B)"),
     'LBRACE_STRUCT': (GRAMMAR, "synthesized `{` of a struct literal (Pass C)"),
+    'SHL': (GRAMMAR, "synthesized shift-left `<<` from an adjacent LESS pair "
+                     "Pass B left unclaimed (Pass D)"),
+    'SHR': (GRAMMAR, "synthesized shift-right `>>` from an adjacent GREATER "
+                     "pair Pass B left unclaimed (Pass D)"),
 
     # -- control flow and declarations -----------------------------------
     'IF': (GRAMMAR, "`if` / `if let`"),

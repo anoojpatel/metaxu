@@ -843,13 +843,21 @@ _ARITH_FLT = {"+": "fadd", "-": "fsub", "*": "fmul", "/": "fdiv", "%": "frem"}
 _CMP_INT = {"==": "eq", "!=": "ne", "<": "slt", "<=": "sle", ">": "sgt", ">=": "sge"}
 _CMP_FLT = {"==": "oeq", "!=": "one", "<": "olt", "<=": "ole", ">": "ogt", ">=": "oge"}
 _LOGIC = {"&&": "and", "||": "or", "and": "and", "or": "or"}
-_SUPPORTED_BINOPS = set(_ARITH_INT) | set(_CMP_INT) | set(_LOGIC)
+# Bitwise operators (Int-only, i64 two's complement).  `>>` is ARITHMETIC
+# (`ashr`), matching Python's sign-extending `>>` in mir_interp.  The two
+# shifts do NOT emit a bare `shl`/`ashr`: LLVM makes an out-of-range shift
+# count poison while the interpreter raises, so the count goes through
+# @mx_shift_check first (see emit_shift_check).
+_BITWISE_INT = {"&": "and", "|": "or", "^": "xor", "<<": "shl", ">>": "ashr"}
+_SHIFT_OPS = frozenset({"<<", ">>"})
+_SUPPORTED_BINOPS = (set(_ARITH_INT) | set(_CMP_INT) | set(_LOGIC)
+                     | set(_BITWISE_INT))
 
 # Builtins --------------------------------------------------------------------
 
 _PRINT_BUILTINS = {"print", "println"}
 _MATH_EXTERNS = {"sqrt", "sin", "cos"}  # double -> double libc functions
-_INLINE_BUILTINS = {"neg", "not"}
+_INLINE_BUILTINS = {"neg", "not", "bnot"}
 
 # Vec/string builtins now lowered to the NATIVE runtime (metaxu_rt.c, linked
 # by llvm_run): these mirror the interpreter's builtins exactly.  NAME
@@ -948,6 +956,10 @@ _RT_SIGS = {
     "mx_str_eq": ("i64", ("ptr", "ptr")),
     "mx_str_free": ("void", ("ptr",)),
     "mx_vec_as_bytes": ("ptr", ("ptr",)),
+    # Shift-count guard: aborts when the count is outside 0..63, which is
+    # what the interpreter's InterpError does.  A bare `shl`/`ashr` would be
+    # POISON there, i.e. the same program with two behaviours.
+    "mx_shift_check": ("i64", ("i64", "i64")),
     # Fixed-size vectors (immutable mx_fvec blocks; increment 10).
     "mx_fvec_new": ("ptr", ("i64",)),
     "mx_fvec_len": ("i64", ("ptr",)),
@@ -3538,7 +3550,7 @@ def _infer_kinds(info: _Info, sigs: Dict[str, _Sig], structs: _StructTable,
                     o = rhs[1]
                     if o in _CMP_INT:
                         changed = unify(args) or changed  # dst stays i64
-                    elif o in _LOGIC:
+                    elif o in _LOGIC or o in _BITWISE_INT:
                         pass  # i64-only
                     elif len(args) == 2 and any(
                             _is_fvec(get(x)) for x in (dst, *args)):
@@ -3621,6 +3633,8 @@ def _infer_kinds(info: _Info, sigs: Dict[str, _Sig], structs: _StructTable,
                     elif bname == "neg":
                         if len(args) == 1:
                             changed = unify((dst, args[0])) or changed
+                    elif bname == "bnot":
+                        pass  # `~x` is i64-only (the default kind)
                     elif bname in _PRINT_BUILTINS or bname == "not":
                         pass  # dst is unit/bool -> i64
                     else:
@@ -4435,6 +4449,11 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                 elif o in _LOGIC:
                     if any(ty(x) != I64 for x in (dst, *args)):
                         probs.append(f"logical binop {o!r} on non-i64 values")
+                elif o in _BITWISE_INT:
+                    if any(ty(x) != I64 for x in (dst, *args)):
+                        probs.append(
+                            f"bitwise binop {o!r} on non-Int values (the "
+                            "interpreter refuses too)")
                 else:
                     if ty(dst) == STR:
                         # str + str -> mx_str_concat (fresh malloc'd string,
@@ -4706,6 +4725,12 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                 elif bname == "not":
                     if len(args) == 1 and ty(dst) != I64:
                         probs.append(f"not of kind {ty(dst)}")
+                elif bname == "bnot":
+                    if len(args) != 1 or any(ty(x) != I64
+                                             for x in (dst, *args)):
+                        probs.append(
+                            "bitwise complement `~` on a non-Int value "
+                            "(the interpreter refuses too)")
                 elif bname in _MATH_EXTERNS or bname in _INLINE_BUILTINS:
                     pass  # kinds pinned during inference
                 elif callee in module_names:
@@ -7450,6 +7475,29 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                     v = fresh()
                     lines.append(f"  {v} = zext i1 {c} to i64")
                     setval(dst, v, lines)
+                elif o in _BITWISE_INT:
+                    # Int-only, i64 two's complement.  A shift's COUNT is
+                    # validated first: @mx_shift_check returns the count
+                    # when it is in 0..63 and aborts with a message
+                    # otherwise, so an out-of-range shift is loud on both
+                    # engines instead of poison natively and an exception in
+                    # the interpreter.  The guard is a call rather than an
+                    # inline compare-and-branch so the surrounding basic
+                    # block stays intact.
+                    amount = r
+                    if o in _SHIFT_OPS:
+                        mod.runtime_syms.add("mx_shift_check")
+                        chk = fresh()
+                        lines.append(
+                            f"  {chk} = call i64 @mx_shift_check("
+                            f"i64 {r}, i64 {1 if o == '<<' else 0})"
+                            f"  ; aborts unless 0 <= count < 64")
+                        amount = chk
+                    v = fresh()
+                    lines.append(
+                        f"  {v} = {_BITWISE_INT[o]} i64 {l}, {amount}"
+                        f"  ; bitwise {o}")
+                    setval(dst, v, lines)
                 elif o in _LOGIC:
                     lb, rb, v = fresh(), fresh(), fresh()
                     lines.append(f"  {lb} = icmp ne i64 {l}, 0")
@@ -7715,6 +7763,12 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                     c, v = fresh(), fresh()
                     lines.append(f"  {c} = icmp eq i64 {a}, 0")
                     lines.append(f"  {v} = zext i1 {c} to i64")
+                    setval(dst, v, lines)
+                elif bname == "bnot":
+                    # `~x` — bitwise complement, exactly `x ^ -1`.
+                    a = use(opargs[0], lines)
+                    v = fresh()
+                    lines.append(f"  {v} = xor i64 {a}, -1  ; bitwise ~")
                     setval(dst, v, lines)
                 elif bname in _MATH_EXTERNS:
                     mod.math_used.add(bname)
