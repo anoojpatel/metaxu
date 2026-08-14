@@ -2919,12 +2919,24 @@ def test_examples_define_census_does_not_regress():
     # rather than emitting code for the wrong route.  Net 87 -> 81 (06 loses
     # 11 and gains the two handler-arm functions plus three main lambdas that
     # are now reachable).
+    #
+    # Increment 15 lowers that runtime choice instead of refusing it: a
+    # perform of an op with BOTH a declared default and a handle scope emits
+    # mx_perform_or_default, which runs the runtime's own innermost-non-busy
+    # scope lookup and calls the op's default thunk only where plain
+    # mx_perform would have aborted — the interpreter's precedence, made
+    # native.  06_vector_operations.mx wins back reduce/sum/mean/dot/norm/
+    # normalize/matmul (+ matmul's two lambdas, sum/prod's fold lambdas and
+    # three main lambdas): 26 -> 33 defines, landing the census at 88.  06's
+    # residue is now genuine polymorphism (one `map` takes f64-valued AND
+    # str-valued lambdas) and fold's `type_of` / free type variables — never
+    # effect routing.
     total_defines = 0
     for path in _example_files():
         ir = llvm_from_source(path.read_text())
         total_defines += len(re.findall(
             r"^define (?:i64|double|ptr|void) @mx_\w+\(", ir, re.M))
-    assert total_defines >= 81
+    assert total_defines >= 88
 
 
 # ---------------------------------------------------------------------------
@@ -3365,6 +3377,170 @@ fn main() -> int {
 }
 """
 
+# Increment 15 — DYNAMIC default routing.  `ask` declares a default AND is
+# listed by a handle scope, so ONE perform site resolves two different ways
+# depending on the handler stack at the moment it runs: inside the handle
+# the scope answers (2), outside it the declared default does (7).
+_DYNAMIC_DEFAULT_SRC = """
+effect Cap {
+    ask(x: int) -> int = 7;
+}
+
+fn inner() -> int performs Cap {
+    perform Cap.ask(1)
+}
+
+fn main() -> int {
+    let handled = handle Cap with { ask(x) -> resume(x + 1) } in { inner() };
+    let bare = inner();
+    print(handled);
+    print(bare);
+    0
+}
+"""
+
+# (a) the default is taken because NO handler is installed anywhere.
+_DYNAMIC_DEFAULT_ONLY_SRC = """
+effect Cap {
+    ask(x: int) -> int = x + 100;
+}
+
+fn inner(x: int) -> int performs Cap {
+    perform Cap.ask(x)
+}
+
+fn wrapped(x: int) -> int {
+    handle Cap with { ask(v) -> resume(v * 2) } in { x }
+}
+
+fn main() -> int {
+    print(inner(1));
+    print(wrapped(9));
+    0
+}
+"""
+
+# (d) a default's result flows into subsequent computation, through an
+# AGGREGATE boundary (the enum crosses as a write-once boundary box on both
+# routes) — exactly example 06's `Option<...>` capability shape.
+_DYNAMIC_DEFAULT_AGG_SRC = """
+enum Answer {
+    Nothing,
+    Value(v: int)
+}
+
+effect Cap {
+    probe(x: int) -> Answer = Nothing;
+}
+
+fn ask(x: int) -> int performs Cap {
+    match perform Cap.probe(x) {
+        Value(v) -> v,
+        Nothing -> x * 3
+    }
+}
+
+fn main() -> int {
+    let bare = ask(4);
+    let handled = handle Cap with { probe(v) -> resume(Value(v + 1000)) }
+        in { ask(4) };
+    print(bare);
+    print(handled);
+    print(bare + handled);
+    0
+}
+"""
+
+# (c) the same op resolving differently at two sites in ONE dynamic extent:
+# the handler case's own perform routes OUTWARD past its busy scope (the
+# interpreter's _find_mir_frame busy skip == mx__find_scope's), finds no
+# other scope, and lands on the default.
+_DYNAMIC_DEFAULT_BUSY_SRC = """
+effect Cap {
+    ask(x: int) -> int = x * 10;
+}
+
+fn inner(x: int) -> int performs Cap {
+    perform Cap.ask(x)
+}
+
+fn nested(x: int) -> int {
+    handle Cap with {
+        ask(v) -> {
+            let outer = perform Cap.ask(v + 1);
+            resume(outer + 1)
+        }
+    } in { inner(x) }
+}
+
+fn main() -> int {
+    print(nested(2));
+    0
+}
+"""
+
+# Two dynamically-routed ops of one effect, answered by DIFFERENT nested
+# scopes (and by their defaults where no scope lists them) — the outward
+# walk past a scope that handles the OTHER op, with a str result crossing
+# the boundary and flowing into a concat.
+_DYNAMIC_DEFAULT_NESTED_SRC = """
+effect Cfg {
+    level(x: int) -> int = x + 1;
+    label(x: int) -> string = "default";
+}
+
+fn describe(x: int) -> string performs Cfg {
+    let n = perform Cfg.level(x);
+    let s = perform Cfg.label(n);
+    s + "/" + n.to_string()
+}
+
+fn boosted(x: int) -> string {
+    handle Cfg with { level(v) -> resume(v * 100) } in { describe(x) }
+}
+
+fn named(x: int) -> string {
+    handle Cfg with { label(v) -> resume("named") } in { describe(x) }
+}
+
+fn both(x: int) -> string {
+    handle Cfg with { level(v) -> resume(v * 2) } in { named(x) }
+}
+
+fn main() -> int {
+    print(describe(1));
+    print(boosted(1));
+    print(named(1));
+    print(both(1));
+    print(describe(5));
+    0
+}
+"""
+
+# A default that ITSELF performs: it runs on the performing stack, so its
+# perform sees the same scope stack and parks the same fiber.  `base` is
+# handled in the second call and defaulted in the first, while `ask` is
+# defaulted in both.
+_DYNAMIC_DEFAULT_PERFORMS_SRC = """
+effect Cap {
+    ask(x: int) -> int = perform Cap.base(x) + 5;
+    base(x: int) -> int = x;
+}
+
+fn inner(x: int) -> int performs Cap {
+    perform Cap.ask(x) * 2
+}
+
+fn main() -> int {
+    let bare = inner(3);
+    let handled = handle Cap with { base(v) -> resume(v * 100) }
+        in { inner(3) };
+    print(bare);
+    print(handled);
+    0
+}
+"""
+
 
 def test_elementwise_binop_lowers_to_simd_or_mx_fvec_binop():
     # Increment 11: the float shapes in this program all have statically
@@ -3467,29 +3643,33 @@ def test_effect_default_perform_lowers_to_direct_call():
     assert "call i64 @mx_perform" not in ir
 
 
-def test_effect_default_with_handle_scope_demotes_honestly():
-    # `ask` has a default AND appears in a handle scope: whether the scope
-    # intercepts a given perform is dynamic, and mx_perform aborts where
-    # the interpreter would fall back to the default — demote.
-    ir = llvm_from_source("""
-effect Cap {
-    ask(x: int) -> int = 7;
-}
-
-fn inner() -> int performs Cap {
-    perform Cap.ask(1)
-}
-
-fn main() -> int {
-    let handled = handle Cap with { ask(x) -> resume(x + 1) } in { inner() };
-    let bare = inner();
-    print(handled);
-    print(bare);
-    0
-}
-""")
-    assert ("effect op 'ask' has a declared default and also appears in a "
-            "handle scope") in ir
+def test_effect_default_with_handle_scope_routes_dynamically():
+    # Increment 15: `ask` has a default AND appears in a handle scope, so
+    # which one answers a given perform is decided AT THE PERFORM by the
+    # runtime's scope stack.  One perform site, one call:
+    # mx_perform_or_default runs the same innermost-non-busy lookup as
+    # mx_perform and calls the op's default thunk only where mx_perform
+    # would have aborted.
+    ir = llvm_from_source(_DYNAMIC_DEFAULT_SRC)
+    assert count_placeholders(ir) == 0
+    # the new call shape, with the per-op thunk pointer and a null env
+    assert re.search(
+        r"call i64 @mx_perform_or_default\(ptr @\.str\.\d+, ptr @\.str\.\d+, "
+        r"ptr %perform\.args, i64 1, "
+        r"ptr @mxfx\.dflt\.__effect_default_Cap_ask, ptr null\)", ir)
+    assert "in-scope handler, else the declared default" in ir
+    assert ("declare i64 @mx_perform_or_default(ptr, ptr, ptr, i64, ptr, ptr)"
+            in ir)
+    # the thunk: word decode -> call the compiled default -> word encode
+    assert ("define internal i64 @mxfx.dflt.__effect_default_Cap_ask"
+            "(ptr %env, ptr %args) {") in ir
+    assert "%a0w = load i64, ptr %a0p" in ir  # word straight off the scratch
+    assert "call i64 @mx___effect_default_Cap_ask(i64 %a0w)" in ir
+    # exactly ONE perform site; the plain mx_perform path is not used here
+    assert ir.count("call i64 @mx_perform_or_default(") == 1
+    assert not re.search(r"call i64 @mx_perform\(", ir)
+    # the static-default direct call is NOT taken (a scope may intercept)
+    assert "-> declared default (no handle scope" not in ir
 
 
 def test_range_value_outside_iteration_demotes():
@@ -3522,19 +3702,35 @@ def test_vector_operations_example_lifts_transpose_and_static_assert():
     # called, and SimdOp performs could only ever be answered by their declared
     # defaults — which the native backend does lower. With the handler real,
     # try_vectorize/try_horizontal have BOTH a declared default and a handle
-    # scope, and dynamic default routing has no native lowering, so map/reduce/
-    # fold (and everything reached through them) demote on that instead.
+    # scope, so answering a perform is a RUNTIME choice; increment 15 lowers
+    # exactly that (mx_perform_or_default), which is what puts reduce/sum/
+    # mean/dot/norm/normalize/matmul back on the native path.
     ir = llvm_from_source(
         (REPO_ROOT / "examples" / "06_vector_operations.mx").read_text())
     assert "define ptr @mx___impl__vector_transpose(ptr" in ir
     assert "define ptr @mx___impl__vector_transpose_lambda8(" in ir
     assert "define ptr @mx_static_assert()" in ir
     assert ir.count("call ptr @mx_fvec_map(ptr") >= 2
-    # the honest residue: higher-order/effect-routing gaps, not vector builtins
+    # increment 15: SimdOp's ops route dynamically — the handle scope in
+    # `with_simd` answers when it is installed, the declared `= None`
+    # defaults answer everywhere else.  `try_horizontal` (reduce's perform)
+    # is the one that survives to emission; `try_vectorize`'s performers
+    # (map/zip) still demote on genuine higher-order polymorphism, so no
+    # thunk is kept for it — thunk liveness follows its users.
+    assert ("define internal i64 @mxfx.dflt.__effect_default_SimdOp_"
+            "try_horizontal(ptr %env, ptr %args) {") in ir
+    assert "mxfx.dflt.__effect_default_SimdOp_try_vectorize" not in ir
+    assert "has a declared default and also appears in a handle scope" not in ir
+    assert ir.count("call i64 @mx_perform_or_default(") == 1
+    assert "define double @mx___impl_VectorOps_vector_reduce(" in ir
+    for lifted in ("__impl__vector_sum",
+                   "__impl__vector_mean", "__impl__vector_dot",
+                   "__impl__vector_norm", "__impl__vector_normalize",
+                   "__impl__vector_matmul"):
+        assert f"; function @mx_{lifted}: placeholder" not in ir
+    # the honest residue: genuine higher-order polymorphism, not routing
     assert "; function @mx_main: placeholder" in ir
-    assert ("has a declared default and also appears in a handle scope" in ir
-            or "irreconcilable value kinds" in ir)
-    assert "call through local 'f' that is not a statically-known closure" in ir
+    assert "irreconcilable value kinds" in ir
     for lifted_builtin in ("__vec_dim", "__vec_zeros", "__vec_filled",
                            "__vec_comprehension", "__slice_get", "__range",
                            "__cast"):
@@ -5285,3 +5481,204 @@ def test_native_dotted_enum_variant_differential(tmp_path):
     undefined variable; in pattern position it degraded to a wildcard, so the
     FIRST arm matched every colour."""
     assert_native_matches_interp(_TRIAGE_DOTTED_VARIANT_SRC, tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Increment 15: dynamic effect-default routing (mx_perform_or_default)
+#
+# An op with BOTH a declared `= expr` default and a handle scope listing it
+# resolves per-perform, from the runtime scope stack.  The interpreter's
+# precedence (mir_interp, `perform`) is:
+#
+#     in-scope non-busy handler frame
+#   > `with SYMBOL` runtime mapping (__effect_runtime$E$op)
+#   > declared `= expr` default (__effect_default$E$op)
+#   > loud "No handler for effect" error
+#
+# Native mirrors rungs 1, 3 and 4 exactly (mx__perform_impl); rung 2 has no
+# native implementation at all, so any op declaring a runtime mapping still
+# demotes with that reason — divergence is refused, not papered over.
+# ---------------------------------------------------------------------------
+
+def test_dynamic_default_thunk_boxes_aggregate_results():
+    # The default's return is an ENUM: it crosses the boundary as a
+    # write-once box pointer, exactly like a handler case's aggregate
+    # result (the thunk mallocs, sret-fills, returns the pointer word).
+    ir = llvm_from_source(_DYNAMIC_DEFAULT_AGG_SRC)
+    assert count_placeholders(ir) == 0
+    assert re.search(
+        r"define internal i64 @mxfx\.dflt\.__effect_default_Cap_probe"
+        r"\(ptr %env, ptr %args\) \{", ir)
+    assert re.search(
+        r"%rbox = call ptr @malloc\(i64 \d+\)"
+        r"  ; boundary box: default result enum:Answer", ir)
+    assert re.search(
+        r"call void @mx___effect_default_Cap_probe\(ptr %rbox, i64 %a0w\)",
+        ir)
+
+
+def test_dynamic_and_static_default_routes_coexist_in_one_module():
+    # Only `base` is listed by a handle scope, so ONLY `base` routes
+    # dynamically; `ask` (a default with no scope anywhere) keeps the
+    # increment-10 static direct call.  The two rungs must not blur.
+    ir = llvm_from_source(_DYNAMIC_DEFAULT_PERFORMS_SRC)
+    assert count_placeholders(ir) == 0
+    assert ("; perform Cap.ask -> declared default (no handle scope in the "
+            "module lists it)") in ir
+    assert "call i64 @mx___effect_default_Cap_ask(i64 %a.x)" in ir
+    assert "mxfx.dflt.__effect_default_Cap_ask" not in ir
+    # `ask`'s default body performs `base`, which IS scoped: one thunk, one
+    # dynamic call site, inside the default function itself (defaults run
+    # on the performing stack, so a perform inside one parks this fiber).
+    assert ir.count(
+        "define internal i64 @mxfx.dflt.__effect_default_Cap_base(") == 1
+    assert ir.count("call i64 @mx_perform_or_default(") == 1
+    assert re.search(
+        r"define i64 @mx___effect_default_Cap_ask\(i64 %a\.x\) \{"
+        r"(?:(?!\n\}).)*mx_perform_or_default", ir, re.S)
+
+
+def test_dynamic_default_disagreeing_with_its_handler_demotes():
+    # The default's signature joins the SAME op-name cells as the handler
+    # cases, so a default answering int where the handler resumes a string
+    # cannot be reconciled.  The result must be an honest demotion, never a
+    # thunk decoding boundary words the wrong way.
+    ir = llvm_from_source("""
+effect Cap {
+    ask(x: int) -> int = 7;
+}
+
+fn inner() -> int performs Cap {
+    perform Cap.ask(1)
+}
+
+fn main() -> int {
+    let a = handle Cap with { ask(x) -> resume("nope") } in { inner() };
+    let b = inner();
+    print(a);
+    print(b);
+    0
+}
+""")
+    assert count_placeholders(ir) > 0
+    # the default was pulled to the op cell's str kind and could not hold
+    # its own `7`, so IT demotes and every performer cascades with it
+    assert ("; function @mx___effect_default_Cap_ask: placeholder" in ir)
+    assert ("calls function '__effect_default$Cap$ask' that is itself a "
+            "placeholder") in ir
+    # no thunk survives for an op whose routes disagree
+    assert "define internal i64 @mxfx.dflt." not in ir
+
+
+def test_runtime_mapped_op_in_a_scope_still_demotes():
+    # The interpreter's precedence puts the `with SYMBOL` runtime mapping
+    # BETWEEN the handler frames and the default.  Native has no EFFECT_*
+    # primitives at all, so an op declaring a mapping must keep demoting
+    # even now that the rung below it (the declared default) is lowerable —
+    # the two ends must never be blurred into one route.
+    ir = llvm_from_source("""
+effect Locky = {
+    fn create() -> int with EFFECT_MUTEX_CREATE
+}
+
+fn grab() -> int performs Locky {
+    perform Locky.create()
+}
+
+fn main() -> int {
+    let a = handle Locky with { create() -> resume(5) } in { grab() };
+    print(a);
+    0
+}
+""")
+    assert "maps to the C effect runtime" in ir
+    assert "@mx_perform_or_default(" not in ir  # header comment aside
+    ir2 = llvm_from_source(
+        (REPO_ROOT / "examples" / "effect_mapping.mx").read_text())
+    assert "maps to the C effect runtime" in ir2
+    assert "@mx_perform_or_default(" not in ir2
+
+
+@needs_clang
+def test_native_dynamic_default_taken_when_unhandled(tmp_path):
+    """(a) No handler installed at the perform -> the declared default
+    answers, and (b) a handler installed elsewhere in the same program does
+    not change that."""
+    assert_native_matches_interp(_DYNAMIC_DEFAULT_ONLY_SRC, tmp_path)
+
+
+@needs_clang
+def test_native_dynamic_default_handler_wins_when_installed(tmp_path):
+    """(b)+(c) ONE perform site, two answers: 2 inside the handle, 7
+    outside it — the routing decision the whole increment exists for."""
+    ir = assert_native_matches_interp(_DYNAMIC_DEFAULT_SRC, tmp_path)
+    assert ir.count("call i64 @mx_perform_or_default(") == 1
+
+
+@needs_clang
+def test_native_dynamic_default_busy_scope_falls_through(tmp_path):
+    """(c) The handler case's own perform routes outward past its BUSY
+    scope and lands on the default — the interpreter's busy skip
+    (_find_mir_frame) and the runtime's (mx__find_scope) agreeing."""
+    assert_native_matches_interp(_DYNAMIC_DEFAULT_BUSY_SRC, tmp_path)
+
+
+@needs_clang
+def test_native_dynamic_default_result_flows_onward(tmp_path):
+    """(d) The default's value flows into subsequent computation, across an
+    aggregate boundary box and back out through a match."""
+    assert_native_matches_interp(_DYNAMIC_DEFAULT_AGG_SRC, tmp_path)
+
+
+@needs_clang
+def test_native_dynamic_default_nested_scopes_differential(tmp_path):
+    """(c)+(d) at scale: two dynamically-routed ops, three nested scopes,
+    each perform walking outward past scopes that handle the OTHER op
+    before either a handler or a default answers — with str results
+    crossing the boundary and flowing into a concat."""
+    ir = assert_native_matches_interp(_DYNAMIC_DEFAULT_NESTED_SRC, tmp_path)
+    assert count_placeholders(ir) == 0
+    assert ir.count("call i64 @mx_perform_or_default(") == 2
+    assert ("define internal i64 @mxfx.dflt.__effect_default_Cfg_level"
+            "(ptr %env, ptr %args) {") in ir
+    assert ("define internal i64 @mxfx.dflt.__effect_default_Cfg_label"
+            "(ptr %env, ptr %args) {") in ir
+    # the str default's result crosses as a pointer word on both routes
+    assert "inttoptr i64 %r to i64" not in ir
+    assert "%w = ptrtoint ptr %r to i64" in ir
+
+
+@needs_clang
+def test_native_dynamic_default_performs_from_the_default(tmp_path):
+    """The default runs ON THE PERFORMING STACK: its own perform sees the
+    same scope stack and, when a scope answers, parks this same fiber."""
+    assert_native_matches_interp(_DYNAMIC_DEFAULT_PERFORMS_SRC, tmp_path)
+
+
+@needs_asan
+def test_native_dynamic_default_asan_leak_clean(tmp_path):
+    """Scalar-only dynamic-default programs are FULLY leak-checked: the
+    default path allocates nothing at all (no scope, no coroutine, no
+    continuation), and the scope path frees its machinery as before."""
+    assert_native_matches_interp_asan(_DYNAMIC_DEFAULT_BUSY_SRC, tmp_path)
+    assert_native_matches_interp_asan(_DYNAMIC_DEFAULT_PERFORMS_SRC, tmp_path)
+
+
+@needs_asan
+def test_native_dynamic_default_aggregate_asan_no_uaf(tmp_path):
+    """Boundary boxes leak BY DESIGN (immortal, write-once) on both routes,
+    so this one proves no use-after-free / no double-free only — the
+    documented aggregate contract."""
+    import os
+    env_key = "ASAN_OPTIONS"
+    old = os.environ.get(env_key)
+    os.environ[env_key] = "detect_leaks=0"
+    try:
+        assert_native_matches_interp(
+            _DYNAMIC_DEFAULT_AGG_SRC, tmp_path,
+            clang_args=("-fsanitize=address",))
+    finally:
+        if old is None:
+            os.environ.pop(env_key, None)
+        else:
+            os.environ[env_key] = old
