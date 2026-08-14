@@ -1,0 +1,42 @@
+# std.log — logging as an algebraic effect.
+#
+# Handlers decide the sink and the filtering: with no handler installed
+# the declared defaults print to stdout with level prefixes; a scope can
+# install its own handler to silence, collect, or redirect. This is
+# strictly better than a global logger object — the "configuration" is
+# lexical and composable.
+
+export { Log, quietly, collect_logs };
+
+effect Log {
+    fn info(message: string) -> () = print("[info]", message)
+    fn warn(message: string) -> () = print("[warn]", message)
+}
+
+# Run `f` with all logging suppressed.
+fn quietly(f: fn() -> int) -> int {
+    handle Log with {
+        info(message) -> resume(()),
+        warn(message) -> resume(())
+    } in {
+        f()
+    }
+}
+
+# Run `f` collecting log lines (level-prefixed) into the given Vec
+# instead of printing. The Vec's identity semantics make it a natural
+# out-parameter.
+fn collect_logs(sink: Vec<string>, f: fn() -> int) -> int {
+    handle Log with {
+        info(message) -> {
+            sink.push("[info] " + message);
+            resume(())
+        },
+        warn(message) -> {
+            sink.push("[warn] " + message);
+            resume(())
+        }
+    } in {
+        f()
+    }
+}
