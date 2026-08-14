@@ -412,6 +412,10 @@ int main(void) {
 
 @needs_clang
 def test_unhandled_perform_aborts_with_message(tmp_path):
+    # The interpreter's MIR `perform` op raises "No handler for effect 'E'"
+    # (mir_interp, naming the EFFECT), and since native try/catch landed
+    # this text is a language-visible value: a `try` binds exactly it.  With
+    # no landing pad installed the raise still prints and abort()s.
     code, _, err = _compile_and_run(tmp_path, _PRELUDE + r"""
 int main(void) {
     mx_perform("Ask", "ask", NULL, 0);
@@ -419,7 +423,7 @@ int main(void) {
 }
 """)
     assert code != 0
-    assert "Unhandled effect operation: 'ask'" in err
+    assert "No handler for effect 'Ask'" in err
 
 
 @needs_clang
@@ -771,7 +775,7 @@ int main(void) {
 }
 """)
     assert code != 0
-    assert "Unhandled effect operation: 'ask'" in err
+    assert "No handler for effect 'Ask'" in err
 
 
 @needs_clang
@@ -881,3 +885,237 @@ int main(void) {
 """, asan=True)
     assert code == 0, f"ASan flagged the mixed-route run:\n{err}"
     assert out == "1050\n30\n"
+
+
+# ---------------------------------------------------------------------------
+# try/catch: mx_try landing pads and their composition with effect scopes
+# ---------------------------------------------------------------------------
+#
+# The compiler side is covered in test_codegen_llvm.py; these drivers pin
+# the RUNTIME CONTRACT at the C ABI level, including two shapes the current
+# compiler demotes for its own reasons but the runtime must still get right
+# (a `try` in a handler case around a `resume`, and an effect abort
+# unwinding through a try).  Expected values come from the interpreter:
+# see the same shapes in .../tests/test_codegen_llvm.py and mir_interp.
+
+_TRY_PRELUDE = _PRELUDE + r"""
+static int64_t body_ok(void *env) { (void)env; return 7; }
+static int64_t catch_never(void *env, const char *m) {
+    (void)env; printf("UNEXPECTED %s\n", m); return -1;
+}
+static int64_t catch_print(void *env, const char *m) {
+    (void)env; printf("caught: %s\n", m); return 42;
+}
+static const char *g_ops[] = {"boom"};
+static const int64_t g_np[] = {1};
+"""
+
+
+@needs_clang
+def test_try_without_failure_returns_the_body_value(tmp_path):
+    code, out, _ = _compile_and_run(tmp_path, _TRY_PRELUDE + r"""
+int main(void) {
+    printf("%lld\n", (long long)mx_try(body_ok, NULL, catch_never, NULL));
+    return 0;
+}
+""")
+    assert code == 0
+    assert out == "7\n"
+
+
+@needs_clang
+def test_try_catches_an_unhandled_perform_with_the_interpreter_message(tmp_path):
+    code, out, _ = _compile_and_run(tmp_path, _TRY_PRELUDE + r"""
+static int64_t body(void *env) {
+    (void)env; return mx_perform("Fail", "boom", NULL, 0);
+}
+int main(void) {
+    printf("%lld\n", (long long)mx_try(body, NULL, catch_print, NULL));
+    return 0;
+}
+""")
+    assert code == 0
+    assert out == "caught: No handler for effect 'Fail'\n42\n"
+
+
+@needs_clang
+def test_nested_try_the_innermost_pad_catches(tmp_path):
+    code, out, _ = _compile_and_run(tmp_path, _TRY_PRELUDE + r"""
+static int64_t inner(void *env) {
+    (void)env; return mx_perform("Fail", "boom", NULL, 0);
+}
+static int64_t inner_catch(void *env, const char *m) {
+    (void)env; printf("inner: %s\n", m); return 5;
+}
+static int64_t outer(void *env) {
+    (void)env; return mx_try(inner, NULL, inner_catch, NULL) + 1;
+}
+static int64_t outer_catch(void *env, const char *m) {
+    (void)env; printf("UNEXPECTED outer %s\n", m); return 99;
+}
+int main(void) {
+    printf("%lld\n", (long long)mx_try(outer, NULL, outer_catch, NULL));
+    return 0;
+}
+""")
+    assert code == 0
+    assert out == "inner: No handler for effect 'Fail'\n6\n"
+
+
+@needs_clang
+def test_try_inside_a_handle_body_survives_a_perform_round_trip(tmp_path):
+    # The pad lives on the BODY COROUTINE.  The perform parks that fiber
+    # (the pad chain is saved with it), the handler runs on the owner stack,
+    # and the resume comes back to a body whose pad is untouched.
+    code, out, _ = _compile_and_run(tmp_path, _TRY_PRELUDE + r"""
+static int64_t try_body(void *env) {
+    (void)env;
+    int64_t a[1] = {2};
+    return mx_perform("Fail", "boom", a, 1) * 10;
+}
+static int64_t hbody(void *env) {
+    (void)env; return mx_try(try_body, NULL, catch_never, NULL);
+}
+static int64_t disp(void *env, int64_t op, const int64_t *args, mx_k *k) {
+    (void)env; (void)op; return mx_resume(k, args[0] + 100);
+}
+int main(void) {
+    printf("%lld\n", (long long)mx_handle(hbody, NULL, disp, NULL,
+                                          "Fail", g_ops, g_np, 1));
+    return 0;
+}
+""")
+    assert code == 0
+    assert out == "1020\n"
+
+
+_CROSS_FIBER_DRIVER = r"""
+static int64_t hbody(void *env) {
+    (void)env;
+    int64_t a[1] = {1};
+    int64_t x = mx_perform("Fail", "boom", a, 1);
+    int64_t y = mx_perform("Other", "ask", NULL, 0);  /* unhandled */
+    return x + y;
+}
+static int64_t disp(void *env, int64_t op, const int64_t *args, mx_k *k) {
+    (void)env; (void)op; return mx_resume(k, args[0] + 1);
+}
+static int64_t outer(void *env) {
+    (void)env;
+    return mx_handle(hbody, NULL, disp, NULL, "Fail", g_ops, g_np, 1);
+}
+int main(void) {
+    printf("%lld\n", (long long)mx_try(outer, NULL, catch_print, NULL));
+    return 0;
+}
+"""
+
+
+@needs_clang
+def test_failure_on_a_body_coroutine_reaches_a_try_outside_the_handle(tmp_path):
+    # No pad on the fiber: the failure becomes MX_EV_ERROR, mx_handle
+    # re-raises it on the OWNER stack, and the try there catches it -- the
+    # interpreter's ("error", exc) message re-raised by _pump_scope.
+    code, out, _ = _compile_and_run(tmp_path, _TRY_PRELUDE
+                                    + _CROSS_FIBER_DRIVER)
+    assert code == 0
+    assert out == "caught: No handler for effect 'Other'\n42\n"
+
+
+@needs_clang
+def test_try_in_a_handler_case_catches_the_resumed_bodys_failure(tmp_path):
+    # The interpreter's resume() raises the body thread's error INSIDE the
+    # handler case, so a try there recovers and its value becomes the
+    # handle's value.  (codegen_llvm demotes this shape today for an
+    # unrelated reason -- `resume` must appear directly in the case -- but
+    # the runtime contract is the interpreter's.)
+    code, out, _ = _compile_and_run(tmp_path, _TRY_PRELUDE + r"""
+static int64_t hbody(void *env) {
+    (void)env;
+    int64_t a[1] = {1};
+    int64_t x = mx_perform("Fail", "boom", a, 1);
+    int64_t y = mx_perform("Other", "ask", NULL, 0);  /* unhandled */
+    return x + y;
+}
+static int64_t resume_body(void *env) { return mx_resume((mx_k *)env, 2) * 2; }
+static int64_t case_catch(void *env, const char *m) {
+    (void)env; printf("case: %s\n", m); return 77;
+}
+static int64_t disp(void *env, int64_t op, const int64_t *args, mx_k *k) {
+    (void)env; (void)op; (void)args;
+    return mx_try(resume_body, k, case_catch, NULL);
+}
+int main(void) {
+    printf("%lld\n", (long long)mx_handle(hbody, NULL, disp, NULL,
+                                          "Fail", g_ops, g_np, 1));
+    return 0;
+}
+""")
+    assert code == 0
+    assert out == "case: No handler for effect 'Other'\n77\n"
+
+
+@needs_clang
+def test_effect_abort_unwinds_through_a_try_without_catching(tmp_path):
+    # A non-resuming handler case is a scope TEARDOWN, not a failure: the
+    # interpreter's _ScopeAbort is a BaseException its try_scope does not
+    # catch, and natively the abort never consults a landing pad.
+    code, out, _ = _compile_and_run(tmp_path, _TRY_PRELUDE + r"""
+static int64_t try_body(void *env) {
+    (void)env;
+    int64_t a[1] = {3};
+    return mx_perform("Fail", "boom", a, 1) * 1000;   /* never returns */
+}
+static int64_t hbody(void *env) {
+    (void)env; return mx_try(try_body, NULL, catch_never, NULL);
+}
+static int64_t disp(void *env, int64_t op, const int64_t *args, mx_k *k) {
+    (void)env; (void)op; (void)k; return args[0] + 500;  /* no resume */
+}
+int main(void) {
+    printf("%lld\n", (long long)mx_handle(hbody, NULL, disp, NULL,
+                                          "Fail", g_ops, g_np, 1));
+    return 0;
+}
+""")
+    assert code == 0
+    assert out == "503\n"
+
+
+@needs_clang
+def test_uncaught_raise_still_prints_and_aborts(tmp_path):
+    code, out, err = _compile_and_run(tmp_path, _TRY_PRELUDE + r"""
+int main(void) {
+    printf("before\n");
+    mx_raise("boom happened");
+    printf("after\n");
+    return 0;
+}
+""")
+    assert code != 0
+    assert out == "before\n"          # flushed before abort()
+    assert "metaxu runtime error: boom happened" in err
+
+
+@needs_asan
+@needs_clang
+def test_unwinding_try_frees_the_scheduler_under_asan(tmp_path):
+    # LEAK CHECKING ON: the caught message copy (mx__dup) is the only
+    # allocation allowed to survive.  A coroutine stack, a scope record or
+    # a continuation record surviving the landing pad's teardown is a bug.
+    code, out, err = _compile_and_run(
+        tmp_path, _TRY_PRELUDE + _CROSS_FIBER_DRIVER, asan=True)
+    if code == 0:
+        # nothing leaked at all: strictly better than the contract
+        assert out == "caught: No handler for effect 'Other'\n42\n"
+        return
+    # LSan's exit path discards buffered stdout, so only the report is
+    # observable here -- and every leaked allocation must be a message copy.
+    assert "LeakSanitizer" in err, err
+    import re as _re
+    m = _re.search(r"leaked in (\d+) allocation\(s\)", err)
+    assert m, err
+    # One mx__dup frame per leaked allocation == every leak is a message
+    # copy.  A coroutine stack (mx_handle's malloc), a scope record or a
+    # continuation record surviving teardown would break this equality.
+    assert err.count("in mx__dup") == int(m.group(1)), err

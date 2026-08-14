@@ -7,7 +7,8 @@ directory, appends a tiny C-ABI ``@main`` wrapper, compiles it with
 The native metaxu runtime (``src/metaxu/runtime/native/metaxu_rt.c``:
 mx_vec_* / mx_str_* / mx_*_to_str, plus ``metaxu_effects.c``: mx_handle /
 mx_perform / mx_resume — the ucontext coroutine scheduler backing
-algebraic effects) is compiled via its cached build recipe
+algebraic effects — and mx_try / mx_raise, the setjmp landing pads backing
+try/catch) is compiled via its cached build recipe
 and linked into every binary, so modules emitted with native vec/string
 builtin lowerings resolve their ``mx_*`` declares.  When the caller passes
 ``-fsanitize=address`` in ``clang_args`` the runtime object is rebuilt

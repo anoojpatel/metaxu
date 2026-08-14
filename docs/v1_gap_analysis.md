@@ -72,6 +72,18 @@ closures (escaping upward), nested struct fields, borrow-informed copy
 elision for @const params, vec/string runtime, effect CPS at the LLVM
 level.
 
+Native try/catch (2026-08-14): `try_scope` was the last construct with no
+LLVM lowering at all. It now emits `mx_try` over per-site body/catch thunks
+(`metaxu_effects.c`: setjmp landing pads whose chain is per-fiber, so they
+compose with the ucontext coroutine scheduler in both directions — a `try`
+inside a handle body survives a perform/resume round trip, and a failure on
+a body coroutine escapes to its owner stack as the interpreter's
+`("error", exc)` message does). Catchable native failures are raised with
+the interpreter's exact wording so the catch binding is byte-identical; the
+one asymmetry, `match_fail` (its message embeds the MIR function name that
+monomorphization renames), demotes the try instead of guessing.
+See docs/try_catch.md § "Native lowering".
+
 Roadmap items completed on this branch beyond the v1 criteria:
 - Item 5 (deep field-mode validation): transitive @global/@local ownership
   rules enforced as kind="deep-locality" diagnostics.
