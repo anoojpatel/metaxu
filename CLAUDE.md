@@ -85,6 +85,13 @@ placeholder, never wrong code. The standard library lives in `std/*.mx`
   (`x.len()`) resolves impl -> builtin -> plain fn and is marked
   `__builtin$m` in MIR; every `__`-prefixed name is reserved
   (`module_loader.check_reserved_names` raises `ReservedNameError`).
+- Name resolution (`docs/name_resolution.md`): an undefined variable or
+  callee is a compile-time `TypeCheckError`, not a silently dropped
+  expression. `compiler/name_resolution.py` runs from
+  `build_context_from_source` over the MUTABLE post-desugar AST (the
+  frozen AST drops match-arm and for-loop bodies and cannot tell a
+  pattern binder from a variable read), and the doc enumerates every
+  in-scope category plus what is left to runtime dispatch on purpose.
 
 ## Current status and remaining work
 

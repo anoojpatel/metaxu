@@ -256,6 +256,21 @@ version:
   reported as an illegal `"`, and `LexError` diagnostics excerpting the
   previously parsed file.
 
+## Name resolution (the last member of that family)
+
+Update (2026-08-14): an undefined variable or callee is now a compile-time
+`TypeCheckError` rather than a dropped expression — `undefined_thing; 42`
+compiled, ran and answered 42, and `helpr()` (a typo) died only at run time.
+This is what made the lexer bug above *silent*: `1e10` split into `1` and an
+identifier `e10` in statement position, where an unused undefined name
+vanished. `compiler/name_resolution.py` runs over the mutable post-desugar
+AST (the frozen AST drops match-arm and for-loop bodies, and cannot tell a
+pattern binder from a variable read), enumerates its in-scope categories in
+`docs/name_resolution.md`, and scopes out only what runtime trait dispatch
+must answer. Zero false positives across the 19 gate files, every
+`std/*.mx`, and the ~1,340 programs the suite compiles; it found two real
+defects in shipped code, both fixed at the source.
+
 ## Headline findings
 
 - 18 of 19 example programs (`examples/*.mx` + root `test_*.mx`) fail at the
