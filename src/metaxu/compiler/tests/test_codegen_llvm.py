@@ -536,13 +536,13 @@ fn main() -> int {
     assert re.search(r"call i64 @mx_getx\(ptr %sv\.\w+\)", ir)
 
 
-def test_rebound_struct_param_keeps_byval_copy_and_write_back():
-    # The case that MUST NOT elide: a rebound struct param still byval-copies
-    # on entry and copies back out through the caller's pointer on ret
-    # (interpreter write-back parity).
+def test_rebound_mut_struct_param_keeps_byval_copy_and_write_back():
+    # The case that MUST NOT elide: a rebound @mut struct param still
+    # byval-copies on entry and copies back out through the caller's pointer
+    # on ret (interpreter write-back parity).
     ir = llvm_from_source("""
 struct Counter { n: int }
-fn bump(c: Counter) -> int {
+fn bump(c: @mut Counter) -> int {
     c.n = c.n + 1;
     c.n
 }
@@ -559,14 +559,37 @@ fn main() -> int {
     assert "copy-out: rebound struct param" in bump               # write-back
 
 
-def test_param_passed_to_rebinding_callee_keeps_byval_copy():
-    # relay never rebinds c itself, but passes it to bump, which writes back
-    # through the pointer it is given.  relay must keep its own copy so
-    # bump's write-back mutates RELAY's binding (interpreter parity), never
-    # main's storage.
+def test_rebound_plain_struct_param_never_writes_back():
+    # Value semantics for plain params (round 5 finding 1): a NON-@mut
+    # struct param the callee mutates keeps its byval copy but is NOT
+    # copied back out — the caller's binding stays untouched, in both
+    # engines (interpreter parity is pinned in test_round5_regressions).
     ir = llvm_from_source("""
 struct Counter { n: int }
 fn bump(c: Counter) -> int {
+    c.n = c.n + 1;
+    c.n
+}
+fn main() -> int {
+    let c = Counter { n: 10 };
+    bump(c) + c.n
+}
+""")
+    assert count_placeholders(ir) == 0
+    bump = ir[ir.index("define i64 @mx_bump"):]
+    bump = bump[:bump.index("\n}") + 2]
+    assert re.search(r"load %struct\.Counter, ptr %a\.c", bump)  # byval in
+    assert "copy-out: rebound struct param" not in bump          # no write-back
+
+
+def test_param_passed_to_rebinding_callee_keeps_byval_copy():
+    # relay never rebinds c itself, but passes it to bump (@mut receiver),
+    # which writes back through the pointer it is given.  relay must keep
+    # its own copy so bump's write-back mutates RELAY's binding
+    # (interpreter parity), never main's storage.
+    ir = llvm_from_source("""
+struct Counter { n: int }
+fn bump(c: @mut Counter) -> int {
     c.n = c.n + 1;
     c.n
 }
@@ -2136,12 +2159,12 @@ fn main() -> int {
 @needs_clang
 def test_native_struct_param_write_back(tmp_path):
     # Interpreter write-back parity (mir_interp._write_back_struct_args): a
-    # callee that rebinds its struct param (`c.n = ...`) mutates the
+    # callee that rebinds its @mut struct param (`c.n = ...`) mutates the
     # CALLER's binding — natively a copy-out through the caller's pointer
     # on every ret path.  11, 12, then c.n itself is 12.
     ir = assert_native_matches_interp("""
 struct Counter { n: int }
-fn bump(c: Counter) -> int {
+fn bump(c: @mut Counter) -> int {
     c.n = c.n + 1;
     c.n
 }
