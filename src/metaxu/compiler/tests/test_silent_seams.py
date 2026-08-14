@@ -827,3 +827,105 @@ fn main() -> int {
 }
 """)
     assert result == 4
+
+
+# ----------------------------------------------------------------------
+# Round 3 (examples/app, the calc interpreter): two more seams where an
+# annotation or a mistake produced no diagnostic at all.
+#
+# 1. A function's TAIL EXPRESSION is its return value, but the locality
+#    escape check only fired on `return x;`.  Since tail-expression
+#    returns are the idiomatic spelling (the whole stdlib returns that
+#    way), `let @local c = ...; c` handed a local straight to the caller
+#    with no error -- the @local annotation did nothing.
+# 2. Calling a function with the wrong number of arguments compiled, and
+#    then died at RUN time with "Unbound variable 'b' in 'take' (bad
+#    lowering or use-after-drop)": a message that blames the compiler for
+#    the caller's mistake.
+# ----------------------------------------------------------------------
+
+def test_tail_expression_returning_a_local_is_a_borrow_error():
+    with pytest.raises(Exception, match="cannot escape its region"):
+        compile_source("""
+struct Cursor { @mut pos: int }
+
+fn make() -> Cursor {
+    let @local cursor = Cursor { pos: 0 };
+    cursor
+}
+
+fn main() -> int {
+    make().pos
+}
+""")
+
+
+def test_explicit_return_of_a_local_is_still_a_borrow_error():
+    with pytest.raises(Exception, match="cannot escape its region"):
+        compile_source("""
+struct Cursor { @mut pos: int }
+
+fn make() -> Cursor {
+    let @local cursor = Cursor { pos: 0 };
+    return cursor;
+}
+
+fn main() -> int {
+    make().pos
+}
+""")
+
+
+def test_tail_expression_returning_a_global_is_accepted():
+    """The check must not fire on the ordinary case: an unannotated (or
+    @global) binding returned by tail expression is exactly how every
+    stdlib function answers."""
+    result, _ = run_main("""
+fn build() -> Vec {
+    let @global out = Vec.new();
+    out.push(7);
+    out
+}
+
+fn main() -> int {
+    build()[0]
+}
+""")
+    assert result == 7
+
+
+def test_call_with_too_few_arguments_is_a_compile_error():
+    with pytest.raises(Exception, match="wrong number of arguments"):
+        compile_source("""
+fn take(a: int, b: int) -> int { a + b }
+
+fn main() -> int { take(1) }
+""")
+
+
+def test_call_with_too_many_arguments_is_a_compile_error():
+    with pytest.raises(Exception, match="wrong number of arguments"):
+        compile_source("""
+fn take(a: int, b: int) -> int { a + b }
+
+fn main() -> int { take(1, 2, 3) }
+""")
+
+
+def test_arity_check_does_not_fire_through_a_shadowing_local():
+    """A parameter or `let` holding a closure shadows the module function
+    of the same name, and its arity is its own -- the check must skip it
+    (this is the same shadowing the module resolver already honours)."""
+    result, _ = run_main("""
+fn helper(a: int, b: int) -> int { a + b }
+
+fn apply_with(helper) -> int { helper(41) }
+
+fn main() -> int {
+    let f = fn(x: int) -> x + 1;
+    let direct = helper(1, 2);
+    let helper = fn(x: int) -> x * 2;
+    apply_with(f) + direct + helper(2)
+}
+""")
+    assert result == 42 + 3 + 4

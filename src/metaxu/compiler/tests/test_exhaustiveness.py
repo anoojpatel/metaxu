@@ -6,12 +6,16 @@ pipeline) instead of failing at runtime with match_fail. The check lives in
 frozen_constraint_emitter._check_match_exhaustiveness, driven by the arm
 descriptors mutaxu_ast freezes into MatchExpression payloads.
 
-Coverage rule (deliberately shallow): a variant is covered iff some arm has
-that constructor with all-irrefutable subpatterns (wildcards/bindings), or
-a wildcard/binding arm exists. Literal-completeness refinement (`Some(1) |
-Some(n)`) treats the variant as covered by the binding arm. Matches whose
-scrutinee type cannot be determined from the patterns (or that contain
-opaque pattern forms) are not checked — no false positives.
+Coverage rule: a variant is covered iff a wildcard/binding arm exists, or
+the arms naming its constructor cover its whole payload space — computed by
+the textbook specialization recursion, so NESTED constructor patterns count
+(`Some(TInt(n)) | Some(TName(s)) | Some(TOp(s)) | None` is exhaustive).
+The recursion only ever answers "provably exhaustive": literal columns,
+unknown enums and mixed ctor/literal columns answer no, so literal
+completeness itself is still not analyzed (`Some(1) | Some(n)` is covered by
+the binding arm, `Some(1)` alone is not). Matches whose scrutinee type
+cannot be determined from the patterns (or that contain opaque pattern
+forms) are not checked — no false positives.
 
 An arm following a wildcard/binding arm is unreachable; that is a
 warning-level advisory on the -1 diagnostics channel (like "Unresolved
@@ -416,3 +420,151 @@ fn f(x: int) -> int {
 }
 """)
     assert not any("Unreachable match arm" in m for m in msgs)
+
+
+# ---------------------------------------------------------------------------
+# Nested constructor patterns (found writing examples/app's parser, which
+# matches `Some(TInt(n))` over Option[Token]).  Coverage is computed by the
+# textbook specialization recursion, so a nested pattern set that really
+# does cover the payload space is accepted -- the old "all subpatterns must
+# be irrefutable" rule rejected it with "missing variants Some", naming a
+# variant that was right there in the match.
+# ---------------------------------------------------------------------------
+
+TOKENS = """
+enum Token { TInt(int), TName(str), TOp(str) }
+"""
+
+
+def test_nested_ctor_patterns_covering_the_payload_are_accepted():
+    compile_src(TOKENS + """
+fn describe(o: Option) -> str {
+    match o {
+        Some(TInt(n)) => "int",
+        Some(TName(s)) => "name",
+        Some(TOp(s)) => "op",
+        None => "eof"
+    }
+}
+
+fn main() -> int { 0 }
+""")
+
+
+def test_nested_ctor_patterns_missing_an_inner_variant_rejected():
+    msg = reject(TOKENS + """
+fn describe(o: Option) -> str {
+    match o {
+        Some(TInt(n)) => "int",
+        Some(TName(s)) => "name",
+        None => "eof"
+    }
+}
+
+fn main() -> int { 0 }
+""")
+    assert "missing variants Some" in msg
+
+
+def test_nested_ctor_patterns_completed_by_a_binding_arm_accepted():
+    compile_src(TOKENS + """
+fn describe(o: Option) -> str {
+    match o {
+        Some(TInt(n)) => "int",
+        Some(other) => "other",
+        None => "eof"
+    }
+}
+
+fn main() -> int { 0 }
+""")
+
+
+def test_two_levels_of_nesting_are_analyzed():
+    compile_src("""
+enum Inner { A, B }
+enum Outer { Wrap(Inner), Empty }
+
+fn f(o: Option) -> int {
+    match o {
+        Some(Wrap(A)) => 1,
+        Some(Wrap(B)) => 2,
+        Some(Empty) => 3,
+        None => 4
+    }
+}
+
+fn main() -> int { 0 }
+""")
+
+
+def test_two_levels_of_nesting_with_a_hole_rejected():
+    msg = reject("""
+enum Inner { A, B }
+enum Outer { Wrap(Inner), Empty }
+
+fn f(o: Option) -> int {
+    match o {
+        Some(Wrap(A)) => 1,
+        Some(Empty) => 3,
+        None => 4
+    }
+}
+
+fn main() -> int { 0 }
+""")
+    assert "missing variants Some" in msg
+
+
+def test_multi_field_variant_needs_every_combination():
+    # Pair(A|B, A|B): three of the four combinations is not coverage.
+    msg = reject("""
+enum Inner { A, B }
+enum Both { Pair(Inner, Inner) }
+
+fn f(b: Both) -> int {
+    match b {
+        Pair(A, A) => 1,
+        Pair(A, B) => 2,
+        Pair(B, A) => 3
+    }
+}
+
+fn main() -> int { 0 }
+""")
+    assert "missing variants Pair" in msg
+
+
+def test_multi_field_variant_with_every_combination_accepted():
+    compile_src("""
+enum Inner { A, B }
+enum Both { Pair(Inner, Inner) }
+
+fn f(b: Both) -> int {
+    match b {
+        Pair(A, A) => 1,
+        Pair(A, B) => 2,
+        Pair(B, A) => 3,
+        Pair(B, B) => 4
+    }
+}
+
+fn main() -> int { 0 }
+""")
+
+
+def test_payload_less_spelling_of_a_ctor_still_covers_it():
+    """`Circle => ...` for a Circle(int) is the payload-less spelling the
+    checker has always read as irrefutable; the recursion keeps that."""
+    compile_src("""
+enum Shape { Circle(r: int), Dot }
+
+fn f(s: Shape) -> int {
+    match s {
+        Circle => 1,
+        Dot => 0
+    }
+}
+
+fn main() -> int { 0 }
+""")
