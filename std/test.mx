@@ -1,0 +1,55 @@
+# std.test — in-language test assertions with reporting as an effect.
+#
+# `check`/`check_eq` perform a Report effect; the defaults print ok/FAIL
+# lines, and `run_suite` installs a counting handler so a suite returns
+# its failure count (0 = success — usable as a process exit code).
+# Handlers-over-globals: a CI harness can install its own Report handler
+# without touching the assertions.
+
+export { Report, check, check_eq, run_suite };
+
+effect Report {
+    fn passed(name: string) -> () = print("ok", name)
+    fn failed(name: string) -> () = print("FAIL", name)
+}
+
+fn check(cond: bool, name: string) -> () {
+    if cond {
+        perform Report.passed(name);
+    } else {
+        perform Report.failed(name);
+    }
+}
+
+fn check_eq(actual: int, expected: int, name: string) -> () {
+    if actual == expected {
+        perform Report.passed(name);
+    } else {
+        print("  expected", expected, "got", actual);
+        perform Report.failed(name);
+    }
+}
+
+# Run a test body counting failures; prints a summary and returns the
+# failure count. Passing tests stay quiet (summaries only) — install no
+# handler (use the defaults) to see per-test ok lines instead.
+fn run_suite(name: string, body: fn() -> ()) -> int {
+    let @mut failures = 0;
+    let @mut total = 0;
+    handle Report with {
+        passed(t) -> {
+            total = total + 1;
+            resume(())
+        },
+        failed(t) -> {
+            total = total + 1;
+            failures = failures + 1;
+            print("FAIL", t);
+            resume(())
+        }
+    } in {
+        body();
+        print(name, ":", total - failures, "passed,", failures, "failed");
+        failures
+    }
+}
