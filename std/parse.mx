@@ -1,0 +1,187 @@
+# std.parse — turning text into values.
+#
+# Ante's stdlib parses through `Char` and `try_from`; Metaxu has no char
+# type (indexing a string yields a one-character string, see std.string)
+# and no numeric conversion builtin, so the digit table is written out in
+# Metaxu and the parsers are honest loops over `s[i]`.
+#
+# Two answer shapes, the same two this library uses everywhere:
+#
+#     parse_int(s)         -> Option    (None on malformed input)
+#     parse_int_or_fail(s) -> int, performing std.fail's Fail effect
+#
+# The Fail form is what composes: `try_opt(fn() -> parse_int_or_fail(s))`
+# recovers the Option, `on_fail(fn() -> ..., 0)` supplies a default, and
+# a whole parse of many fields aborts at the first bad one without any
+# per-field matching.
+#
+# Not handled (documented, not silently wrong): overflow (accumulation
+# wraps on the native backend and grows unbounded in the interpreter),
+# underscores, radix prefixes, and floats — Metaxu has no string-to-float
+# builtin and building one from digits would lose precision.
+
+from std.fail import Fail, fail_if;
+
+export {
+    is_digit,
+    is_space,
+    digit_value,
+    parse_int,
+    parse_int_or,
+    parse_int_or_fail,
+    parse_bool,
+    trim,
+    split_on,
+    parse_int_vec
+};
+
+# The ten decimal digits, indexed by their value.
+let digit_table = "0123456789";
+
+# The value of a one-character digit string, or -1 when it is not a digit.
+fn digit_value(c: string) -> int {
+    let @mut i = 0;
+    let @mut value = 0 - 1;
+    while i < 10 {
+        if digit_table[i] == c { value = i } else { () };
+        i = i + 1
+    }
+    value
+}
+
+# True when `c` is a one-character decimal digit string.
+fn is_digit(c: string) -> bool {
+    digit_value(c) >= 0
+}
+
+# True when `c` is a space, tab, newline or carriage return.
+fn is_space(c: string) -> bool {
+    c == " " || c == "\t" || c == "\n" || c == "\r"
+}
+
+# Some(the integer `s` denotes), else None.
+#
+# Accepts an optional leading `-` or `+` followed by one or more decimal
+# digits, and nothing else — no surrounding space (compose with `trim`),
+# no empty string, no trailing junk.
+fn parse_int(s: string) {
+    let n = len(s);
+    if n == 0 {
+        None
+    } else {
+        let @mut i = 0;
+        let @mut negative = false;
+        if s[0] == "-" {
+            negative = true;
+            i = 1
+        } else {
+            if s[0] == "+" { i = 1 } else { () }
+        };
+        if i >= n {
+            None
+        } else {
+            let @mut accumulator = 0;
+            let @mut ok = true;
+            while i < n {
+                let d = digit_value(s[i]);
+                if d < 0 {
+                    ok = false
+                } else {
+                    accumulator = accumulator * 10 + d
+                };
+                i = i + 1
+            };
+            if ok {
+                if negative { Some(0 - accumulator) } else { Some(accumulator) }
+            } else {
+                None
+            }
+        }
+    }
+}
+
+# The integer `s` denotes, or `default` when it is malformed.
+fn parse_int_or(s: string, default: int) -> int {
+    match parse_int(s) {
+        Some(v) => v,
+        None => default
+    }
+}
+
+# The integer `s` denotes, performing Fail when it is malformed.
+# Compose with std.fail's handlers:
+#
+#     try_opt(fn() -> parse_int_or_fail(text))     # Option
+#     on_fail(fn() -> parse_int_or_fail(text), 0)  # default
+fn parse_int_or_fail(s: string) -> int performs Fail {
+    match parse_int(s) {
+        Some(v) => v,
+        None => {
+            perform Fail.fail();
+            0
+        }
+    }
+}
+
+# Some(true/false) for "true"/"false", else None.
+fn parse_bool(s: string) {
+    if s == "true" {
+        Some(true)
+    } else {
+        if s == "false" { Some(false) } else { None }
+    }
+}
+
+# `s` without leading or trailing whitespace.
+fn trim(s: string) -> string {
+    let n = len(s);
+    let @mut start = 0;
+    while start < n && is_space(s[start]) {
+        start = start + 1
+    }
+    let @mut stop = n;
+    while stop > start && is_space(s[stop - 1]) {
+        stop = stop - 1
+    }
+    let @mut out = "";
+    let @mut i = start;
+    while i < stop {
+        out = out + s[i];
+        i = i + 1
+    }
+    out
+}
+
+# `s` split on every occurrence of the one-character string `sep`,
+# as a Vec of strings. Adjacent separators produce empty fields, and the
+# result always has (occurrences of sep) + 1 elements — so `split_on("",
+# ",")` is a Vec holding one empty string.
+fn split_on(s: string, sep: string) -> Vec {
+    let @mut parts = Vec.new();
+    let @mut current = "";
+    let @mut i = 0;
+    while i < len(s) {
+        if s[i] == sep {
+            parts.push(current);
+            current = ""
+        } else {
+            current = current + s[i]
+        };
+        i = i + 1
+    }
+    parts.push(current);
+    parts
+}
+
+# Parse a separated list of integers, performing Fail at the first field
+# that is not one. Fields are trimmed, so "1, 2, 3" parses.
+fn parse_int_vec(s: string, sep: string) -> Vec performs Fail {
+    let fields = split_on(s, sep);
+    let @mut out = Vec.new();
+    let @mut i = 0;
+    while i < len(fields) {
+        out.push(parse_int_or_fail(trim(fields[i])));
+        i = i + 1
+    }
+    out
+}

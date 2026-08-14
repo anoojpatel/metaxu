@@ -2,38 +2,185 @@
 #
 # Handlers decide the sink and the filtering: with no handler installed
 # the declared defaults print to stdout with level prefixes; a scope can
-# install its own handler to silence, collect, or redirect. This is
-# strictly better than a global logger object — the "configuration" is
-# lexical and composable.
+# install its own handler to silence, collect, filter, or redirect. This
+# is strictly better than a global logger object — the "configuration" is
+# lexical, composable, and testable (`with_collected_logs` hands a test
+# the exact lines a computation would have printed).
+#
+# Ante has no logging module; this one is Metaxu's own.
+#
+# Four levels, ordered debug < info < warn < error, exposed both as
+# effect operations (`perform Log.info(msg)`) and as plain wrappers
+# (`log_info(msg)`) for call sites that would rather not spell `perform`.
+# Level numbers are the module constants `level_debug` .. `level_error`.
 
-export { Log, quietly, collect_logs };
+export {
+    Log,
+    LogRun,
+    log_debug,
+    log_info,
+    log_warn,
+    log_error,
+    level_debug,
+    level_info,
+    level_warn,
+    level_error,
+    with_stdout_logging,
+    with_collected_logs,
+    run_collected,
+    collect_logs,
+    with_min_level,
+    quietly
+};
 
+# Unhandled, each operation prints to stdout with its level prefix.
 effect Log {
+    fn debug(message: string) -> () = print("[debug]", message)
     fn info(message: string) -> () = print("[info]", message)
     fn warn(message: string) -> () = print("[warn]", message)
+    fn error(message: string) -> () = print("[error]", message)
 }
 
-# Run `f` with all logging suppressed.
-fn quietly(f: fn() -> int) -> int {
+# Level numbers, for `with_min_level`.
+let level_debug = 0;
+let level_info = 1;
+let level_warn = 2;
+let level_error = 3;
+
+# ---------------------------------------------------------------------
+# Call-site wrappers (plain functions, no `perform` at the call site)
+# ---------------------------------------------------------------------
+
+fn log_debug(message: string) -> () {
+    perform Log.debug(message)
+}
+
+fn log_info(message: string) -> () {
+    perform Log.info(message)
+}
+
+fn log_warn(message: string) -> () {
+    perform Log.warn(message)
+}
+
+fn log_error(message: string) -> () {
+    perform Log.error(message)
+}
+
+# ---------------------------------------------------------------------
+# Handlers (the sinks)
+# ---------------------------------------------------------------------
+
+# Run `f` printing every message to stdout with its level prefix. This is
+# what the unhandled defaults already do; installing it explicitly makes
+# a scope's sink visible in the source, and stops an enclosing collector
+# or filter from capturing these lines.
+fn with_stdout_logging(f) {
     handle Log with {
-        info(message) -> resume(()),
-        warn(message) -> resume(())
+        debug(message) -> {
+            print("[debug]", message);
+            resume(())
+        },
+        info(message) -> {
+            print("[info]", message);
+            resume(())
+        },
+        warn(message) -> {
+            print("[warn]", message);
+            resume(())
+        },
+        error(message) -> {
+            print("[error]", message);
+            resume(())
+        }
     } in {
         f()
     }
 }
 
-# Run `f` collecting log lines (level-prefixed) into the given Vec
-# instead of printing. The Vec's identity semantics make it a natural
-# out-parameter.
-fn collect_logs(sink: Vec<string>, f: fn() -> int) -> int {
+# Run `f` with all logging suppressed.
+fn quietly(f) {
     handle Log with {
+        debug(message) -> resume(()),
+        info(message) -> resume(()),
+        warn(message) -> resume(()),
+        error(message) -> resume(())
+    } in {
+        f()
+    }
+}
+
+# Run `f` and ANSWER the level-prefixed lines it logged, as a Vec of
+# strings, discarding f's result. Nothing is printed.
+fn with_collected_logs(f) -> Vec {
+    let @mut lines = Vec.new();
+    collect_logs(lines, f);
+    lines
+}
+
+# Both halves of a collected run: `f`'s result and the lines it logged.
+struct LogRun<T> {
+    value: T,
+    lines: Vec
+}
+
+# Run `f` answering both its result and the lines it logged.
+fn run_collected(f) -> LogRun {
+    let @mut lines = Vec.new();
+    let result = collect_logs(lines, f);
+    LogRun { value: result, lines: lines }
+}
+
+# Run `f` appending level-prefixed lines to the given Vec instead of
+# printing; answers f's result. The Vec's identity semantics make it a
+# natural out-parameter, and this is the primitive the two functions
+# above are written in terms of.
+fn collect_logs(sink: Vec, f) {
+    handle Log with {
+        debug(message) -> {
+            sink.push("[debug] " + message);
+            resume(())
+        },
         info(message) -> {
             sink.push("[info] " + message);
             resume(())
         },
         warn(message) -> {
             sink.push("[warn] " + message);
+            resume(())
+        },
+        error(message) -> {
+            sink.push("[error] " + message);
+            resume(())
+        }
+    } in {
+        f()
+    }
+}
+
+# Run `f` dropping every message below `min`, and RE-PERFORMING the ones
+# that pass. A handler arm evaluates outside its own delimitation, so the
+# re-performed operation routes to the NEXT enclosing Log handler (or to
+# the effect's stdout default when there is none) — the same idiom
+# std.throw's `map_err` uses to re-throw. Filters therefore compose:
+# `with_collected_logs(fn() -> with_min_level(level_warn, body))`
+# collects only the warnings and errors.
+fn with_min_level(min: int, f) {
+    handle Log with {
+        debug(message) -> {
+            if min <= 0 { perform Log.debug(message) } else { () };
+            resume(())
+        },
+        info(message) -> {
+            if min <= 1 { perform Log.info(message) } else { () };
+            resume(())
+        },
+        warn(message) -> {
+            if min <= 2 { perform Log.warn(message) } else { () };
+            resume(())
+        },
+        error(message) -> {
+            if min <= 3 { perform Log.error(message) } else { () };
             resume(())
         }
     } in {

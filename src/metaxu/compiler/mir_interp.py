@@ -1665,12 +1665,52 @@ def _is_truthy(val: Any) -> bool:
     return bool(val)
 
 
+def _int_div(a: int, b: int) -> int:
+    """Integer division TRUNCATING TOWARD ZERO (C / LLVM ``sdiv``).
+
+    Python's ``//`` floors, so ``-7 // 2 == -4`` while every backend
+    (``codegen_llvm``'s ``sdiv``, ``codegen_clif``'s ``sdiv``) answers
+    ``-3``.  The interpreter is the semantics reference, so it must not
+    be the odd one out: a program whose result depended on the sign of an
+    operand used to compile to two different answers with no diagnostic.
+    """
+    q = abs(a) // abs(b)
+    return -q if (a < 0) != (b < 0) else q
+
+
+def _int_mod(a: int, b: int) -> int:
+    """Remainder with the sign of the DIVIDEND (C / LLVM ``srem``).
+
+    Paired with :func:`_int_div` so ``(a / b) * b + a % b == a`` holds
+    with truncating division, exactly as it does natively.
+    """
+    return a - _int_div(a, b) * b
+
+
+def _div(a: Any, b: Any) -> Any:
+    if isinstance(a, int) and isinstance(b, int):
+        return _int_div(a, b)
+    return a / b
+
+
+def _mod(a: Any, b: Any) -> Any:
+    """``%``: srem for ints, ``frem`` (C ``fmod``) for floats.
+
+    Python's float ``%`` also floors (``-7.0 % 5.0 == 3.0``); LLVM's
+    ``frem`` truncates like ``fmod`` (``-2.0``).  Same reasoning as
+    :func:`_int_mod`.
+    """
+    if isinstance(a, int) and isinstance(b, int):
+        return _int_mod(a, b)
+    return math.fmod(a, b)
+
+
 _BINOPS: Dict[str, Callable[[Any, Any], Any]] = {
     "+":  lambda a, b: a + b,
     "-":  lambda a, b: a - b,
     "*":  lambda a, b: a * b,
-    "/":  lambda a, b: a // b if isinstance(a, int) and isinstance(b, int) else a / b,
-    "%":  lambda a, b: a % b,
+    "/":  _div,
+    "%":  _mod,
     "==": lambda a, b: a == b,
     "!=": lambda a, b: a != b,
     "<":  lambda a, b: a < b,
@@ -1701,7 +1741,8 @@ def _vec_elementwise(op: str, lv: Any, rv: Any) -> "MxVector":
     """Element-wise vector arithmetic; a scalar operand broadcasts.
 
     Recurses through _eval_binop per element, so nested vectors (matrices)
-    combine element-wise too and int/int division keeps its `//` semantics.
+    combine element-wise too and int/int division keeps its truncating
+    (C `sdiv`) semantics.
     """
     if isinstance(lv, MxVector) and isinstance(rv, MxVector):
         if len(lv) != len(rv):
