@@ -2931,6 +2931,16 @@ def test_examples_define_census_does_not_regress():
     # residue is now genuine polymorphism (one `map` takes f64-valued AND
     # str-valued lambdas) and fold's `type_of` / free type variables — never
     # effect routing.
+    #
+    # Increment 16 (aggregates in indirect closure-call signatures) leaves
+    # this census UNCHANGED at 88, and that is the honest result: not one
+    # of the 19 examples passes a struct or an enum through an indirect
+    # closure call.  06's remaining higher-order demotions are the genuine
+    # polymorphism above (conflicting f64/str kinds), which no ABI change
+    # can fix.  The increment's coverage win is census'd where it actually
+    # lands — test_std_stream_aggregate_element_census, where std.stream's
+    # map/filter over a struct/enum element type go from demoted to
+    # emitted-and-natively-differential.
     total_defines = 0
     for path in _example_files():
         ir = llvm_from_source(path.read_text())
@@ -4782,10 +4792,11 @@ fn main() -> int { pick(true) }
     assert "irreconcilable value kinds for 'f" in ir
 
 
-def test_aggregate_args_through_indirect_call_stay_demoted():
-    # Two lambdas taking a STRUCT parameter reach one site: the word ABI
-    # is scalar-only this increment, so the site demotes with the
-    # scalar-only reason (never wrong code).
+def test_aggregate_args_through_indirect_call_now_box():
+    # Increment 16: two lambdas taking a STRUCT parameter reach one site.
+    # The struct arg boxes (malloc + write-once copy in) and travels as a
+    # pointer word; both lambdas take `i64 %aw.p` and copy out.  This
+    # replaces the increment-13 scalar-only demotion.
     ir = llvm_from_source("""
 struct P { a: int }
 fn apply(f: fn(P) -> int, p: P) -> int { f(p) }
@@ -4796,9 +4807,16 @@ fn main() -> int {
     apply(h, P { a: 4 })
 }
 """)
-    assert count_placeholders(ir) >= 1
+    assert count_placeholders(ir) == 0
+    assert "scalar-only" not in ir
     assert re.search(
-        r"reason: indirect closure call through 'f'.*scalar-only", ir)
+        r"call ptr @malloc\(i64 \d+\)"
+        r"  ; boundary box: struct:P \(write-once, leaks by design\)", ir)
+    assert re.search(
+        r"call i64 %\w+\(ptr %\w+, i64 %\w+\)"
+        r"  ; indirect closure call \(.*\), word-uniform ABI", ir)
+    assert len(re.findall(
+        r"; word-uniform param p: boundary box struct:P", ir)) == 2
 
 
 _COMPREHENSION_DYN_SRC = """
@@ -5682,3 +5700,454 @@ def test_native_dynamic_default_aggregate_asan_no_uaf(tmp_path):
             os.environ.pop(env_key, None)
         else:
             os.environ[env_key] = old
+
+
+# ---------------------------------------------------------------------------
+# Increment 16: aggregates in indirect closure-call signatures.
+#
+# The word-uniform indirect ABI (`i64 (ptr env, i64 args...)`, increment 13)
+# was scalar-only.  It now carries struct/enum aggregates through the SAME
+# write-once boundary boxes increment 14 introduced at the effect boundary:
+#   * an aggregate ARGUMENT at an indirect site mallocs a fresh copy and
+#     travels as its pointer word; the callee's prelude decodes the word to
+#     a ptr and the ordinary aggregate-param convention (byval copy-out, or
+#     the elide-copy read-through) is exactly the copy-out contract;
+#   * an aggregate RETURN drops sret: the word-uniform lambda mallocs a box,
+#     copies its result in and rets the pointer word; the caller copies out
+#     into its own storage.
+# Boxes are immortal (leak by design), so nothing can dangle across the
+# call.  Fast paths are untouched: a lambda pinned at every site keeps its
+# TYPED signature (ptr params / sret) and allocates nothing, and scalar
+# indirect calls still pass raw words.  Still demoted honestly: closure
+# pairs and konts in indirect args/returns, kinds that conflict across the
+# member set, aggregates with an infinite layout, and @mut aggregate params
+# (their write-back cannot travel back through a box the caller drops).
+# ---------------------------------------------------------------------------
+
+_IND_AGG_ROUNDTRIP_SRC = """
+struct Point { x: int, y: int }
+fn apply(f: fn(Point) -> Point, p: Point) -> Point {
+    f(p)
+}
+fn main() -> int {
+    let a = apply(fn(q: Point) -> Point { Point { x: q.y, y: q.x } },
+                  Point { x: 1, y: 2 });
+    let b = apply(fn(q: Point) -> Point { Point { x: q.x + 10, y: q.y + 20 } },
+                  Point { x: 3, y: 4 });
+    print(a.x, a.y, b.x, b.y);
+    0
+}
+"""
+
+
+def test_indirect_aggregate_param_and_return_box_at_the_site():
+    # The target shape: two different lambdas through one indirect site,
+    # a struct in AND a struct out.
+    ir = llvm_from_source(_IND_AGG_ROUNDTRIP_SRC)
+    assert count_placeholders(ir) == 0
+    # Both lambdas take the word-uniform ABI: i64 word in, i64 word out,
+    # NO sret result slot.
+    defs = re.findall(
+        r"^define i64 @(mx_main_lambda\d+)\(ptr %cl\.env, i64 %aw\.q\) \{"
+        r"  ; word-uniform lambda ABI$", ir, re.M)
+    assert len(defs) == 2, ir
+    # the lambdas' bodies carry no sret result slot at all
+    for body in re.findall(r"^define i64 @mx_main_lambda\d+.*?^\}",
+                           ir, re.M | re.S):
+        assert "%agg.ret" not in body
+    # Caller side: box the argument in, call, copy the result box out.
+    assert re.search(
+        r"call ptr @malloc\(i64 16\)"
+        r"  ; boundary box: struct:Point \(write-once, leaks by design\)", ir)
+    assert re.search(
+        r"call i64 %\w+\(ptr %\w+, i64 %\w+\)"
+        r"  ; indirect closure call \(main\$lambda\d+\|main\$lambda\d+\), "
+        r"word-uniform ABI", ir)
+    assert re.search(
+        r"inttoptr i64 %\w+ to ptr  ; boundary box: struct:Point", ir)
+    # Callee side: the param word decodes to a ptr, the return value boxes.
+    assert len(re.findall(
+        r"; word-uniform param q: boundary box struct:Point", ir)) == 2
+    assert len(re.findall(
+        r"ret i64 %\w+  ; word-uniform lambda return \(struct:Point encoded\)",
+        ir)) == 2
+
+
+_IND_ENUM_RETURN_SRC = """
+enum Opt { Some(int), None }
+fn pick(f: fn(int) -> Opt, x: int) -> int {
+    match f(x) {
+        Opt.Some(v) => v,
+        Opt.None => 0 - 1
+    }
+}
+fn main() -> int {
+    let g = fn(x: int) -> Opt { if x > 0 { Opt.Some(x * 2) } else { Opt.None } };
+    let h = fn(x: int) -> Opt { Opt.Some(x + 100) };
+    print(pick(g, 5));
+    print(pick(g, 0 - 3));
+    print(pick(h, 5));
+    0
+}
+"""
+
+
+def test_indirect_enum_return_boxes():
+    # A lambda returning an ENUM through an indirect call: the tagged
+    # union boxes on the way out and is copied into the caller's slot.
+    ir = llvm_from_source(_IND_ENUM_RETURN_SRC)
+    assert count_placeholders(ir) == 0
+    assert re.search(
+        r"call ptr @malloc\(i64 \d+\)"
+        r"  ; boundary box: enum:Opt\{[^}]*\} \(write-once, leaks by design\)",
+        ir)
+    assert re.search(
+        r"ret i64 %\w+  ; word-uniform lambda return \(enum:Opt", ir)
+    assert re.search(
+        r"inttoptr i64 %\w+ to ptr  ; boundary box: enum:Opt", ir)
+
+
+_IND_AGG_CAPTURE_SRC = """
+struct Pt { x: int, y: int }
+fn run(f: fn(Pt) -> Pt, p: Pt) -> Pt { f(p) }
+fn main() -> int {
+    let base = Pt { x: 100, y: 200 };
+    let add = fn(q: Pt) -> Pt { Pt { x: q.x + base.x, y: q.y + base.y } };
+    let neg = fn(q: Pt) -> Pt { Pt { x: 0 - q.x, y: 0 - q.y } };
+    let a = run(add, Pt { x: 1, y: 2 });
+    let b = run(neg, Pt { x: 1, y: 2 });
+    print(a.x, a.y, b.x, b.y);
+    0
+}
+"""
+
+
+def test_indirect_closure_capturing_and_taking_an_aggregate():
+    # A closure that CAPTURES an aggregate (env field, inline copy) and
+    # TAKES one through the word ABI (boundary box) in the same lambda.
+    ir = llvm_from_source(_IND_AGG_CAPTURE_SRC)
+    assert count_placeholders(ir) == 0
+    # the capture is an inline struct field of the env, not a box
+    assert re.search(r"%env\.main_lambda\d+ = type \{ %struct\.Pt \}", ir)
+    assert re.search(r"; word-uniform param q: boundary box struct:Pt", ir)
+
+
+def test_scalar_indirect_call_allocates_nothing():
+    # Work item 2: a purely scalar indirect site still passes raw words —
+    # no malloc, no boundary box anywhere in the module.
+    ir = llvm_from_source("""
+fn twice(f: fn(int) -> int, x: int) -> int { f(f(x)) }
+fn main() -> int {
+    print(twice(fn(v: int) -> v + 1, 3));
+    print(twice(fn(v: int) -> v * 3, 3));
+    0
+}
+""")
+    assert count_placeholders(ir) == 0
+    assert "indirect closure call" in ir
+    assert "call ptr @malloc(" not in ir
+    assert "; boundary box:" not in ir
+
+
+def test_pinned_aggregate_lambda_keeps_its_typed_signature():
+    # Work item 2: ONE lambda through the site stays pinned, so it keeps
+    # the typed closure-call path (ptr param + sret return) and allocates
+    # nothing — the increment-13 aggregate fast path is not regressed.
+    ir = llvm_from_source("""
+struct Point { x: int, y: int }
+fn apply(f: fn(Point) -> Point, p: Point) -> Point { f(p) }
+fn main() -> int {
+    let a = apply(fn(q: Point) -> Point { Point { x: q.y, y: q.x } },
+                  Point { x: 1, y: 2 });
+    print(a.x, a.y);
+    0
+}
+""")
+    assert count_placeholders(ir) == 0
+    assert "call ptr @malloc(" not in ir
+    assert "; boundary box:" not in ir
+    assert "word-uniform lambda ABI" not in ir
+    assert "word-uniform param" not in ir
+    assert re.search(
+        r"^define void @mx_main_lambda\d+\(ptr %agg\.ret, ptr %cl\.env, "
+        r"ptr %a\.q\)", ir, re.M)
+
+
+def test_closure_pair_in_indirect_args_still_demotes():
+    # Kind agreement / honest demotion: a closure PAIR travelling through
+    # an indirect site has no boundary box (the boxed env pointer's
+    # lifetime cannot be vouched for), so the site demotes with a reason.
+    ir = llvm_from_source("""
+fn drive(h, k) -> int { h(k, 4) }
+fn main() -> int {
+    let twice = fn(g, x) -> g(g(x));
+    let thrice = fn(g, x) -> g(g(g(x)));
+    print(drive(twice, fn(v: int) -> v + 1));
+    print(drive(thrice, fn(v: int) -> v * 2));
+    0
+}
+""")
+    assert count_placeholders(ir) >= 1
+    assert re.search(
+        r"reason: indirect closure call through 'h': arg 'k' of kind "
+        r"closure:\*\{.*\} has no word encoding and no boundary box", ir)
+
+
+def test_indirect_members_disagreeing_on_aggregate_kind_demote():
+    # Work item 3: one member says the position is a STRUCT, the other an
+    # ENUM.  The two-way fixpoint conflicts the kind and the site demotes
+    # rather than guessing a representation.
+    ir = llvm_from_source("""
+struct P { a: int }
+enum E { X(int), Y }
+fn apply(f, v) { f(v) }
+fn main() -> int {
+    print(apply(fn(p: P) -> p.a + 1, P { a: 4 }));
+    print(apply(fn(e: E) -> match e { E.X(n) => n * 2, E.Y => 0 }, E.X(5)));
+    0
+}
+""")
+    assert count_placeholders(ir) >= 1
+    assert "reason: irreconcilable value kinds for 'v'" in ir
+    assert re.search(
+        r"reason: indirect closure call through 'f': arg 'v' of kind "
+        r"conflict has no word encoding and no boundary box", ir)
+
+
+def test_mut_aggregate_param_through_indirect_call_demotes():
+    # A @mut aggregate param has WRITE-BACK semantics (the callee copies
+    # it out through the caller's pointer).  A boundary box is dropped by
+    # the caller, so the write-back would be lost: demote, never emit a
+    # silently non-writing call.
+    ir = llvm_from_source("""
+struct P { a: int }
+fn apply(f: fn(@mut P) -> int, @mut p: P) -> int { f(p) }
+fn main() -> int {
+    let mut p = P { a: 1 };
+    let mut q = P { a: 2 };
+    print(apply(fn(@mut r: P) -> { r.a = r.a + 10; r.a }, p));
+    print(apply(fn(@mut r: P) -> { r.a = r.a * 10; r.a }, q));
+    print(p.a, q.a);
+    0
+}
+""")
+    assert count_placeholders(ir) >= 1
+    assert re.search(
+        r"reason: indirect closure call through 'f': lambda 'main\$lambda\d+' "
+        r"is not word-uniform \(its @mut parameter 'r' of kind struct:P "
+        r"writes back through the caller's pointer, which the indirect ABI's "
+        r"boundary box cannot carry back\)", ir)
+
+
+@needs_clang
+def test_native_indirect_aggregate_roundtrip(tmp_path):
+    assert_native_matches_interp(_IND_AGG_ROUNDTRIP_SRC, tmp_path)
+
+
+@needs_clang
+def test_native_indirect_enum_return(tmp_path):
+    assert_native_matches_interp(_IND_ENUM_RETURN_SRC, tmp_path)
+
+
+@needs_clang
+def test_native_indirect_aggregate_capture_and_param(tmp_path):
+    assert_native_matches_interp(_IND_AGG_CAPTURE_SRC, tmp_path)
+
+
+_IND_AGG_LOOP_SRC = """
+struct Acc { lo: int, hi: int }
+fn step(f: fn(Acc, int) -> Acc, a: Acc, n: int) -> Acc {
+    let @mut acc = a;
+    let @mut i = 0;
+    while i < n {
+        acc = f(acc, i);
+        i = i + 1
+    };
+    acc
+}
+fn main() -> int {
+    let up = fn(a: Acc, i: int) -> Acc { Acc { lo: a.lo + i, hi: a.hi } };
+    let dn = fn(a: Acc, i: int) -> Acc { Acc { lo: a.lo, hi: a.hi - i } };
+    let x = step(up, Acc { lo: 0, hi: 100 }, 5);
+    let y = step(dn, Acc { lo: 0, hi: 100 }, 5);
+    print(x.lo, x.hi, y.lo, y.hi);
+    0
+}
+"""
+
+
+@needs_clang
+def test_native_indirect_aggregate_in_a_loop(tmp_path):
+    # The boxes are per-call and immortal: a loop over an indirect
+    # aggregate site allocates a fresh box every iteration and each
+    # callee copy-out sees exactly its own.
+    assert_native_matches_interp(_IND_AGG_LOOP_SRC, tmp_path)
+
+
+@needs_asan
+def test_native_indirect_aggregate_asan_no_uaf(tmp_path):
+    # Indirect-call boundary boxes leak BY DESIGN (immortal, write-once),
+    # exactly like the effect-boundary boxes: detect_leaks=0, so exit 0
+    # proves no use-after-free and no double-free only.
+    assert_native_matches_interp_asan_boxes(_IND_AGG_ROUNDTRIP_SRC, tmp_path)
+    assert_native_matches_interp_asan_boxes(_IND_AGG_CAPTURE_SRC, tmp_path)
+
+
+@needs_asan
+def test_native_pinned_aggregate_closure_call_asan_leak_clean(tmp_path):
+    # The pinned (typed) aggregate closure path allocates nothing at all,
+    # so it stays under the FULL leak check.
+    assert_native_matches_interp_asan("""
+struct Point { x: int, y: int }
+fn apply(f: fn(Point) -> Point, p: Point) -> Point { f(p) }
+fn main() -> int {
+    let a = apply(fn(q: Point) -> Point { Point { x: q.y, y: q.x } },
+                  Point { x: 1, y: 2 });
+    print(a.x, a.y);
+    0
+}
+""", tmp_path)
+
+
+# --- the real-world payoff: std.stream over an aggregate element type -------
+
+_STREAM_STRUCT_ELEM_SRC = """
+from std.stream import Emit, map, filter;
+
+struct Item { id: int, w: int }
+
+fn items() -> fn() -> Unit {
+    fn() {
+        perform Emit.emit(Item { id: 1, w: 10 });
+        perform Emit.emit(Item { id: 2, w: 20 });
+        perform Emit.emit(Item { id: 3, w: 30 });
+        ()
+    }
+}
+
+fn total_w(s: fn() -> Unit) -> int {
+    handle Emit with {
+        emit(it) -> it.w + resume(())
+    } in {
+        s();
+        0
+    }
+}
+
+fn main() -> int {
+    let heavy = filter(items(), fn(it: Item) -> bool { it.w > 10 });
+    let bumped = map(heavy,
+                     fn(it: Item) -> Item { Item { id: it.id + 100, w: it.w * 2 } });
+    print(total_w(bumped));
+    print(total_w(map(items(),
+                      fn(it: Item) -> Item { Item { id: it.id, w: it.w + 1 } })));
+    0
+}
+"""
+
+_STREAM_ENUM_ELEM_SRC = """
+from std.stream import Emit, map, filter;
+
+enum Cell { Val(int), Empty }
+
+fn cells() -> fn() -> Unit {
+    fn() {
+        perform Emit.emit(Cell.Val(1));
+        perform Emit.emit(Cell.Empty);
+        perform Emit.emit(Cell.Val(3));
+        ()
+    }
+}
+
+fn total(s: fn() -> Unit) -> int {
+    handle Emit with {
+        emit(c) -> match c {
+            Cell.Val(n) => n + resume(()),
+            Cell.Empty => resume(())
+        }
+    } in {
+        s();
+        0
+    }
+}
+
+fn main() -> int {
+    let doubled = map(cells(), fn(c: Cell) -> Cell {
+        match c { Cell.Val(n) => Cell.Val(n * 10), Cell.Empty => Cell.Empty }
+    });
+    let nonempty = filter(doubled, fn(c: Cell) -> bool {
+        match c { Cell.Val(n) => true, Cell.Empty => false }
+    });
+    print(total(nonempty));
+    print(total(map(cells(), fn(c: Cell) -> Cell { c })));
+    0
+}
+"""
+
+
+def test_std_stream_aggregate_element_census():
+    # THE PAYOFF.  std.stream's map/filter over a STRUCT (and an ENUM)
+    # element type: the element crosses the Emit boundary as a box
+    # (increment 14) and the user lambda `f(x)` is an indirect call taking
+    # AND returning that same aggregate (increment 16).  Before this
+    # increment map's handler case, map itself, its thunk and `main` all
+    # demoted with the scalar-only reason; now the whole consumed pipeline
+    # emits.
+    #
+    # The rest of std.stream still demotes, honestly and for an unrelated
+    # reason: the module's Emit element cell is MONOMORPHIC, so pulling in
+    # iota/emit_range/sum/product/count (which do int arithmetic on the
+    # element) under an aggregate element type conflicts their kinds.
+    # That is the generic-instantiation gap, not the ABI.
+    for src, elem in ((_STREAM_STRUCT_ELEM_SRC, r"struct:Item"),
+                      (_STREAM_ENUM_ELEM_SRC, r"enum:Cell")):
+        ir = llvm_from_source(src)
+        for sym in ("mx_main", "mx_std_stream_map", "mx_std_stream_filter",
+                    "mx_std_stream_map_lambda1",
+                    "mx_std_stream_filter_lambda1",
+                    "mx___handler_Emit_emit_std_stream_map_hs3",
+                    "mx___handler_Emit_emit_std_stream_filter_hs3",
+                    "mx___handle_body_Emit_std_stream_map_hs3",
+                    "mx___handle_body_Emit_std_stream_filter_hs3"):
+            assert re.search(rf"^define (?:i64|void|ptr|double) @{sym}\(",
+                             ir, re.M), (sym, elem)
+        assert "scalar-only" not in ir
+        assert re.search(rf"; word-uniform param \w+: boundary box {elem}", ir)
+        assert re.search(
+            rf"ret i64 %\w+  ; word-uniform lambda return \({elem}", ir)
+
+
+@needs_clang
+def test_native_std_stream_struct_element_differential(tmp_path):
+    assert_native_matches_interp(_STREAM_STRUCT_ELEM_SRC, tmp_path)
+
+
+@needs_clang
+def test_native_std_stream_enum_element_differential(tmp_path):
+    assert_native_matches_interp(_STREAM_ENUM_ELEM_SRC, tmp_path)
+
+
+@needs_asan
+def test_native_std_stream_aggregate_element_asan_no_uaf(tmp_path):
+    # Effect scopes + heap envs + boundary boxes on both the effect edge
+    # and the indirect-call edge: detect_leaks=0 per the leak-by-design
+    # contract, so exit 0 proves no use-after-free / no double-free.
+    assert_native_matches_interp_asan_boxes(_STREAM_STRUCT_ELEM_SRC, tmp_path)
+    assert_native_matches_interp_asan_boxes(_STREAM_ENUM_ELEM_SRC, tmp_path)
+
+
+def test_indirect_aggregate_ir_passes_llvm_verifier(tmp_path):
+    # The boxed-aggregate indirect ABI produces well-formed IR: the
+    # `i64 (ptr, i64...)` indirect call type, the inttoptr/ptrtoint word
+    # conversions and the box copies all check out under LLVM's verifier.
+    if shutil.which("opt") is None:
+        pytest.skip("LLVM opt not installed")
+    for src in (_IND_AGG_ROUNDTRIP_SRC, _IND_ENUM_RETURN_SRC,
+                _IND_AGG_CAPTURE_SRC, _IND_AGG_LOOP_SRC,
+                _STREAM_STRUCT_ELEM_SRC, _STREAM_ENUM_ELEM_SRC):
+        ll = tmp_path / "ind_agg.ll"
+        ll.write_text(llvm_from_source(src))
+        proc = subprocess.run(
+            ["opt", "-passes=verify", "-disable-output", str(ll)],
+            capture_output=True, text=True)
+        assert proc.returncode == 0, proc.stderr
