@@ -154,6 +154,16 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
                 return scope[name]
         return None
 
+    def _is_locally_bound(name: Any) -> bool:
+        """True when `name` is bound inside a function/block scope.
+
+        scopes[0] is the module scope, where top-level declarations live;
+        anything found deeper is a parameter, a `let`, or a nested `fn`,
+        and shadows the module's function of that name."""
+        if not isinstance(name, str):
+            return False
+        return any(name in scope for scope in scopes[1:])
+
     def payload_name(node: Any) -> Any | None:
         value = getattr(node, "value", None)
         if isinstance(value, dict):
@@ -582,6 +592,23 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
         type_params = [p for p in sig.get("type_params") or [] if isinstance(p, str)]
         declared = list(sig.get("param_types") or [])
         args = list(getattr(node, "children", ()))
+        # ARGUMENT COUNT. Without this, `take(1)` for `fn take(a, b)`
+        # compiled and died at run time as "Unbound variable 'b' in 'take'
+        # (bad lowering or use-after-drop)" — a message that blames the
+        # compiler for the caller's mistake. A call whose name resolves to
+        # a LOCAL binding (a parameter or let holding a closure) is skipped:
+        # the local shadows the module function and its arity is not this
+        # signature's.
+        param_names = [p for p in sig.get("params") or []]
+        if not _is_locally_bound(name) and len(args) != len(param_names):
+            spelled = ", ".join(str(p) for p in param_names if p is not None)
+            _type_error(
+                f"wrong number of arguments in call of {name}: expected "
+                f"{len(param_names)}" + (f" ({spelled})" if spelled else "")
+                + f", got {len(args)}",
+                node, kind="type-call-arity",
+            )
+            return
         explicit = [a for a in payload.get("type_args", []) or [] if isinstance(a, str)]
         subst: dict[str, str] = {}
         deep_subst: dict[str, tuple[str, list | None]] = {}
@@ -939,13 +966,21 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
     # any pattern is opaque/unknown), no check is performed: unknown-typed
     # scrutinees stay permissive with no false positives.
     #
-    # Coverage rule (kept deliberately shallow): a variant is covered iff
-    # some arm names its ctor with all-irrefutable subpatterns
-    # (wildcards/bindings), OR a wildcard/binding arm exists. Deeper
-    # refinement is NOT attempted: `Some(1) | Some(n)` treats Some as
-    # covered by the binding arm `Some(n)`, while `Some(1)` alone leaves
-    # Some incompletely covered (literal completeness over an infinite
-    # domain is not analyzed).
+    # Coverage rule: a variant is covered iff a wildcard/binding arm exists,
+    # or the arms naming its ctor cover its whole payload space. The payload
+    # check is the textbook specialization recursion (_matrix_exhaustive
+    # below), so NESTED constructor patterns count:
+    # `Some(Circle(r)) | Some(Dot) | None` is exhaustive over
+    # Option[Shape] with Shape = {Circle, Dot}, and rejecting it (which the
+    # old shallow "all subpatterns must be irrefutable" rule did) was a false
+    # positive on a correct program.
+    # The recursion only ever answers "provably exhaustive"; anything it
+    # cannot reason about (a column of literal patterns, a variant whose
+    # enum is unknown, a pattern arity that disagrees with the declaration)
+    # answers False and keeps the old behavior. So `Some(1) | Some(n)`
+    # treats Some as covered by the binding arm `Some(n)`, while `Some(1)`
+    # alone leaves Some incompletely covered (literal completeness over an
+    # infinite domain is still not analyzed).
 
     _BUILTIN_ENUM_VARIANTS = {"Option": ("Some", "None"), "Result": ("Ok", "Err")}
     _BUILTIN_VARIANT_ENUM = {"Some": "Option", "None": "Option",
@@ -975,6 +1010,81 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
             return True
         return any(_has_unknown_pattern(s)
                    for s in desc.get("subpatterns") or [])
+
+    def _ctor_enum(desc: dict[str, Any]) -> str | None:
+        name = desc.get("name")
+        enum_name = (desc.get("enum") or variant_to_enum.get(name)
+                     or _BUILTIN_VARIANT_ENUM.get(name))
+        return enum_name if isinstance(enum_name, str) else None
+
+    def _enum_variants(enum_name: str) -> list[tuple[str, int]] | None:
+        """[(variant name, payload arity)] for a known enum, else None."""
+        edef = enum_defs.get(enum_name)
+        if edef is not None:
+            out: list[tuple[str, int]] = []
+            for v in edef.get("variants") or []:
+                if not isinstance(v, dict) or not isinstance(v.get("name"), str):
+                    return None
+                out.append((v["name"], len(v.get("fields") or [])))
+            return out or None
+        if enum_name in _BUILTIN_ENUM_VARIANTS:
+            # Option/Result payloads: everything but None carries one value.
+            return [(v, 0 if v == "None" else 1)
+                    for v in _BUILTIN_ENUM_VARIANTS[enum_name]]
+        return None
+
+    def _matrix_exhaustive(rows: list[list[dict[str, Any]]], width: int) -> bool:
+        """True when the pattern matrix PROVABLY covers every value tuple.
+
+        `rows` are pattern rows of `width` resolved descriptors each — the
+        textbook specialization recursion, run left to right. It only ever
+        answers True when it can prove coverage; every shape it cannot
+        reason about (a literal column, an unknown enum, a mix of ctor and
+        literal tests) answers False, so the caller's diagnostic stays on
+        the "reject only what is not provably covered" side it always was.
+        """
+        if width <= 0:
+            return bool(rows)
+        if not rows:
+            return False
+        column = [r[0] for r in rows]
+        irrefutable = ("wildcard", "binding")
+        ctors = [d for d in column if d.get("kind") == "ctor"]
+        if not ctors:
+            # No constructor test in this column: only rows with an
+            # irrefutable head say anything about every value (a literal
+            # head narrows an unbounded domain and is never complete).
+            return _matrix_exhaustive(
+                [r[1:] for r, d in zip(rows, column)
+                 if d.get("kind") in irrefutable], width - 1)
+        if any(d.get("kind") == "literal" for d in column):
+            return False        # ctor and literal tests mixed: not analyzed
+        enums = {_ctor_enum(d) for d in ctors}
+        if len(enums) != 1 or None in enums:
+            return False
+        variants = _enum_variants(next(iter(enums)))
+        if variants is None:
+            return False
+        for (vname, arity) in variants:
+            specialized: list[list[dict[str, Any]]] = []
+            for row, d in zip(rows, column):
+                subs: list[dict[str, Any]] | None = None
+                if d.get("kind") == "ctor":
+                    if d.get("name") != vname:
+                        continue
+                    subs = [_resolve_pattern(s)
+                            for s in d.get("subpatterns") or []]
+                    if len(subs) != arity:
+                        # `Circle => ...` for a Circle(int): a payload-less
+                        # spelling of the ctor, irrefutable for this variant
+                        # (the reading this checker has always had).
+                        subs = None
+                if subs is None:
+                    subs = [{"kind": "wildcard"}] * arity
+                specialized.append(subs + list(row[1:]))
+            if not _matrix_exhaustive(specialized, arity + width - 1):
+                return False
+        return True
 
     def _check_match_exhaustiveness(node: Any) -> None:
         arms = payload_dict(node).get("arms")
@@ -1015,20 +1125,24 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
             if len(enums) != 1:
                 return
             enum_name = next(iter(enums))
-            edef = enum_defs.get(enum_name)
-            if edef is not None:
-                all_variants = [v.get("name") for v in edef.get("variants") or []
-                                if isinstance(v, dict) and isinstance(v.get("name"), str)]
-            elif enum_name in _BUILTIN_ENUM_VARIANTS:
-                all_variants = list(_BUILTIN_ENUM_VARIANTS[enum_name])
-            else:
+            variants = _enum_variants(enum_name)
+            if variants is None:
                 return
-            covered: set[str] = set()
-            for d in ctor_arms:
-                subs = [_resolve_pattern(s) for s in d.get("subpatterns") or []]
-                if all(s.get("kind") in ("wildcard", "binding") for s in subs):
-                    covered.add(d.get("name"))
-            missing = [v for v in all_variants if v not in covered]
+            # A variant is covered when the arms naming it cover its whole
+            # payload space — recursively, so nested ctor patterns count.
+            missing: list[str] = []
+            for (vname, arity) in variants:
+                rows: list[list[dict[str, Any]]] = []
+                for d in ctor_arms:
+                    if d.get("name") != vname:
+                        continue
+                    subs = [_resolve_pattern(s)
+                            for s in d.get("subpatterns") or []]
+                    if len(subs) != arity:
+                        subs = [{"kind": "wildcard"}] * arity
+                    rows.append(subs)
+                if not _matrix_exhaustive(rows, arity):
+                    missing.append(vname)
             if missing:
                 _type_error(
                     "non-exhaustive match: missing variants "
@@ -1264,7 +1378,8 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
             # Must do this BEFORE walking the body
             return_types.append(node_ty)
 
-            for child in non_param_nodes(children):
+            body_children = non_param_nodes(children)
+            for child in body_children:
                 child_ty = types.get(child.node_id)
                 # Subtype from child to function's return type
                 if CompactType is not None and types.get(node.node_id) is not None:
@@ -1274,6 +1389,27 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
                 elif node_ty is not None and child_ty is not None:
                     simplesub.add_subtype(child_ty, node_ty)
                 walk(child)
+            # A function's TAIL EXPRESSION is a return. `fn f() -> Cursor {
+            # let @local c = ...; c }` hands `c` to the caller exactly like
+            # `return c;` does — and the tail form is the idiomatic spelling
+            # here (the whole stdlib returns that way), so checking only
+            # ReturnStatement let every escaping @local through as long as
+            # the author left the keyword off. Same region comparison the
+            # ReturnStatement case makes.
+            # Deliberately shallow: a tail `if`/`match` answering a local
+            # from one of its arms is not walked back into, so this covers
+            # the direct form only.
+            tail = body_children[-1] if body_children else None
+            if tail is not None and getattr(tail, "kind", None) == "Variable":
+                tail_name = payload_dict(tail).get("name")
+                if isinstance(tail_name, str):
+                    caller_region = (
+                        function_region_stack[-1] - 1
+                        if function_region_stack
+                        else borrow_checker.current_region()
+                    )
+                    borrow_checker.check_locality(tail_name, caller_region,
+                                                  tail.node_id)
             return_types.pop()
             function_region_stack.pop()
             borrow_checker.exit_region()

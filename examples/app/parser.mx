@@ -1,0 +1,287 @@
+# app.parser — spanned tokens to a Vec of Stmt.
+#
+# Recursive descent for statements, precedence climbing for expressions.
+# Every parse function takes the token Vec and a position and answers a
+# TUPLE of (what it parsed, the position after it) — the shape that keeps
+# a hand-written parser honest without a mutable cursor threaded through
+# every call:
+#
+#     let (condition, after_cond) = parse_expr(tokens, pos + 1);
+#
+# Syntax errors are the Throw effect: they abort the parse with a message
+# naming the offending token and its source offset. The caller (app.main)
+# turns that into an Err through std.throw's `catch_`.
+
+from std.throw import Throw;
+from syntax import Expr, Stmt, Spanned, describe_at;
+
+export {
+    parse_program,
+    parse_expr,
+    precedence_of
+}
+
+# The whole program: statements until the tokens run out. Each one is
+# spanned with the offset of its first token, so a failure during
+# evaluation can say WHICH statement failed.
+fn parse_program(tokens: Vec) -> Vec performs Throw {
+    let @mut statements = Vec.new();
+    let @mut pos = 0;
+    while pos < len(tokens) {
+        let (statement, next) = parse_stmt(tokens, pos);
+        statements.push(Spanned { item: statement, pos: offset_at(tokens, pos) });
+        pos = next
+    }
+    statements
+}
+
+# `let name = expr;` or `print expr;`
+fn parse_stmt(tokens: Vec, pos: int) -> (Stmt, int) performs Throw {
+    if is_name_at(tokens, pos, "let") {
+        let name = expect_name(tokens, pos + 1);
+        let after_eq = expect_op(tokens, pos + 2, "=");
+        let (value, after_value) = parse_expr(tokens, after_eq);
+        (SLet(name, value), expect_punct(tokens, after_value, ";"))
+    } else if is_name_at(tokens, pos, "print") {
+        let (value, after_value) = parse_expr(tokens, pos + 1);
+        (SPrint(value), expect_punct(tokens, after_value, ";"))
+    } else {
+        perform Throw.throw(
+            "parse error: expected 'let' or 'print' but found "
+                + describe_token(tokens, pos));
+        (SPrint(ENum(0)), pos)
+    }
+}
+
+# An expression: either a conditional or a binary-operator chain.
+fn parse_expr(tokens: Vec, pos: int) -> (Expr, int) performs Throw {
+    if is_name_at(tokens, pos, "if") {
+        let (condition, after_cond) = parse_expr(tokens, pos + 1);
+        let after_then = expect_name_word(tokens, after_cond, "then");
+        let (then_branch, after_then_branch) = parse_expr(tokens, after_then);
+        let after_else = expect_name_word(tokens, after_then_branch, "else");
+        let (else_branch, after_else_branch) = parse_expr(tokens, after_else);
+        (EIf(condition, then_branch, else_branch), after_else_branch)
+    } else {
+        parse_binary(tokens, pos, 1)
+    }
+}
+
+# Precedence climbing: parse a left operand, then keep folding in
+# operators that bind at least as tightly as `min_prec`. Every operator
+# here is left-associative, which is what parsing the right-hand side at
+# `prec + 1` expresses.
+fn parse_binary(tokens: Vec, pos: int, min_prec: int) -> (Expr, int) performs Throw {
+    let (first, after_first) = parse_unary(tokens, pos);
+    let @mut lhs = first;
+    let @mut at = after_first;
+    let @mut climbing = true;
+    while climbing {
+        let prec = precedence_of(operator_at(tokens, at));
+        if prec < min_prec {
+            climbing = false
+        } else {
+            let op = operator_at(tokens, at);
+            let (rhs, after_rhs) = parse_binary(tokens, at + 1, prec + 1);
+            lhs = EBinary(op, lhs, rhs);
+            at = after_rhs
+        }
+    }
+    (lhs, at)
+}
+
+# Binding power, 0 for anything that is not a binary operator (which is
+# what stops the loop above).
+fn precedence_of(op: string) -> int {
+    match op {
+        "==" => 1,
+        "!=" => 1,
+        "<" => 1,
+        ">" => 1,
+        "<=" => 1,
+        ">=" => 1,
+        "+" => 2,
+        "-" => 2,
+        "*" => 3,
+        "/" => 3,
+        "%" => 3,
+        _ => 0
+    }
+}
+
+fn parse_unary(tokens: Vec, pos: int) -> (Expr, int) performs Throw {
+    if is_op_at(tokens, pos, "-") {
+        let (operand, after) = parse_unary(tokens, pos + 1);
+        (EUnary("-", operand), after)
+    } else {
+        parse_atom(tokens, pos)
+    }
+}
+
+# A literal, a variable, a builtin call, or a parenthesized expression.
+fn parse_atom(tokens: Vec, pos: int) -> (Expr, int) performs Throw {
+    match peek(tokens, pos) {
+        Some(TInt(value)) => (ENum(value), pos + 1),
+        Some(TName(name)) => parse_name_atom(tokens, pos, name),
+        Some(TPunct(text)) => {
+            if text == "(" {
+                let (inner, after_inner) = parse_expr(tokens, pos + 1);
+                (inner, expect_punct(tokens, after_inner, ")"))
+            } else {
+                (unexpected(tokens, pos, "an expression"), pos)
+            }
+        },
+        Some(TOp(text)) => (unexpected(tokens, pos, "an expression"), pos),
+        None => (unexpected(tokens, pos, "an expression"), pos)
+    }
+}
+
+# A name in expression position is a variable, unless a `(` follows, in
+# which case it is a call of one of the builtins the evaluator knows.
+fn parse_name_atom(tokens: Vec, pos: int, name: string) -> (Expr, int) performs Throw {
+    if is_punct_at(tokens, pos + 1, "(") {
+        let @mut args = Vec.new();
+        let @mut at = pos + 2;
+        if is_punct_at(tokens, at, ")") {
+            at = at + 1
+        } else {
+            let @mut more = true;
+            while more {
+                let (argument, after_argument) = parse_expr(tokens, at);
+                args.push(argument);
+                if is_punct_at(tokens, after_argument, ",") {
+                    at = after_argument + 1
+                } else {
+                    at = expect_punct(tokens, after_argument, ")");
+                    more = false
+                }
+            }
+        };
+        (ECall(name, args), at)
+    } else {
+        (EVar(name), pos + 1)
+    }
+}
+
+# --- token access ---------------------------------------------------------
+#
+# `peek` and `offset_at` are the only functions that know the Vec holds
+# SPANNED tokens, and that running off the end is None (or the last
+# token's offset) rather than an error. Everything above reads tokens
+# through them.
+
+fn peek(tokens: Vec, pos: int) {
+    if pos < len(tokens) { Some(tokens[pos].item) } else { None }
+}
+
+fn offset_at(tokens: Vec, pos: int) -> int {
+    if pos < len(tokens) {
+        tokens[pos].pos
+    } else {
+        if len(tokens) > 0 { tokens[len(tokens) - 1].pos } else { 0 }
+    }
+}
+
+# The operator spelling at `pos`, or "" when that token is not one.
+fn operator_at(tokens: Vec, pos: int) -> string {
+    match peek(tokens, pos) {
+        Some(TOp(text)) => text,
+        Some(TInt(value)) => "",
+        Some(TName(name)) => "",
+        Some(TPunct(text)) => "",
+        None => ""
+    }
+}
+
+fn is_op_at(tokens: Vec, pos: int, op: string) -> bool {
+    operator_at(tokens, pos) == op
+}
+
+fn is_punct_at(tokens: Vec, pos: int, text: string) -> bool {
+    match peek(tokens, pos) {
+        Some(TPunct(actual)) => actual == text,
+        Some(TInt(value)) => false,
+        Some(TName(name)) => false,
+        Some(TOp(actual)) => false,
+        None => false
+    }
+}
+
+fn is_name_at(tokens: Vec, pos: int, word: string) -> bool {
+    match peek(tokens, pos) {
+        Some(TName(actual)) => actual == word,
+        Some(TInt(value)) => false,
+        Some(TOp(actual)) => false,
+        Some(TPunct(actual)) => false,
+        None => false
+    }
+}
+
+# --- expectations ---------------------------------------------------------
+#
+# Each one answers the position AFTER the token it required, so call sites
+# read as a running position.
+
+fn expect_punct(tokens: Vec, pos: int, text: string) -> int performs Throw {
+    if is_punct_at(tokens, pos, text) {
+        pos + 1
+    } else {
+        perform Throw.throw("parse error: expected '" + text + "' but found "
+                                + describe_token(tokens, pos));
+        pos
+    }
+}
+
+fn expect_op(tokens: Vec, pos: int, op: string) -> int performs Throw {
+    if is_op_at(tokens, pos, op) {
+        pos + 1
+    } else {
+        perform Throw.throw("parse error: expected '" + op + "' but found "
+                                + describe_token(tokens, pos));
+        pos
+    }
+}
+
+fn expect_name_word(tokens: Vec, pos: int, word: string) -> int performs Throw {
+    if is_name_at(tokens, pos, word) {
+        pos + 1
+    } else {
+        perform Throw.throw("parse error: expected '" + word + "' but found "
+                                + describe_token(tokens, pos));
+        pos
+    }
+}
+
+fn expect_name(tokens: Vec, pos: int) -> string performs Throw {
+    match peek(tokens, pos) {
+        Some(TName(name)) => name,
+        Some(TInt(value)) => bad_name(tokens, pos),
+        Some(TOp(text)) => bad_name(tokens, pos),
+        Some(TPunct(text)) => bad_name(tokens, pos),
+        None => bad_name(tokens, pos)
+    }
+}
+
+# --- private diagnostics helpers -----------------------------------------
+
+fn bad_name(tokens: Vec, pos: int) -> string performs Throw {
+    perform Throw.throw("parse error: expected a name but found "
+                            + describe_token(tokens, pos));
+    ""
+}
+
+# `describe_at` is the generic spanned-thing renderer: the token's own
+# Show impl decides how it prints, and the span supplies the offset.
+fn describe_token(tokens: Vec, pos: int) -> string {
+    if pos < len(tokens) {
+        describe_at(tokens[pos])
+    } else {
+        "end of input"
+    }
+}
+
+fn unexpected(tokens: Vec, pos: int, wanted: string) -> Expr performs Throw {
+    perform Throw.throw("parse error: expected " + wanted + " but found "
+                            + describe_token(tokens, pos));
+    ENum(0)
+}
