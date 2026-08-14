@@ -12,6 +12,7 @@ Welcome to the Metaxu documentation! Metaxu is a self-hosted, low-level function
 - [Type System](type_system.md)
 - [Ownership and Borrowing](ownership_and_borrowing.md)
 - [Name-resolution precedence](name_precedence.md)
+- [Source locations in diagnostics](diagnostics_locations.md)
 
 ### Effects and Runtime
 - [Builtin Algebraic Effects](effects/index.md)

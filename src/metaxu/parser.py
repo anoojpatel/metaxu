@@ -6,7 +6,9 @@ from metaxu.extern_ast import ExternBlock, ExternFunctionDeclaration, ExternType
 from metaxu.unsafe_ast import (UnsafeBlock, PointerType, TypeCast,
                        PointerDereference, AddressOf)
 from metaxu.type_defs import (SharedType, BoxType, ReferenceType, NoneType)
-from metaxu.errors import CompileError, SourceLocation, get_source_context
+from metaxu.errors import CompileError, SourceLocation, register_source
+import bisect
+import functools
 import traceback
 import logging
 
@@ -18,6 +20,15 @@ scoped_nodes = (ast.FunctionDeclaration, ast.LambdaExpression, ast.Block, ast.Wh
 # (see Parser._parse_fstring_expr).  Module-level so the ~0.5s PLY table
 # build happens at most once per process.
 _FSTRING_SEGMENT_PARSER = None
+
+
+class _GrammarNamespace:
+    """Namespace handed to ``yacc.yacc(module=...)``.
+
+    Holds the grammar actions with the location-attaching wrapper applied
+    (see Parser._locating); PLY reads rules off this object exactly as it
+    would off the Parser instance.
+    """
 
 
 class Parser:
@@ -32,13 +43,150 @@ class Parser:
         # Initialize the lexer
         self.lexer = Lexer()
         self.tokens = self.lexer.tokens  # Get token list from lexer
-        self.parser = yacc.yacc(module=self, debug=False, write_tables=False,
-                                errorlog=yacc.NullLogger())
+        self.parser = yacc.yacc(module=self._grammar_namespace(), debug=False,
+                                write_tables=False, errorlog=yacc.NullLogger())
         self.module_names = set()
         self.parse_stack = []
         self.current_scope = None
         self.scope_stack = []  # Stack to track nested scopes
         self.current_module = None
+
+    # ------------------------------------------------------------------
+    # Source locations
+    #
+    # Every grammar action is wrapped so the node it produces gets a
+    # SourceLocation covering the whole production, without touching any of
+    # the ~130 productions individually.  PLY's `tracking=True` reduce path
+    # stamps each nonterminal symbol with the start position of its first
+    # token and the end position of its last one BEFORE calling the action,
+    # so the wrapper can read them off `p` afterwards.
+    # ------------------------------------------------------------------
+
+    def _grammar_namespace(self) -> '_GrammarNamespace':
+        """Build the object PLY reads the grammar from: every ``p_*`` action
+        except ``p_error`` wrapped in the location-attaching decorator."""
+        ns = _GrammarNamespace()
+        ns.tokens = self.tokens
+        ns.start = self.start
+        precedence = getattr(self, 'precedence', None)
+        if precedence is not None:
+            ns.precedence = precedence
+        for name in dir(self):
+            if not name.startswith('p_'):
+                continue
+            method = getattr(self, name)
+            if not callable(method):
+                continue
+            setattr(ns, name, method if name == 'p_error' else self._locating(method))
+        return ns
+
+    def _locating(self, method):
+        """Wrap one grammar action so its result carries a source location."""
+        attach = self._attach_location
+
+        @functools.wraps(method)
+        def action(p):
+            method(p)
+            attach(p)
+
+        # PLY sorts productions by their definition line and reports errors
+        # against it; the wrapper must not collapse every rule onto the same
+        # line (rule ORDER decides reduce/reduce conflicts, so changing it
+        # would change the language).  `get_pfunctions` reads an explicit
+        # `co_firstlineno` attribute in preference to the code object's.
+        action.co_firstlineno = method.__func__.__code__.co_firstlineno
+        return action
+
+    #: Attributes that are back-references or bookkeeping, never child nodes.
+    _NON_CHILD_ATTRS = frozenset({'parent', 'scope', 'location'})
+
+    def _attach_location(self, p) -> None:
+        """Give `p[0]` a SourceLocation spanning the reduced production.
+
+        Only fills in nodes that do not have one yet, so a pass-through rule
+        (`p[0] = p[1]`) keeps the inner node's own, tighter location.  The
+        same span is then pushed down into descendants that are still
+        unlocated — the helper-built nodes (HandleCase, EffectApplication,
+        QualifiedName, ...) that no production of their own ever produced.
+        The descent STOPS at any node that already has a location, so a
+        located subtree keeps its own tighter positions and the fill costs
+        one visit per node overall.
+        """
+        try:
+            node = p[0]
+        except Exception:
+            return
+        if not isinstance(node, ast.Node) or getattr(node, 'location', None) is not None:
+            return
+        try:
+            start = p.lexpos(0)
+            end = getattr(p.slice[0], 'endlexpos', start)
+        except Exception:
+            return
+        loc = self.location_for_offsets(start, end)
+        if loc is None:
+            return
+        try:
+            node.location = loc
+        except Exception:  # frozen/slotted node: not locatable, skip
+            return
+        self._fill_locations(node, loc)
+
+    def _fill_locations(self, node, loc, depth: int = 0) -> None:
+        """Give `loc` to every still-unlocated node reachable from `node`."""
+        if depth > 60:
+            return
+        for attr, value in vars(node).items():
+            if attr in self._NON_CHILD_ATTRS:
+                continue
+            self._fill_value(value, loc, depth)
+
+    def _fill_value(self, value, loc, depth: int) -> None:
+        if isinstance(value, ast.Node):
+            if getattr(value, 'location', None) is None:
+                try:
+                    value.location = loc
+                except Exception:
+                    return
+                self._fill_locations(value, loc, depth + 1)
+            return
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                self._fill_value(item, loc, depth)
+        elif isinstance(value, dict):
+            for item in value.values():
+                self._fill_value(item, loc, depth)
+
+    def location_for_offsets(self, start: int, end: int | None = None) -> 'SourceLocation | None':
+        """SourceLocation for a half-open character range of the current file."""
+        if start is None or start < 0:
+            return None
+        line, column = self._line_col(start)
+        end_line = end_column = None
+        if end is not None and end >= start:
+            end_line, end_column = self._line_col(end)
+        return SourceLocation(
+            file=self.lexer.source_file,
+            line=line,
+            column=column,
+            end_line=end_line,
+            end_column=end_column,
+            offset=start,
+            end_offset=end,
+        )
+
+    def _line_col(self, offset: int) -> tuple[int, int]:
+        """1-based (line, column) of a 0-based character offset.
+
+        Derived from the lexer's `line_starts` table (filled while tokenizing)
+        rather than from token linenos, so a position and its line always
+        agree.
+        """
+        starts = self.lexer.line_starts or [0]
+        idx = bisect.bisect_right(starts, offset) - 1
+        if idx < 0:
+            idx = 0
+        return idx + 1, offset - starts[idx] + 1
 
     def parse(self, source: str, file_path: str = "<unknown>") -> 'ast.Module':
         """Parse source code into an AST"""
@@ -56,14 +204,22 @@ class Parser:
             # Initialize lexer with source
             self.lexer.source_file = file_path
             self.lexer.input(source)
+            # Diagnostics excerpt the offending line; register the text so
+            # in-memory sources ("<mem>") render like on-disk ones.
+            register_source(file_path, source)
             self._enter_scope(ast.Scope(name="global"))
-            # Parse using PLY
-            result = self.parser.parse(source, lexer=self.lexer, debug=False)
+            # Parse using PLY. tracking=True makes PLY record the token span
+            # of every reduced nonterminal, which is what _attach_location
+            # turns into node locations.
+            result = self.parser.parse(source, lexer=self.lexer, debug=False,
+                                       tracking=True)
 
             # If the result is a list of statements, wrap it in a module
             if isinstance(result, list):
                 module_body = ast.ModuleBody(statements=result)
+                module_body.location = self.location_for_offsets(0, len(source))
                 result = ast.Module(name="main", body=module_body)
+                result.location = module_body.location
 
             # Set source file for all modules
             if isinstance(result, ast.Module):
@@ -81,20 +237,17 @@ class Parser:
         except CompileError:
             raise
         except Exception as e:
-            # Get current token for error location
+            # Location of the token the parser was looking at when it failed.
             token = getattr(self.lexer, 'current_token', None)
             self.logger.debug("Parser error: %s: %s", type(e).__name__, e)
-            location = SourceLocation(
-                file=file_path,
-                line=token.lineno if token else 0,
-                column=getattr(token, 'column', 0) if token else 0
-            ) if token else None
+            location = self.location_for_offsets(
+                token.lexpos, getattr(token, 'endlexpos', token.lexpos)
+            ) if token is not None else None
 
             error = CompileError(
                 message=str(e),
                 error_type="ParseError",
                 location=location,
-                context=get_source_context(file_path, location.line) if location else None,
                 stack_trace=traceback.format_stack(),
                 notes=["Check syntax near this location"]
             )
@@ -1561,13 +1714,8 @@ class Parser:
             raise CompileError(
                 message=f"Duplicate module name '{name}'",
                 error_type="ParseError",
-                location=SourceLocation(
-                    file=self.lexer.source_file,
-                    line=p.lineno(1),
-                    column=getattr(p.slice[1], 'column', 0)
-                ),
-                context=get_source_context(self.lexer.source_file, p.lineno(1)),
-                stack_trace=traceback.format_stack(),
+                location=self.location_for_offsets(
+                    p.lexpos(1), getattr(p.slice[1], 'endlexpos', p.lexpos(1))),
                 notes=[f"Module '{name}' was already declared"]
             )
         self.module_names.add(name)
@@ -1747,29 +1895,36 @@ class Parser:
     def p_error(self, p):
         if p:
             msg = f"Syntax error at '{p.value}'"
-            lineno = getattr(p, 'lineno', 0)
-            column = getattr(p, 'column', 0)
+            lexpos = getattr(p, 'lexpos', None)
+            location = self.location_for_offsets(
+                lexpos, getattr(p, 'endlexpos', lexpos)) if lexpos is not None else \
+                SourceLocation(file=self.lexer.source_file,
+                               line=getattr(p, 'lineno', 0),
+                               column=getattr(p, 'column', 0))
+            # The location now renders the offending line with a caret (see
+            # errors.format_diagnostic), so the old multi-line `context`
+            # block and the Python-level stack trace are redundant noise on
+            # what is a plain user syntax error.
             raise CompileError(
                 message=msg,
                 error_type="ParseError",
-                location=SourceLocation(
-                    file=self.lexer.source_file,
-                    line=lineno,
-                    column=column
-                ),
-                context=get_source_context(self.lexer.source_file, lineno),
-                stack_trace=traceback.format_stack(),
+                location=location,
                 notes=["Check syntax near this location"]
             )
         else:
             raise CompileError(
                 message="Syntax error at EOF",
                 error_type="ParseError",
-                location=None,
-                context=None,
-                stack_trace=traceback.format_stack(),
+                location=self._eof_location(),
                 notes=["Unexpected end of file"]
             )
+
+    def _eof_location(self) -> 'SourceLocation | None':
+        """Location of the end of the current source (for EOF errors)."""
+        source = getattr(self.lexer, 'source', None)
+        if not isinstance(source, str) or not source:
+            return None
+        return self.location_for_offsets(len(source.rstrip()) - 1)
 
     # ------------------------------------------------------------------
     # Scope management helpers

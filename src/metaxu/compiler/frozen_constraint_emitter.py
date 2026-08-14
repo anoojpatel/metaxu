@@ -681,6 +681,20 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
                 arg,
             )
 
+    def _field_node(node: Any, field_name: Any) -> Any:
+        """The frozen StructField child named `field_name`, else `node`.
+
+        Field-level diagnostics are built from the struct's payload (which
+        has no node ids); this maps a payload field back to the node that
+        carries its source location.
+        """
+        if isinstance(field_name, str):
+            for child in getattr(node, "children", ()) or ():
+                if getattr(child, "kind", None) == "StructField" and \
+                        payload_dict(child).get("name") == field_name:
+                    return child
+        return node
+
     def _check_struct_field_type_params(node: Any, payload: dict) -> None:
         """Reject field types that use a type parameter the struct never declares.
 
@@ -731,7 +745,8 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
                     f"{struct_name!r}: a vector size must be an integer literal "
                     f"or a declared const generic parameter "
                     f"(declare it as `struct {struct_name}<{hint}>`)",
-                    node, kind="type-undeclared-param",
+                    # Report the FIELD's own line, not the struct header's.
+                    _field_node(node, f.get("name")), kind="type-undeclared-param",
                 )
 
     def _check_struct_field_types(node: Any, struct_name: str) -> None:
