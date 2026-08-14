@@ -23,21 +23,38 @@ borrow diagnostic and `test_type_error.mx` with a type diagnostic.
 ## Pipeline shape
 
 ```
-source -> Parser (PLY, src/metaxu/parser.py; token disambiguation in lexer.py)
-       -> desugar passes (compiler/desugar.py: trait impls -> mangled fns)
+source -> Parser (PLY, src/metaxu/parser.py; shared instance via
+          compiler/shared_parser.py — construction costs ~430ms, reuse it)
+       -> module resolution (compiler/module_loader.py: multi-file imports,
+          visibility, std/ stdlib resolution, dotted-name namespacing)
+       -> desugar passes (compiler/desugar.py: trait impls -> mangled fns,
+          bracket-form generic ctors)
        -> freeze (compiler/mutaxu_ast.py: immutable AST + JSON goldens)
        -> infer (compiler/infer_tables.py -> simplesub_adapter.py
-                 + frozen_constraint_emitter.py + frozen_borrow_checker.py)
-       -> HIR (compiler/hir.py: typed, patterns, effects, trait dispatch)
+                 + frozen_constraint_emitter.py + frozen_borrow_checker.py:
+                 generics instantiation checking, exhaustiveness, borrow/modes)
+       -> HIR (compiler/hir.py: typed, patterns, effects, trait dispatch;
+               optional monomorphize.py pass)
        -> MIR (compiler/lower_hir_to_mir.py: ANF, multi-block CFG)
-       -> CLIF text (compiler/codegen_clif.py) + CPS frames (cps_frames.py)
+       -> backends:
+          - compiler/mir_interp.py (semantics REFERENCE; execution gate)
+          - compiler/codegen_llvm.py + llvm_run.py (native: clang -O2 +
+            runtime/native/*.o — differentially tested vs the interpreter)
+          - compiler/codegen_clif.py + cps_frames.py (Cranelift text; lags LLVM)
 ```
 
 `compiler/pipeline.py` is the entry point: `run_pipeline_from_source`
-raises `BorrowCheckError` / `TypeCheckError` in strict mode.
-`compiler/mir_interp.py` executes MIR directly (the execution gate's
-engine): delimited single-shot effect continuations, trait dispatch on
-runtime types, Vec/vector runtime, strict name resolution.
+raises `BorrowCheckError` / `TypeCheckError` in strict mode;
+`emit_llvm_from_source` + `llvm_run.compile_and_run` produce and execute
+native binaries. The interpreter provides delimited single-shot effect
+continuations, trait dispatch on runtime types, Vec/vector runtime, a
+bounds-checked simulated C heap for FFI, and strict name resolution. The
+LLVM backend mirrors it with mode-based memory (stack default, @global
+malloc+free, write-once boxes), tagged-union enums, {fn,env} closures with
+indirect calls, a ucontext coroutine scheduler for effects, and real SIMD
+for statically-sized vectors — anything unprovable demotes to a reasoned
+placeholder, never wrong code. The standard library lives in `std/*.mx`
+(Ante-modeled, effect-based idioms) and resolves via `import std.foo`.
 
 ## Where enforcement lives
 
@@ -68,4 +85,10 @@ tracks the phase-by-phase plan.
   silent no-op fallback. Do not add lenient fallbacks to make a test pass.
 - New compiler behavior needs a regression test in
   `src/metaxu/compiler/tests/`, and the example gates must stay green
-  (19/19 pipeline; do not regress the run-stage count).
+  (19/19 pipeline AND 19/19 run; do not regress either).
+- Native lowering claims need differential tests (native stdout/exit ==
+  interpreter) and, for memory claims, ASan runs scoped to the documented
+  contract (full leak-check where frees are claimed; detect_leaks=0 where
+  leak-by-design applies).
+- Writing real library code in std/ is the best compiler stress test:
+  several silent-degradation bugs were only found that way.
