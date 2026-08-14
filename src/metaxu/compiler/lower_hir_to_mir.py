@@ -6,6 +6,7 @@ from .desugar import IMPL_PREFIX
 from .hir import HFun, HExpr, HPattern, tuple_field_name
 from .mir import MirFunc, MirBlock
 from .borrow_analysis import plan_drops
+from .recursion import compiler_phase
 
 
 def _span_location(span: Any) -> Any:
@@ -688,6 +689,7 @@ def _mut_param_names(f: HFun) -> tuple:
     return tuple(names)
 
 
+@compiler_phase
 def lower_hir_to_mir(funcs: Sequence[HFun], borrow_errors: List[Any] | None = None) -> list[MirFunc]:
     """Lower HIR to MIR (ANF direct vs CPS later).
 

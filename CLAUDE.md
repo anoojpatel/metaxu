@@ -85,6 +85,13 @@ placeholder, never wrong code. The standard library lives in `std/*.mx`
   (`x.len()`) resolves impl -> builtin -> plain fn and is marked
   `__builtin$m` in MIR; every `__`-prefixed name is reserved
   (`module_loader.check_reserved_names` raises `ReservedNameError`).
+- Recursion depth (`docs/v1_gap_analysis.md` § "Recursion depth"): a
+  Metaxu frame costs ~4 Python frames (~24 for effect-and-closure-heavy
+  code), so `compiler/recursion.py` installs a 100k-frame budget around
+  each entry point (interpreter AND compile-time phases) and restores the
+  host's limit after. Overrunning it is `RecursionLimitExceeded` (an
+  `InterpError`, uncatchable by `try`) at run time and a `CompileError` at
+  compile time — never a host `RecursionError`.
 - Name resolution (`docs/name_resolution.md`): an undefined variable or
   callee is a compile-time `TypeCheckError`, not a silently dropped
   expression. `compiler/name_resolution.py` runs from
