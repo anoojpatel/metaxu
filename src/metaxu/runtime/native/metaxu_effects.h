@@ -77,9 +77,10 @@
  * mirroring the interpreter's arity error).
  *
  * mx_perform routes to the innermost matching scope as described and
- * returns the value passed to mx_resume; when no scope matches it prints
- * "Unhandled effect operation: '<op>'" and aborts (the interpreter's
- * InterpError).
+ * returns the value passed to mx_resume; when no scope matches it RAISES
+ * the interpreter's catchable failure "No handler for effect '<effect>'"
+ * (mir_interp's perform op) -- caught by an enclosing `try`, and otherwise
+ * printed to stderr before abort().
  *
  * mx_perform_or_default is mx_perform for an op that ALSO declares a
  * `= expr` default (the surface `op(x) -> T = expr` form).  Routing is
@@ -128,6 +129,97 @@
  *
  * Thread-unsafe by design (single-threaded native programs; the scope
  * stack is a process-wide global), like the rest of the native runtime.
+ *
+ * ---------------------------------------------------------------------
+ * DELIMITED FAILURE RECOVERY (try/catch) -- mx_try / mx_raise
+ * ---------------------------------------------------------------------
+ *
+ * `try { body } catch e { handler }` is the interpreter's `try_scope`
+ * (docs/try_catch.md, mir_interp._eval_rhs): the body runs as a delimited
+ * scope; a RUNTIME FAILURE anywhere in its dynamic extent is materialized
+ * as the failure's plain message text, bound to `e`, and the handler's
+ * value becomes the try expression's value.  Abort semantics: the rest of
+ * the body never runs.
+ *
+ * | symbol     | signature                                              |
+ * |------------|--------------------------------------------------------|
+ * | mx_try     | int64_t (mx_try_body_fn body, void *body_env,          |
+ * |            |          mx_try_catch_fn katch, void *catch_env)       |
+ * | mx_raise   | _Noreturn void (const char *msg)                       |
+ * | mx_raisef  | _Noreturn void (const char *fmt, ...)                  |
+ *
+ *   mx_try_body_fn  = int64_t (*)(void *env)
+ *   mx_try_catch_fn = int64_t (*)(void *env, const char *msg)
+ *
+ * MECHANISM: setjmp/longjmp landing pads, NOT LLVM's invoke/landingpad.
+ * The failure sites are C runtime functions compiled without unwind
+ * tables, and -- decisively -- a failure raised inside a handle body runs
+ * on a ucontext COROUTINE STACK that no DWARF unwinder can walk back to
+ * the owner stack.  This file already transfers control non-locally with
+ * setjmp/longjmp (a non-resuming handler case unwinds to its scope's
+ * mx_handle through `abort_jmp`), so try/catch reuses that machinery
+ * rather than introducing a second, incompatible one.
+ *
+ * COMPOSITION WITH EFFECT SCOPES.  Three invariants make the two mix:
+ *
+ *   1. THE PAD CHAIN IS PER-FIBER.  A longjmp may only target a frame on
+ *      the stack it is executed on, so the landing-pad chain is saved and
+ *      restored across every context switch exactly like `g_cur` (and a
+ *      fresh body coroutine starts with an EMPTY chain).  A try installed
+ *      inside a handle body therefore stays invisible to the handler side
+ *      while the body is parked, and becomes visible again when the body
+ *      is resumed -- so `try { ... perform ... }` with the handler OUTSIDE
+ *      the try keeps working, and a failure on the handler side can never
+ *      longjmp into a parked coroutine frame.
+ *
+ *   2. A FAILURE ON A BODY FIBER WITH NO LOCAL PAD ESCAPES TO ITS OWNER.
+ *      It becomes an MX_EV_ERROR event (the interpreter's ("error", exc)
+ *      message from the body thread to _pump_scope), which mx_handle /
+ *      mx_resume re-raise on the OWNER stack -- where the enclosing try's
+ *      pad lives.  This is what makes `try { handle { ... fail ... } }`
+ *      and a try inside a handler case that catches the RESUMED body's
+ *      failure behave exactly as the interpreter does.
+ *
+ *   3. CATCHING UNWINDS THE SCOPE STACK.  Each pad records the scope-stack
+ *      top (and that scope's `busy` flag) at install time; when the pad is
+ *      reached, every scope pushed since is torn down -- coroutine stacks,
+ *      continuation records and scope records freed -- and the busy flag is
+ *      restored.  That is the interpreter's `finally: self._abort_scope
+ *      (scope); self._mir_handler_frames.remove(frame)` plus _pump_scope's
+ *      `finally: frame["busy"] = False`, so no parked body survives a
+ *      caught failure and no stale frame can catch a later perform.
+ *
+ * WHAT IS CATCHABLE.  A failure is catchable iff the interpreter raises
+ * InterpError for it AND this runtime can produce the interpreter's exact
+ * message text (the caught value is language-visible, so it must be
+ * byte-identical on every backend).  Catchable here:
+ *
+ *   - "No handler for effect '<E>'"   (mx_perform with no matching scope
+ *     and no declared default -- mir_interp's perform op)
+ *   - "Effect op '<op>' performed with N argument(s) but its handler case
+ *     declares only M parameter(s)"
+ *   - the metaxu_rt.c contract violations that mirror an InterpError
+ *     (see metaxu_rt.h: pop on empty, index out of bounds, index
+ *     assignment out of bounds, slice step, vector size mismatch, zip
+ *     length mismatch, comprehension length, as_ptr byte range, shift
+ *     count range)
+ *
+ * DELIBERATELY FATAL (mx__fatal / mx_rt_fail, unchanged): everything the
+ * interpreter does NOT raise InterpError for -- the single-shot
+ * continuation violation (RuntimeError there), assert failures
+ * (AssertionError), integer division by zero (ZeroDivisionError) -- plus
+ * every allocation / OS / internal-invariant failure, which has no
+ * interpreter counterpart at all and must never become a program value.
+ * The compiler keeps `match_fail` fatal too and demotes any try whose
+ * extent can reach one, because the interpreter's message embeds the MIR
+ * function name and monomorphization renames it (see codegen_llvm).
+ *
+ * MEMORY.  The caught message is a fresh heap copy that LEAKS BY DESIGN
+ * (the catch binding is an ordinary metaxu string value and may outlive
+ * the try, exactly like every other produced string the backend cannot
+ * prove dead).  The landing pad itself is a stack object with no
+ * allocation, and the scope teardown above is the same leak-clean path
+ * mx_handle uses, so an unwinding try leaks nothing of the machinery.
  */
 #ifndef METAXU_EFFECTS_H
 #define METAXU_EFFECTS_H
@@ -166,6 +258,20 @@ int64_t mx_perform_or_default(const char *effect, const char *op,
                               mx_default_fn dflt, void *dflt_env);
 
 int64_t mx_resume(mx_k *k, int64_t value);
+
+/* --- Delimited failure recovery (try/catch) ----------------------------- */
+
+typedef int64_t (*mx_try_body_fn)(void *env);
+typedef int64_t (*mx_try_catch_fn)(void *env, const char *msg);
+
+int64_t mx_try(mx_try_body_fn body, void *body_env,
+               mx_try_catch_fn katch, void *catch_env);
+
+/* Raise a CATCHABLE runtime failure: transfer to the innermost landing pad
+ * with `msg` as the caught value; with no pad installed anywhere, print
+ * "metaxu runtime error: <msg>" and abort (today's behavior). */
+_Noreturn void mx_raise(const char *msg);
+_Noreturn void mx_raisef(const char *fmt, ...);
 
 #ifdef __cplusplus
 }
