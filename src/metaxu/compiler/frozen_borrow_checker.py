@@ -16,20 +16,83 @@ class BorrowError:
     """A structured borrow checking error.
 
     Fields:
-        message: Human-readable description (also returned by str()).
+        message: Human-readable description.
         node_id: Frozen AST node id where the error was detected.
         kind: Machine-readable error category, e.g. "use-after-move",
               "borrow-conflict", "locality-escape", "suspend-local",
               "reference-conflict", "dangling-reference", "linearity".
         variable: The variable the error is about, when applicable.
+        location: Source position of `node_id`, filled in from the frozen
+              AST by `locate_errors` once the whole tree is available (the
+              checks themselves only know node ids).  When set, str() is
+              "file:line:column: message".
     """
     message: str
     node_id: int
     kind: str = "borrow"
     variable: Optional[str] = None
+    location: Optional[Any] = None
 
     def __str__(self) -> str:
+        if self.location is not None:
+            from metaxu.errors import format_location
+            return f"{format_location(self.location)}: {self.message}"
         return self.message
+
+    def excerpt(self) -> Optional[str]:
+        """Source line with a caret under this error, when available."""
+        if self.location is None:
+            return None
+        from metaxu.errors import source_excerpt
+        return source_excerpt(self.location)
+
+
+def locate_errors(errors: Any, frozen_root: Any) -> None:
+    """Fill in `location` on every structured error that names a node id.
+
+    The checkers run over frozen nodes and only record node ids; the frozen
+    AST holds the spans, so resolving ids to source positions happens once,
+    here, instead of at each of the ~20 error sites.
+    """
+    spans: Dict[int, Any] = {}
+
+    def index(n: Any) -> None:
+        spans[n.node_id] = n.span
+        for c in n.children:
+            index(c)
+
+    if frozen_root is None:
+        return
+    index(frozen_root)
+    root_file = getattr(getattr(frozen_root, 'span', None), 'file', None)
+    if root_file in (None, "<unknown>"):
+        for child in getattr(frozen_root, 'children', ()):  # Module carries it
+            cand = getattr(getattr(child, 'span', None), 'file', None)
+            if cand and cand != "<unknown>":
+                root_file = cand
+                break
+    for err in errors or ():
+        if getattr(err, 'location', None) is not None:
+            continue
+        span = spans.get(getattr(err, 'node_id', None))
+        if span is None:
+            continue
+        try:
+            err.location = span.location(root_file)
+        except AttributeError:
+            continue
+
+
+def _diagnostic_text(headline: str, errors: List[Any]) -> str:
+    """`<headline>: <loc>: msg; <loc>: msg` followed by one source excerpt
+    per located error, so the exception text shows the offending lines."""
+    summary = "; ".join(str(e) for e in errors) or headline
+    parts = [f"{headline}: {summary}"]
+    for err in errors:
+        excerpt = err.excerpt() if hasattr(err, "excerpt") else None
+        if excerpt:
+            parts.append(excerpt)
+    return "\n".join(parts)
 
 
 class BorrowCheckError(Exception):
@@ -40,8 +103,7 @@ class BorrowCheckError(Exception):
 
     def __init__(self, errors: List[BorrowError]):
         self.errors = list(errors)
-        summary = "; ".join(str(e) for e in self.errors) or "borrow check failed"
-        super().__init__(f"borrow check failed: {summary}")
+        super().__init__(_diagnostic_text("borrow check failed", self.errors))
 
 
 class TypeCheckError(Exception):
@@ -54,8 +116,7 @@ class TypeCheckError(Exception):
 
     def __init__(self, errors: List[BorrowError]):
         self.errors = list(errors)
-        summary = "; ".join(str(e) for e in self.errors) or "type check failed"
-        super().__init__(f"type check failed: {summary}")
+        super().__init__(_diagnostic_text("type check failed", self.errors))
 
 
 @dataclass

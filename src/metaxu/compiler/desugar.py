@@ -194,7 +194,29 @@ def is_reserved_name(name: str) -> bool:
 
 
 class CoherenceError(Exception):
-    """Two distinct implement blocks define the same (trait, type, method)."""
+    """Two distinct implement blocks define the same (trait, type, method).
+
+    `location` is the source position of the offending method (None when the
+    node carries none); when known, the message carries the standard
+    `file:line:column` prefix and an excerpt with a caret.
+    """
+
+    def __init__(self, message: str, location: Any = None):
+        self.location = location
+        from metaxu.errors import format_location, source_excerpt
+        if location is not None:
+            message = f"{format_location(location)}: {message}"
+            excerpt = source_excerpt(location)
+            if excerpt:
+                message = f"{message}\n{excerpt}"
+        super().__init__(message)
+
+
+def node_location(node: Any) -> Any:
+    """The parser-attached SourceLocation of `node`, when it has one."""
+    from metaxu.errors import SourceLocation
+    loc = getattr(node, "location", None)
+    return loc if isinstance(loc, SourceLocation) and loc.line else None
 IMPL_PREFIX = f"__impl{IMPL_SEP}"
 
 
@@ -320,14 +342,16 @@ class TraitImplDesugarPass(DesugarPass):
                     raise CoherenceError(
                         f"Conflicting implementations: method {method!r} of "
                         f"trait '{trait_name}' for type '{type_name}' is "
-                        f"defined twice in the same implement block")
+                        f"defined twice in the same implement block",
+                        location=node_location(m) or node_location(impl))
                 # Duplicate across distinct blocks.
                 owner = self._seen_methods.setdefault(key, id(impl))
                 if owner != id(impl):
                     raise CoherenceError(
                         f"Conflicting implementations: method {method!r} of "
                         f"trait '{trait_name}' for type '{type_name}' is "
-                        f"defined by more than one implement block")
+                        f"defined by more than one implement block",
+                        location=node_location(m) or node_location(impl))
                 out.append(fn)
         self._expanded[id(impl)] = out
         return out

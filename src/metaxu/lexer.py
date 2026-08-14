@@ -10,6 +10,12 @@ class Lexer:
     # A string containing ignored characters (spaces, tabs, carriage returns)
     t_ignore = ' \t\r'
 
+    #: Token most recently handed to the parser (class-level default so the
+    #: lineno/lexpos properties are safe to read during lex.lex() setup,
+    #: which walks dir(self) before __init__ has run).
+    current_token = None
+    line_starts = [0]
+
     # Keywords
     reserved = {
         'if': 'IF',
@@ -138,21 +144,25 @@ class Lexer:
     # before NUMBER so that "3.14" lexes as a single float.
     def t_FLOAT(self, t):
         r'\d+\.\d+|\.\d+'
+        t.endlexpos = t.lexpos + len(t.value)
         t.value = float(t.value)
         return t
 
     def t_NUMBER(self, t):
         r'\d+'
+        t.endlexpos = t.lexpos + len(t.value)
         t.value = int(t.value)
         return t
 
     def t_FSTRING(self, t):
         r'f"[^"]*"'
+        t.endlexpos = t.lexpos + len(t.value)
         t.value = (t.value[2:-1], 'string')  # Tuple with (value, type)
         return t
 
     def t_STRING(self, t):
         r'"[^"]*"'
+        t.endlexpos = t.lexpos + len(t.value)
         t.value = (t.value[1:-1], 'string')  # Tuple with (value, type)
         return t
 
@@ -313,11 +323,15 @@ class Lexer:
         self._tokens = []
         self._index = 0
         self.source_file = "<unknown>"
+        self.source = ""
+        self.current_token = None
 
     def input(self, data):
         self.lexer.lineno = 1
         self.lexer.input(data)
+        self.source = data
         self.line_starts = [0]  # Reset line starts
+        self.current_token = None
         toks = []
         while True:
             tok = self.lexer.token()
@@ -325,6 +339,15 @@ class Lexer:
                 break
             line_start = self.line_starts[min(tok.lineno - 1, len(self.line_starts) - 1)]
             tok.column = tok.lexpos - line_start + 1  # 1-based column
+            # End offset (exclusive) of the token's raw text.  PLY's
+            # `tracking=True` reduce path copies `endlexpos` from the LAST
+            # symbol of a production onto the nonterminal, so setting it here
+            # is what makes production end positions point PAST the final
+            # token instead of at its first character.  Function rules that
+            # rewrite t.value (numbers, strings) set it themselves above.
+            if not hasattr(tok, 'endlexpos'):
+                tok.endlexpos = tok.lexpos + (
+                    len(tok.value) if isinstance(tok.value, str) else 1)
             toks.append(tok)
         self._tokens = self._transform(toks)
         self._index = 0
@@ -336,3 +359,19 @@ class Lexer:
         self._index += 1
         self.current_token = tok
         return tok
+
+    # PLY's tracking-enabled reduce path reads `lexer.lineno` / `lexer.lexpos`
+    # for EMPTY productions (there is no first symbol to copy a position
+    # from).  This wrapper hands PLY a pre-tokenized stream, so the inner
+    # lex object has already run to end-of-input and its own lineno/lexpos
+    # are stale; report the position of the token most recently handed to
+    # the parser instead, which is the empty production's insertion point.
+    @property
+    def lineno(self) -> int:
+        tok = self.current_token
+        return getattr(tok, 'lineno', 1) if tok is not None else 1
+
+    @property
+    def lexpos(self) -> int:
+        tok = self.current_token
+        return getattr(tok, 'lexpos', 0) if tok is not None else 0

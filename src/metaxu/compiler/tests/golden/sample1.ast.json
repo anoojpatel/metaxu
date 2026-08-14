@@ -3,8 +3,12 @@
   "kind": "Fn",
   "node_id": 1,
   "span": {
+    "column": 0,
     "end": 0,
+    "end_column": 0,
+    "end_line": 0,
     "file": "<mem>",
+    "line": 0,
     "start": 0
   },
   "value": null

@@ -8,9 +8,57 @@ import metaxu.metaxu_ast as fast
 
 @dataclass(frozen=True, slots=True)
 class Span:
+    """Source range of a frozen AST node.
+
+    Position semantics (unambiguous, and the same everywhere in the
+    compiler):
+
+      start / end   0-based CHARACTER OFFSETS into the source text of
+                    `file`, half-open: `source[start:end]` is the node's
+                    text.  0/0 means "position unknown".
+      line / column 1-based line and column of `start` — the human-readable
+                    form printed in diagnostics as `file:line:column`.
+                    0 means "unknown".
+      end_line /    1-based line and column of `end`, i.e. just past the
+      end_column    node's last character (0 when unknown).
+
+    Before source locations were attached at parse time, `start` held a
+    column number; it is an offset now, and `line`/`column` are the fields
+    to print.  Use `Span.text()` for the `file:line:column` rendering.
+    """
     file: str
     start: int
     end: int
+    line: int = 0
+    column: int = 0
+    end_line: int = 0
+    end_column: int = 0
+
+    def text(self, fallback_file: str | None = None) -> str:
+        """`file:line:column`, degrading to just the file when the line is
+        unknown and to `fallback_file` when even the file is unknown."""
+        file = self.file
+        if not file or file == "<unknown>":
+            file = fallback_file or file or "<unknown>"
+        return f"{file}:{self.line}:{self.column}" if self.line else str(file)
+
+    def location(self, fallback_file: str | None = None):
+        """This span as an errors.SourceLocation (None when position-less)."""
+        from metaxu.errors import SourceLocation
+        if not self.line:
+            return None
+        file = self.file
+        if not file or file == "<unknown>":
+            file = fallback_file or file
+        return SourceLocation(
+            file=file,
+            line=self.line,
+            column=self.column,
+            end_line=self.end_line or None,
+            end_column=self.end_column or None,
+            offset=self.start,
+            end_offset=self.end,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,6 +86,10 @@ class AstNode:
                 "file": self.span.file,
                 "start": self.span.start,
                 "end": self.span.end,
+                "line": self.span.line,
+                "column": self.span.column,
+                "end_line": self.span.end_line,
+                "end_column": self.span.end_column,
             },
             "value": self.value,
             "children": [c.to_json_obj() for c in self.children],
@@ -50,15 +102,32 @@ def dump_ast_json(root: AstNode) -> str:
 
 
 def _span_of(node: Any) -> Span:
+    """Freeze the parser's SourceLocation for `node` into a Span.
+
+    The parser attaches a SourceLocation (file, 1-based line/column, and the
+    0-based character offsets of the node's text) to every node it builds;
+    see parser.Parser._attach_location.  Nodes synthesized after parsing
+    (desugaring, module resolution) may have none — those keep a file-only
+    span with zeroed positions, which renders as just the file name.
+    """
     loc = getattr(node, 'location', None)
     if loc is None:
         # Fallbacks from parser where file and positions may be missing
         return Span(file=getattr(node, 'source_file', '<unknown>'), start=0, end=0)
-    # Location may be a simple object with file/line/column; normalize to a range
-    file = getattr(loc, 'file', getattr(node, 'source_file', '<unknown>'))
-    start = getattr(loc, 'column', 0) or 0
-    end = start
-    return Span(file=file, start=start, end=end)
+    file = getattr(loc, 'file', None) or getattr(node, 'source_file', '<unknown>')
+    line = getattr(loc, 'line', 0) or 0
+    column = getattr(loc, 'column', 0) or 0
+    start = getattr(loc, 'offset', None)
+    end = getattr(loc, 'end_offset', None)
+    return Span(
+        file=file,
+        start=start if isinstance(start, int) else 0,
+        end=end if isinstance(end, int) else (start if isinstance(start, int) else 0),
+        line=line,
+        column=column,
+        end_line=getattr(loc, 'end_line', 0) or 0,
+        end_column=getattr(loc, 'end_column', 0) or 0,
+    )
 
 
 def _pattern_descriptor(p: Any) -> dict[str, Any]:
@@ -339,15 +408,98 @@ def _value_of(node: Any) -> Any | None:
         if type_args:
             payload["type_args"] = [_type_display(a) for a in type_args]
         return payload
+    # Borrow/move payloads name the borrowed variable. The parser always
+    # supplies a name string here (`&x`, `move(x)`); _operand_name also
+    # accepts a Variable node so a directly-constructed node freezes to the
+    # same payload instead of smuggling an AST node into the JSON.
     if isinstance(node, fast.BorrowShared):
-        return {"variable": getattr(node, "variable", None)}
+        return {"variable": _operand_name(getattr(node, "variable", None))}
     if isinstance(node, fast.BorrowUnique):
-        return {"variable": getattr(node, "variable", None)}
+        return {"variable": _operand_name(getattr(node, "variable", None))}
     if isinstance(node, fast.Move):
-        return {"variable": getattr(node, "variable", None)}
+        return {"variable": _operand_name(getattr(node, "variable", None))}
     if isinstance(node, fast.ExclaveExpression):
-        return {"expression": getattr(node, "expression", None)}
+        # `exclave e`: the payload names the exclaved VARIABLE when there is
+        # one (the borrow checker's check_exclave takes a name), and never
+        # the operand node itself — the operand is already a frozen child,
+        # and putting an AST node in the payload made `dump_ast_json` die
+        # with "Object of type Literal is not JSON serializable".
+        return {"expression": _operand_name(getattr(node, "expression", None))}
+    if isinstance(node, fast.Resume):
+        return {"value": _operand_name(getattr(node, "value", None))}
     return None
+
+
+def _operand_name(operand: Any) -> str | None:
+    """Variable name of a sub-expression used as a payload key, else None.
+
+    Payloads must stay JSON-serializable (the frozen AST is dumped for the
+    golden tests and for tooling), so a sub-expression is summarized by its
+    variable name when it is a plain name and dropped otherwise; the operand
+    itself is always reachable as a frozen child.
+    """
+    if operand is None:
+        return None
+    if isinstance(operand, str):
+        return operand
+    if isinstance(operand, fast.Variable):
+        name = getattr(operand, "name", None)
+        return name if isinstance(name, str) else None
+    return None
+
+
+#: Types allowed inside a frozen-AST payload (everything json.dumps handles).
+_JSON_SCALARS = (str, int, float, bool, type(None))
+
+
+def _first_unserializable(value: Any, depth: int = 0) -> Any | None:
+    """First value inside `value` that JSON cannot represent, else None."""
+    if depth > 12:
+        return value
+    if isinstance(value, _JSON_SCALARS):
+        return None
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            bad = _first_unserializable(item, depth + 1)
+            if bad is not None:
+                return bad
+        return None
+    if isinstance(value, dict):
+        for k, v in value.items():
+            if not isinstance(k, str):
+                return k
+            bad = _first_unserializable(v, depth + 1)
+            if bad is not None:
+                return bad
+        return None
+    return value
+
+
+def _checked_value_of(node: Any) -> Any | None:
+    """`_value_of` plus the invariant that payloads are JSON-serializable.
+
+    A payload holding an AST node is a compiler bug in `_value_of`, and it
+    used to surface far away as a bare `TypeError: Object of type Literal is
+    not JSON serializable` from `json.dumps`.  Catch it here, where the node
+    (and therefore the source location) is still in hand, and report it as a
+    located compile error instead of a crash.
+    """
+    payload = _value_of(node)
+    bad = _first_unserializable(payload)
+    if bad is None:
+        return payload
+    from metaxu.errors import CompileError
+    span = _span_of(node)
+    raise CompileError(
+        message=(f"frozen AST payload for {node.__class__.__name__} holds a "
+                 f"{type(bad).__name__} value that is not serializable "
+                 f"({bad!r})"),
+        error_type="FrozenAstError",
+        location=span.location(),
+        notes=["this is a compiler bug in mutaxu_ast._value_of: payloads must "
+               "be plain JSON values; sub-expressions belong in the node's "
+               "children, not in its payload"],
+    )
 
 
 def _type_display(t: Any) -> str | None:
@@ -534,7 +686,8 @@ def build_frozen_ast_with_map(parsed_root: Any) -> Tuple[AstNode, Dict[int, Any]
                     if is_ast_node(c):
                         kids.append(go(c))
         span = _span_of(n)
-        return AstNode(node_id=nid, kind=kind, children=tuple(kids), span=span, value=_value_of(n))
+        return AstNode(node_id=nid, kind=kind, children=tuple(kids), span=span,
+                       value=_checked_value_of(n))
 
     root = go(parsed_root)
     return root, id_map

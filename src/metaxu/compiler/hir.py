@@ -13,6 +13,7 @@ from metaxu.extern_ast import (ExternBlock, ExternFunctionDeclaration,
                                ExternTypeDeclaration)
 
 from .desugar import IMPL_SEP, parse_impl_method_name, type_base_name
+from metaxu.errors import SourceLocation, format_location, source_excerpt
 
 # Methods that are dispatched as interpreter builtins with the receiver as
 # first argument (`x.to_string()` -> __builtin$to_string(x); see
@@ -359,7 +360,17 @@ class HIRLoweringError(NotImplementedError):
     Subclasses NotImplementedError so the raises that already existed in this
     module keep their exception class. Every raise is LOUD by design: HIR
     lowering must never quietly drop a construct.
+
+    `location` is the source position of the offending construct (None when
+    the node carries none); when it is known, the message gained the
+    standard excerpt-with-caret rendering below, so a caller printing the
+    exception shows the offending line.
     """
+
+    def __init__(self, message: str, location: SourceLocation | None = None):
+        self.location = location
+        excerpt = source_excerpt(location) if location is not None else None
+        super().__init__(f"{message}\n{excerpt}" if excerpt else message)
 
 
 class UnsupportedConstruct(HIRLoweringError):
@@ -571,7 +582,8 @@ class HIRBuilder:
                 raise UnsupportedConstruct(
                     f"comptime fn {getattr(orig, 'name', '?')!r} at "
                     f"{self._span_text(n.span, orig)} is not supported: "
-                    "compile-time evaluation is not implemented")
+                    "compile-time evaluation is not implemented",
+                    location=self._loc(n.span, orig))
             if isinstance(orig, fast.FunctionDeclaration):
                 # Determine return type from side tables for this node or fallback
                 ret = self.t.apply_tyenv(self.t.types.get(n.node_id, "Unit"))  # type: ignore[index]
@@ -848,7 +860,8 @@ class HIRBuilder:
             if not parts:
                 raise HIRCompilerBug(
                     f"QualifiedName with no parts at "
-                    f"{self._span_text(frozen_ctx.span)}")
+                    f"{self._span_text(frozen_ctx.span)}",
+                    location=self._loc(frozen_ctx.span, orig))
             ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, "Unknown"))
             # `Enum.Variant` names a nullary variant, it is not a field read of
             # a variable called `Enum` (which is what the FieldGet chain below
@@ -1677,7 +1690,8 @@ class HIRBuilder:
                 raise UnsupportedConstruct(
                     f"handle block at {self._span_text(frozen_ctx.span)} handles "
                     f"operations of more than one effect ({', '.join(sorted(eff_names))}); "
-                    "a handler frame names a single effect — use one `handle` per effect")
+                    "a handler frame names a single effect — use one `handle` per effect",
+                    location=self._loc(frozen_ctx.span, orig))
             # No qualified prefix on any arm: leave the effect unnamed, which
             # the runtime treats as "match by operation name alone".
             eff_name = next(iter(eff_names)) if eff_names else ""
@@ -1792,7 +1806,8 @@ class HIRBuilder:
                 raise UnsupportedConstruct(
                     f"unary operator {op_sym!r} at "
                     f"{self._span_text(frozen_ctx.span)} is not supported "
-                    "(only `-` and `!`/`not` lower)")
+                    "(only `-` and `!`/`not` lower)",
+                    location=self._loc(frozen_ctx.span, orig))
             # Unary operators are compiler-synthesized builtin calls:
             # marked so a module function named `neg`/`not` cannot capture
             # `-x` / `!x`.
@@ -1947,24 +1962,54 @@ class HIRBuilder:
     # The loud fallback
     # ------------------------------------------------------------------
 
-    def _span_text(self, span: Any, orig: Any = None) -> str:
-        """Human-readable source location for a diagnostic.
+    def _loc(self, span: Any = None, orig: Any = None) -> SourceLocation | None:
+        """SourceLocation for a diagnostic about `orig` / frozen `span`.
 
-        Prefers the ORIGINAL parsed node's SourceLocation ("file:line:column")
-        when the parser attached one; the frozen Span records only a file and a
-        column, and most inner nodes carry neither, so the compilation unit's
-        own file name is the last resort. (Line-accurate spans on every node
-        are a parser-side gap, not something HIR can synthesize.)
+        Prefers the ORIGINAL parsed node's location (the parser attaches one
+        to every node it builds) and falls back to the frozen Span, which
+        carries the same information for nodes that survived freezing.
+        Nodes synthesized after parsing have neither; those report the
+        compilation unit's file with no line.
         """
         loc = getattr(orig, 'location', None)
-        if loc is not None and getattr(loc, 'line', None) is not None:
-            return (f"{getattr(loc, 'file', None) or self._root_file}:"
-                    f"{loc.line}:{getattr(loc, 'column', 0)}")
+        if isinstance(loc, SourceLocation) and loc.line:
+            if not loc.file or loc.file == "<unknown>":
+                return SourceLocation(file=self._root_file, line=loc.line,
+                                      column=loc.column, end_line=loc.end_line,
+                                      end_column=loc.end_column,
+                                      offset=loc.offset, end_offset=loc.end_offset)
+            return loc
+        if span is not None and hasattr(span, 'location'):
+            resolved = span.location(self._root_file)
+            if resolved is not None:
+                return resolved
+        return None
+
+    def _span_text(self, span: Any, orig: Any = None) -> str:
+        """Human-readable `file:line:column` for a diagnostic.
+
+        Degrades to the compilation unit's file name for nodes that have no
+        location (everything synthesized after parsing).
+        """
+        loc = self._loc(span, orig)
+        if loc is not None:
+            return format_location(loc, fallback=self._root_file)
         fpath = getattr(span, 'file', None)
         if not fpath or fpath == "<unknown>":
             fpath = self._root_file
-        col = getattr(span, 'start', None)
-        return f"{fpath}:{col}" if col else str(fpath)
+        return str(fpath)
+
+    def _pat_where(self, p: Any) -> str:
+        """`file:line:column` of a pattern node for a diagnostic.
+
+        Patterns are converted without a frozen context (they are plain
+        expression nodes hanging off a match arm), so the location comes
+        straight off the parsed node; the compilation-unit file is the
+        fallback for synthesized patterns.
+        """
+        loc = self._loc(None, p)
+        return format_location(loc, fallback=self._root_file) if loc is not None \
+            else self._root_file
 
     def _unlowerable(self, orig: Any, frozen_ctx: mast.AstNode) -> HExpr:
         """Raise for an AST node expression lowering does not handle.
@@ -1975,25 +2020,28 @@ class HIRBuilder:
         has triaged (also a compiler bug — the table is the checklist).
         """
         cls = type(orig).__name__
-        where = self._span_text(getattr(frozen_ctx, 'span', None), orig)
+        span = getattr(frozen_ctx, 'span', None)
+        where = self._span_text(span, orig)
+        loc = self._loc(span, orig)
         entry = AST_NODE_TRIAGE.get(cls)
         if entry is None:
             raise HIRCompilerBug(
                 f"{cls} at {where} is not in AST_NODE_TRIAGE: HIR lowering "
                 "does not know whether it is an expression, and refuses to "
-                "guess. Add it to the table in hir.py (see test_hir_coverage).")
+                "guess. Add it to the table in hir.py (see test_hir_coverage).",
+                location=loc)
         bucket, reason = entry
         if bucket == UNSUPPORTED:
             raise UnsupportedConstruct(
-                f"{cls} at {where} is not supported: {reason}")
+                f"{cls} at {where} is not supported: {reason}", location=loc)
         if bucket == NOT_AN_EXPRESSION:
             raise HIRCompilerBug(
                 f"{cls} at {where} reached HIR expression lowering, but it is "
                 f"not an expression ({reason}) — an earlier pass should have "
-                "consumed it")
+                "consumed it", location=loc)
         raise HIRCompilerBug(
             f"{cls} at {where} is registered as lowered ({reason}) but fell "
-            "through to the fallback in _from_orig_expr")
+            "through to the fallback in _from_orig_expr", location=loc)
 
     def _enum_variant_of(self, base: Any, fields: Any) -> tuple[str, str] | None:
         """(enum, variant) if `base.fields` spells a nullary variant, else None.
@@ -2047,7 +2095,8 @@ class HIRBuilder:
             raise UnsupportedConstruct(
                 f"handle block at {self._span_text(frozen_ctx.span)}: arm "
                 f"{type(pat_node).__name__} is not an operation pattern; write "
-                "`perform Effect.op(params) => body`")
+                "`perform Effect.op(params) => body`",
+                location=self._loc(frozen_ctx.span, pat_node))
         effect, _, op_name = raw_name.rpartition(".")
         params: list[str] = []
         for a in args:
@@ -2059,7 +2108,8 @@ class HIRBuilder:
                 raise UnsupportedConstruct(
                     f"handle block at {self._span_text(frozen_ctx.span)}: arm "
                     f"{op_name!r} binds a {type(a).__name__} where a parameter "
-                    "name is required — handler arms bind plain names")
+                    "name is required — handler arms bind plain names",
+                    location=self._loc(frozen_ctx.span, a))
         # Zero-arg ops still need a slot: the MIR handler sub-function takes
         # (params..., __k), and the interpreter tolerates fewer args than
         # params. Mirrors the parser's HandleCase default.
@@ -2072,9 +2122,11 @@ class HIRBuilder:
         if he is not None:
             return he
         cls = type(orig).__name__
-        where = self._span_text(getattr(frozen_ctx, 'span', None), orig)
+        span = getattr(frozen_ctx, 'span', None)
+        where = self._span_text(span, orig)
         raise HIRCompilerBug(
-            f"{what} at {where} is missing ({cls}) — refusing to drop it")
+            f"{what} at {where} is missing ({cls}) — refusing to drop it",
+            location=self._loc(span, orig))
 
     # ------------------------------------------------------------------
     # Vector literal / comprehension helpers
@@ -2165,8 +2217,9 @@ class HIRBuilder:
         targets = tuple(str(t) for t in (getattr(comp, 'targets', []) or []))
         if not targets:
             raise HIRCompilerBug(
-                f"comprehension at {self._span_text(frozen_ctx.span)} has no "
-                "loop target — refusing to drop it")
+                f"comprehension at {self._span_text(frozen_ctx.span, comp)} has no "
+                "loop target — refusing to drop it",
+                location=self._loc(frozen_ctx.span, comp))
         body_node = getattr(comp, 'expression', None)
         body_he = self._require(
             self._from_orig_expr(body_node, ctx_for(body_node)), comp,
@@ -2316,9 +2369,9 @@ class HIRBuilder:
                 if isinstance(v, (int, float)) and not isinstance(v, bool):
                     return HPattern(kind="literal", value=-v)
             raise UnsupportedConstruct(
-                f"[{self._root_file}] unsupported pattern: `{getattr(p, 'operator', '?')}"
+                f"[{self._pat_where(p)}] unsupported pattern: `{getattr(p, 'operator', '?')}"
                 f"{type(operand).__name__}` — only a negative numeric literal "
-                "(`-1`) is a valid unary pattern")
+                "(`-1`) is a valid unary pattern", location=self._loc(None, p))
         if isinstance(p, fast.NoneExpression):
             return HPattern(kind="ctor", name="None",
                             enum_name=self._variant_to_enum.get("None"), subpatterns=())
@@ -2351,8 +2404,8 @@ class HIRBuilder:
                                 enum_name=self._variant_to_enum.get(callee, default_enum),
                                 subpatterns=subs)
             raise UnsupportedConstruct(
-                f"[{self._root_file}] unsupported pattern: `{callee}(...)` is not a known enum "
-                "variant, and a call is not a pattern")
+                f"[{self._pat_where(p)}] unsupported pattern: `{callee}(...)` is not a known enum "
+                "variant, and a call is not a pattern", location=self._loc(None, p))
         # `Enum.Variant(sub, ...)` and the nullary `Enum.Variant`.
         if isinstance(p, fast.QualifiedFunctionCall):
             parts = list(getattr(p, 'parts', []) or [])
@@ -2362,9 +2415,9 @@ class HIRBuilder:
                 return HPattern(kind="ctor", name=str(parts[-1]),
                                 enum_name=str(parts[-2]), subpatterns=subs)
             raise UnsupportedConstruct(
-                f"[{self._root_file}] unsupported pattern: a qualified call "
+                f"[{self._pat_where(p)}] unsupported pattern: a qualified call "
                 "pattern needs at least `Enum.Variant`, got "
-                f"{'.'.join(str(x) for x in parts)!r}")
+                f"{'.'.join(str(x) for x in parts)!r}", location=self._loc(None, p))
         # `Color.Red => ...` parses as a FieldAccess. It used to fall into the
         # wildcard fallback, so the arm matched EVERYTHING and every later arm
         # became dead code.
@@ -2374,8 +2427,9 @@ class HIRBuilder:
             if ctor is not None:
                 return HPattern(kind="ctor", name=ctor[1], enum_name=ctor[0])
             raise UnsupportedConstruct(
-                f"[{self._root_file}] unsupported pattern: `{p}` is not a known enum variant, and "
-                "matching against a field's value is not implemented")
+                f"[{self._pat_where(p)}] unsupported pattern: `{p}` is not a known enum variant, and "
+                "matching against a field's value is not implemented",
+                location=self._loc(None, p))
         if isinstance(p, fast.QualifiedName):
             parts = [str(x) for x in (getattr(p, 'parts', []) or [])]
             # `Color.Red => ...` is a nullary variant pattern; it used to fall
@@ -2393,8 +2447,8 @@ class HIRBuilder:
                                     enum_name=self._variant_to_enum[name])
                 return HPattern(kind="var", name=name)
             raise UnsupportedConstruct(
-                f"[{self._root_file}] unsupported pattern: `{'.'.join(parts)}` is not a known enum "
-                "variant, and a dotted name is not a pattern")
+                f"[{self._pat_where(p)}] unsupported pattern: `{'.'.join(parts)}` is not a known enum "
+                "variant, and a dotted name is not a pattern", location=self._loc(None, p))
         # Unknown pattern node. Degrading to a wildcard here made the arm match
         # EVERYTHING — the seam that turned examples/02's
         # `match list { [] -> ..., [x, ...xs] -> ... }` into "always return the
@@ -2403,11 +2457,13 @@ class HIRBuilder:
         entry = PATTERN_TRIAGE.get(cls_name)
         if entry is not None and entry[0] == UNSUPPORTED:
             raise UnsupportedConstruct(
-                f"[{self._root_file}] unsupported pattern {cls_name}: {entry[1]}")
+                f"[{self._pat_where(p)}] unsupported pattern {cls_name}: {entry[1]}",
+                location=self._loc(None, p))
         raise HIRCompilerBug(
-            f"[{self._root_file}] {cls_name} reached pattern conversion and is "
+            f"[{self._pat_where(p)}] {cls_name} reached pattern conversion and is "
             "not in PATTERN_TRIAGE: refusing to degrade it to a match-anything "
-            "wildcard. Add it to the table in hir.py (see test_hir_coverage).")
+            "wildcard. Add it to the table in hir.py (see test_hir_coverage).",
+            location=self._loc(None, p))
 
     # Plain-string mode tokens as produced by the parser's binding_prefix
     # (`let @global x = ...` builds ModeAnnotation('global'): mode_type is the
