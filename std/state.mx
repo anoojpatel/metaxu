@@ -1,0 +1,38 @@
+# std.state — mutable state as an algebraic effect.
+#
+# Design lineage: the State idiom every effect system demonstrates
+# (Ante folds it into user code; Metaxu's example 02 sketches it).
+# `get`/`put` are effect operations; `with_state` interprets them over a
+# handler-local cell, so stateful code stays pure at its interface and
+# tests can install their own handlers.
+#
+# Payloads are unannotated (like std.throw): ints, strings, structs all
+# work through the same ops.
+
+export { State, with_state, modify };
+
+effect State {
+    fn get() -> int
+    fn put(value: int) -> ()
+}
+
+# Run `f` with an initial state; returns f's result. Deep handler: every
+# get/put in f (including in called functions) routes here. The state
+# lives in a mutable capture cell shared by both handler arms.
+fn with_state(init: int, f: fn() -> int) -> int {
+    let @mut current = init;
+    handle State with {
+        get() -> resume(current),
+        put(value) -> {
+            current = value;
+            resume(())
+        }
+    } in {
+        f()
+    }
+}
+
+# Apply a function to the current state and store the result.
+fn modify(f: fn(int) -> int) -> () {
+    perform State.put(f(perform State.get()))
+}
