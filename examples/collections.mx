@@ -1,16 +1,19 @@
 # Collections module
-struct List<T> {
+# `N` is the list's fixed capacity: a const generic parameter, so it has to be
+# declared (`const N: int`) everywhere the type is written, exactly like the
+# `implement<T, const N: int>` blocks in 06_vector_operations.mx.
+struct List<T, const N: int> {
     data: vector[T,N]
     len: Int
 }
 
 
 
-fn empty<T>() -> List[T] {
-    List { data: vector[T,N], len: 0 }
+fn empty<T, const N: int>() -> List[T,N] {
+    List { data: vector[T,N](), len: 0 }
 }
 
-fn push<T>(list: @mut List[T], item: T) {
+fn push<T, const N: int>(list: @mut List[T,N], item: T) {
     list.data[list.len] = item
     list.len = list.len + 1
 }

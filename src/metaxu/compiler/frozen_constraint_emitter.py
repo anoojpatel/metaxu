@@ -681,6 +681,59 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
                 arg,
             )
 
+    def _check_struct_field_type_params(node: Any, payload: dict) -> None:
+        """Reject field types that use a type parameter the struct never declares.
+
+        Only the SIZE position of a `vector[T, N]` field type is checked: it is
+        the one place where an unknown bare name cannot be a foreign type, a
+        type alias or an imported name — a vector size must be an integer
+        literal or a const generic parameter (`struct S<T, const N: int>`), so
+        an undeclared name there is a definite error, not a name the checker
+        merely does not know about.  Element positions stay permissive for the
+        same reason the rest of this file does.
+
+        This has to be loud HERE because nothing downstream can recover: the
+        `vector[T, N]` written in value position for such a field has no
+        expression lowering, so HIR used to drop the whole field assignment,
+        MIR's alloc_struct lost the field, and native codegen then reported the
+        misleading "struct 'List' has no field 'data'".
+        """
+        declared = {p for p in payload.get("type_params", []) or [] if isinstance(p, str)}
+        struct_name = payload.get("name")
+
+        def bad_sizes(parsed: tuple[str, list | None]) -> list[str]:
+            base, args = parsed
+            if not args:
+                return []
+            out: list[str] = []
+            for a in args:
+                out.extend(bad_sizes(a))
+            # Only the two-argument spelling `vector[T, N]` has a size
+            # position to check; anything else stays permissive.
+            if base == "vector" and len(args) == 2:
+                size_base, size_args = args[-1]
+                if (size_args is None and size_base not in declared
+                        and not size_base.lstrip("-").isdigit()):
+                    out.append(size_base)
+            return out
+
+        for f in payload.get("fields", []) or []:
+            if not isinstance(f, dict):
+                continue
+            parsed = _parse_display(f.get("type"))
+            if parsed is None:
+                continue
+            for missing in bad_sizes(parsed):
+                hint = ", ".join(sorted(declared | {f"const {missing}: int"}))
+                _type_error(
+                    f"undeclared type parameter {missing!r} in the type "
+                    f"{f.get('type')!r} of field {f.get('name')!r} of struct "
+                    f"{struct_name!r}: a vector size must be an integer literal "
+                    f"or a declared const generic parameter "
+                    f"(declare it as `struct {struct_name}<{hint}>`)",
+                    node, kind="type-undeclared-param",
+                )
+
     def _check_struct_field_types(node: Any, struct_name: str) -> None:
         """Check field values against the struct's declared field types.
 
@@ -1548,6 +1601,7 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
             name = payload_name(node)
             if isinstance(name, str):
                 struct_defs[name] = payload_dict(node)
+                _check_struct_field_type_params(node, payload_dict(node))
         if kind == "EnumDefinition":
             name = payload_name(node)
             if isinstance(name, str):
