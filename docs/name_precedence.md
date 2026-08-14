@@ -69,6 +69,26 @@ syntax can never be rebound:
 | `print(...)` (a grammar production; `print` is a lexer keyword) | `__builtin$print` |
 | `-x` / `!x` | `__builtin$neg` / `__builtin$not` |
 | `for x in c` (the desugared bound) | `__builtin$len` |
+| `f"…{e}…"` (each interpolated segment) | `__builtin$to_string` |
+
+The f-string row was the last hole: `parser._desugar_fstring` synthesized a
+BARE `to_string(expr)` call, so a program declaring `fn to_string` changed
+the output of every `f"{x}"` in the file.  The user function is of course
+still directly callable as `to_string(x)` — only the *syntax* is protected.
+
+Every OTHER call the front end synthesizes is already unrebindable, either
+because it carries this marker or because its name lives in the reserved
+`__` namespace of section 4 (`__index_get`/`__index_set`/`__index_store`,
+`__slice_get`, `__range`, `__zip`, `__cast`, `__vec_*`, `__list_lit`,
+`__list_concat`, `__trait$`/`__static$`/`__effect_runtime$`).  The two
+remaining literal-name constructions in the desugar passes take a *user*
+name by construction (`desugar.GenericCallDesugarPass` re-spells
+`f[T](x)` as a call of the user's own `f`; the trait-dictionary pass builds
+an indirect call whose callee is an expression), so they are exempt rather
+than unmarked.  This is enforced by a scan, not by review:
+`test_round6_regressions.test_no_synthesized_call_targets_an_unmarked_builtin_name`
+parses the front-end sources and fails on any synthesized callee that is a
+bare `BUILTIN_FUNCTION_NAMES` literal.
 
 ## 3. Module scope — unqualified builtin calls bind lexically
 
@@ -88,6 +108,31 @@ excluded.  The result is lexical scoping for builtins: each module's bare
 
 The shadowable builtin surface is `hir.BUILTIN_FUNCTION_NAMES`, pinned
 equal to `mir_interp._register_builtins` by a test.
+
+### "this module's scope" includes NESTED `fn` declarations
+
+`HIRBuilder.build`'s hoisting walk lifts **every `FunctionDeclaration` in
+the tree**, not just top-level ones, into a real MIR function under its
+bare name.  A `fn len` declared inside another function's body therefore
+occupies the flat namespace exactly like a top-level one — so the resolver
+counts it as a name this module provides, and it shadows the builtin.
+
+`ModuleInfo.nested_functions` (collected by
+`ModuleResolver._collect_nested_functions`, which mirrors that hoisting
+walk) is what makes the resolver see them.  Without it, only *top-level*
+`fn`s were known, so a nested `fn len` had its own call sites rewritten to
+`__builtin$len` — and because single-file programs with no imports skip
+module resolution entirely (`_has_module_constructs`), the identical source
+returned `99` with no import and died with
+`len: unsupported receiver type 'Int'` as soon as any `import` was added.
+Whether a file imports something must not change what its own names mean.
+
+Nested functions are *not* module symbols: they are never exported, never
+renamed to a dotted path, and take no part in visibility or global-collision
+checks.  They only make the resolver leave their call sites alone.  Impl and
+trait methods, and effect-op defaults, are excluded from the collection —
+the desugar pass mangles them to `__impl$Trait$Type$m` /
+`__effect_default$E$op`, so they never occupy a bare name.
 
 ## 4. Reserved names
 
