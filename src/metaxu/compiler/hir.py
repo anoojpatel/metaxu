@@ -1063,8 +1063,21 @@ class HIRBuilder:
                 fname = getattr(sf, 'name', None)
                 fval_node = getattr(sf, 'value', None)
                 fval = self._from_orig_expr(fval_node, frozen_ctx)
-                if fname and fval is not None:
-                    field_exprs.append((str(fname), fval))
+                if not fname:
+                    raise NotImplementedError(
+                        f"struct instantiation of {sname}: field assignment "
+                        f"without a field name — refusing to drop it")
+                if fval is None:
+                    # Dropping the field here made the struct silently LOSE it:
+                    # MIR's alloc_struct only lists the fields that survive, so
+                    # both engines then built a short struct and native codegen
+                    # blamed the *declaration* ("struct 'List' has no field
+                    # 'data'") for an un-lowerable initializer.
+                    raise NotImplementedError(
+                        f"struct instantiation of {sname}: could not lower the "
+                        f"value of field {str(fname)!r} "
+                        f"({type(fval_node).__name__}) — refusing to drop it")
+                field_exprs.append((str(fname), fval))
             ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, "Unknown"))
             return self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span,
                                   op="Struct", struct_name=sname,
@@ -1332,6 +1345,69 @@ class HIRBuilder:
         # or `vector[T, N](expr for x in iterable)` (comprehension).
         if isinstance(orig, fast.VectorLiteral):
             return self._convert_vector_literal(orig, frozen_ctx, ctx_for)
+
+        # ListLiteral: `[]`, `[a, b, c]` — a growable Vec, the same runtime
+        # object `Vec.new()` returns (fixed-size `vector[T, N]` is the literal
+        # above).  This node had NO lowering: every list literal silently
+        # vanished, which is how `Queue { items: [], capacity: 10 }` in
+        # examples/04_advanced_types.mx built a Queue with no `items` field.
+        if isinstance(orig, fast.ListLiteral):
+            ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, 'Unknown'))
+
+            def mk_call(callee: str, ops: tuple) -> HExpr:
+                return self._mk_hexpr(frozen_ctx.node_id, 'Expr', ty,
+                                      frozen_ctx.span, op='Call', callee=callee,
+                                      operands=ops)
+
+            # `[a, ...rest, b]` splits into segments: runs of ordinary
+            # elements become __list_lit calls, each spread contributes its
+            # own list, and the segments are joined by __list_concat (strict:
+            # a spread of a non-list is a runtime error, never a silent skip).
+            segments: list[HExpr] = []
+            run: list[HExpr] = []
+            saw_spread = False
+            for el in getattr(orig, 'elements', []) or []:
+                if isinstance(el, fast.SpreadElement):
+                    saw_spread = True
+                    inner = getattr(el, 'expression', None)
+                    he = self._from_orig_expr(inner, ctx_for(inner)) if inner is not None else None
+                    if he is None:
+                        raise NotImplementedError(
+                            "list literal: could not lower the spread element "
+                            f"...{type(inner).__name__} — refusing to drop it")
+                    if run:
+                        segments.append(mk_call('__list_lit', tuple(run)))
+                        run = []
+                    segments.append(he)
+                    continue
+                he = self._from_orig_expr(el, ctx_for(el))
+                if he is None:
+                    raise NotImplementedError(
+                        f"list literal: could not lower element "
+                        f"{type(el).__name__} — refusing to drop it")
+                run.append(he)
+            if run or not segments:
+                segments.append(mk_call('__list_lit', tuple(run)))
+            if not saw_spread:
+                return segments[0]
+            # A literal containing a spread always goes through __list_concat,
+            # even when it is the only segment: `[...xs]` is a fresh list, and
+            # Vec has identity semantics, so returning `xs` itself would alias.
+            return mk_call('__list_concat', tuple(segments))
+
+        # A bare `vector[T, N]` in VALUE position is a TYPE, not a value: the
+        # value forms all spell the call (`vector[T,N]()` zeros,
+        # `vector[T,N](a, b)` elements, `vector[T,N].filled(x)`, which are
+        # VectorLiteral / MethodCall nodes handled above).  This used to fall
+        # into the None fallback and vanish wherever it appeared.
+        if isinstance(orig, fast.VectorTypeExpression):
+            base = mast._type_display(getattr(orig, 'base_type', None)) or '?'
+            size = mast._type_display(getattr(orig, 'size', None)) or '?'
+            raise NotImplementedError(
+                f"vector[{base}, {size}] is a TYPE, not a value: write "
+                f"vector[{base}, {size}]() for a zero-initialized vector, "
+                f"vector[{base}, {size}](e1, ...) for one with elements, or "
+                f"vector[{base}, {size}].filled(e)")
 
         # LambdaExpression
         if isinstance(orig, fast.LambdaExpression):

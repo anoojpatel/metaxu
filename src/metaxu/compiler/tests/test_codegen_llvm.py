@@ -5129,3 +5129,50 @@ def test_effect_mapping_runtime_mapped_ops_demote_precisely():
     # their unlinkable primitive callees.
     assert re.search(r"@mx_main: placeholder", ir)
     assert re.search(r"@mx_main_lambda\d+: placeholder", ir)
+
+
+# ---------------------------------------------------------------------------
+# examples/collections.mx: the fixed-capacity List, natively
+# ---------------------------------------------------------------------------
+# The example's `push` used to demote with the misleading "struct 'List' has
+# no field 'data'": `struct List<T>` never declared the vector size `N`, and
+# the `vector[T,N]` written in value position was dropped by HIR, so
+# alloc_struct — the only thing codegen's struct table is built from — listed
+# `len` alone.  With `const N: int` declared and the value spelled
+# `vector[T,N](...)`, List is a two-field native struct and push emits.
+# (`len` is renamed `n` and `push` `push_item` only because the interpreter
+# resolves the BUILTIN `push` first; the lowering under test is identical.)
+
+_COLLECTIONS_PUSH_SRC = """
+struct List<T, const N: int> {
+    data: vector[T,N]
+    len: Int
+}
+
+fn push_item<T, const N: int>(list: @mut List[T,N], item: T) {
+    list.data[list.len] = item
+    list.len = list.len + 1
+}
+
+fn main() {
+    let @mut l = List { data: vector[int,4](0, 0, 0, 0), len: 0 }
+    push_item(l, 7)
+    push_item(l, 9)
+    print(l.data[0])
+    print(l.data[1])
+    print(l.len)
+}
+"""
+
+
+def test_collections_push_emits_with_both_fields():
+    ir = llvm_from_source(_COLLECTIONS_PUSH_SRC)
+    assert "%struct.List = type { ptr, i64 }  ; data, len" in ir
+    assert "define void @mx_push_item(" in ir
+    assert "has no field" not in ir
+    assert count_placeholders(ir) == 0
+
+
+@needs_clang
+def test_native_collections_push_differential(tmp_path):
+    assert_native_matches_interp(_COLLECTIONS_PUSH_SRC, tmp_path)

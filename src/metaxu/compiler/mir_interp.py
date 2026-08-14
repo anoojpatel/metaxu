@@ -1199,6 +1199,10 @@ class MirInterpreter:
         self._builtins["assert"] = _builtin_assert
         # --- Runtime library: Vec (growable, mutable; see MxVec) ------------
         self._builtins["Vec.new"] = lambda: MxVec()
+        # `[a, b, c]` / `[]` (HIR lowers ListLiteral to this): a fresh Vec,
+        # identical to Vec.new() followed by pushes.
+        self._builtins["__list_lit"] = lambda *xs: MxVec(list(xs))
+        self._builtins["__list_concat"] = _builtin_list_concat
         self._builtins["push"] = _builtin_push
         self._builtins["pop"] = _builtin_pop
         # --- Runtime library: math methods on numbers -----------------------
@@ -1665,6 +1669,24 @@ def _builtin_push(recv: Any, *vals: Any) -> Any:
         raise InterpError(f"push: expected exactly 1 value, got {len(vals)}")
     recv.items.append(vals[0])
     return UNIT
+
+
+def _builtin_list_concat(*parts: Any) -> Any:
+    """`[a, ...xs, b]` — join the literal's segments into ONE fresh Vec.
+
+    Spreading anything that is not a list is an error, not a skipped element:
+    the whole point of lowering list literals is that nothing vanishes."""
+    items: List[Any] = []
+    for p in parts:
+        if isinstance(p, MxVec):
+            items.extend(p.items)
+        elif isinstance(p, MxVector):
+            items.extend(p.elements)
+        else:
+            raise InterpError(
+                "list literal: cannot spread a "
+                f"{_runtime_type_name(p)!r} (expected a list)")
+    return MxVec(items)
 
 
 def _builtin_pop(recv: Any) -> Any:
