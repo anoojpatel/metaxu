@@ -20,8 +20,12 @@ sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
 
 
 def default_targets() -> list[str]:
-    return sorted(glob.glob(os.path.join(REPO_ROOT, "examples", "*.mx"))) + sorted(
-        glob.glob(os.path.join(REPO_ROOT, "test_*.mx"))
+    # examples/app/ is a multi-file application: only its ENTRY file is a
+    # target, the sibling modules are reached through its imports.
+    return (
+        sorted(glob.glob(os.path.join(REPO_ROOT, "examples", "*.mx")))
+        + sorted(glob.glob(os.path.join(REPO_ROOT, "examples", "app", "main.mx")))
+        + sorted(glob.glob(os.path.join(REPO_ROOT, "test_*.mx")))
     )
 
 

@@ -180,6 +180,47 @@ parameters, and a handler case performing its own effect routes to the next
 enclosing handler (handler bodies evaluate outside their own delimitation)
 instead of deadlocking.
 
+### Found by `examples/app` (the whole-language application, 2026-08-14)
+
+`examples/app/` is a five-module interpreter for a small expression
+language (lexer -> parser -> evaluator, ~680 lines of Metaxu). It is the
+first artifact that uses the whole language at once — modules, generics
+with `where` bounds, a trait with three impls, a custom effect with three
+handlers plus `std.throw`/`std.state`, tuples, a recursive AST enum, six
+`std.*` modules, and `@mut`/`@local`/`@global`. Writing it exposed three
+front-end bugs, all fixed on this branch:
+
+1. **Exhaustiveness rejected genuinely exhaustive nested patterns.**
+   A variant counted as covered only when some arm named its ctor with
+   all-irrefutable subpatterns, so `match o { Some(TInt(n)) => ..,
+   Some(TName(s)) => .., Some(TOp(s)) => .., None => .. }` was rejected
+   with "missing variants Some" — naming a variant that was right there.
+   Coverage is now the textbook specialization recursion
+   (`frozen_constraint_emitter._matrix_exhaustive`), which handles nesting
+   to any depth and multi-field variants (`Pair(A, A) | Pair(A, B) |
+   Pair(B, A)` is still one combination short), and answers "not covered"
+   for everything it cannot prove — literal columns, unknown enums, mixed
+   ctor/literal columns — so nothing that compiled before stops compiling.
+   Tests: `test_exhaustiveness.py`.
+2. **`@local` did nothing for tail-expression returns.** The locality
+   escape check fired only on `return x;`, while `fn f() { let @local c =
+   ..; c }` — the idiomatic spelling, and the one the whole stdlib uses —
+   handed the local to the caller silently. The function's tail
+   expression is now checked exactly like a return.
+3. **Argument-count mismatches were not a compile error.** `take(1)` for
+   `fn take(a, b)` compiled and died at run time with "Unbound variable
+   'b' in 'take' (bad lowering or use-after-drop)", blaming the compiler
+   for the caller's mistake. Calls to a known signature now check arity
+   (skipping names shadowed by a local binding, whose arity is its own).
+   Tests for 2 and 3: `test_silent_seams.py`.
+
+Limitation found and NOT fixed (no silent wrongness, so it is a capacity
+issue rather than a bug): the MIR interpreter recurses on the host Python
+stack, so a calc program whose evaluation nests deeper than ~45 user
+frames (e.g. a 50-term left-associative sum) exits with a raw
+`RecursionError` instead of a Metaxu diagnostic. Raising the ceiling needs
+a trampolined interpreter.
+
 ## Loudly-unsupported surface constructs (HIR triage)
 
 Update (2026-08-14): HIR lowering used to end in `return None` for any AST

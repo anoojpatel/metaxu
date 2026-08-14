@@ -1,0 +1,210 @@
+# app.eval — running a parsed calc program.
+#
+# The evaluator is a plain structural recursion over Expr, but it talks to
+# the outside world entirely through effects, which is what makes it
+# reusable:
+#
+#   * Throw (std.throw) carries every runtime error — an unbound name, a
+#     type mismatch, division by zero. The evaluator never decides what a
+#     failure means; the caller's handler does.
+#   * State (std.state) counts evaluated nodes, so a caller can report
+#     "expression X took N steps" without the evaluator owning a counter.
+#   * Trace (declared here) reports each node's value as it is produced.
+#     app.main installs three different handlers over this one evaluator —
+#     discard, collect, and a step budget that throws when it runs out —
+#     with no flag threaded through the recursion.
+#
+# The environment is a std.map Map from name to Value. It is passed
+# `@mut` because `let` really does write into the caller's environment:
+# statements share one binding table for the whole program run.
+
+from std.throw import Throw, map_err;
+from std.state import State, increment;
+from std.map import Map, empty, get, put;
+from std.math import abs, min, max;
+from syntax import Value, Expr, Stmt, render, value_type_name, show_expr, same_value;
+
+export {
+    Trace,
+    run_program,
+    eval_expr,
+    eval_stmt
+}
+
+# Reported once per evaluated expression node, deepest first. The op
+# carries the NODE and its VALUE rather than a rendered line: a handler
+# that discards steps should not pay for formatting, and one that keeps
+# them can render however it likes.
+effect Trace {
+    fn step(depth: int, node: Expr, value: Value) -> ()
+}
+
+# Run a whole program, answering the lines its `print` statements
+# produced. The environment starts empty and outlives every statement.
+# `stmts` holds SPANNED statements, and `map_err` re-throws each failure
+# with the statement's source offset appended — std.throw's idiom of
+# performing Throw from inside a Throw handler, which routes to the NEXT
+# enclosing handler (app.main's `catch_`).
+fn run_program(stmts: Vec) -> Vec performs Throw, State, Trace {
+    let @global env = empty();
+    let @mut output = Vec.new();
+    let @mut i = 0;
+    while i < len(stmts) {
+        let spanned = stmts[i];
+        let line = map_err(
+            fn() -> eval_stmt(spanned.item, env),
+            fn(message) -> message + " (statement at offset "
+                               + spanned.pos.to_string() + ")");
+        match line {
+            Some(text) => output.push(text),
+            None => ()
+        };
+        i = i + 1
+    }
+    output
+}
+
+# A statement either binds a name or produces a line of output.
+fn eval_stmt(s: Stmt, env: @mut Map) performs Throw, State, Trace {
+    match s {
+        SLet(name, value) => {
+            put(env, name, eval_expr(value, env, 0));
+            None
+        },
+        SPrint(value) => Some(render(eval_expr(value, env, 0)))
+    }
+}
+
+# The evaluator proper. `depth` is carried for the Trace handler's
+# benefit only — nothing in the semantics depends on it.
+fn eval_expr(e: Expr, env: @mut Map, depth: int) -> Value performs Throw, State, Trace {
+    increment(1);
+    let value = match e {
+        ENum(n) => VInt(n),
+        EVar(name) => lookup(env, name),
+        EUnary(op, operand) =>
+            VInt(0 - as_int(eval_expr(operand, env, depth + 1), op, e)),
+        EBinary(op, lhs, rhs) => apply_binary(
+            op,
+            eval_expr(lhs, env, depth + 1),
+            eval_expr(rhs, env, depth + 1),
+            e),
+        EIf(condition, then_branch, else_branch) =>
+            if as_bool(eval_expr(condition, env, depth + 1), e) {
+                eval_expr(then_branch, env, depth + 1)
+            } else {
+                eval_expr(else_branch, env, depth + 1)
+            },
+        ECall(name, args) => apply_call(name, eval_args(args, env, depth), e)
+    };
+    perform Trace.step(depth, e, value);
+    value
+}
+
+# --- operators ------------------------------------------------------------
+
+fn apply_binary(op: string, lhs: Value, rhs: Value, site: Expr) -> Value performs Throw {
+    match op {
+        "+" => VInt(as_int(lhs, op, site) + as_int(rhs, op, site)),
+        "-" => VInt(as_int(lhs, op, site) - as_int(rhs, op, site)),
+        "*" => VInt(as_int(lhs, op, site) * as_int(rhs, op, site)),
+        "/" => VInt(as_int(lhs, op, site) / nonzero(as_int(rhs, op, site), site)),
+        "%" => VInt(as_int(lhs, op, site) % nonzero(as_int(rhs, op, site), site)),
+        "<" => VBool(as_int(lhs, op, site) < as_int(rhs, op, site)),
+        ">" => VBool(as_int(lhs, op, site) > as_int(rhs, op, site)),
+        "<=" => VBool(as_int(lhs, op, site) <= as_int(rhs, op, site)),
+        ">=" => VBool(as_int(lhs, op, site) >= as_int(rhs, op, site)),
+        # Equality is the one operator that works on both value shapes,
+        # so it compares structurally instead of demanding ints.
+        "==" => VBool(same_value(lhs, rhs)),
+        "!=" => VBool(!same_value(lhs, rhs)),
+        _ => {
+            perform Throw.throw("eval error: unknown operator '" + op + "'");
+            VInt(0)
+        }
+    }
+}
+
+# The three builtin functions calc offers, over std.math.
+fn apply_call(name: string, args: Vec, site: Expr) -> Value performs Throw {
+    match name {
+        "abs" => VInt(abs(arg_int(name, args, 0, 1, site))),
+        "min" => VInt(min(arg_int(name, args, 0, 2, site),
+                          arg_int(name, args, 1, 2, site))),
+        "max" => VInt(max(arg_int(name, args, 0, 2, site),
+                          arg_int(name, args, 1, 2, site))),
+        _ => {
+            perform Throw.throw("eval error: no builtin named '" + name
+                                    + "' in " + show_expr(site));
+            VInt(0)
+        }
+    }
+}
+
+fn eval_args(args: Vec, env: @mut Map, depth: int) -> Vec performs Throw, State, Trace {
+    let @mut values = Vec.new();
+    let @mut i = 0;
+    while i < len(args) {
+        values.push(eval_expr(args[i], env, depth + 1));
+        i = i + 1
+    }
+    values
+}
+
+# --- environment and coercions -------------------------------------------
+
+fn lookup(env: @mut Map, name: string) -> Value performs Throw {
+    match get(env, name) {
+        Some(value) => value,
+        None => {
+            perform Throw.throw("eval error: unbound name '" + name + "'");
+            VInt(0)
+        }
+    }
+}
+
+# calc has no implicit conversions: a bool where an int belongs is an
+# error naming the operator and the expression it came from.
+fn as_int(v: Value, op: string, site: Expr) -> int performs Throw {
+    match v {
+        VInt(n) => n,
+        VBool(b) => {
+            perform Throw.throw("eval error: '" + op + "' wants an int but got "
+                                    + value_type_name(v) + " in " + show_expr(site));
+            0
+        }
+    }
+}
+
+fn as_bool(v: Value, site: Expr) -> bool performs Throw {
+    match v {
+        VBool(b) => b,
+        VInt(n) => {
+            perform Throw.throw("eval error: a condition must be a bool but got "
+                                    + value_type_name(v) + " in " + show_expr(site));
+            false
+        }
+    }
+}
+
+fn nonzero(n: int, site: Expr) -> int performs Throw {
+    if n == 0 {
+        perform Throw.throw("eval error: division by zero in " + show_expr(site));
+        1
+    } else {
+        n
+    }
+}
+
+# Argument `index` of a call to `name`, which must have exactly `arity`
+# of them.
+fn arg_int(name: string, args: Vec, index: int, arity: int, site: Expr) -> int performs Throw {
+    if len(args) == arity {
+        as_int(args[index], name, site)
+    } else {
+        perform Throw.throw("eval error: " + name + " wants " + arity.to_string()
+                                + " arguments but got " + len(args).to_string()
+                                + " in " + show_expr(site));
+        0
+    }
+}
