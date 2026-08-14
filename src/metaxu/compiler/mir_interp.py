@@ -400,6 +400,9 @@ class MirInterpreter:
         # fallback after frame-local bindings.
         self._globals: Dict[str, Any] = {}
         self._globals_ready: bool = False
+        # A failed __module_init is cached here and re-raised on every
+        # subsequent entry-point call (never silently skipped).
+        self._globals_init_error: Exception | None = None
         self._register_builtins()
 
     # ------------------------------------------------------------------
@@ -436,21 +439,33 @@ class MirInterpreter:
 
     def _ensure_globals(self) -> None:
         """Run the synthesized __module_init once (module-level `let`
-        bindings), publishing its declared names as globals."""
+        bindings), publishing its declared names as globals.
+
+        _globals_ready is only set after SUCCESS: a failed initializer is
+        cached and re-raised on every subsequent call — running the program
+        without its module constants would just misbehave later and blame
+        the wrong code."""
         if self._globals_ready:
             return
-        self._globals_ready = True
+        if self._globals_init_error is not None:
+            raise self._globals_init_error
         init = self._funcs.get("__module_init")
         if init is None:
+            self._globals_ready = True
             return
         out: Dict[str, Any] = {}
-        self._call_func(init, [], {}, out_env=out)
-        for name in init.globals_decl:
-            if name not in out:
-                raise InterpError(
-                    f"module constant {name!r} was declared but its "
-                    "initializer bound nothing (bad lowering)")
-            self._globals[name] = out[name]
+        try:
+            self._call_func(init, [], {}, out_env=out)
+            for name in init.globals_decl:
+                if name not in out:
+                    raise InterpError(
+                        f"module constant {name!r} was declared but its "
+                        "initializer bound nothing (bad lowering)")
+                self._globals[name] = out[name]
+        except Exception as exc:
+            self._globals_init_error = exc
+            raise
+        self._globals_ready = True
 
     # ------------------------------------------------------------------
     # Internal execution
@@ -465,6 +480,7 @@ class MirInterpreter:
         if out_env is not None:
             out_env.update(env)
             out_env["__params__"] = tuple(f.param_names())
+            out_env["__mut_params__"] = tuple(getattr(f, "mut_params", ()) or ())
         return result
 
     def _run_blocks(self, f: MirFunc, start: int, env: Dict[str, Any]) -> Any:
@@ -789,7 +805,13 @@ class MirInterpreter:
                 if target is None:
                     raise InterpError(
                         f"call: no func {local_val.func_name!r} for closure {callee_name!r}")
-                return self._call_func(target, arg_vals, local_val.captured)
+                # Closure calls write back @mut struct params exactly like
+                # direct/trait/static calls (mut_params-gated, so plain
+                # lambda params still never copy out).
+                result = self._call_func(target, arg_vals, local_val.captured,
+                                         out_env=final_env)
+                self._write_back_struct_args(args, arg_vals, final_env, env)
+                return result
             # Runtime primitive behind a `with SYMBOL` effect mapping: the
             # __effect_runtime$E$op thunk's body calls
             # __mx_effect_runtime$SYMBOL. Dispatch to the shim table; an
@@ -1039,8 +1061,13 @@ class MirInterpreter:
             if target is None:
                 raise InterpError(f"call_closure: no func {closure.func_name!r}")
             arg_vals = [self._lookup(a, env, f) for a in args[1:]]
-            # Inject captured env on top of params
-            return self._call_func(target, arg_vals, closure.captured)
+            # Inject captured env on top of params. @mut struct params write
+            # back to the caller exactly like every other call path.
+            final_env: Dict[str, Any] = {}
+            result = self._call_func(target, arg_vals, closure.captured,
+                                     out_env=final_env)
+            self._write_back_struct_args(args[1:], arg_vals, final_env, env)
+            return result
         else:
             raise InterpError(f"Unknown rhs kind: {kind!r}")
 
@@ -1049,16 +1076,21 @@ class MirInterpreter:
                                 caller_env: Dict[str, Any]) -> None:
         """Propagate struct mutations from a completed callee to the caller.
 
-        For each argument that was an MxStruct, if the callee's final binding
-        of the corresponding parameter is a *different* struct value (the
-        callee rebound it, i.e. assigned through it), the caller's argument
-        slot is updated. Non-struct args and untouched params are left alone,
-        preserving value semantics everywhere else.
+        Write-back applies ONLY to parameters with by-reference semantics
+        (MirFunc.mut_params: declared @mut, or a method's `self` receiver).
+        For such a parameter that was passed an MxStruct, if the callee's
+        final binding is a *different* struct value (the callee rebound it,
+        i.e. assigned through it), the caller's argument slot is updated.
+        Plain parameters keep value semantics — a callee rebinding its own
+        (non-@mut) param stays local to the callee.
         """
         pnames = final_env.get("__params__")
         if not pnames:
             return
+        mut_params = final_env.get("__mut_params__") or ()
         for slot, pname, passed in zip(arg_slots, pnames, arg_vals):
+            if pname not in mut_params:
+                continue
             if not isinstance(passed, MxStruct):
                 continue
             newv = final_env.get(pname, passed)
@@ -1357,7 +1389,11 @@ class MirInterpreter:
             raise InterpError(
                 f"{what}: unterminated C string — no NUL byte before the end "
                 f"of the allocation ({ptr!r})")
-        return bytes(buf[ptr.offset:end]).decode("utf-8")
+        try:
+            return bytes(buf[ptr.offset:end]).decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise InterpError(
+                f"{what}: invalid UTF-8 in C string at {ptr!r}: {exc}") from exc
 
     def _ffi_fopen(self, path: Any, mode: Any) -> Any:
         """fopen shim over the real filesystem: returns null on failure."""
