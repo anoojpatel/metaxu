@@ -36,7 +36,7 @@ Two properties make the table load-bearing rather than decorative:
 
 ## Current contents
 
-102 tokens: 97 `GRAMMAR`, 3 `CONTEXTUAL`, 2 `RESERVED_ONLY`.
+106 tokens: 101 `GRAMMAR`, 3 `CONTEXTUAL`, 2 `RESERVED_ONLY`.
 
 ### `CONTEXTUAL` — reachable through the `@` rewrite
 
@@ -69,15 +69,82 @@ Writing the bare word (`let once = 1;`) is a syntax error that points at the
 | `option` | reserved keyword | ordinary identifier | the surface type is `Option`; lowercase `option` only ever appeared as the module name `std.option`, which already reached the parser as an `IDENTIFIER` through the `.`-rewrite. |
 | `async` | reserved keyword | ordinary identifier | no `async` syntax anywhere; concurrency is expressed with suspend effects and handlers (`docs/effects/`), not a keyword. |
 
+## The bitwise operators
+
+`&`, `|`, `^`, `~`, `<<`, `>>` — the C/Rust spelling, with **Rust's
+precedence**, not C's: shifts bind tighter than `&`, `&` tighter than `^`,
+`^` tighter than `|`, and all four bind tighter than the comparisons, so
+`flags & MASK == 0` groups as `(flags & MASK) == 0`. They are Int-only
+(`frozen_constraint_emitter` classes both operands and the result `Int`, so
+a Float or String operand is a compile error through the same conflict
+detection that rejects `1 + "a"`), i64 two's complement on both engines,
+`>>` is arithmetic, and a shift count outside `0..63` is a **loud error**
+on both engines rather than LLVM poison / an unbounded Python shift
+(natively: `mx_shift_check` aborts before the `shl`/`ashr`).
+
+Four of the six spellings are *strict extensions* — nothing that compiled
+before changes meaning:
+
+* `^` and `~` were illegal characters, i.e. a `LexError`;
+* `|` in expression position was `Syntax error at '|'`;
+* `<<` and `>>` are **synthesized by Pass D** of `Lexer._transform` from an
+  *adjacent* `LESS LESS` / `GREATER GREATER` pair that Pass B did not claim
+  for a generic argument list. They are deliberately not lexer regexes: a
+  `t_SHR = r'>>'` rule would have eaten the two closing brackets of
+  `Vec<Vec<int>>` before Pass B ever saw them — the C++ nested-generics
+  bug, and precisely the silent misparse this document exists to prevent.
+  Adjacency is required, so `a > > b` stays the syntax error it was.
+  Pass B additionally refuses to *start* a generic scan at an adjacent
+  `<<`: a type argument list can never open with `<`, and without that
+  refusal `a << b >> (c)` (balanced angles, `(` in the follow set) would
+  have been retagged as generic arguments.
+
+Only binary `&` overlaps something the old grammar accepted: two juxtaposed
+statements, `a` followed by `&b`. That reading is gone, exactly as `a` `-b`
+has always read as subtraction rather than as a statement pair — the same
+grammar shape and the same shift/reduce resolution (see below). A borrow in
+statement position still works after a `;`.
+
+`~e` lowers to the `bnot` builtin, joining `-e` (`neg`) and `!e` (`not`);
+the frozen AST now carries a `UnaryOperation`'s operator, which it did not
+before, so a checker can tell the three apart.
+
 ## Grammar reachability (the reverse direction)
 
 Checked on the live grammar and currently clean: every nonterminal is
 reachable from the start symbol `program`, every nonterminal is referenced by
-some production, no production is orphaned, and the grammar has **zero**
-shift/reduce and reduce/reduce conflicts. Every terminal a production names
+some production, no production is orphaned, and the grammar has **zero
+reduce/reduce** conflicts. Every terminal a production names
 is one the lexer can actually produce, and every token the lexer declares is
-producible (reserved word, `t_*` rule, or one of the three tokens
-`_transform` synthesizes: `LGENERIC`, `RGENERIC`, `LBRACE_STRUCT`).
+producible (reserved word, `t_*` rule, or one of the five tokens
+`_transform` synthesizes: `LGENERIC`, `RGENERIC`, `LBRACE_STRUCT`, `SHL`,
+`SHR`).
+
+### The conflict check was vacuous (found during the bitwise work)
+
+`test_the_grammar_has_no_parser_conflicts` asserted that PLY reported no
+conflicts — but `ply.yacc` only reports conflict counts inside `if debug:`,
+and `Parser.__init__` builds with `debug=False`. The assertion therefore
+ran against a logger PLY never wrote conflicts to, and passed on a grammar
+carrying **154 shift/reduce conflicts**. A check that cannot fail is worse
+than no check.
+
+The test now forces `debug=True` and asserts what is actually true:
+
+* **zero reduce/reduce conflicts** (one of those silently discards a rule,
+  making the language depend on the order of methods in `parser.py`);
+* **every shift/reduce conflict resolves as shift**, with the count pinned
+  as a ratchet (`_EXPECTED_SHIFT_REDUCE_CONFLICTS`, 164 after the bitwise
+  levels were added).
+
+They all come from one shape: `statements : statements statement` juxtaposes
+statements with no required separator, while a statement may itself be an
+expression that *starts* with a prefix operator (`-x`, `!x`, `&x`, `@mut x`,
+`~x`) or *continues* one (`a - b`). Shift is the maximal-munch reading —
+`a - b` is a subtraction, never the two statements `a` and `-b` — which is
+the pre-existing, documented behaviour of `-`; binary `&` now joins it.
+`^`, `|`, `<<` and `>>` add none, because none of them can start an
+expression.
 
 ## Lexer silent paths closed by the audit
 

@@ -415,6 +415,64 @@ fn main() -> int {
     assert result == 8    # -1 (None) + 9
 
 
+def test_xorshift_draws_are_spread_across_buckets():
+    """Distribution sanity for the xorshift64 generator (it replaced an LCG
+    once the language grew `^`/`<<`/`>>`).
+
+    160 draws below 4 must land in all four buckets, none of them wildly
+    over-represented. A stuck or short-period generator fails this; so
+    would an LCG whose LOW bits were used (the reason the old one had to
+    concatenate two high-bit slices). The draw count is kept modest
+    because every draw is a delimited `perform`."""
+    result, prints = run_main(_DRAWS + """
+fn body() -> Vec {
+    let @mut counts = Vec.new();
+    let @mut k = 0;
+    while k < 4 {
+        counts.push(0);
+        k = k + 1
+    }
+    let @mut i = 0;
+    while i < 160 {
+        let d = next_below(4);
+        counts[d] = counts[d] + 1;
+        i = i + 1
+    }
+    counts
+}
+
+fn main() -> int {
+    print(show(with_seed(7, fn() -> body())));
+    0
+}
+""")
+    counts = [int(x) for x in prints[0].split(",") if x]
+    assert len(counts) == 4
+    assert sum(counts) == 160
+    # Expected 40 per bucket; a very loose band that still excludes a
+    # degenerate generator.
+    assert all(15 <= c <= 75 for c in counts), counts
+
+
+def test_neighbouring_seeds_produce_different_first_draws():
+    """Small, adjacent seeds must not produce correlated streams — the
+    weakness `stir()` (three discarded steps) exists to remove."""
+    result, prints = run_main(_DRAWS + """
+fn first_three() -> Vec {
+    take_random(3, 1000)
+}
+
+fn main() -> int {
+    print(show(with_seed(0, fn() -> first_three())));
+    print(show(with_seed(1, fn() -> first_three())));
+    print(show(with_seed(2, fn() -> first_three())));
+    0
+}
+""")
+    streams = [p for p in prints]
+    assert len(set(streams)) == 3, streams
+
+
 def test_random_without_a_handler_is_loud():
     """No entropy shim exists, so Random declares NO default: performing it
     unhandled must fail loudly rather than answer a constant."""

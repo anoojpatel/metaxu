@@ -262,9 +262,32 @@ def test_every_production_is_reachable():
     assert not unreachable, f"unreachable productions: {unreachable}"
 
 
-def test_the_grammar_has_no_parser_conflicts():
-    """Shift/reduce and reduce/reduce conflicts silently resolve one way and
-    lose the other reading; the grammar is conflict-free and must stay so."""
+#: Shift/reduce conflicts PLY reports for the live grammar, all resolved as
+#: SHIFT.  This is a RATCHET, not an aspiration: the number may only go down
+#: without a stated reason, and a new conflict must be justified in the same
+#: commit that raises it.
+#:
+#: The whole family comes from one grammar shape: `statements : statements
+#: statement` juxtaposes statements with no required separator, while a
+#: statement may itself BE an expression that starts with a prefix operator
+#: (`-x`, `!x`, `&x`, `@mut x`) or continue one (`a - b`).  Every conflict
+#: resolves as shift, i.e. the maximal-munch reading — `a - b` is a
+#: subtraction, never the two statements `a` and `-b`.  Binary `&` (bitwise
+#: and) joined that family; `^`, `|`, `<<` and `>>` cannot conflict at all,
+#: because none of them can START an expression.
+_EXPECTED_SHIFT_REDUCE_CONFLICTS = 164
+
+
+def _grammar_build_warnings() -> list[str]:
+    """Every warning PLY emits while building the LIVE grammar.
+
+    `debug=True` MATTERS: ply.yacc only reports conflict counts inside
+    `if debug:` (yacc.py), and `Parser.__init__` builds with `debug=False`.
+    An earlier version of this test therefore asserted "zero conflicts"
+    against a logger PLY never wrote conflicts to — the assertion passed on
+    a grammar carrying 154 of them.  A check that cannot fail is worse than
+    no check, so the flag is forced on here.
+    """
     warnings: list[str] = []
 
     class _Log:
@@ -283,6 +306,8 @@ def test_the_grammar_has_no_parser_conflicts():
 
     def capturing(*a, **kw):
         kw["errorlog"] = _Log()
+        kw["debug"] = True
+        kw["debuglog"] = _Log()
         return real(*a, **kw)
 
     yacc.yacc = capturing
@@ -290,10 +315,38 @@ def test_the_grammar_has_no_parser_conflicts():
         Parser()
     finally:
         yacc.yacc = real
-    conflicts = [w for w in warnings if "conflict" in w]
-    assert not conflicts, f"grammar conflicts: {conflicts}"
-    # The unused-token warnings must exactly match the non-GRAMMAR buckets.
-    unused = sorted(w.split("'")[1] for w in warnings
+    return warnings
+
+
+def test_the_grammar_has_no_reduce_reduce_conflicts():
+    """A reduce/reduce conflict silently DISCARDS one of two rules — the
+    surviving one is whichever was defined first, so the language depends on
+    the order of methods in parser.py.  There must be none."""
+    conflicts = [w for w in _grammar_build_warnings()
+                 if "reduce/reduce" in w]
+    assert not conflicts, f"reduce/reduce conflicts: {conflicts}"
+
+
+def test_every_shift_reduce_conflict_resolves_as_shift():
+    """Shift/reduce conflicts are real and are all resolved the same way.
+
+    See `_EXPECTED_SHIFT_REDUCE_CONFLICTS` for why they exist.  What must
+    stay true is that every one resolves as SHIFT: a conflict resolved as
+    reduce would cut an expression short mid-parse, which is the silent
+    misreading this file exists to catch."""
+    warnings = _grammar_build_warnings()
+    resolutions = [w for w in warnings
+                   if "shift/reduce conflict for" in w]
+    as_reduce = [w for w in resolutions if "resolved as reduce" in w]
+    assert not as_reduce, f"conflicts resolved as reduce: {as_reduce}"
+    assert len(resolutions) == _EXPECTED_SHIFT_REDUCE_CONFLICTS, (
+        f"shift/reduce conflict count moved to {len(resolutions)} (expected "
+        f"{_EXPECTED_SHIFT_REDUCE_CONFLICTS}); a new conflict needs a reason "
+        "in the constant's comment, a removed one needs the number lowered")
+
+
+def test_unused_token_warnings_match_the_non_grammar_buckets():
+    unused = sorted(w.split("'")[1] for w in _grammar_build_warnings()
                     if "defined, but not used" in w)
     tabled = sorted(n for n, (b, _r) in TOKEN_TRIAGE.items() if b != GRAMMAR)
     assert unused == tabled, (unused, tabled)

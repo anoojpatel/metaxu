@@ -17,20 +17,26 @@
 # loud unhandled-effect error, never a silently constant "random" number.
 # Adding an EFFECT_RANDOM_SEED shim later is a one-line change here.
 #
-# The generator is a Lehmer/ANSI-C style linear congruential generator
-# written in Metaxu:
+# The generator is Marsaglia's XORSHIFT64, written in Metaxu now that the
+# language has bitwise operators (it was an ANSI-C LCG while it did not):
 #
-#     state' = (1103515245 * state + 12345) % 2147483648
+#     x ^= x << 13;  x ^= x >>> 7;  x ^= x << 17
 #
-# and `next()` returns two successive draws' bits 30..16 concatenated,
-# which is the classic way to get a usable spread out of an LCG's high
-# bits (the low bits of an LCG have very short periods). Products stay
-# under 2^61, so the arithmetic is exact in i64 on every backend.
+# with one adjustment. Metaxu's `>>` is ARITHMETIC (it sign-extends, like
+# LLVM's ashr and Python's `>>`), while xorshift's period argument needs
+# the LOGICAL shift: duplicating the sign bit is not a GF(2)-linear
+# transform, and a state with the top bits set could stop being a
+# bijection. Masking the result with `shr7_mask` (57 ones) clears exactly
+# the bits sign extension would have filled, so `(x >> 7) & shr7_mask` IS
+# the logical shift.
 #
-# A stronger generator would want xorshift, which needs `^` and `<<`;
-# Metaxu has no bitwise operators yet (see std/README.md). This is
-# adequate for tests, sampling and shuffling, and it is NOT
-# cryptographic.
+# `<<` wraps into i64 on both engines (mir_interp normalises, native code
+# wraps by construction), which is what xorshift needs and what the
+# differential tests in test_bitwise.py pin.
+#
+# `next()` answers bits 33..62 of the state — the high half, where a
+# xorshift's bits are best mixed — as a value in [0, random_max).
+# Adequate for tests, sampling and shuffling; NOT cryptographic.
 
 export {
     Random,
@@ -55,31 +61,34 @@ effect Random {
 # `next()` answers a value in [0, random_max).
 let random_max = 1073741824;
 
-# LCG parameters (ANSI C's; modulus 2^31).
-let lcg_multiplier = 1103515245;
-let lcg_increment = 12345;
-let lcg_modulus = 2147483648;
+# random_max - 1: the 30 low bits `next()` keeps.
+let random_mask = 1073741823;
+
+# (1 << 57) - 1. ANDing after `x >> 7` clears the seven bits arithmetic
+# shift filled with copies of the sign, turning it into a logical shift.
+let shr7_mask = 144115188075855871;
+
+# Marsaglia's canonical non-zero xorshift64 seed. 0 is the generator's one
+# fixed point, so the seed is folded away from it (normalize_seed).
+let xorshift_base = 88172645463325252;
 
 # ---------------------------------------------------------------------
 # Handlers (the sources)
 # ---------------------------------------------------------------------
 
-# Run `f` with a deterministic LCG seeded by `seed`; answers f's result.
-# The same seed always produces the same sequence, on every backend —
-# that is what makes randomized tests reproducible.
+# Run `f` with a deterministic xorshift64 seeded by `seed`; answers f's
+# result. The same seed always produces the same sequence, on every
+# backend — that is what makes randomized tests reproducible.
 #
-# Negative and huge seeds are folded into range first. `%` truncates
-# toward zero (C semantics), so the fold adds the modulus back when the
-# remainder came out negative.
+# Any int is a usable seed: it is xored away from the generator's fixed
+# point and then stirred, so neighbouring seeds (0, 1, 2 ...) do not
+# produce neighbouring first draws.
 fn with_seed(seed: int, f) {
-    let @mut state = normalize_seed(seed);
+    let @mut state = stir(normalize_seed(seed));
     handle Random with {
         next() -> {
-            state = (lcg_multiplier * state + lcg_increment) % lcg_modulus;
-            let high = (state / 65536) % 32768;
-            state = (lcg_multiplier * state + lcg_increment) % lcg_modulus;
-            let low = (state / 65536) % 32768;
-            resume(high * 32768 + low)
+            state = xorshift(state);
+            resume((state >> 33) & random_mask)
         }
     } in {
         f()
@@ -172,8 +181,22 @@ fn shuffle(v: Vec) -> Vec {
     out
 }
 
-# private: fold an arbitrary int into [0, lcg_modulus).
+# private: one xorshift64 step. `(x >> 7) & shr7_mask` is the LOGICAL
+# right shift the algorithm calls for (see the header).
+fn xorshift(state: int) -> int {
+    let a = state ^ (state << 13);
+    let b = a ^ ((a >> 7) & shr7_mask);
+    b ^ (b << 17)
+}
+
+# private: fold any int to a non-zero state (0 is xorshift's fixed point).
 fn normalize_seed(seed: int) -> int {
-    let r = seed % lcg_modulus;
-    if r < 0 { r + lcg_modulus } else { r }
+    let s = seed ^ xorshift_base;
+    if s == 0 { xorshift_base } else { s }
+}
+
+# private: three discarded steps, so a low-entropy seed (0, 1, 2 ...) has
+# a well-mixed state before the first draw is taken.
+fn stir(state: int) -> int {
+    xorshift(xorshift(xorshift(state)))
 }

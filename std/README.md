@@ -55,7 +55,7 @@ object, a seeded RNG singleton, an aborting `assert`).
 | --- | --- | --- |
 | `std.state` | implemented | `effect State { get, put }`; `eval_state`/`with_state` (result), `exec_state` (final state), `run_state` (both, via `StateResult`), `modify`, `gets`, `update`, `increment` |
 | `std.log` | implemented | `effect Log { debug, info, warn, error }` with stdout defaults; `log_*` wrappers; `level_*` constants; handlers `with_stdout_logging`, `quietly`, `collect_logs`, `with_collected_logs`, `run_collected` (`LogRun`), `with_min_level` |
-| `std.random` | implemented (seeded only) | `effect Random { next }` with **no default** (see below); `with_seed` (LCG), `with_sequence` (scripted draws); `next_below`, `next_range`, `next_bool`, `next_sign`, `choose`, `take_random`, `shuffle` |
+| `std.random` | implemented (seeded only) | `effect Random { next }` with **no default** (see below); `with_seed` (xorshift64), `with_sequence` (scripted draws); `next_below`, `next_range`, `next_bool`, `next_sign`, `choose`, `take_random`, `shuffle` |
 | `std.parse` | implemented | `parse_int` (Option) / `parse_int_or` / `parse_int_or_fail` (Fail), `parse_bool`, `digit_value`, `is_digit`, `is_space`, `trim`, `split_on`, `parse_int_vec` |
 | `std.test` | implemented | `effect Report { passed, failed }`; `assert_true`/`assert_false`/`assert_eq`/`assert_ne`/`check`/`check_eq`; runners `run_suite` (failure count), `run_tests` (`TestReport`), `collect_failures` |
 | `std.iter` | implemented | the adapters `std.stream` defers, over a real `Pair` struct: `enumerate`, `zip`, `zip_with`, `take_while`, `drop_while`, `step_by`, `windows`, `chunks` |
@@ -82,10 +82,14 @@ Design notes worth knowing before using them:
   performing it unhandled is a loud unhandled-effect error, never a
   silently constant "random" number. Adding an `EFFECT_RANDOM_SEED` shim
   later is a one-line change in `std/random.mx`.
-  The generator is an ANSI-C LCG (modulus 2^31), two 15-bit high-bit
-  draws concatenated per `next()`. A xorshift would be better but needs
-  `^`/`<<` — Metaxu has **no bitwise operators** (gap 13 below). Not
-  cryptographic.
+  The generator is **Marsaglia's xorshift64** (it was an ANSI-C LCG until
+  the language grew bitwise operators — gap 13 below, now fixed), with
+  one adjustment: Metaxu's `>>` is arithmetic, so the `x >> 7` step is
+  masked with 57 ones to make it the logical shift the algorithm's
+  GF(2)-linearity argument requires. `next()` answers bits 33..62 of the
+  state. A seed is folded away from the generator's one fixed point (0)
+  and stirred with three discarded steps, so adjacent small seeds give
+  uncorrelated streams. Not cryptographic.
 - **`std.test.assert_eq` deliberately shadows the `assert_eq`
   builtin.** The builtin aborts the program on the first mismatch; the
   module's version reports through `Report`, so a suite runs to the end
@@ -279,10 +283,34 @@ are fixed; the regression tests are at the bottom of
     still the empty-parameter lambda opener; the two uses never collide
     because one is at expression start.
 
-13. **No bitwise operators** (`^`, `<<`, `>>`, `|`, `&` as binary and).
-    `&` is borrow syntax and `|` is a pattern separator, so these need
-    real design work, not just a token. This is what keeps
-    `std/random.mx` on an LCG instead of a xorshift. Parse-time-loud.
+13. **FIXED — bitwise operators exist** (`&`, `|`, `^`, `~`, `<<`, `>>`).
+    They keep the C/Rust spelling with **Rust's precedence**: shifts bind
+    tighter than `&`, `&` tighter than `^`, `^` tighter than `|`, and all
+    four tighter than the comparisons, so `flags & MASK == 0` groups the
+    way it reads. Four of the six spellings are strict extensions — `^`
+    and `~` were illegal characters, `|` in expression position was a
+    syntax error, and `<<`/`>>` are synthesized by a new lexer pass from
+    *adjacent* angle brackets the generic-argument pass did not claim, so
+    `Vec<Vec<int>>` is untouched and `a > > b` is still an error. Only
+    binary `&` displaces an old reading (two juxtaposed statements `a`
+    and `&b`), exactly as `a` `-b` has always been read as subtraction.
+    The operators are **Int-only** (a Float or String operand is a
+    compile error via the same class-conflict detection that rejects
+    `1 + "a"`), i64 two's complement on both engines, and a shift count
+    outside `0..63` is a **loud error** on both — natively via
+    `mx_shift_check`, because LLVM's `shl`/`ashr` would be poison there.
+    `std/random.mx` is a real xorshift64 now.
+    Tests: `src/metaxu/compiler/tests/test_bitwise.py` (spelling, lexing,
+    semantics, typing, and native differentials including negative
+    operands and the xorshift step).
+    Found while fixing it: **the grammar's "no parser conflicts" test was
+    vacuous** — `ply.yacc` only reports conflict counts under `debug=True`
+    and the parser builds with `debug=False`, so the assertion ran against
+    a logger PLY never wrote to and passed on a grammar carrying 154
+    shift/reduce conflicts. The test now forces the flag on and asserts
+    what is true: zero reduce/reduce conflicts, every shift/reduce
+    conflict resolved as shift, count pinned as a ratchet
+    (`docs/token_reachability.md`).
 
 14. **FIXED — string literals kept their backslashes verbatim.** `"a\nb"`
     was the four characters `a \ n b` and printed that way, and
