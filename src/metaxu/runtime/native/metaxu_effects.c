@@ -264,6 +264,10 @@ static void mx__teardown_above(mx_scope *top) {
     }
 }
 
+/* Defined with the try/catch machinery at the bottom of this file; used by
+ * mx_handle / mx_resume to re-raise a failure that escaped a body fiber. */
+static _Noreturn void mx__raise_owned(char *owned);
+
 static char *mx__dup(const char *s) {
     size_t n = strlen(s) + 1;
     char *p = malloc(n);
@@ -391,7 +395,7 @@ int64_t mx_handle(mx_body_fn body, void *body_env,
          * teardown here -- that pad's unwind frees this scope, and if the
          * pad is inside one of our own handler cases the scope must SURVIVE
          * (the interpreter keeps the frame until handle_scope's finally). */
-        mx_raise(s->ev_error);
+        mx__raise_owned(s->ev_error);
     }
     /* MX_EV_PERFORM: dispatch the first perform.  Deep semantics make one
      * dispatch enough -- every later perform against this scope is pumped
@@ -522,7 +526,7 @@ int64_t mx_resume(mx_k *k, int64_t value) {
          * this very handler case can catch it.  busy stays as the pad
          * recorded it (mx_try restores scope_top->busy on catch), matching
          * the interpreter's resume() `finally: frame["busy"] = was_busy`. */
-        mx_raise(s->ev_error);
+        mx__raise_owned(s->ev_error);
     }
     /* The body performed against this scope again: pump recursively (the
      * interpreter's _pump_scope recursion, as plain C recursion on the
@@ -577,27 +581,22 @@ int64_t mx_try(mx_try_body_fn body, void *body_env,
     return v;
 }
 
-_Noreturn void mx_raise(const char *msg) {
-    /* Heap-copied once, here: the caught value is an ordinary metaxu string
-     * that may outlive the try (leak by design, like every produced string
-     * the backend cannot prove dead), and the caller's buffer is usually a
-     * stack scratch buffer the longjmp is about to destroy. */
-    char *owned = mx__dup(msg != NULL ? msg : "");
-    for (;;) {
-        if (g_pad != NULL) {
-            g_raise_msg = owned;
-            longjmp(g_pad->jb, 1);
-        }
-        if (g_fiber != NULL) {
-            /* No pad on this coroutine: hand the failure to the scope's
-             * owner side (the interpreter's ("error", exc) message) and
-             * abandon this fiber -- its stack is freed at teardown. */
-            mx_scope *s = g_fiber;
-            s->ev_kind = MX_EV_ERROR;
-            s->ev_error = owned;
-            mx__switch_dead(&s->handler_ctx, s->owner_stack);
-        }
-        break;
+/* The raise machinery, over a message this function takes ownership of.
+ * Re-raising an escaped fiber failure reuses its existing copy rather than
+ * duplicating it again (mx_handle / mx_resume call this directly). */
+static _Noreturn void mx__raise_owned(char *owned) {
+    if (g_pad != NULL) {
+        g_raise_msg = owned;
+        longjmp(g_pad->jb, 1);
+    }
+    if (g_fiber != NULL) {
+        /* No pad on this coroutine: hand the failure to the scope's owner
+         * side (the interpreter's ("error", exc) message) and abandon this
+         * fiber -- its stack is freed when the scope is torn down. */
+        mx_scope *s = g_fiber;
+        s->ev_kind = MX_EV_ERROR;
+        s->ev_error = owned;
+        mx__switch_dead(&s->handler_ctx, s->owner_stack);
     }
     /* Uncaught: identical to the pre-try/catch behavior of mx_rt_fail --
      * flush what the program already printed, name the failure, abort. */
@@ -605,6 +604,14 @@ _Noreturn void mx_raise(const char *msg) {
     fprintf(stderr, "metaxu runtime error: %s\n", owned);
     fflush(stderr);
     abort();
+}
+
+_Noreturn void mx_raise(const char *msg) {
+    /* Heap-copied once, here: the caught value is an ordinary metaxu string
+     * that may outlive the try (leak by design, like every produced string
+     * the backend cannot prove dead), and the caller's buffer is usually a
+     * stack scratch buffer the longjmp is about to destroy. */
+    mx__raise_owned(mx__dup(msg != NULL ? msg : ""));
 }
 
 _Noreturn void mx_raisef(const char *fmt, ...) {

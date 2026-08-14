@@ -3091,6 +3091,8 @@ def _compute_try_extent_blockers(funcs: Sequence[MirFunc],
     (the target set is not statically fixed here) and a trait/static
     dispatch with no candidate implementation in the module.
     """
+    if not any(rec.kind == "try" for rec in table.sites.values()):
+        return {}   # no try in the module: nothing to decide
     by_name = {f.name: f for f in funcs}
     impls_by_method: Dict[str, List[str]] = {}
     impls_by_type_method: Dict[Tuple[str, str], List[str]] = {}
