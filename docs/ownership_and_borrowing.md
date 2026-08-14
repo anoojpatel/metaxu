@@ -25,9 +25,9 @@ let new_owner = file
 #### Mutable Mode
 ```metaxu
 # Mutable mode represents an exclusively owned reference to a value
-let @mutable x = &mut some_value
+let @mut x = &mut some_value
 x.modify()  # Can modify the referenced value
-let @mutable y = x  # Transfers the exclusive reference
+let @mut y = x  # Transfers the exclusive reference
 # Error: x no longer has access
 # x.modify()
 ```
@@ -71,7 +71,7 @@ fn process(data: @global String) {
 }
 ```
 
-Note: These two dimensions are orthogonal - any uniqueness mode (@owned, @mutable, @const) can be combined with either locality mode (@local, @global) to control both how a value is accessed and where it can live.
+Note: These two dimensions are orthogonal - any uniqueness mode (@owned, @mut, @const) can be combined with either locality mode (@local, @global) to control both how a value is accessed and where it can live.
 
 ## 2. Locality and Regions
 

@@ -1,5 +1,5 @@
 import ply.yacc as yacc
-from metaxu.lexer import Lexer
+from metaxu.lexer import Lexer, RESERVED_WITHOUT_GRAMMAR
 import metaxu.metaxu_ast as ast
 from metaxu.decorator_ast import Decorator, CFunctionDecorator, DecoratorList
 from metaxu.extern_ast import ExternBlock, ExternFunctionDeclaration, ExternTypeDeclaration
@@ -219,10 +219,15 @@ class Parser:
             self.current_module = None
             # Initialize lexer with source
             self.lexer.source_file = file_path
-            self.lexer.input(source)
             # Diagnostics excerpt the offending line; register the text so
-            # in-memory sources ("<mem>") render like on-disk ones.
+            # in-memory sources ("<mem>") render like on-disk ones.  This has
+            # to happen BEFORE lexing: `lexer.input` runs the whole scan and
+            # raises LexError for an illegal character, an unterminated
+            # string or a bad numeric literal, and those diagnostics were
+            # excerpting whatever source was registered LAST — i.e. the
+            # previous file's text, with a caret over an unrelated line.
             register_source(file_path, source)
+            self.lexer.input(source)
             self._enter_scope(ast.Scope(name="global"))
             # Parse using PLY. tracking=True makes PLY record the token span
             # of every reduced nonterminal, which is what _attach_location
@@ -509,9 +514,39 @@ class Parser:
         else:
             p[0] = p[1] + [p[2]]
 
+    #: Every mode name `frozen_constraint_emitter._split_mode` understands:
+    #: uniqueness (plus its surface aliases), locality, linearity.  Kept in
+    #: sync by a test (test_token_coverage.py).
+    MODE_NAMES = (
+        # uniqueness (spec names, then surface aliases)
+        'shared', 'unique', 'exclusive', 'owned', 'mut', 'const',
+        # locality
+        'local', 'global',
+        # linearity
+        'once', 'separate', 'many',
+    )
+
     def p_mode_annotation(self, p):
         '''mode_annotation : AT IDENTIFIER'''
-        p[0] = ast.ModeAnnotation(p[2])
+        # VALIDATE THE NAME.  The lexer retags every keyword after `@` as an
+        # IDENTIFIER (so `@once`/`@const` reach this production at all), and
+        # this production used to accept whatever followed.  Downstream,
+        # `_split_mode` keeps only the tokens it recognises and DROPS the
+        # rest, so `@moot` — a plausible typo for `@mut` — compiled clean
+        # and bound a shared value, and docs' older `@mutable` spelling did
+        # the same.  An unknown mode is now a loud parse error.
+        name = p[2]
+        if name not in self.MODE_NAMES:
+            raise CompileError(
+                message=f"unknown mode '@{name}'",
+                error_type="ParseError",
+                location=self.location_for_offsets(
+                    p.lexpos(1), p.lexpos(2) + len(str(name))),
+                notes=["Valid modes are " + ", ".join(
+                    "@" + m for m in self.MODE_NAMES),
+                    "An unrecognized mode would otherwise be silently ignored"],
+            )
+        p[0] = ast.ModeAnnotation(name)
 
     # ------------------------------------------------------------------
     # Expressions
@@ -1625,9 +1660,21 @@ class Parser:
         else:
             p[0] = ast.MethodDefinition(p[2], p[5], p[8], type_params=p[3])
 
+    def p_implement_keyword(self, p):
+        '''implement_keyword : IMPLEMENT
+                             | IMPL'''
+        # `impl` is an accepted spelling of `implement`, exactly as
+        # `interface` is of `trait` (p_trait_keyword above).  It is the
+        # spelling docs/ownership_and_borrowing.md and docs/type_system.md
+        # use throughout, and the lexer's generic disambiguation has always
+        # listed IMPL alongside IMPLEMENT in `_GENERIC_PREV`, so `impl<T>`
+        # was already retagged for a production that did not exist: writing
+        # `impl Show for int { .. }` reported `Syntax error at 'impl'`.
+        p[0] = p[1]
+
     def p_implementation(self, p):
-        '''implementation : IMPLEMENT type_params_opt type_expression FOR type_expression where_clause_opt LBRACE impl_item_seq RBRACE
-                          | IMPLEMENT type_params_opt type_expression where_clause_opt LBRACE impl_item_seq RBRACE
+        '''implementation : implement_keyword type_params_opt type_expression FOR type_expression where_clause_opt LBRACE impl_item_seq RBRACE
+                          | implement_keyword type_params_opt type_expression where_clause_opt LBRACE impl_item_seq RBRACE
                           | IMPLEMENTS type_expression COLON type_expression LBRACE impl_item_seq RBRACE'''
         if p[1] == 'implements':
             impl = ast.Implementation(p[4], p[2], None, p[6])
@@ -1990,6 +2037,12 @@ class Parser:
                 SourceLocation(file=self.lexer.source_file,
                                line=getattr(p, 'lineno', 0),
                                column=getattr(p, 'column', 0))
+            # A reserved word with no grammar production can ONLY ever end
+            # up here, so this is the complete diagnostic surface for it:
+            # say what the word is and where to go instead, rather than the
+            # bare "Syntax error at 'use'" it produced before the token
+            # reachability audit (docs/token_reachability.md).
+            guidance = RESERVED_WITHOUT_GRAMMAR.get(getattr(p, 'type', None))
             # The location now renders the offending line with a caret (see
             # errors.format_diagnostic), so the old multi-line `context`
             # block and the Python-level stack trace are redundant noise on
@@ -1998,7 +2051,8 @@ class Parser:
                 message=msg,
                 error_type="ParseError",
                 location=location,
-                notes=["Check syntax near this location"]
+                notes=list(guidance) if guidance
+                else ["Check syntax near this location"]
             )
         else:
             raise CompileError(

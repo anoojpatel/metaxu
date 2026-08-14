@@ -55,7 +55,9 @@ codegens) is module-unaware and sees only the merged program.
 - **[doc]** `public import` / `public from ... import` re-export the
   imported names: they become importable *from* the re-exporting module.
 - `use` is a reserved keyword but has no grammar production; there is no
-  `use` statement (unchanged).
+  `use` statement (unchanged). Since no production names the token, every
+  appearance of it is a syntax error, and `Parser.p_error` routes the reader
+  to `import` (see `docs/token_reachability.md`).
 
 ## File mapping and loading
 

@@ -1385,15 +1385,23 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
                             _check_global_struct_binding(var_name, child)
                 # Register callable linearity when binding a lambda so calls can
                 # enforce once/separate semantics by name.
-                for child in children:
-                    if child.kind == "LambdaExpression":
-                        lam_linearity = payload_dict(child).get("linearity")
-                        if isinstance(lam_linearity, str):
-                            declared_linearity[var_name] = lam_linearity
-                        elif isinstance(linearity, str):
-                            declared_linearity[var_name] = linearity
-                if isinstance(linearity, str) and var_name not in declared_linearity:
+                #
+                # The BINDING's own annotation wins.  `LambdaExpression`
+                # initialises `.linearity` to the DEFAULT `many`, so reading
+                # the lambda first meant `let @once f = fn(x: int) -> int
+                # { x };` recorded "many" and the once-ness of an annotated
+                # lambda binding vanished without a word — the checker was
+                # there, it was just never told. Only when the binding says
+                # nothing does the lambda's own linearity apply (it becomes
+                # `separate` when the lambda captures a mutable borrow).
+                if isinstance(linearity, str):
                     declared_linearity[var_name] = linearity
+                else:
+                    for child in children:
+                        if child.kind == "LambdaExpression":
+                            lam_linearity = payload_dict(child).get("linearity")
+                            if isinstance(lam_linearity, str):
+                                declared_linearity[var_name] = lam_linearity
                 # Track reference relationships created by borrow initializers,
                 # e.g. `let r = &x` makes r hold a reference to x.
                 for child in children:
