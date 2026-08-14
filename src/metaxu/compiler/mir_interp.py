@@ -30,7 +30,8 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from .mir import MirBlock, MirFunc
 from .desugar import IMPL_SEP, parse_impl_method_name
-from .hir import EFFECT_RUNTIME_CALL_PREFIX, STATIC_CALL_PREFIX, TRAIT_CALL_PREFIX
+from .hir import (BUILTIN_CALL_PREFIX, EFFECT_RUNTIME_CALL_PREFIX,
+                  STATIC_CALL_PREFIX, TRAIT_CALL_PREFIX)
 
 
 # ---------------------------------------------------------------------------
@@ -825,12 +826,27 @@ class MirInterpreter:
                         f"but this interpreter provides no shim for it "
                         f"(available: {', '.join(sorted(self._effect_runtime_shims))})")
                 return shim(arg_vals)
-            # Builtins first
-            if callee_name in self._builtins:
-                return self._builtins[callee_name](*arg_vals)
-            # User functions
+            # Method-position builtin call (`x.len()` -> __builtin$len):
+            # always the builtin, never a same-named plain function — see
+            # hir._method_callee / docs/name_precedence.md.
+            if callee_name.startswith(BUILTIN_CALL_PREFIX):
+                bname = callee_name[len(BUILTIN_CALL_PREFIX):]
+                builtin = self._builtins.get(bname)
+                if builtin is None:
+                    raise InterpError(
+                        f"no builtin method {bname!r} (method-position call)")
+                return builtin(*arg_vals)
+            # NAME PRECEDENCE for plain calls: a user-defined module
+            # function WINS over a same-named builtin; the builtin is the
+            # fallback when no user function of that name exists.  Names
+            # the compiler owns (the __-prefixed intrinsics and the
+            # __trait$/__static$/... dispatch prefixes) are rejected as
+            # reserved at the front end, so they can never be shadowed.
             target = self._funcs.get(callee_name)
             if target is None:
+                builtin = self._builtins.get(callee_name)
+                if builtin is not None:
+                    return builtin(*arg_vals)
                 raise InterpError(f"Unknown callee: {callee_name!r}")
             result = self._call_func(target, arg_vals, {}, out_env=final_env)
             self._write_back_struct_args(args, arg_vals, final_env, env)
@@ -1225,9 +1241,10 @@ class MirInterpreter:
         self._builtins["__vec_comprehension"] = self._builtin_vec_comprehension
         # --- FFI shims over a simulated, bounds-checked C heap --------------
         # Extern fns lower to plain calls; these builtins are their runtime.
-        # (Builtins are checked before user functions, but the only functions
-        # with these bare names come from `extern` declarations — impl methods
-        # are mangled to __impl$... and dispatch via __trait$/__static$.)
+        # (`extern` declarations produce no MIR function, so these bare names
+        # normally resolve here; a program that also defines `fn malloc`
+        # WINS over the shim, like every other plain call — see
+        # docs/name_precedence.md.)
         self._builtins["malloc"] = self._ffi_malloc
         self._builtins["free"] = self._ffi_free
         self._builtins["memcpy"] = self._ffi_memcpy

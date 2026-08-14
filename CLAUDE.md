@@ -66,6 +66,11 @@ placeholder, never wrong code. The standard library lives in `std/*.mx`
 - Effects: classes (`stack`/`suspend`) checked in the emitter;
   runtime semantics in `mir_interp.py`; CPS state machines for
   suspending functions in `codegen_clif.py`.
+- Name precedence (`docs/name_precedence.md`): plain calls resolve a
+  USER function before a same-named builtin; method position
+  (`x.len()`) resolves impl -> builtin -> plain fn and is marked
+  `__builtin$m` in MIR; every `__`-prefixed name is reserved
+  (`module_loader.check_reserved_names` raises `ReservedNameError`).
 
 ## Current status and remaining work
 
