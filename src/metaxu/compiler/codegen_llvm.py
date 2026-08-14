@@ -715,12 +715,47 @@ one-call-site-reached-by-many-lambdas shapes:
     closure kind is marked heap-env, so the pair's env pointer aims at an
     immortal block and can never dangle wherever the capturing env
     travels.
-  * still demoted honestly, with scalar-only reasons: aggregates
-    (structs, enums, closure pairs, konts) in indirect-call arguments or
-    returns, aggregate-signatured lambdas reaching an indirect site,
-    wrong-arity members reaching one site, dynamic closures as
-    comprehension bodies, and closures crossing the effect boundary as
-    perform/resume values (env capture is the supported route).
+  * still demoted honestly: wrong-arity members reaching one site,
+    dynamic closures as comprehension bodies, and closures crossing the
+    effect boundary as perform/resume values (env capture is the
+    supported route).
+
+AGGREGATES IN INDIRECT CALL SIGNATURES (increment 16) — the word-uniform
+ABI above was scalar-only; struct/enum aggregates now cross it through
+the SAME write-once BOUNDARY BOXES increment 14 uses at the effect
+boundary:
+  * an aggregate ARGUMENT at an indirect site mallocs a fresh copy
+    (``to_word``: malloc + whole-aggregate copy in) and travels as that
+    pointer word.  The word-uniform lambda's prelude decodes the word to
+    a ``ptr %a.<p>``, at which point the ORDINARY aggregate-parameter
+    convention — the byval copy-out into the callee's own storage, or
+    the elide-copy read-through — is exactly the copy-out contract.
+  * an aggregate RETURN drops sret entirely: the lambda keeps the
+    ``i64 (ptr env, i64 args...)`` signature, mallocs a box at each ret,
+    copies its result in and returns the pointer word (encoded BEFORE
+    the frame's frees, so a heap-backed result is copied while alive);
+    the caller copies out of the box into its own storage.
+  * boxes are immortal (never freed, leak by design), so nothing can
+    dangle across the call in either direction, and both edges keep
+    value semantics — the receiver always owns a private copy.
+  * FAST PATHS ARE PRESERVED.  Scalar indirect calls still pass raw
+    words and allocate nothing.  An AGGREGATE-signatured lambda takes
+    the uniform ABI only when it is a member of some DYNAMIC closure
+    kind — only then must it agree on one native signature with another
+    lambda.  A lambda pinned at every one of its sites keeps its TYPED
+    signature (ptr params, sret return) and the typed call path, so a
+    pinned aggregate closure call costs zero allocation.
+  * KIND AGREEMENT is the pre-existing two-way fixpoint: a site's
+    argument/result kinds unify with every member lambda's signature, so
+    a member disagreeing on whether a position is a struct, an enum or a
+    scalar joins to ``conflict`` and the site demotes.
+  * still demoted honestly, each with its own reason: closure PAIRS and
+    konts in indirect args/returns (a boxed pair would carry an env
+    pointer whose lifetime the box cannot vouch for), aggregates with an
+    infinite layout (no box can be sized), and ``@mut`` aggregate
+    parameters — their write-back copies out through the CALLER's
+    pointer, which is a box the caller drops, so the mutation would be
+    silently lost.
 
 Per-function value kinds (i64 / f64 / str / struct:T / enum:E /
 closure:L) are inferred exactly
@@ -1074,7 +1109,15 @@ _HEADER = (
     ";   indirect sites call the loaded fn pointer with word-encoded\n"
     ";   args/results; closure pairs may be captured into handle-site\n"
     ";   and closure envs (members forced heap-env so pairs never\n"
-    ";   dangle); aggregates through the word ABI stay demoted;\n"
+    ";   dangle);\n"
+    ";   AGGREGATES THROUGH THE WORD ABI (increment 16): a struct/enum\n"
+    ";   argument or result on a DYNAMIC indirect edge travels as a\n"
+    ";   write-once boundary box (malloc + copy in, pointer as the word,\n"
+    ";   copy out at the receiver; immortal, leaks by design).  Scalar\n"
+    ";   indirect calls still allocate nothing, and an aggregate lambda\n"
+    ";   pinned at every site keeps its typed ptr/sret signature.\n"
+    ";   Closure pairs, konts, infinite layouts and @mut aggregate\n"
+    ";   params (their write-back cannot travel back) stay demoted;\n"
     "; functions outside the subset appear as comment-only placeholders."
 )
 
@@ -1264,12 +1307,23 @@ def _dyn_closure_of(members: Sequence[str]) -> str:
     return _DYN_CLOSURE_PREFIX + ",".join(sorted(set(members))) + "}"
 
 
+def _word_boxable(kind: str) -> bool:
+    """Aggregate kinds that cross the word-uniform indirect-call ABI as a
+    BOUNDARY BOX (increment 16): the caller mallocs a fresh write-once
+    copy and passes its POINTER as the word; the receiver copies out into
+    its own storage.  Structs and enums box; a closure PAIR does not (the
+    boxed {fn, env} pair would carry an env pointer whose lifetime the box
+    cannot vouch for), and konts/rawptr/conflicts never box."""
+    return _is_struct(kind) or _is_enum(kind)
+
+
 def _word_abi_ok(kind: str) -> bool:
     """Kinds that can cross the word-uniform indirect-call ABI: 8-byte
-    scalars with an exact word encoding.  Aggregates (structs, enums,
-    closure pairs), continuations and conflicts stay demoted — the word
-    ABI is scalar-only this increment."""
-    return kind in (I64, F64, STR, PTR) or _is_vec(kind) or _is_fvec(kind)
+    scalars with an exact word encoding, plus struct/enum aggregates that
+    travel as a boundary-box pointer word (increment 16).  Closure pairs,
+    continuations and conflicts stay demoted."""
+    return (kind in (I64, F64, STR, PTR) or _is_vec(kind) or _is_fvec(kind)
+            or _word_boxable(kind))
 
 
 def _is_vec(kind: str) -> bool:
@@ -3704,9 +3758,11 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                        scopes: _ScopeTable, module_names: Set[str],
                        cells: "_CellTable", gtable: "_GlobalTable",
                        word_uniform: Optional[Set[str]] = None,
+                       word_blocked: Optional[Dict[str, str]] = None,
                        ) -> List[str]:
     probs: List[str] = []
     word_uniform = word_uniform if word_uniform is not None else set()
+    word_blocked = word_blocked if word_blocked is not None else {}
 
     def ty(n: str) -> str:
         return kinds.get(n, I64)
@@ -4438,32 +4494,52 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                                 probs.append(
                                     f"indirect closure call through "
                                     f"{callee!r}: lambda {m!r} has "
-                                    f"signature kind {bad[0]} (the "
-                                    "word-uniform ABI is scalar-only this "
-                                    "increment; aggregates in indirect "
-                                    "args/returns stay demoted)")
+                                    f"signature kind {bad[0]}, which has no "
+                                    "word encoding and no boundary box "
+                                    "(closure pairs, konts and conflicting "
+                                    "kinds stay demoted in indirect "
+                                    "args/returns)")
                             elif m not in word_uniform:
                                 probs.append(
                                     f"indirect closure call through "
                                     f"{callee!r}: lambda {m!r} is not "
-                                    "word-uniform (participation analysis "
-                                    "missed a flow)")
+                                    "word-uniform ("
+                                    + word_blocked.get(
+                                        m, "participation analysis missed a "
+                                           "flow")
+                                    + ")")
                         for a in args:
                             if not _word_abi_ok(ty(a)):
                                 probs.append(
                                     f"indirect closure call through "
                                     f"{callee!r}: arg {a!r} of kind {ty(a)} "
-                                    "has no word encoding (the word-uniform "
-                                    "ABI is scalar-only this increment; "
-                                    "aggregates in indirect args stay "
-                                    "demoted)")
+                                    "has no word encoding and no boundary "
+                                    "box (closure pairs, konts and "
+                                    "conflicting kinds stay demoted in "
+                                    "indirect args)")
+                            elif (_word_boxable(ty(a))
+                                  and _kind_size(ty(a), structs,
+                                                 variants) is None):
+                                probs.append(
+                                    f"indirect closure call through "
+                                    f"{callee!r}: arg {a!r} of kind {ty(a)} "
+                                    "has an infinite layout, so no boundary "
+                                    "box can be sized")
                         if not _word_abi_ok(ty(dst)):
                             probs.append(
                                 f"indirect closure call through {callee!r}: "
                                 f"result {dst!r} of kind {ty(dst)} has no "
-                                "word encoding (the word-uniform ABI is "
-                                "scalar-only this increment; aggregates in "
-                                "indirect returns stay demoted)")
+                                "word encoding and no boundary box (closure "
+                                "pairs, konts and conflicting kinds stay "
+                                "demoted in indirect returns)")
+                        elif (_word_boxable(ty(dst))
+                              and _kind_size(ty(dst), structs,
+                                             variants) is None):
+                            probs.append(
+                                f"indirect closure call through {callee!r}: "
+                                f"result {dst!r} of kind {ty(dst)} has an "
+                                "infinite layout, so no boundary box can be "
+                                "sized")
                     for m in members:
                         sigm = sigs[m]
                         for a, pk in zip(args, sigm.params):
@@ -6100,7 +6176,10 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
     # entry-block malloc'd block instead of an alloca, freed on every ret.
     heap_vars = sorted(n for n in agg_vars if n in info.global_alloc_vars)
     heapset = set(heap_vars)
-    sret = _is_agg(sig.ret)
+    # A word-uniform lambda NEVER uses the sret convention: its aggregate
+    # return travels as a boundary-box pointer word (increment 16), so the
+    # native signature stays `i64 (ptr env, i64 args...)`.
+    sret = _is_agg(sig.ret) and not is_uniform_lambda
 
     counter = 0
 
@@ -6515,11 +6594,12 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
     def to_word(k: str, v: str, lines: List[str]) -> str:
         """Reinterpret a value of word kind k as the opaque i64 element word
         the native Vec ABI stores (the runtime never inspects elements).
-        Aggregate kinds (only reachable from effect-boundary senders —
-        every other word position demotes aggregates in the checks) box:
-        a fresh malloc'd write-once copy, its pointer as the word
-        (increment 14; immortal, leaks by design — it can never dangle
-        across coroutine switches)."""
+        Aggregate kinds (effect-boundary senders, increment 14, and
+        indirect closure-call arguments/returns, increment 16 — every
+        other word position demotes aggregates in the checks) box: a
+        fresh malloc'd write-once copy, its pointer as the word
+        (immortal, leaks by design — it can never dangle across coroutine
+        switches or across an indirect call)."""
         if _is_agg(k):
             size = _kind_size(k, structs, variants)
             if size is None:  # unreachable: checks demote infinite layouts
@@ -6811,7 +6891,15 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                                  ret_kind: str) -> None:
                 """Thunk-side call of the body lambda, producing `%r` (its
                 typed result).  A word-uniform participant is called
-                through the word ABI (args encoded, result decoded)."""
+                through the word ABI (args encoded, result decoded).
+                Aggregates never reach here (a comprehension's element
+                kinds are word kinds), and the thunk has no place to copy
+                a boundary box out to — so they demote explicitly."""
+                if any(_is_agg(k) for (_v, k) in typed_args) \
+                        or _is_agg(ret_kind):
+                    raise _Unsupported(
+                        f"comprehension body lambda {lname!r} has an "
+                        "aggregate in its signature")
                 if lname in word_uniform:
                     words = []
                     for i, (v, pkk) in enumerate(typed_args):
@@ -7427,6 +7515,9 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                     if is_word:
                         avals = [f"ptr {envv}"]
                         for a in opargs:
+                            # to_word boxes struct/enum args (malloc +
+                            # write-once copy in, pointer as the word);
+                            # scalars pass raw, with no allocation.
                             w = to_word(kind(a), use(a, lines), lines)
                             avals.append(f"i64 {w}")
                         v = fresh()
@@ -7434,7 +7525,9 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                             f"  {v} = call i64 {fnv}({', '.join(avals)})"
                             f"  ; indirect closure call "
                             f"({'|'.join(members)}), word-uniform ABI")
-                        setval(dst, from_word(kind(dst), v, lines), lines)
+                        # word_into copies an aggregate result OUT of the
+                        # callee's fresh box into dst's own storage.
+                        word_into(dst, v, lines)
                     else:
                         lname = members[0]
                         csig = sigs[lname]
@@ -7982,10 +8075,17 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                     emit_frees(lines)
                     lines.append("  ret void")
                 elif is_uniform_lambda:
+                    if _is_agg(sig.ret) and kind(t[1]) != sig.ret:
+                        raise _Unsupported(
+                            f"return value {t[1]!r} is {kind(t[1])}, "
+                            f"function returns {sig.ret}")
                     rv = use(t[1], lines)
                     emit_writebacks(lines)
-                    emit_frees(lines)
+                    # Encode BEFORE the frees: an aggregate return boxes a
+                    # copy (to_word), and the value may live in a heap
+                    # block emit_frees is about to release.
                     rw = to_word(sig.ret, rv, lines)
+                    emit_frees(lines)
                     lines.append(
                         f"  ret i64 {rw}  ; word-uniform lambda return "
                         f"({sig.ret} encoded)")
@@ -8007,9 +8107,6 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
     pdecls = []
     uniform_decodes: List[str] = []
     if sret:
-        if is_uniform_lambda:  # unreachable: word-eligible rets are scalar
-            raise _Unsupported(
-                "word-uniform lambda with an aggregate return")
         pdecls.append("ptr %agg.ret")
     if info.is_lambda or info.is_scope_member:
         pdecls.append("ptr %cl.env")
@@ -8021,7 +8118,22 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
             if not _word_abi_ok(pk):  # unreachable given eligibility
                 raise _Unsupported(
                     f"word-uniform lambda parameter {p!r} of kind {pk}")
-            if _llscalar(pk) == "i64":
+            if _word_boxable(pk):
+                # BOUNDARY BOX (increment 16): the word is the caller's
+                # write-once box pointer.  Decoding it to `%a.<p>` (a ptr)
+                # makes the ordinary aggregate-param prelude below — the
+                # byval copy-out into this frame's own storage, or the
+                # elide-copy read-through — the exact copy-out contract.
+                if p in writeback_params:  # unreachable given eligibility
+                    raise _Unsupported(
+                        f"word-uniform lambda write-back parameter {p!r} "
+                        f"of kind {pk} (a boundary box cannot carry the "
+                        "copy-out back to the caller)")
+                pdecls.append(f"i64 %aw.{_sanitize(p)}")
+                uniform_decodes.append(
+                    f"  %a.{_sanitize(p)} = inttoptr i64 %aw.{_sanitize(p)} "
+                    f"to ptr  ; word-uniform param {p}: boundary box {pk}")
+            elif _llscalar(pk) == "i64":
                 pdecls.append(f"i64 %a.{_sanitize(p)}")
             else:
                 pdecls.append(f"i64 %aw.{_sanitize(p)}")
@@ -8482,6 +8594,9 @@ def emit_llvm(funcs: Sequence[MirFunc]) -> str:
     # could outlive the lambda's creating frame, and an immortal env can
     # never dangle.
     participants: Set[str] = set()
+    # Members of some DYNAMIC closure kind: these lambdas share one call
+    # site with another lambda, so they MUST agree on one native ABI.
+    dyn_members: Set[str] = set()
     for sig in sigs.values():
         for pk in sig.params:
             participants.update(_closure_members(pk))
@@ -8496,9 +8611,12 @@ def emit_llvm(funcs: Sequence[MirFunc]) -> str:
             + list(variants.cells.values())):
         if _is_dyn_closure(store_kind):
             participants.update(_closure_members(store_kind))
+            dyn_members.update(_closure_members(store_kind))
     for env_kind in list(closures.cells.values()) + list(scopes.cells.values()):
         ms = _closure_members(env_kind)
         participants.update(ms)
+        if _is_dyn_closure(env_kind):
+            dyn_members.update(ms)
         closures.heap_env.update(m for m in ms if m in module_names)
 
     # BOUNDARY-CROSSING CLOSURES (increment 14): a closure kind reaching
@@ -8515,13 +8633,56 @@ def emit_llvm(funcs: Sequence[MirFunc]) -> str:
         closures.heap_env.update(
             m for m in _closure_members(bk) if m in module_names)
 
+    # Why a PARTICIPATING lambda cannot take the word-uniform ABI, when it
+    # cannot — recorded so an indirect site naming it demotes with the real
+    # reason instead of a generic "participation analysis missed a flow".
+    _info_by_name = {info.f.name: info for info in infos}
+    word_blocked: Dict[str, str] = {}
+
     def _word_eligible(m: str) -> bool:
         s = sigs.get(m)
-        return (s is not None and m in module_names
-                and all(_word_abi_ok(pk) for pk in s.params)
-                and _word_abi_ok(s.ret))
+        if s is None or m not in module_names:
+            return False
+        for k in [*s.params, s.ret]:
+            if not _word_abi_ok(k):
+                return False
+            if _word_boxable(k) and _kind_size(k, structs, variants) is None:
+                word_blocked[m] = (
+                    f"its signature kind {k} has an infinite layout, so no "
+                    "boundary box can be sized")
+                return False
+        # A @mut aggregate parameter has WRITE-BACK semantics (the callee
+        # copies it out through the caller's pointer on ret).  Through the
+        # word ABI the caller's pointer is a fresh boundary box the caller
+        # drops, so the write-back would be lost — demote instead.
+        minfo = _info_by_name.get(m)
+        if minfo is not None:
+            muts = set(getattr(minfo.f, "mut_params", ()) or ())
+            for p, pk in zip(minfo.params, s.params):
+                if p in muts and _word_boxable(pk):
+                    word_blocked[m] = (
+                        f"its @mut parameter {p!r} of kind {pk} writes back "
+                        "through the caller's pointer, which the indirect "
+                        "ABI's boundary box cannot carry back")
+                    return False
+        return True
 
-    word_uniform = {m for m in participants if _word_eligible(m)}
+    def _sig_has_agg(m: str) -> bool:
+        s = sigs.get(m)
+        return s is not None and any(
+            _word_boxable(k) for k in [*s.params, s.ret])
+
+    # An AGGREGATE-signatured lambda takes the uniform ABI only when it is
+    # actually a member of a dynamic kind — only then must it agree on one
+    # native signature with another lambda.  A lambda pinned at every site
+    # keeps its typed signature (ptr params, sret return), so a pinned
+    # aggregate closure call still costs ZERO allocation; only aggregates
+    # on a genuinely dynamic edge box (increment 16, work item 2).
+    word_uniform = {m for m in participants
+                    if _word_eligible(m)
+                    and (m in dyn_members or not _sig_has_agg(m))}
+    word_blocked = {m: r for m, r in word_blocked.items()
+                    if m not in word_uniform}
 
     # Mark module-wide variant cells whose stores disagree post-fixpoint:
     # the joined cell kind is then NOT the representation every writer used
@@ -8546,7 +8707,7 @@ def emit_llvm(funcs: Sequence[MirFunc]) -> str:
         kinds = kind_sets.get(info.f.name, {})
         for p in _check_consistency(info, kinds, sigs, structs, variants,
                                     closures, traits, scopes, module_names,
-                                    cells, gtable, word_uniform):
+                                    cells, gtable, word_uniform, word_blocked):
             info.add_reason(p)
 
     # WRITE-BACK MAP (increment 8, for copy elision): per function, the
