@@ -1,0 +1,129 @@
+# app.lexer — calc source text to a Vec of spanned tokens.
+#
+# One pass over the string with a shared cursor. The sub-scanners take
+# the cursor `@mut` and leave it one past the text they consumed, which
+# is why `tokenize` never has to compute a length and re-derive an index
+# after calling one of them.
+#
+# The cursor itself is `@local`: it indexes into the source string and
+# has no meaning outside this call, so the mode says it must not escape.
+# The token Vec is the opposite — it is the whole point of the pass and
+# is handed to the parser, so it is `@global`.
+#
+# Errors are the Throw effect (std.throw): a bad character aborts the
+# whole tokenization with a message, and the caller decides whether that
+# becomes an Err or a crash by choosing a handler.
+
+from std.throw import Throw;
+from std.parse import is_digit, is_space, digit_value;
+from std.string import contains_char;
+
+export {
+    Cursor,
+    tokenize
+}
+
+# A mutable scan position. Passed `@mut` to every sub-scanner.
+struct Cursor {
+    @mut pos: int
+}
+
+# The characters an identifier may be built from. calc has no unicode
+# ambition: names are ASCII words with underscores.
+let name_chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_";
+
+# The two-character operators, checked before the one-character ones so
+# `<=` never lexes as `<` followed by `=`.
+let two_char_ops = "== != <= >=";
+
+# The single characters that are operators, and the ones that are
+# punctuation. `=` is an operator here only so that a stray `=` gets a
+# sensible message; the parser rejects it in expression position.
+let one_char_ops = "+-*/%<>=";
+let punctuation = "();,";
+
+fn tokenize(source: string) -> Vec performs Throw {
+    let @global tokens = Vec.new();
+    let @local cursor = Cursor { pos: 0 };
+    let n = len(source);
+    while cursor.pos < n {
+        let start = cursor.pos;
+        let c = source[start];
+        if is_space(c) {
+            cursor.pos = start + 1
+        } else if is_digit(c) {
+            tokens.push(Spanned { item: TInt(scan_int(source, cursor)), pos: start })
+        } else if contains_char(name_chars, c) {
+            tokens.push(Spanned { item: TName(scan_name(source, cursor)), pos: start })
+        } else {
+            tokens.push(scan_symbol(source, cursor))
+        }
+    }
+    tokens
+}
+
+# --- sub-scanners ---------------------------------------------------------
+#
+# Each one reads from `cursor.pos` and advances it past what it consumed.
+
+fn scan_int(source: string, cursor: @mut Cursor) -> int {
+    let n = len(source);
+    let @mut value = 0;
+    while cursor.pos < n && is_digit(source[cursor.pos]) {
+        value = value * 10 + digit_value(source[cursor.pos]);
+        cursor.pos = cursor.pos + 1
+    }
+    value
+}
+
+fn scan_name(source: string, cursor: @mut Cursor) -> string {
+    let n = len(source);
+    let @mut text = "";
+    while cursor.pos < n && is_name_char(source[cursor.pos]) {
+        text = text + source[cursor.pos];
+        cursor.pos = cursor.pos + 1
+    }
+    text
+}
+
+# Operators and punctuation, longest match first.
+fn scan_symbol(source: string, cursor: @mut Cursor) -> Spanned performs Throw {
+    let start = cursor.pos;
+    let n = len(source);
+    let c = source[start];
+    if start + 1 < n && contains_pair(two_char_ops, c + source[start + 1]) {
+        cursor.pos = start + 2;
+        Spanned { item: TOp(c + source[start + 1]), pos: start }
+    } else if contains_char(one_char_ops, c) {
+        cursor.pos = start + 1;
+        Spanned { item: TOp(c), pos: start }
+    } else if contains_char(punctuation, c) {
+        cursor.pos = start + 1;
+        Spanned { item: TPunct(c), pos: start }
+    } else {
+        perform Throw.throw(
+            "lex error: unexpected character '" + c
+                + "' at offset " + start.to_string());
+        Spanned { item: TPunct(c), pos: start }
+    }
+}
+
+# --- private helpers ------------------------------------------------------
+
+# Identifiers continue with digits, they just cannot start with one — the
+# `is_digit` test in `tokenize` runs first.
+fn is_name_char(c: string) -> bool {
+    contains_char(name_chars, c) || is_digit(c)
+}
+
+# `table` is a space-separated list of two-character operators; true when
+# `pair` is one of them.
+fn contains_pair(table: string, pair: string) -> bool {
+    let @mut i = 0;
+    let @mut found = false;
+    while i + 1 < len(table) {
+        if table[i] + table[i + 1] == pair { found = true } else { () };
+        i = i + 3
+    }
+    found
+}
