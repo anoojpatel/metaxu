@@ -7306,3 +7306,188 @@ def test_example_04_gains_its_try_parse_defines():
     assert re.search(r"define i64 @mx___try_body_try_parse\w*\(", ir)
     assert re.search(r"define i64 @mx___catch_try_parse\w*\(", ir)
     assert re.search(r"call i64 @mx_try\(", ir)
+
+
+# ---------------------------------------------------------------------------
+# Boxed aggregates in Vec slots (increment 20)
+#
+# A native Vec slot is one 8-byte word. Word kinds sit in it directly;
+# struct/enum aggregates sit in it as a pointer to an immortal write-once
+# ELEMENT BOX (to_word mallocs a fresh copy on write, vec_elem_into copies
+# back out on read). That keeps MIR's value semantics at both edges while
+# the vec itself keeps mx_vec identity semantics.
+# ---------------------------------------------------------------------------
+
+_VEC_OF_ENUM_SRC = """
+enum Value {
+    VInt(int),
+    VBool(bool)
+}
+
+fn main() -> int {
+    let mut v = Vec.new();
+    v.push(VInt(1));
+    v.push(VBool(true));
+    let x = v[0];
+    let n = match x { VInt(i) => i, VBool(_) => 0 };
+    print(n);
+    print(v.len());
+    return 0;
+}
+"""
+
+
+def test_vec_of_enum_needs_no_placeholder(tmp_path):
+    """Before element boxes this demoted with 'Vec of enum:Value{...}
+    elements (only 8-byte word kinds fit native Vec slots)' — one push was
+    enough to lose the whole function."""
+    ir = assert_native_matches_interp(_VEC_OF_ENUM_SRC, tmp_path)
+    assert count_placeholders(ir) == 0
+    assert "element box" in ir
+
+
+def test_vec_push_boxes_a_fresh_copy_per_push(tmp_path):
+    """Value semantics on the WRITE edge: mutating the local after pushing
+    must not show through the vec, and pushing the same local twice with a
+    mutation in between must yield two distinct elements. A shared (not
+    per-push) box would print 99 twice."""
+    ir = assert_native_matches_interp("""
+struct P { a: int, b: int }
+
+fn main() -> int {
+    let mut p = P { a: 1, b: 2 };
+    let mut v = Vec.new();
+    v.push(p);
+    p.a = 99;
+    v.push(p);
+    print(v[0].a);
+    print(v[1].a);
+    return 0;
+}
+""", tmp_path)
+    assert count_placeholders(ir) == 0
+
+
+def test_vec_aggregate_read_write_and_pop_round_trip(tmp_path):
+    """index_set replaces a slot with a new box; an element already read
+    out is unaffected by that store (read edge copies OUT); pop decodes an
+    aggregate; multi-slot enum payloads survive the round trip."""
+    ir = assert_native_matches_interp("""
+struct P { a: int, b: int }
+
+enum Shape {
+    Circle(int),
+    Rect(int, int)
+}
+
+fn main() -> int {
+    let mut v = Vec.new();
+    v.push(P { a: 1, b: 2 });
+    v.push(P { a: 99, b: 0 });
+    let e0 = v[0];
+    v[0] = P { a: 7, b: 8 };
+    print(v[0].a);
+    print(v[0].b);
+    print(e0.a);
+    let popped = v.pop();
+    print(popped.a);
+    print(v.len());
+
+    let mut s = Vec.new();
+    s.push(Circle(5));
+    s.push(Rect(3, 4));
+    let mut i = 0;
+    let mut total = 0;
+    while i < s.len() {
+        let area = match s[i] {
+            Circle(r) => r * r,
+            Rect(w, h) => w * h
+        };
+        total = total + area;
+        i = i + 1;
+    }
+    print(total);
+    return 0;
+}
+""", tmp_path)
+    assert count_placeholders(ir) == 0
+
+
+def test_vec_keeps_reference_identity_with_boxed_elements(tmp_path):
+    """Element boxes must not turn a Vec into a value: a push through one
+    name is still visible through an alias, and a nested inner vec pushed
+    into an outer one keeps aliasing after the fact."""
+    ir = assert_native_matches_interp("""
+struct P { a: int, b: int }
+
+fn main() -> int {
+    let mut v = Vec.new();
+    v.push(P { a: 1, b: 2 });
+    let w = v;
+    w.push(P { a: 42, b: 0 });
+    print(v.len());
+    print(v[1].a);
+
+    let mut outer = Vec.new();
+    let mut inner = Vec.new();
+    inner.push(P { a: 7, b: 7 });
+    outer.push(inner);
+    inner.push(P { a: 8, b: 8 });
+    print(outer[0].len());
+    return 0;
+}
+""", tmp_path)
+    assert count_placeholders(ir) == 0
+
+
+_ESCAPING_PAYLOAD_SRC = """
+struct Inner { x: int, y: int }
+
+enum Wrap {
+    Boxed(Inner),
+    Empty
+}
+
+fn build() -> Vec {
+    let w = Boxed(Inner { x: 11, y: 22 });
+    let mut v = Vec.new();
+    v.push(w);
+    return v;
+}
+
+fn main() -> int {
+    let v = build();
+    let got = v[0];
+    let sum = match got {
+        Boxed(inner) => inner.x + inner.y,
+        Empty => 0
+    };
+    print(sum);
+    return 0;
+}
+"""
+
+
+def test_enum_payload_box_is_not_freed_when_the_enum_reaches_a_vec(tmp_path):
+    """_unique_box_enums frees an entry-block make_variant's payload box on
+    every ret path when it proves this frame is the sole owner. Pushing the
+    enum into a Vec breaks that: the element box holds a COPY of the enum
+    carrying the same payload pointer, and here the vec outlives build().
+
+    The disqualification is load-bearing rather than theoretical — letting
+    `push` through the use whitelist makes this program print 30 instead of
+    33, reading a freed payload box."""
+    ir = assert_native_matches_interp(_ESCAPING_PAYLOAD_SRC, tmp_path)
+    assert count_placeholders(ir) == 0
+    # No unique-box free survives in build(): the push made ownership shared.
+    assert "unique box:" not in ir
+
+
+@needs_asan
+def test_vec_element_boxes_are_asan_clean(tmp_path):
+    """Element boxes leak by design (immortal, write-once — exactly the
+    enum payload / effect boundary contract), so leak detection is off;
+    exit 0 proves no use-after-free and no double-free across push, index
+    read/write, pop and an escaping vec."""
+    assert_native_matches_interp_asan_boxes(_VEC_OF_ENUM_SRC, tmp_path)
+    assert_native_matches_interp_asan_boxes(_ESCAPING_PAYLOAD_SRC, tmp_path)
