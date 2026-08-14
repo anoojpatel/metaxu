@@ -60,6 +60,32 @@ object, a seeded RNG singleton, an aborting `assert`).
 | `std.test` | implemented | `effect Report { passed, failed }`; `assert_true`/`assert_false`/`assert_eq`/`assert_ne`/`check`/`check_eq`; runners `run_suite` (failure count), `run_tests` (`TestReport`), `collect_failures` |
 | `std.iter` | implemented | the adapters `std.stream` defers, over real tuples: `enumerate`, `zip`, `zip_with`, `take_while`, `drop_while`, `step_by`, `windows`, `chunks` |
 
+### Round 3
+
+| Module | Status | Contents |
+| --- | --- | --- |
+| `std.sort` | implemented | stable merge sort: `sort`, `sort_desc`, `sort_by`, `sort_by_key`; `merge`, `merge_by`; `is_sorted`, `is_sorted_by`; `binary_search` (Option), `unique_sorted`, `min_by_key`, `max_by_key` |
+
+`std.sort` fills a gap neither round covered: `std.vec`'s combinators
+are all single-pass and a stream cannot sort at all (sorting needs the
+whole sequence). It follows `std.vec`'s contract exactly — eager, Vec
+in, fresh Vec out, argument never mutated.
+
+Two choices in it are deliberate:
+
+- **Merge sort, not quicksort.** Stability is the point (it is what
+  makes chained `sort_by_key` calls order by several keys: sort by the
+  least significant first), it needs no in-place swapping so it fits the
+  fresh-Vec-out contract without copying twice, and its worst case is
+  its average case. A standard library should not ship an algorithm with
+  an adversarial input.
+- **Comparators are a strict LESS-THAN predicate** (`less(a, b) -> bool`),
+  not a three-way `cmp` returning -1/0/1. One predicate orders a
+  sequence, it is cheaper to write at the call site, and it removes the
+  question of what a comparator returning 2 means. Stability then falls
+  out of a single rule in `merge_by`: take from the left run unless the
+  right element is *strictly* less, so ties never cross.
+
 Design notes worth knowing before using them:
 
 - **`std.state` reads its final state out of the handler's own capture
