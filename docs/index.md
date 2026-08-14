@@ -11,6 +11,7 @@ Welcome to the Metaxu documentation! Metaxu is a self-hosted, low-level function
 ### Type System and Safety
 - [Type System](type_system.md)
 - [Ownership and Borrowing](ownership_and_borrowing.md)
+- [Name resolution: undefined names are errors](name_resolution.md)
 - [Name-resolution precedence](name_precedence.md)
 - [Source locations in diagnostics](diagnostics_locations.md)
 - [Token and grammar reachability](token_reachability.md)

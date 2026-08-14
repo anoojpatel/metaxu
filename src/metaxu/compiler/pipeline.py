@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from .mutaxu_ast import AstNode, Span, dump_ast_json, build_frozen_ast_with_map
 from .infer_tables import InferSideTables
@@ -115,6 +115,20 @@ def build_context_from_source(source: str, file_path: str = "<mem>") -> PhaseCon
 
     frozen_root, id_map = build_frozen_ast_with_map(program)
     tables = build_tables_from_frozen_via_simplesub(frozen_root)
+
+    # Name resolution: an undefined variable or callee is a compile-time
+    # error (compiler/name_resolution.py, docs/name_resolution.md). It runs
+    # over the MUTABLE post-desugar AST — the frozen AST drops match-arm and
+    # for-loop bodies and cannot tell a pattern binder from a variable read
+    # — and files its diagnostics on the same structured channel (-2) the
+    # frozen checkers use, with kind "type-unresolved-name", so run_pipeline
+    # promotes them to TypeCheckError like every other `type-*` diagnostic.
+    from .name_resolution import check_names
+    name_errors = check_names(program, file_path=file_path)
+    if name_errors:
+        merged = dict(tables.constraints)
+        merged[-2] = tuple(merged.get(-2, ())) + tuple(name_errors)
+        tables = replace(tables, constraints=merged)
     return PhaseContext(
         source=source,
         file_path=file_path,

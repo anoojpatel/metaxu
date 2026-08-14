@@ -40,13 +40,17 @@ implement<T, const N: int> VectorOps<T,N> for vector[T,N] {
         }
     }
     
-    # Zip operation with SIMD effect
-    fn zip<U,V>(self, other: vector[U,N], f: fn(T,U) -> V) -> vector[V,N] performs SimdOp {
-        # Try SIMD optimization first
-        match perform SimdOp.try_vectorize(self, fn(x: T) -> V { f(x, other[i]) }) {
-            Some(result) -> result,
-            None -> vector[V,N](f(a, b) for (a, b) in (self, other))
-        }
+    # Zip operation — scalar only.
+    #
+    # `SimdOp.try_vectorize` takes a UNARY `fn(T) -> U`, so there is no
+    # vectorized form to ask it for here: a two-operand zip cannot be
+    # expressed as a map over `self` alone.  This body used to ask anyway,
+    # passing `fn(x: T) -> V { f(x, other[i]) }` — where `i` was never
+    # bound.  It compiled because an unresolved name was silently dropped,
+    # and it never blew up because the capability answers None before the
+    # lambda is ever called (docs/name_resolution.md).
+    fn zip<U,V>(self, other: vector[U,N], f: fn(T,U) -> V) -> vector[V,N] {
+        vector[V,N](f(a, b) for (a, b) in (self, other))
     }
     
     # Reduction with SIMD effect
