@@ -146,48 +146,25 @@ implement<T, const M: int, const N: int> vector[vector[T,N],M] {
     }
 }
 
-# SIMD handler for modern x86 processors
+# SIMD handler for modern x86 processors.
+#
+# The inline `handle SUBJECT { perform Op(params) => body }` form is real:
+# `f()` runs delimited by this handler, and each arm answers one SimdOp
+# operation. Both arms answer `None`, which is the capability's "no vectorized
+# form available" answer — every caller above then takes its scalar-fallback
+# branch (see the `None ->` arms in map/zip/reduce).
+#
+# Selecting an actual SIMD intrinsic per element function would need
+# compile-time type matching (`match typeof(T)`) and matching on the STRUCTURE
+# of a function value (`fn(x) -> x * x => mul_ps`). Neither is implemented, and
+# neither degrades quietly any more: `typeof` has no lowering and a lambda
+# used as a match pattern is a loud "unsupported pattern" error. Previously
+# this whole `handle` block had no HIR lowering at all — `with_simd` compiled
+# to a function that never called `f` and returned unit.
 fn with_simd<T, E>(f: fn() -> T performs SimdOp | E) -> T performs E {
     handle f() {
-        perform SimdOp.try_vectorize(v, f) => {
-            match typeof(T) {
-                float => {
-                    # Use SIMD for floating point
-                    unsafe {
-                        let reg = SimdRegister.from_vector(v);
-                        let result = match f {
-                            fn(x) -> x * x => SimdIntrinsic.mul_ps(reg, reg),
-                            fn(x) -> sqrt(x) => SimdIntrinsic.sqrt_ps(reg),
-                            fn(x) -> sin(x) => SimdIntrinsic.sin_ps(reg),
-                            fn(x) -> cos(x) => SimdIntrinsic.cos_ps(reg),
-                            _ => resume(None) # Non-specialized case
-                        };
-                        resume(Some(result.to_vector()))
-                    }
-                },
-                _ => resume(None) # Non-float types
-            }
-        }
-        
-        perform SimdOp.try_horizontal(v, f) => {
-            match typeof(T) {
-                float => {
-                    # Use SIMD horizontal operations
-                    unsafe {
-                        let reg = SimdRegister.from_vector(v);
-                        let result = match f {
-                            fn(a,b) -> a + b => SimdIntrinsic.horizontal_add_ps(reg),
-                            fn(a,b) -> a * b => SimdIntrinsic.horizontal_mul_ps(reg),
-                            fn(a,b) -> max(a,b) => SimdIntrinsic.horizontal_max_ps(reg),
-                            fn(a,b) -> min(a,b) => SimdIntrinsic.horizontal_min_ps(reg),
-                            _ => resume(None) # Non-specialized case
-                        };
-                        resume(Some(result))
-                    }
-                },
-                _ => resume(None) # Non-float types
-            }
-        }
+        perform SimdOp.try_vectorize(v, g) => resume(None)
+        perform SimdOp.try_horizontal(v, g) => resume(None)
     }
 }
 

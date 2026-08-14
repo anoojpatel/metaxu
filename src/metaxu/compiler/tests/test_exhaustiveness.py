@@ -300,10 +300,25 @@ fn f(s: str) -> int {
 # Unknown scrutinee types stay unchecked (no false positives)
 # ---------------------------------------------------------------------------
 
+def _no_exhaustiveness_error(src: str) -> None:
+    """Check + infer the source and assert no non-exhaustive-match diagnostic.
+
+    These two cases stop BEFORE HIR: their whole point is an opaque pattern
+    shape, and HIR lowering now rejects opaque patterns loudly (a pattern it
+    cannot convert used to degrade to a match-anything wildcard). The fact
+    being pinned here belongs to the exhaustiveness checker, which runs during
+    build_context_from_source.
+    """
+    ctx = build_context_from_source(src)
+    errs = [e for diags in ctx.tables.constraints.values() for e in diags]
+    assert not [e for e in errs
+                if getattr(e, "kind", "") == "type-nonexhaustive-match"], errs
+
+
 def test_unknown_type_scrutinee_unchecked():
     # The ctor pattern names no known variant, so the scrutinee's type is
     # not statically known here — the match must stay permissive.
-    compile_src("""
+    _no_exhaustiveness_error("""
 fn g<T>(x: T) -> int {
     match x {
         WeirdThing(a) => 1
@@ -317,7 +332,34 @@ fn main() -> int { 0 }
 def test_opaque_pattern_shape_unchecked():
     # A lambda-shaped pattern is an opaque form: the whole match is skipped
     # even though another arm has a resolvable ctor pattern.
-    compile_src("""
+    _no_exhaustiveness_error("""
+fn f(o: Option) -> int {
+    match o {
+        Some(v) => v,
+        fn(x) -> x => 0
+    }
+}
+""")
+
+
+def test_opaque_pattern_shapes_are_rejected_by_hir():
+    """...and the pipeline as a whole still refuses them: an opaque pattern
+    that HIR cannot convert would become a match-anything wildcard, silently
+    making every later arm dead code."""
+    from metaxu.compiler.hir import UnsupportedConstruct
+
+    with pytest.raises(UnsupportedConstruct, match="not a known enum variant"):
+        compile_src("""
+fn g<T>(x: T) -> int {
+    match x {
+        WeirdThing(a) => 1
+    }
+}
+
+fn main() -> int { 0 }
+""")
+    with pytest.raises(UnsupportedConstruct, match="LambdaExpression"):
+        compile_src("""
 fn f(o: Option) -> int {
     match o {
         Some(v) => v,

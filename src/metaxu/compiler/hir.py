@@ -8,7 +8,9 @@ from .infer_tables import InferSideTables
 from .constraints import ClassConstraint
 from . import mutaxu_ast as mast
 import metaxu.metaxu_ast as fast
-from metaxu.unsafe_ast import TypeCast, UnsafeBlock
+from metaxu.unsafe_ast import AddressOf, PointerDereference, TypeCast, UnsafeBlock
+from metaxu.extern_ast import (ExternBlock, ExternFunctionDeclaration,
+                               ExternTypeDeclaration)
 
 from .desugar import IMPL_SEP, parse_impl_method_name, type_base_name
 
@@ -49,6 +51,270 @@ STATIC_CALL_PREFIX = f"__static{IMPL_SEP}"
 # interpreter dispatches that callee to its runtime shim table (loudly
 # erroring on symbols it has no shim for).
 EFFECT_RUNTIME_CALL_PREFIX = f"__mx_effect_runtime{IMPL_SEP}"
+
+
+# ======================================================================
+# AST-node triage
+# ======================================================================
+#
+# HIR lowering used to end in `return None` for every AST node class it did
+# not recognize, and every caller skipped a None result. The construct then
+# VANISHED: `if let`, `while let`, `unsafe { }`, `@mut e`, `[a, b]`, `for`,
+# `e as T`, early `return` and struct-field initializers were each found this
+# way, one accident at a time, each one a program that compiled and quietly
+# did less than it said.
+#
+# The fallback is now loud (see `_unlowerable`), and every AST node class is
+# triaged into EXACTLY ONE bucket below, so a construct can never again be
+# forgotten silently — `test_hir_coverage.py` fails if a newly added AST node
+# class is missing from this table.
+#
+# The bucket answers one question: *what does it mean for this node class to
+# reach HIR expression lowering?*
+#
+#   LOWERED           it is handled by `_from_orig_expr` today. This includes
+#                     declaration nodes that deliberately lower to unit (their
+#                     meaning is realized by an earlier pass or by
+#                     HIRBuilder.build's own hoisting walk) and the two nodes
+#                     handled by raising a targeted *user* diagnostic
+#                     (a bare `vector[T,N]`, a non-unit tuple literal).
+#   NOT_AN_EXPRESSION type-level, structural (a child consumed by its parent's
+#                     branch), a pattern-position-only node, an abstract base,
+#                     or a form already consumed by an earlier pass. Reaching
+#                     expression lowering is a COMPILER BUG -> raise.
+#   UNSUPPORTED       a real surface construct a user can write that has no
+#                     HIR semantics yet. Reaching lowering is a USER error ->
+#                     raise a "not supported" diagnostic naming the construct.
+#                     Never silence.
+#
+# Pattern position has its own table (`PATTERN_TRIAGE`) because the set of
+# node classes that may appear there is different: the parser's match-arm
+# grammar is `expression => body`, so patterns arrive as expression nodes.
+
+LOWERED = "lowered"
+NOT_AN_EXPRESSION = "not-an-expression"
+UNSUPPORTED = "unsupported"
+
+#: class name -> (bucket, one-line reason). Covers every Node subclass of
+#: metaxu_ast, unsafe_ast, extern_ast and decorator_ast.
+AST_NODE_TRIAGE: dict[str, tuple[str, str]] = {
+    # ---- (a) lowered: ordinary expressions and statements ----
+    "AddressOf": (LOWERED, "`&e` on a non-variable operand: same borrow rule as `&x` — evaluates to the referenced value"),
+    "Assignment": (LOWERED, "`x = e`, `x.f = e`, `v[i] = e`"),
+    "BinaryOperation": (LOWERED, "arithmetic/logical binop"),
+    "Block": (LOWERED, "`{ stmts }`"),
+    "BorrowExpression": (LOWERED, "`borrow x` / `borrow x as T` — evaluates to the borrowed value"),
+    "BorrowShared": (LOWERED, "`&x` — evaluates to the referenced value"),
+    "BorrowUnique": (LOWERED, "`&mut x` / `@mut x` — evaluates to the referenced value"),
+    "CallExpression": (LOWERED, "call with a computed callee (`(f)(x)`, `v[0](x)`) via a temp binding"),
+    "ComparisonExpression": (LOWERED, "comparison binop"),
+    "ExclaveExpression": (LOWERED, "`exclave e` — evaluates to the inner value"),
+    "FieldAccess": (LOWERED, "`a.b.c` -> chained FieldGet"),
+    "ForStatement": (LOWERED, "`for x in it { }` -> desugared to the While machinery"),
+    "FunctionCall": (LOWERED, "`f(args)`, perform-as-bare-call, variant constructors"),
+    "HandleBlock": (LOWERED, "`handle e { perform Op(p) => body }` (inline handler form)"),
+    "HandleEffect": (LOWERED, "`handle e with { } in body`"),
+    "IfExpression": (LOWERED, "`if c { } else { }`"),
+    "IfLetExpression": (LOWERED, "`if let PAT = e { }` -> two-arm Match"),
+    "IfStatement": (LOWERED, "statement form of `if` (built by desugar passes)"),
+    "IndexExpression": (LOWERED, "`v[i]` / `v[a:b]` -> __index_get / __slice_get"),
+    "LambdaExpression": (LOWERED, "`fn(x) -> e` / `x -> e`"),
+    "LetStatement": (LOWERED, "`let x = e`"),
+    "ListLiteral": (LOWERED, "`[]`, `[a, b]`, `[a, ...rest]` -> Vec"),
+    "Literal": (LOWERED, "int/float/bool/string literal"),
+    "MatchExpression": (LOWERED, "`match e { pat => body }`"),
+    "MethodCall": (LOWERED, "`e.m(args)` on a computed receiver"),
+    "ModeExpression": (LOWERED, "`@const e` / `@mut e` — evaluates to the inner value"),
+    "Move": (LOWERED, "`move(x)` — evaluates to the moved value"),
+    "NoneExpression": (LOWERED, "`None`"),
+    "PerformEffect": (LOWERED, "`perform Effect.op(args)`"),
+    "PrintStatement": (LOWERED, "`print(args)`"),
+    "QualifiedFunctionCall": (LOWERED, "`a.b(args)`: trait/static/builtin dispatch or dotted callee"),
+    "QualifiedName": (LOWERED, "`a`, `a.b.c`, `Enum.Variant`"),
+    "RangeExpression": (LOWERED, "`a..b` -> __range"),
+    "Resume": (LOWERED, "`resume(v)` in a handler arm"),
+    "ReturnStatement": (LOWERED, "`return e` -> explicit Return op"),
+    "SomeExpression": (LOWERED, "`Some(e)`"),
+    "StructInstantiation": (LOWERED, "`S { f: e }`"),
+    "TryCatch": (LOWERED, "`try { } catch e { }`"),
+    "TupleLiteral": (LOWERED, "`()` is unit; a non-unit tuple raises (no runtime representation)"),
+    "TypeCast": (LOWERED, "`e as T` -> __cast"),
+    "UnaryOperation": (LOWERED, "`-e` / `!e` -> neg / not"),
+    "UnsafeBlock": (LOWERED, "`unsafe { }` — an ordinary block (unsafe is a static permission)"),
+    "Variable": (LOWERED, "name read, `null`, or a bare nullary variant"),
+    "VariantInstance": (LOWERED, "`Enum::Variant(f: e)`"),
+    "VectorLiteral": (LOWERED, "`vector[T,N](...)` incl. comprehension and zip forms"),
+    "VectorTypeExpression": (LOWERED, "raises a targeted diagnostic: `vector[T,N]` is a TYPE, not a value"),
+    "WhileLetStatement": (LOWERED, "`while let PAT = e { }`"),
+    "WhileStatement": (LOWERED, "`while c { }`"),
+
+    # ---- (a) lowered: declarations, which evaluate to unit ----
+    # The parser allows all of these in statement position. Their meaning is
+    # realized elsewhere (module loader, desugar, or HIRBuilder.build's own
+    # hoisting walk, which lifts every FunctionDeclaration anywhere in the
+    # tree), so as a *statement* each one contributes nothing at run time.
+    "EffectDeclaration": (LOWERED, "declaration -> unit (ops/defaults compiled by build())"),
+    "EnumDefinition": (LOWERED, "declaration -> unit (variants collected by build())"),
+    "ExportDeclaration": (LOWERED, "declaration -> unit (consumed by the module loader)"),
+    "ExternBlock": (LOWERED, "declaration -> unit (FFI declarations, consumed earlier)"),
+    "ExternFunctionDeclaration": (LOWERED, "declaration -> unit (FFI declaration)"),
+    "ExternTypeDeclaration": (LOWERED, "declaration -> unit (FFI declaration)"),
+    "FromImport": (LOWERED, "declaration -> unit (consumed by the module loader)"),
+    "FunctionDeclaration": (LOWERED, "declaration -> unit (hoisted to an HFun by build())"),
+    "Implementation": (LOWERED, "declaration -> unit (desugared to mangled __impl$ functions)"),
+    "Import": (LOWERED, "declaration -> unit (consumed by the module loader)"),
+    "InterfaceDefinition": (LOWERED, "declaration -> unit (trait method names collected by build())"),
+    "Module": (LOWERED, "declaration -> unit (consumed by the module loader)"),
+    "StructDefinition": (LOWERED, "declaration -> unit (type names collected by build())"),
+    "TypeDefinition": (LOWERED, "declaration -> unit (consumed by inference)"),
+    "VisibilityRules": (LOWERED, "declaration -> unit (consumed by the module loader)"),
+
+    # ---- (b) not an expression: abstract bases ----
+    "Node": (NOT_AN_EXPRESSION, "abstract base class"),
+    "Expression": (NOT_AN_EXPRESSION, "abstract base class"),
+    "Statement": (NOT_AN_EXPRESSION, "abstract base class"),
+    "Pattern": (NOT_AN_EXPRESSION, "abstract base class"),
+    "Type": (NOT_AN_EXPRESSION, "abstract base class"),
+    "TypeExpression": (NOT_AN_EXPRESSION, "abstract base class"),
+    "TypePattern": (NOT_AN_EXPRESSION, "abstract base class"),
+    "EffectExpression": (NOT_AN_EXPRESSION, "abstract base class"),
+
+    # ---- (b) not an expression: type level ----
+    "BasicType": (NOT_AN_EXPRESSION, "type-level: a primitive type"),
+    "CompoundTypeBound": (NOT_AN_EXPRESSION, "type-level: `A + B` bound"),
+    "EffectApplication": (NOT_AN_EXPRESSION, "type-level: `Reader[T]` effect application"),
+    "EffectReference": (NOT_AN_EXPRESSION, "type-level: an effect parameter"),
+    "FunctionType": (NOT_AN_EXPRESSION, "type-level: `fn(T) -> U`"),
+    "InterfaceType": (NOT_AN_EXPRESSION, "type-level: a trait used as a type"),
+    "ModeTypeAnnotation": (NOT_AN_EXPRESSION, "type-level: `@mut T`"),
+    "PointerType": (NOT_AN_EXPRESSION, "type-level: `*mut T` / `*const T`"),
+    "RecursiveType": (NOT_AN_EXPRESSION, "type-level: a recursive type"),
+    "TypeAlias": (NOT_AN_EXPRESSION, "type-level: an alias declaration"),
+    "TypeApplication": (NOT_AN_EXPRESSION, "type-level: `Stack[Int]`"),
+    "TypeConstraint": (NOT_AN_EXPRESSION, "type-level: a where-clause constraint"),
+    "TypeInfo": (NOT_AN_EXPRESSION, "type-level: reflected type information"),
+    "TypeParameter": (NOT_AN_EXPRESSION, "type-level: a generic parameter"),
+    "TypeReference": (NOT_AN_EXPRESSION, "type-level: a named type"),
+    "WhereClause": (NOT_AN_EXPRESSION, "type-level: a where clause"),
+
+    # ---- (b) not an expression: type-level patterns (comptime type matching) ----
+    "EnumPattern": (NOT_AN_EXPRESSION, "type-level pattern (comptime type match)"),
+    "GenericTypePattern": (NOT_AN_EXPRESSION, "type-level pattern (comptime type match)"),
+    "StructPattern": (NOT_AN_EXPRESSION, "type-level pattern (comptime type match)"),
+    "TraitPattern": (NOT_AN_EXPRESSION, "type-level pattern (comptime type match)"),
+    "TypeNamePattern": (NOT_AN_EXPRESSION, "type-level pattern (comptime type match)"),
+    "TypeVarPattern": (NOT_AN_EXPRESSION, "type-level pattern (comptime type match)"),
+    "UnionPattern": (NOT_AN_EXPRESSION, "type-level pattern (comptime type match)"),
+    "WildcardPattern": (NOT_AN_EXPRESSION, "pattern position only (see PATTERN_TRIAGE)"),
+
+    # ---- (b) not an expression: value-level pattern nodes ----
+    "LiteralPattern": (NOT_AN_EXPRESSION, "pattern position only (see PATTERN_TRIAGE)"),
+    "VariablePattern": (NOT_AN_EXPRESSION, "pattern position only (see PATTERN_TRIAGE)"),
+    "VariantPattern": (NOT_AN_EXPRESSION, "pattern position only (see PATTERN_TRIAGE)"),
+
+    # ---- (b) not an expression: structural children consumed by a parent ----
+    "Decorator": (NOT_AN_EXPRESSION, "structural: an annotation on a declaration"),
+    "CFunctionDecorator": (NOT_AN_EXPRESSION, "structural: an annotation on an extern declaration"),
+    "DecoratorList": (NOT_AN_EXPRESSION, "structural: a list of annotations"),
+    "EffectOperation": (NOT_AN_EXPRESSION, "structural: child of EffectDeclaration"),
+    "EnumVariant": (NOT_AN_EXPRESSION, "structural: child of EnumDefinition"),
+    "FieldInfo": (NOT_AN_EXPRESSION, "structural: reflected field metadata"),
+    "HandleCase": (NOT_AN_EXPRESSION, "structural: child of HandleEffect/HandleBlock"),
+    "LetBinding": (NOT_AN_EXPRESSION, "structural: child of LetStatement"),
+    "LinearityMode": (NOT_AN_EXPRESSION, "structural: a mode annotation"),
+    "LocalityMode": (NOT_AN_EXPRESSION, "structural: a mode annotation"),
+    "LocalDeclaration": (NOT_AN_EXPRESSION, "structural: a locality declaration (no parser production)"),
+    "LocalParameter": (NOT_AN_EXPRESSION, "structural: a local parameter (no parser production)"),
+    "MethodDefinition": (NOT_AN_EXPRESSION, "structural: child of InterfaceDefinition"),
+    "MethodImplementation": (NOT_AN_EXPRESSION, "structural: child of Implementation"),
+    "ModeAnnotation": (NOT_AN_EXPRESSION, "structural: a mode annotation"),
+    "ModuleBody": (NOT_AN_EXPRESSION, "structural: child of Module"),
+    "Parameter": (NOT_AN_EXPRESSION, "structural: a function parameter"),
+    "Program": (NOT_AN_EXPRESSION, "structural: the compilation-unit root"),
+    "RelativePath": (NOT_AN_EXPRESSION, "structural: an import path"),
+    "SliceExpression": (NOT_AN_EXPRESSION, "structural: only valid inside an index (handled by IndexExpression)"),
+    "SpreadElement": (NOT_AN_EXPRESSION, "structural: only valid inside a list literal (handled by ListLiteral)"),
+    "StructField": (NOT_AN_EXPRESSION, "structural: child of StructDefinition"),
+    "StructFieldDefinition": (NOT_AN_EXPRESSION, "structural: child of StructDefinition"),
+    "UniquenessMode": (NOT_AN_EXPRESSION, "structural: a mode annotation"),
+    "VariantDefinition": (NOT_AN_EXPRESSION, "structural: child of EnumDefinition"),
+    "WithClause": (NOT_AN_EXPRESSION, "structural: the `with SYMBOL` effect-mapping clause"),
+
+    # ---- (c) unsupported: real surface constructs with no semantics yet ----
+    "Comprehension": (UNSUPPORTED, "a bare comprehension has no value representation; only `vector[T,N](e for x in it)` is supported"),
+    "ComptimeBlock": (UNSUPPORTED, "compile-time evaluation is not implemented"),
+    "ComptimeFunction": (UNSUPPORTED, "compile-time evaluation is not implemented"),
+    "ComptimeValue": (UNSUPPORTED, "compile-time evaluation is not implemented"),
+    "FromDevice": (UNSUPPORTED, "GPU device transfer has no runtime"),
+    "GenericInstance": (UNSUPPORTED, "an uncalled generic instantiation (`f<T>`) has no value representation; call it directly (`f<T>(x)`)"),
+    "GetType": (UNSUPPORTED, "compile-time type reflection is not implemented"),
+    "KernelAnnotation": (UNSUPPORTED, "GPU kernels have no runtime"),
+    "PointerDereference": (UNSUPPORTED, "raw pointer dereference has no HIR/MIR representation"),
+    "SpawnExpression": (UNSUPPORTED, "the threads runtime is out of scope for v1 (docs/v1_gap_analysis.md)"),
+    "ToDevice": (UNSUPPORTED, "GPU device transfer has no runtime"),
+    "TypeMatchExpression": (UNSUPPORTED, "compile-time matching on types is not implemented"),
+}
+
+#: Declaration node classes that lower to unit in statement position (the
+#: LOWERED entries above whose reason begins "declaration -> unit").
+_DECLARATION_NODES: tuple[type, ...] = (
+    fast.EffectDeclaration, fast.EnumDefinition, fast.ExportDeclaration,
+    fast.FromImport, fast.FunctionDeclaration, fast.Implementation,
+    fast.Import, fast.InterfaceDefinition, fast.Module,
+    fast.StructDefinition, fast.TypeDefinition, fast.VisibilityRules,
+    ExternBlock, ExternFunctionDeclaration, ExternTypeDeclaration,
+)
+
+#: Pattern-position triage. The parser's arm grammar is `expression => body`,
+#: so most patterns arrive as expression nodes; the *Pattern classes are here
+#: too because desugar passes emit them. Anything not listed makes
+#: `_convert_pattern` raise instead of silently degrading to a wildcard —
+#: which would make the arm match EVERYTHING (the seam that made
+#: `match list { [] -> ..., [x, ...xs] -> ... }` always take its first arm).
+PATTERN_TRIAGE: dict[str, tuple[str, str]] = {
+    "WildcardPattern": (LOWERED, "`_`"),
+    "VariablePattern": (LOWERED, "a binding"),
+    "LiteralPattern": (LOWERED, "a literal"),
+    "VariantPattern": (LOWERED, "`Enum::Variant(sub, ...)`"),
+    "Literal": (LOWERED, "literal in arm position"),
+    "Variable": (LOWERED, "`_`, a nullary variant, or a binding"),
+    "UnaryOperation": (LOWERED, "negative numeric literal (`-1`); any other unary form raises"),
+    "NoneExpression": (LOWERED, "`None`"),
+    "SomeExpression": (LOWERED, "`Some(sub)`"),
+    "BorrowShared": (LOWERED, "`&x` in a pattern binds the name"),
+    "BorrowUnique": (LOWERED, "`@mut x` in a pattern binds the name"),
+    "Move": (LOWERED, "`move(x)` in a pattern binds the name"),
+    "ModeExpression": (LOWERED, "a mode-annotated sub-pattern"),
+    "FunctionCall": (LOWERED, "`Variant(sub, ...)`; a non-variant callee raises"),
+    "QualifiedFunctionCall": (LOWERED, "`Enum.Variant(sub, ...)`"),
+    "QualifiedName": (LOWERED, "`Enum.Variant` (nullary); a non-variant dotted name raises"),
+    "FieldAccess": (LOWERED, "`Enum.Variant` (nullary, the shape the parser actually builds); any other dotted form raises"),
+    "ListLiteral": (UNSUPPORTED, "list patterns (`[]`, `[x, ...xs]`) need a pattern kind MIR cannot test yet"),
+    "TupleLiteral": (UNSUPPORTED, "tuple patterns need a tuple runtime representation"),
+    "StructInstantiation": (UNSUPPORTED, "struct patterns (`S { f: p }`) are not implemented"),
+    "RangeExpression": (UNSUPPORTED, "range patterns (`1..5`) are not implemented"),
+    "BinaryOperation": (UNSUPPORTED, "an arbitrary expression is not a pattern"),
+    "ComparisonExpression": (UNSUPPORTED, "pattern guards are not implemented"),
+    "LambdaExpression": (UNSUPPORTED, "matching on the structure of a function is not implemented"),
+    "IndexExpression": (UNSUPPORTED, "matching against an indexed value is not implemented"),
+}
+
+
+class HIRLoweringError(NotImplementedError):
+    """A construct reached HIR lowering that the compiler cannot lower.
+
+    Subclasses NotImplementedError so the raises that already existed in this
+    module keep their exception class. Every raise is LOUD by design: HIR
+    lowering must never quietly drop a construct.
+    """
+
+
+class UnsupportedConstruct(HIRLoweringError):
+    """Bucket (c): a real surface construct with no HIR semantics yet."""
+
+
+class HIRCompilerBug(HIRLoweringError):
+    """Bucket (b): a node that must never reach expression lowering did."""
 
 
 @dataclass(slots=True)
@@ -178,9 +444,19 @@ class HIRBuilder:
         # All declared type names (structs, enums) plus runtime type
         # constructors — used to tell `Type.method()` from `variable.method()`.
         self._type_names: set[str] = {"Vec", "vector"}
+        # Compilation-unit file name, used as the last-resort location in
+        # lowering diagnostics (most parsed nodes carry no SourceLocation).
+        self._root_file: str = "<unknown file>"
 
     def build(self, root: mast.AstNode) -> list[HFun]:
         funcs: list[HFun] = []
+        # The compilation-unit file name for diagnostics: the frozen root
+        # itself carries "<unknown>", its Module child carries the real path.
+        for cand in (root, *root.children):
+            fname = getattr(getattr(cand, 'span', None), 'file', None)
+            if fname and fname != "<unknown>":
+                self._root_file = fname
+                break
 
         # Build reverse map: id(orig_obj) -> frozen AstNode
         def index_nodes(n: mast.AstNode) -> None:
@@ -235,6 +511,14 @@ class HIRBuilder:
             orig = self.id_map.get(n.node_id)
             if not in_fn and isinstance(orig, fast.LetStatement):
                 module_lets.append((n, orig))
+            if isinstance(orig, fast.ComptimeFunction):
+                # A ComptimeFunction IS a FunctionDeclaration; hoisting it here
+                # would compile it as an ordinary run-time function and lose
+                # the "evaluate at compile time" meaning entirely.
+                raise UnsupportedConstruct(
+                    f"comptime fn {getattr(orig, 'name', '?')!r} at "
+                    f"{self._span_text(n.span, orig)} is not supported: "
+                    "compile-time evaluation is not implemented")
             if isinstance(orig, fast.FunctionDeclaration):
                 # Determine return type from side tables for this node or fallback
                 ret = self.t.apply_tyenv(self.t.types.get(n.node_id, "Unit"))  # type: ignore[index]
@@ -438,6 +722,15 @@ class HIRBuilder:
 
         frozen_ctx: a frozen node to provide node_id/span context when the original
         node lacks a corresponding frozen node in id_map traversal.
+
+        None contract (the ONLY one): this returns None if and only if `orig`
+        is None — i.e. the source genuinely had nothing there (an absent else
+        branch, an extern function's missing body). Every other outcome is
+        either a real HExpr or a raised HIRLoweringError. Callers may test the
+        `orig is None` case; they must NEVER treat a None as "skip this
+        construct", which is how if-let, while-let, `unsafe { }`, `@mut e`,
+        list literals, `for`, `as` casts and early `return` each silently
+        vanished from compiled programs.
         """
         if orig is None:
             return None
@@ -500,8 +793,18 @@ class HIRBuilder:
         if isinstance(orig, fast.QualifiedName):
             parts = list(getattr(orig, 'parts', []) or [])
             if not parts:
-                return None
+                raise HIRCompilerBug(
+                    f"QualifiedName with no parts at "
+                    f"{self._span_text(frozen_ctx.span)}")
             ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, "Unknown"))
+            # `Enum.Variant` names a nullary variant, it is not a field read of
+            # a variable called `Enum` (which is what the FieldGet chain below
+            # produced — "Unbound variable 'Color'" at run time).
+            if (len(parts) == 2
+                    and self._variant_to_enum.get(str(parts[1])) == str(parts[0])):
+                return self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span,
+                                      op="MakeVariant", enum_name=str(parts[0]),
+                                      variant_name=str(parts[1]), operands=())
             if len(parts) == 1:
                 return self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span, op="Var", var_name=str(parts[0]))
             # Build chained FieldGet: start from the first part as a Var
@@ -513,13 +816,30 @@ class HIRBuilder:
         # Borrow/move/exclave expressions: at runtime these evaluate to the
         # referenced value (aliasing and ownership rules are enforced earlier
         # by the frozen borrow checker, not at HIR/MIR level).
-        if isinstance(orig, (fast.BorrowShared, fast.BorrowUnique, fast.Move)):
+        # `borrow x` / `borrow x as T` carries the borrowed name as a bare
+        # string, like BorrowShared/BorrowUnique. It had no lowering: the whole
+        # expression vanished, so `let y = borrow x;` bound nothing.
+        if isinstance(orig, (fast.BorrowShared, fast.BorrowUnique, fast.Move,
+                             fast.BorrowExpression)):
             var = getattr(orig, 'variable', None)
             if isinstance(var, str):
                 ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, 'Unknown'))
                 return self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span,
                                       op="Var", var_name=var)
-            return self._from_orig_expr(var, ctx_for(var)) if var is not None else None
+            return self._require(
+                self._from_orig_expr(var, ctx_for(var)) if var is not None else None,
+                orig, frozen_ctx, "the borrowed/moved operand")
+        # `&e` / `&mut e` where `e` is NOT a plain name (`&x.f`, `&v[0]`): the
+        # parser only builds BorrowShared/BorrowUnique for the bare-name form
+        # and an AddressOf for everything else. Same rule as the bare-name form
+        # — at runtime it evaluates to the referenced value; aliasing and
+        # ownership are enforced earlier by the frozen borrow checker. (It had
+        # no lowering, so `&x.f` silently became nothing.)
+        if isinstance(orig, AddressOf):
+            inner = getattr(orig, 'expr', None)
+            return self._require(
+                self._from_orig_expr(inner, ctx_for(inner)) if inner is not None else None,
+                orig, frozen_ctx, "the `&`-operand")
         if isinstance(orig, fast.ExclaveExpression):
             inner = getattr(orig, 'expression', None)
             if isinstance(inner, str):
@@ -619,6 +939,33 @@ class HIRBuilder:
                           if isinstance(t, str))
             return self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span, op="Call", callee=callee, operands=tuple(args_exprs),
                                   type_args=targs or None)
+
+        # CallExpression: a call whose callee is an arbitrary EXPRESSION rather
+        # than a name — `(fn(x) -> x)(1)`, `v[0](41)`, `mk()(2)`. HIR's Call op
+        # carries a callee NAME, and the interpreter/native backends already
+        # resolve a name bound to a closure value by calling that closure, so
+        # bind the computed callee to a fresh local first and call it by that
+        # name. (This node had no lowering: the whole call vanished and the
+        # expression evaluated to unit.)
+        if isinstance(orig, fast.CallExpression):
+            callee_node = getattr(orig, 'callee', None)
+            callee_he = self._require(
+                self._from_orig_expr(callee_node, ctx_for(callee_node))
+                if callee_node is not None else None,
+                orig, frozen_ctx, "the callee expression of an indirect call")
+            arg_exprs = []
+            for a in getattr(orig, 'arguments', []) or []:
+                arg_exprs.append(self._require(
+                    self._from_orig_expr(a, ctx_for(a)), a, frozen_ctx,
+                    "an argument of an indirect call"))
+            ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, "Unknown"))
+            tmp = f"__callee{frozen_ctx.node_id}"
+            bind = self._mk_hexpr(frozen_ctx.node_id, "Stmt", "Unit", frozen_ctx.span,
+                                  op="Let", bindings=((tmp, callee_he),))
+            call = self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span,
+                                  op="Call", callee=tmp, operands=tuple(arg_exprs))
+            return self._mk_hexpr(frozen_ctx.node_id, "Block", ty, frozen_ctx.span,
+                                  op="Block", operands=(bind, call))
 
         # BinaryOperation / ComparisonExpression (same structure, both use left/operator/right)
         if isinstance(orig, (fast.BinaryOperation, fast.ComparisonExpression)):
@@ -735,7 +1082,9 @@ class HIRBuilder:
         # the constraint emitter; typing of bindings currently falls back to the
         # arm-body node types (frozen_constraint_emitter is owned by another agent).
         if isinstance(orig, fast.MatchExpression):
-            expr = self._from_orig_expr(getattr(orig, 'expression', None), frozen_ctx)
+            expr = self._require(
+                self._from_orig_expr(getattr(orig, 'expression', None), frozen_ctx),
+                orig, frozen_ctx, "the scrutinee of a `match`")
             cases = getattr(orig, 'cases', []) or []
             case_exprs: list[HExpr] = []
             arms: list[tuple[HPattern, HExpr]] = []
@@ -751,10 +1100,14 @@ class HIRBuilder:
                 else:
                     pattern, case_body = case
                     pat = self._convert_pattern(pattern)
-                case_hexpr = self._from_orig_expr(case_body, frozen_ctx)
-                if case_hexpr is not None:
-                    case_exprs.append(case_hexpr)
-                    arms.append((pat, case_hexpr))
+                # A dropped arm silently changes which arm wins for a value
+                # (the next arm takes over), so an un-lowerable arm body is a
+                # hard error rather than a skip.
+                case_hexpr = self._require(
+                    self._from_orig_expr(case_body, frozen_ctx), orig,
+                    frozen_ctx, "the body of a `match` arm")
+                case_exprs.append(case_hexpr)
+                arms.append((pat, case_hexpr))
             ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, "Unit"))
             return self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span, op="Match",
                                   scrutinee=expr, cases=tuple(case_exprs), match_arms=tuple(arms))
@@ -1224,11 +1577,56 @@ class HIRBuilder:
                             f"handler arm {op_name!r} "
                             f"({type(c.body).__name__}) — refusing to drop the arm")
                     case_triples.append((op_name, params, case_body))
-            body_he = self._from_orig_expr(cont, ctx_for(cont) if cont is not None else frozen_ctx)
+            # An absent/undroppable `in` target would make the whole handled
+            # computation disappear (MIR falls back to a typed constant), so
+            # require it.
+            body_he = self._require(
+                self._from_orig_expr(cont, ctx_for(cont)) if cont is not None else None,
+                orig, frozen_ctx, f"the `in` body of `handle {eff_name}`")
             ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, 'Unknown'))
             return self._mk_hexpr(frozen_ctx.node_id, 'Expr', ty, frozen_ctx.span,
                                   op='Handle',
                                   handle_effect=eff_name,
+                                  handle_cases=tuple(case_triples),
+                                  handle_body=body_he)
+
+        # HandleBlock: the inline handler form
+        #     handle SUBJECT { perform Eff.op(p, q) => body, ... }
+        # (the `handle e with { } in body` form is HandleEffect above). Same
+        # delimited semantics: SUBJECT is the delimited body, each arm handles
+        # one operation. This node had NO lowering — `with_simd(...)` in
+        # examples/06_vector_operations.mx compiled to a function that ran
+        # nothing and returned unit.
+        if isinstance(orig, fast.HandleBlock):
+            subject = getattr(orig, 'subject', None)
+            body_he = self._require(
+                self._from_orig_expr(subject, ctx_for(subject))
+                if subject is not None else None,
+                orig, frozen_ctx, "the subject of a `handle` block")
+            eff_names: set[str] = set()
+            case_triples: list[tuple[str, tuple, HExpr]] = []
+            for arm in (getattr(orig, 'arms', []) or []):
+                pat_node, arm_body = arm
+                eff, op_name, params = self._handle_arm_signature(pat_node, frozen_ctx)
+                if eff:
+                    eff_names.add(eff)
+                arm_he = self._require(
+                    self._from_orig_expr(arm_body, ctx_for(arm_body))
+                    if arm_body is not None else None,
+                    orig, frozen_ctx,
+                    f"the body of handler arm {op_name!r}")
+                case_triples.append((op_name, params, arm_he))
+            if len(eff_names) > 1:
+                raise UnsupportedConstruct(
+                    f"handle block at {self._span_text(frozen_ctx.span)} handles "
+                    f"operations of more than one effect ({', '.join(sorted(eff_names))}); "
+                    "a handler frame names a single effect — use one `handle` per effect")
+            # No qualified prefix on any arm: leave the effect unnamed, which
+            # the runtime treats as "match by operation name alone".
+            eff_name = next(iter(eff_names)) if eff_names else ""
+            ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, 'Unknown'))
+            return self._mk_hexpr(frozen_ctx.node_id, 'Expr', ty, frozen_ctx.span,
+                                  op='Handle', handle_effect=eff_name,
                                   handle_cases=tuple(case_triples),
                                   handle_body=body_he)
 
@@ -1255,21 +1653,32 @@ class HIRBuilder:
         # FieldAccess
         if isinstance(orig, fast.FieldAccess):
             base_node = getattr(orig, 'base', None) or getattr(orig, 'expression', None)
+            # `Color.Red` parses as a FieldAccess, but it names a nullary enum
+            # variant — not a field of a variable called `Color` (which is what
+            # the FieldGet chain below built: "Unbound variable 'Color'").
+            enum_ctor = self._enum_variant_of(base_node,
+                                              getattr(orig, 'fields', ()) or ())
+            if enum_ctor is not None:
+                ety = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, "Unknown"))
+                return self._mk_hexpr(frozen_ctx.node_id, "Expr", ety, frozen_ctx.span,
+                                      op="MakeVariant", enum_name=enum_ctor[0],
+                                      variant_name=enum_ctor[1], operands=())
             if isinstance(base_node, str):
                 # The parser stores the base of `c.name` as a raw name string.
                 base_ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, "Unknown"))
                 base_he = self._mk_hexpr(frozen_ctx.node_id, "Expr", base_ty,
                                          frozen_ctx.span, op="Var", var_name=base_node)
             else:
-                base_he = self._from_orig_expr(base_node, frozen_ctx)
+                base_he = self._require(
+                    self._from_orig_expr(base_node, frozen_ctx), orig,
+                    frozen_ctx, "the base of a field access")
             field_names = getattr(orig, 'fields', ()) or ()
             # Chain: for a.b.c, build nested FieldGet(FieldGet(a, b), c)
             current = base_he
             ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, "Unknown"))
             for fname in field_names:
-                if current is not None:
-                    current = self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span,
-                                             op="FieldGet", base=current, field_name=str(fname))
+                current = self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span,
+                                         op="FieldGet", base=current, field_name=str(fname))
             return current
 
         # IndexExpression: `base[i]` (plain index) or `base[a:b:c]` (slice).
@@ -1277,9 +1686,9 @@ class HIRBuilder:
         # __slice_get (absent slice parts become literal None).
         if isinstance(orig, fast.IndexExpression):
             base_node = getattr(orig, 'base', None)
-            base_he = self._from_orig_expr(base_node, ctx_for(base_node))
-            if base_he is None:
-                return None
+            base_he = self._require(
+                self._from_orig_expr(base_node, ctx_for(base_node)), orig,
+                frozen_ctx, "the base of an index expression")
             ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, 'Unknown'))
             idx = getattr(orig, 'index', None)
             idx_list = idx if isinstance(idx, list) else [idx]
@@ -1296,18 +1705,17 @@ class HIRBuilder:
                                 frozen_ctx.node_id, 'Expr', ty, frozen_ctx.span,
                                 op='Literal', literal=None))
                         else:
-                            he = self._from_orig_expr(part, ctx_for(part))
-                            if he is None:
-                                return None
-                            parts.append(he)
+                            parts.append(self._require(
+                                self._from_orig_expr(part, ctx_for(part)), part,
+                                frozen_ctx, "a slice bound"))
                     current = self._mk_hexpr(frozen_ctx.node_id, 'Expr', ty,
                                              frozen_ctx.span, op='Call',
                                              callee='__slice_get',
                                              operands=(current, *parts))
                 else:
-                    ih = self._from_orig_expr(i, ctx_for(i))
-                    if ih is None:
-                        return None
+                    ih = self._require(
+                        self._from_orig_expr(i, ctx_for(i)), i, frozen_ctx,
+                        "an index expression")
                     current = self._mk_hexpr(frozen_ctx.node_id, 'Expr', ty,
                                              frozen_ctx.span, op='Call',
                                              callee='__index_get',
@@ -1317,13 +1725,17 @@ class HIRBuilder:
         # UnaryOperation: `-x` / `!x` — lowered to the neg/not builtins.
         if isinstance(orig, fast.UnaryOperation):
             operand = getattr(orig, 'operand', None)
-            operand_he = self._from_orig_expr(operand, ctx_for(operand))
-            if operand_he is None:
-                return None
+            operand_he = self._require(
+                self._from_orig_expr(operand, ctx_for(operand)), orig,
+                frozen_ctx, "the operand of a unary operator")
             op_sym = str(getattr(orig, 'operator', '') or '')
             callee = {'-': 'neg', '!': 'not', 'not': 'not'}.get(op_sym)
             if callee is None:
-                return None
+                # Dropping the whole expression here turned `~x` into nothing.
+                raise UnsupportedConstruct(
+                    f"unary operator {op_sym!r} at "
+                    f"{self._span_text(frozen_ctx.span)} is not supported "
+                    "(only `-` and `!`/`not` lower)")
             ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, 'Unknown'))
             return self._mk_hexpr(frozen_ctx.node_id, 'Expr', ty, frozen_ctx.span,
                                   op='Call', callee=callee, operands=(operand_he,))
@@ -1332,10 +1744,10 @@ class HIRBuilder:
         if isinstance(orig, fast.RangeExpression):
             s_node = getattr(orig, 'start', None)
             e_node = getattr(orig, 'end', None)
-            s_he = self._from_orig_expr(s_node, ctx_for(s_node))
-            e_he = self._from_orig_expr(e_node, ctx_for(e_node))
-            if s_he is None or e_he is None:
-                return None
+            s_he = self._require(self._from_orig_expr(s_node, ctx_for(s_node)),
+                                 orig, frozen_ctx, "the start of a range")
+            e_he = self._require(self._from_orig_expr(e_node, ctx_for(e_node)),
+                                 orig, frozen_ctx, "the end of a range")
             ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, 'Unknown'))
             return self._mk_hexpr(frozen_ctx.node_id, 'Expr', ty, frozen_ctx.span,
                                   op='Call', callee='__range',
@@ -1414,7 +1826,9 @@ class HIRBuilder:
             params = getattr(orig, 'params', []) or []
             param_names = tuple(str(getattr(p, 'name', p)) for p in params)
             body_nodes = getattr(orig, 'body', None)
-            body_he = self._from_orig_expr(body_nodes, frozen_ctx)
+            body_he = self._require(
+                self._from_orig_expr(body_nodes, frozen_ctx), orig, frozen_ctx,
+                "the body of a lambda")
             captured_vars = {str(v) for v in (getattr(orig, 'captured_vars', set()) or set())}
             capture_modes = getattr(orig, 'capture_modes', {}) or {}
             # The parser's scope-based capture analysis only sees scopes it
@@ -1444,8 +1858,162 @@ class HIRBuilder:
                                   lambda_body=body_he,
                                   captures=captures)
 
-        # Fallback: None
-        return None
+        # ComptimeFunction subclasses FunctionDeclaration, so it must be
+        # rejected BEFORE the declaration branch below (and before build()'s
+        # hoisting walk treats it as an ordinary function): compiling a
+        # `comptime fn` as a run-time function is exactly the "quietly does
+        # something else" failure this triage exists to stop.
+        if isinstance(orig, fast.ComptimeFunction):
+            return self._unlowerable(orig, frozen_ctx)
+
+        # Declarations in statement position. The parser allows `fn`, `struct`,
+        # `enum`, `trait`, `implement`, `import`, `module`, `effect`, `extern`
+        # and friends inside any block; their meaning is realized by the module
+        # loader, the desugar passes, or build()'s own hoisting walk (which
+        # lifts every FunctionDeclaration anywhere in the tree into an HFun).
+        # As a *statement* each one therefore contributes nothing at run time —
+        # an EXPLICIT unit, not a silently skipped None.
+        if isinstance(orig, _DECLARATION_NODES):
+            return self._mk_hexpr(frozen_ctx.node_id, "Block", "Unit",
+                                  frozen_ctx.span, op="Block", operands=())
+
+        # Loud fallback. There is no silent "unknown node" path any more:
+        # every AST node class is triaged in AST_NODE_TRIAGE and an unhandled
+        # one raises, naming the class and the source span.
+        return self._unlowerable(orig, frozen_ctx)
+
+    # ------------------------------------------------------------------
+    # The loud fallback
+    # ------------------------------------------------------------------
+
+    def _span_text(self, span: Any, orig: Any = None) -> str:
+        """Human-readable source location for a diagnostic.
+
+        Prefers the ORIGINAL parsed node's SourceLocation ("file:line:column")
+        when the parser attached one; the frozen Span records only a file and a
+        column, and most inner nodes carry neither, so the compilation unit's
+        own file name is the last resort. (Line-accurate spans on every node
+        are a parser-side gap, not something HIR can synthesize.)
+        """
+        loc = getattr(orig, 'location', None)
+        if loc is not None and getattr(loc, 'line', None) is not None:
+            return (f"{getattr(loc, 'file', None) or self._root_file}:"
+                    f"{loc.line}:{getattr(loc, 'column', 0)}")
+        fpath = getattr(span, 'file', None)
+        if not fpath or fpath == "<unknown>":
+            fpath = self._root_file
+        col = getattr(span, 'start', None)
+        return f"{fpath}:{col}" if col else str(fpath)
+
+    def _unlowerable(self, orig: Any, frozen_ctx: mast.AstNode) -> HExpr:
+        """Raise for an AST node expression lowering does not handle.
+
+        Consults AST_NODE_TRIAGE so the diagnostic says WHICH kind of problem
+        this is: a construct with no semantics yet (user error), a node that
+        should never have reached here (compiler bug), or a node class nobody
+        has triaged (also a compiler bug — the table is the checklist).
+        """
+        cls = type(orig).__name__
+        where = self._span_text(getattr(frozen_ctx, 'span', None), orig)
+        entry = AST_NODE_TRIAGE.get(cls)
+        if entry is None:
+            raise HIRCompilerBug(
+                f"{cls} at {where} is not in AST_NODE_TRIAGE: HIR lowering "
+                "does not know whether it is an expression, and refuses to "
+                "guess. Add it to the table in hir.py (see test_hir_coverage).")
+        bucket, reason = entry
+        if bucket == UNSUPPORTED:
+            raise UnsupportedConstruct(
+                f"{cls} at {where} is not supported: {reason}")
+        if bucket == NOT_AN_EXPRESSION:
+            raise HIRCompilerBug(
+                f"{cls} at {where} reached HIR expression lowering, but it is "
+                f"not an expression ({reason}) — an earlier pass should have "
+                "consumed it")
+        raise HIRCompilerBug(
+            f"{cls} at {where} is registered as lowered ({reason}) but fell "
+            "through to the fallback in _from_orig_expr")
+
+    def _enum_variant_of(self, base: Any, fields: Any) -> tuple[str, str] | None:
+        """(enum, variant) if `base.fields` spells a nullary variant, else None.
+
+        `Color.Red` reaches HIR as FieldAccess(base=Variable('Color'),
+        fields=['Red']) in expression position and in pattern position alike.
+        The match is deliberately tight — the base must be exactly the enum
+        that declares the variant — so a real field read of a same-named
+        variable is untouched.
+        """
+        names = [str(f) for f in (fields or [])]
+        if len(names) != 1:
+            return None
+        if isinstance(base, fast.Variable):
+            base = getattr(base, 'name', None)
+        elif isinstance(base, fast.QualifiedName):
+            parts = list(getattr(base, 'parts', []) or [])
+            base = str(parts[0]) if len(parts) == 1 else None
+        if not isinstance(base, str):
+            return None
+        if self._variant_to_enum.get(names[0]) != base:
+            return None
+        return base, names[0]
+
+    def _handle_arm_signature(self, pat_node: Any,
+                              frozen_ctx: mast.AstNode) -> tuple[str, str, tuple[str, ...]]:
+        """(effect, op, param names) of an inline `handle { ... }` arm pattern.
+
+        Arms are written `perform Eff.op(p, q) => body` (a PerformEffect) or
+        `op(p) => body` / `op => body` (a bare call/name). Anything else is a
+        loud error: guessing an operation name would silently install a
+        handler for the wrong op — which is indistinguishable from installing
+        no handler at all.
+        """
+        raw_name: str | None = None
+        args: list = []
+        if isinstance(pat_node, fast.PerformEffect):
+            raw_name = str(getattr(pat_node, 'effect_name', '') or '')
+            args = list(getattr(pat_node, 'arguments', []) or [])
+        elif isinstance(pat_node, fast.QualifiedFunctionCall):
+            raw_name = '.'.join(str(p) for p in (getattr(pat_node, 'parts', []) or []))
+            args = list(getattr(pat_node, 'arguments', []) or [])
+        elif isinstance(pat_node, fast.FunctionCall):
+            raw_name = str(getattr(pat_node, 'name', '') or '')
+            args = list(getattr(pat_node, 'arguments', []) or [])
+        elif isinstance(pat_node, fast.QualifiedName):
+            raw_name = '.'.join(str(p) for p in (getattr(pat_node, 'parts', []) or []))
+        elif isinstance(pat_node, fast.Variable):
+            raw_name = str(getattr(pat_node, 'name', '') or '')
+        if not raw_name:
+            raise UnsupportedConstruct(
+                f"handle block at {self._span_text(frozen_ctx.span)}: arm "
+                f"{type(pat_node).__name__} is not an operation pattern; write "
+                "`perform Effect.op(params) => body`")
+        effect, _, op_name = raw_name.rpartition(".")
+        params: list[str] = []
+        for a in args:
+            if isinstance(a, fast.Variable):
+                params.append(str(getattr(a, 'name', '_')))
+            elif isinstance(a, str):
+                params.append(a)
+            else:
+                raise UnsupportedConstruct(
+                    f"handle block at {self._span_text(frozen_ctx.span)}: arm "
+                    f"{op_name!r} binds a {type(a).__name__} where a parameter "
+                    "name is required — handler arms bind plain names")
+        # Zero-arg ops still need a slot: the MIR handler sub-function takes
+        # (params..., __k), and the interpreter tolerates fewer args than
+        # params. Mirrors the parser's HandleCase default.
+        return effect, op_name, tuple(params) or ("_",)
+
+    def _require(self, he: HExpr | None, orig: Any, frozen_ctx: mast.AstNode,
+                 what: str) -> HExpr:
+        """Return `he`, or raise naming `what` — used where a sub-expression is
+        mandatory (dropping it would silently change the program)."""
+        if he is not None:
+            return he
+        cls = type(orig).__name__
+        where = self._span_text(getattr(frozen_ctx, 'span', None), orig)
+        raise HIRCompilerBug(
+            f"{what} at {where} is missing ({cls}) — refusing to drop it")
 
     # ------------------------------------------------------------------
     # Vector literal / comprehension helpers
@@ -1473,7 +2041,7 @@ class HIRBuilder:
         return None
 
     def _convert_vector_literal(self, orig: Any, frozen_ctx: mast.AstNode,
-                                ctx_for: Any) -> HExpr | None:
+                                ctx_for: Any) -> HExpr:
         n = self._const_int_of(getattr(orig, 'size', None))
         ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, 'Unknown'))
         n_he = self._mk_hexpr(frozen_ctx.node_id, 'Expr', ty, frozen_ctx.span,
@@ -1500,9 +2068,9 @@ class HIRBuilder:
                                          frozen_ctx.span, op='Call',
                                          callee='__zip', operands=tuple(parts))
             else:
-                iter_he = self._from_orig_expr(iter_node, ctx_for(iter_node))
-            if lam is None or iter_he is None:
-                return None
+                iter_he = self._require(
+                    self._from_orig_expr(iter_node, ctx_for(iter_node)), comp,
+                    frozen_ctx, "the iterable of a vector comprehension")
             return self._mk_hexpr(frozen_ctx.node_id, 'Expr', ty, frozen_ctx.span,
                                   op='Call', callee='__vec_comprehension',
                                   operands=(n_he, lam, iter_he))
@@ -1517,16 +2085,15 @@ class HIRBuilder:
         # Explicit elements
         elem_hes: list[HExpr] = []
         for el in elements:
-            he = self._from_orig_expr(el, ctx_for(el))
-            if he is None:
-                return None
-            elem_hes.append(he)
+            elem_hes.append(self._require(
+                self._from_orig_expr(el, ctx_for(el)), el, frozen_ctx,
+                "an element of a vector literal"))
         return self._mk_hexpr(frozen_ctx.node_id, 'Expr', ty, frozen_ctx.span,
                               op='Call', callee='__vec_lit',
                               operands=(n_he, *elem_hes))
 
     def _comprehension_lambda(self, comp: Any, frozen_ctx: mast.AstNode,
-                              ctx_for: Any) -> HExpr | None:
+                              ctx_for: Any) -> HExpr:
         """Compile a comprehension body into a Lambda HExpr.
 
         The comprehension targets become the lambda parameters. Free names in
@@ -1536,11 +2103,13 @@ class HIRBuilder:
         """
         targets = tuple(str(t) for t in (getattr(comp, 'targets', []) or []))
         if not targets:
-            return None
+            raise HIRCompilerBug(
+                f"comprehension at {self._span_text(frozen_ctx.span)} has no "
+                "loop target — refusing to drop it")
         body_node = getattr(comp, 'expression', None)
-        body_he = self._from_orig_expr(body_node, ctx_for(body_node))
-        if body_he is None:
-            return None
+        body_he = self._require(
+            self._from_orig_expr(body_node, ctx_for(body_node)), comp,
+            frozen_ctx, "the body of a comprehension")
         free = self._free_names(body_node) - set(targets)
         captures = tuple((name, 'auto') for name in sorted(free))
         ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, 'Unknown'))
@@ -1608,11 +2177,17 @@ class HIRBuilder:
         """Convert an `if let` / `while let` pattern, failing loudly when the
         pattern shape is not understood.
 
-        _convert_pattern falls back to a wildcard for unknown nodes (fine for
-        the last match arm); for `if let`/`while let` a silent wildcard would
-        make the branch unconditionally taken, so reject it instead.
+        _convert_pattern is itself loud now, but it still legitimately answers
+        a wildcard for `_`; for `if let`/`while let` a wildcard reached any
+        other way would make the branch unconditionally taken, so this second
+        check stays as a belt-and-braces guard.
         """
-        pat = self._convert_pattern(pat_node)
+        try:
+            pat = self._convert_pattern(pat_node)
+        except HIRLoweringError as exc:
+            # Name the construct: `if let`/`while let` read very differently
+            # from a match arm even for the same rejected pattern shape.
+            raise type(exc)(f"{construct}: {exc}") from exc
         is_source_wildcard = (
             pat_node is None
             or type(pat_node).__name__ == "WildcardPattern"
@@ -1672,12 +2247,17 @@ class HIRBuilder:
                                 enum_name=self._variant_to_enum[name], subpatterns=())
             return HPattern(kind="var", name=name)
         # Negative number literal pattern: `-1 => ...` parses as UnaryOperation.
-        if isinstance(p, fast.UnaryOperation) and getattr(p, 'operator', None) == '-':
+        if isinstance(p, fast.UnaryOperation):
             operand = getattr(p, 'operand', None)
-            if isinstance(operand, fast.Literal):
+            if (getattr(p, 'operator', None) == '-'
+                    and isinstance(operand, fast.Literal)):
                 v = getattr(operand, 'value', None)
                 if isinstance(v, (int, float)) and not isinstance(v, bool):
                     return HPattern(kind="literal", value=-v)
+            raise UnsupportedConstruct(
+                f"[{self._root_file}] unsupported pattern: `{getattr(p, 'operator', '?')}"
+                f"{type(operand).__name__}` — only a negative numeric literal "
+                "(`-1`) is a valid unary pattern")
         if isinstance(p, fast.NoneExpression):
             return HPattern(kind="ctor", name="None",
                             enum_name=self._variant_to_enum.get("None"), subpatterns=())
@@ -1709,6 +2289,10 @@ class HIRBuilder:
                 return HPattern(kind="ctor", name=callee,
                                 enum_name=self._variant_to_enum.get(callee, default_enum),
                                 subpatterns=subs)
+            raise UnsupportedConstruct(
+                f"[{self._root_file}] unsupported pattern: `{callee}(...)` is not a known enum "
+                "variant, and a call is not a pattern")
+        # `Enum.Variant(sub, ...)` and the nullary `Enum.Variant`.
         if isinstance(p, fast.QualifiedFunctionCall):
             parts = list(getattr(p, 'parts', []) or [])
             if len(parts) >= 2:
@@ -1716,8 +2300,53 @@ class HIRBuilder:
                              for a in getattr(p, 'arguments', []) or [])
                 return HPattern(kind="ctor", name=str(parts[-1]),
                                 enum_name=str(parts[-2]), subpatterns=subs)
-        # Unknown pattern node: treat as wildcard so lowering stays total.
-        return HPattern(kind="wildcard")
+            raise UnsupportedConstruct(
+                f"[{self._root_file}] unsupported pattern: a qualified call "
+                "pattern needs at least `Enum.Variant`, got "
+                f"{'.'.join(str(x) for x in parts)!r}")
+        # `Color.Red => ...` parses as a FieldAccess. It used to fall into the
+        # wildcard fallback, so the arm matched EVERYTHING and every later arm
+        # became dead code.
+        if isinstance(p, fast.FieldAccess):
+            ctor = self._enum_variant_of(getattr(p, 'base', None),
+                                         getattr(p, 'fields', ()) or ())
+            if ctor is not None:
+                return HPattern(kind="ctor", name=ctor[1], enum_name=ctor[0])
+            raise UnsupportedConstruct(
+                f"[{self._root_file}] unsupported pattern: `{p}` is not a known enum variant, and "
+                "matching against a field's value is not implemented")
+        if isinstance(p, fast.QualifiedName):
+            parts = [str(x) for x in (getattr(p, 'parts', []) or [])]
+            # `Color.Red => ...` is a nullary variant pattern; it used to fall
+            # into the wildcard fallback, so the arm matched EVERYTHING and
+            # every later arm became dead code.
+            if len(parts) == 2 and self._variant_to_enum.get(parts[1]) == parts[0]:
+                return HPattern(kind="ctor", name=parts[1],
+                                enum_name=parts[0], subpatterns=())
+            if len(parts) == 1:
+                name = parts[0]
+                if name == "_":
+                    return HPattern(kind="wildcard")
+                if name in self._variant_to_enum:
+                    return HPattern(kind="ctor", name=name,
+                                    enum_name=self._variant_to_enum[name])
+                return HPattern(kind="var", name=name)
+            raise UnsupportedConstruct(
+                f"[{self._root_file}] unsupported pattern: `{'.'.join(parts)}` is not a known enum "
+                "variant, and a dotted name is not a pattern")
+        # Unknown pattern node. Degrading to a wildcard here made the arm match
+        # EVERYTHING — the seam that turned examples/02's
+        # `match list { [] -> ..., [x, ...xs] -> ... }` into "always return the
+        # first arm". Consult the pattern triage table so the diagnostic says
+        # what is unsupported and why.
+        entry = PATTERN_TRIAGE.get(cls_name)
+        if entry is not None and entry[0] == UNSUPPORTED:
+            raise UnsupportedConstruct(
+                f"[{self._root_file}] unsupported pattern {cls_name}: {entry[1]}")
+        raise HIRCompilerBug(
+            f"[{self._root_file}] {cls_name} reached pattern conversion and is "
+            "not in PATTERN_TRIAGE: refusing to degrade it to a match-anything "
+            "wildcard. Add it to the table in hir.py (see test_hir_coverage).")
 
     # Plain-string mode tokens as produced by the parser's binding_prefix
     # (`let @global x = ...` builds ModeAnnotation('global'): mode_type is the

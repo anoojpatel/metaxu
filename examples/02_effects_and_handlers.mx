@@ -47,13 +47,18 @@ fn main() {
     }
 }
 
-# Example of effect polymorphism
+# Example of effect polymorphism: `map` is polymorphic in the effect row E,
+# so it works with any effectful `f` and performs exactly E itself.
+#
+# This used to be written with list patterns (`[] -> ...`, `[x, ...xs] -> ...`).
+# List patterns are NOT implemented — HIR lowering degraded both of them to
+# match-anything wildcards, so the first arm always won and `map` silently
+# returned an empty list for every input. Written as a loop it does what it
+# says; `_convert_pattern` now rejects list patterns loudly instead.
 fn map<T, U, E>(list: List<T>, f: fn(T) -> U performs E) performs E -> List<U> {
-    match list {
-        [] -> [],
-        [x, ...xs] -> {
-            let y = f(x);
-            [y, ...map(xs, f)]
-        }
+    let out = Vec.new();
+    for x in list {
+        out.push(f(x));
     }
+    out
 }
