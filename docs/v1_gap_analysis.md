@@ -226,6 +226,36 @@ That form is now lowered for real; its arms answer `None` (the capability's
 promise), because selecting an intrinsic per element function needs the
 comptime type matching and function-structure patterns listed above.
 
+## Token and grammar reachability (the layer above the HIR triage)
+
+Update (2026-08-14): the same treatment was applied one layer up, to tokens
+and grammar productions — the layer where this project's worst bug lived
+(`!` was never a lexer token, and `t_error` logged-and-skipped, so `!e`
+compiled as `e`). Full write-up in `docs/token_reachability.md`; the short
+version:
+
+- Every token in `Lexer.tokens` is triaged in `lexer.TOKEN_TRIAGE` into
+  `GRAMMAR` (97), `CONTEXTUAL` (3 — `once`/`separate`/`many`, reachable as
+  `@once` etc.) or `RESERVED_ONLY` (2 — `use`, `kernel`, which now answer
+  with a route instead of `Syntax error at 'use'`).
+  `tests/test_token_coverage.py` recomputes the `GRAMMAR` bucket from PLY's
+  live production table, so the table cannot rot in either direction.
+- Nine tokens had no production at all. `impl` is now an accepted spelling
+  of `implement` (which is what the docs use); `box`, `option` and `async`
+  were reserved with no feature anywhere and are back in the user's
+  identifier namespace; `use` and `kernel` stay reserved with guidance;
+  `once`/`separate`/`many` were already reachable through the `@` rewrite.
+- Grammar reachability is clean: no unreachable or unreferenced
+  nonterminals, no orphaned productions, and zero parser conflicts — now
+  pinned by tests.
+- Silent lexer paths closed: numeric forms the language does not have
+  (`1e10` ran as `1`), integer literals outside i64 (interpreter/native
+  divergence), unknown mode annotations (`@moot` was silently dropped), the
+  import-list keyword rewrite firing in ordinary argument lists, the
+  generic-argument scan's silent 80-token cliff, unterminated strings
+  reported as an illegal `"`, and `LexError` diagnostics excerpting the
+  previously parsed file.
+
 ## Headline findings
 
 - 18 of 19 example programs (`examples/*.mx` + root `test_*.mx`) fail at the

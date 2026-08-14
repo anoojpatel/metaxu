@@ -74,11 +74,15 @@ class Lexer:
         'comptime': 'COMPTIME',
         'some': 'SOME',
         'none': 'NONE',
-        'box': 'BOX',
-        'option': 'OPTION',
+        # NOTE: `box`, `option` and `async` were reserved here for years with
+        # no grammar production, no AST node and no mention in docs/, so
+        # `let box = 1` was a syntax error for a keyword the language does
+        # not have.  They were removed during the token reachability audit
+        # (docs/token_reachability.md); the surface types are the ordinary
+        # identifiers `Box`/`Option`, and concurrency is expressed with
+        # effect handlers rather than an `async` keyword.
         'vector': 'VECTOR',
         'unsafe': 'UNSAFE',
-        'async': 'ASYNC',
         'void': 'VOID',
         'size_t': 'SIZE_T',
         'as': 'AS',
@@ -152,18 +156,97 @@ class Lexer:
         r'\#.*|//.*'
         pass
 
+    #: Metaxu's `int` is a signed 64-bit machine integer everywhere below the
+    #: front end (MIR, the interpreter and every `i64` in codegen_llvm), but
+    #: `int(...)` here yields an unbounded Python int.  A literal past the
+    #: i64 range therefore used to sail through the front end and then MEAN
+    #: DIFFERENT THINGS in the two backends — the interpreter answered with
+    #: the exact bignum while native code wrapped — which is precisely the
+    #: interpreter/native divergence the differential tests exist to prevent.
+    #: The bound is `2**63` rather than `2**63 - 1` because the most negative
+    #: i64 is written `-9223372036854775808`, i.e. unary minus applied to the
+    #: literal `9223372036854775808`.
+    _INT_LITERAL_MAX = 2 ** 63
+
+    def _reject_numeric_junk(self, t) -> None:
+        """Reject a numeric literal glued to a letter, `_`, or a second dot.
+
+        Metaxu has exactly two numeric literal forms: decimal integers and
+        `digits.digits` floats.  There is no exponent, hex, binary or
+        digit-separator syntax.  Without this check the lexer split the
+        unsupported forms into two tokens and the second half QUIETLY
+        BECAME SOMETHING ELSE:
+
+            1e10     ->  NUMBER(1)  IDENTIFIER(e10)   # exponent vanished:
+                                                      # `let x = 1e10;` bound 1
+            0x1f     ->  NUMBER(0)  IDENTIFIER(x1f)
+            1_000    ->  NUMBER(1)  IDENTIFIER(_000)
+            1.5.2    ->  FLOAT(1.5) FLOAT(0.2)
+
+        The `IDENTIFIER` half landed in statement position, where an unused
+        undefined name is dropped, so `1e10` compiled and ran as `1`.  This
+        is the same shape of silent seam as `!e` compiling as `e`.
+        """
+        data = t.lexer.lexdata
+        end = t.lexer.lexpos          # PLY has already advanced past the match
+        n = len(data)
+        bad = ''
+        if end < n and (data[end].isalpha() or data[end] == '_'):
+            j = end
+            while j < n and (data[j].isalnum() or data[j] == '_'):
+                j += 1
+            bad = data[end:j]
+        elif (end + 1 < n and data[end] == '.' and data[end + 1].isdigit()
+                and '.' in t.value):
+            j = end + 1
+            while j < n and data[j].isdigit():
+                j += 1
+            bad = data[end:j]
+        if not bad:
+            return
+        self._numeric_error(
+            t, f"invalid numeric literal {t.value + bad!r}",
+            ["Metaxu has decimal integer literals (`42`) and `d.d` float "
+             "literals (`3.14`) only",
+             "There is no exponent (`1e10`), hex (`0x1f`), binary (`0b1`) or "
+             "digit-separator (`1_000`) form"])
+
+    def _numeric_error(self, t, message: str, notes):
+        line_start = self.line_starts[min(t.lineno - 1, len(self.line_starts) - 1)]
+        raise CompileError(
+            message=message,
+            error_type="LexError",
+            location=SourceLocation(
+                file=self.source_file, line=t.lineno,
+                column=t.lexpos - line_start + 1),
+            notes=list(notes),
+        )
+
     # NOTE: function rules are matched in definition order; FLOAT must come
     # before NUMBER so that "3.14" lexes as a single float.
     def t_FLOAT(self, t):
         r'\d+\.\d+|\.\d+'
+        self._reject_numeric_junk(t)
         t.endlexpos = t.lexpos + len(t.value)
-        t.value = float(t.value)
+        value = float(t.value)
+        if value in (float('inf'), float('-inf')):
+            self._numeric_error(
+                t, f"float literal {t.value!r} is out of range for f64",
+                ["The largest finite f64 is about 1.8e308"])
+        t.value = value
         return t
 
     def t_NUMBER(self, t):
         r'\d+'
+        self._reject_numeric_junk(t)
         t.endlexpos = t.lexpos + len(t.value)
-        t.value = int(t.value)
+        value = int(t.value)
+        if value > self._INT_LITERAL_MAX:
+            self._numeric_error(
+                t, f"integer literal {t.value} is out of range for a 64-bit int",
+                [f"Metaxu's `int` is a signed 64-bit integer: "
+                 f"-{self._INT_LITERAL_MAX} .. {self._INT_LITERAL_MAX - 1}"])
+        t.value = value
         return t
 
     #: Recognised backslash escapes in string and f-string literals.
@@ -253,12 +336,23 @@ class Lexer:
         # lexer does not know is a compile error.
         line_start = self.line_starts[min(t.lineno - 1, len(self.line_starts) - 1)]
         column = t.lexpos - line_start + 1
+        # A well-formed string always matches t_STRING/t_FSTRING, so a `"`
+        # that reaches the error rule is an opening quote with no closing
+        # one.  Saying "illegal character '\"'" for that sends the reader
+        # looking at the wrong thing entirely.
+        if t.value[0] == '"':
+            message = "unterminated string literal"
+            notes = ["Close it with a matching '\"' on the same line",
+                     "Metaxu string literals do not span lines"]
+        else:
+            message = f"illegal character {t.value[0]!r}"
+            notes = ["Remove it, or quote it inside a string literal"]
         raise CompileError(
-            message=f"illegal character {t.value[0]!r}",
+            message=message,
             error_type="LexError",
             location=SourceLocation(
                 file=self.source_file, line=t.lineno, column=column),
-            notes=["Remove it, or quote it inside a string literal"],
+            notes=notes,
         )
 
     # ------------------------------------------------------------------
@@ -297,7 +391,40 @@ class Lexer:
         'ARROW', 'GREATER', 'RGENERIC', 'WHERE', 'WITH', 'FOR',
     })
 
-    _GENERIC_SCAN_LIMIT = 80
+    # NOTE: there is deliberately no scan limit here.  An earlier
+    # `_GENERIC_SCAN_LIMIT = 80` made the scan give up SILENTLY once a
+    # candidate argument list ran past 80 tokens, so a long-but-legal
+    # generic list (`fn f<T0, ..., T44>(..)`) fell back to comparison and
+    # reported `Syntax error at '<'` — a cliff with no relation to what was
+    # wrong.  The scan is already bounded by the first token that cannot
+    # appear inside `< ... >` (`_GENERIC_INSIDE`), which in real source is a
+    # handful of tokens away, so the cap bought nothing.
+
+    def _import_statement_spans(self, toks):
+        """Index set covering every `import ... ;` statement's token range.
+
+        Pass A lets an import list shadow keywords
+        (`from std.effects import Effect, handle, perform;`).  The old test
+        for "am I in an import list?" was `previous token is COMMA`, which
+        is true inside ANY comma-separated list: `g(x, match, x)` quietly
+        turned the keyword `match` into a variable reference in a plain call
+        argument, so the same word was an identifier in one argument
+        position and a syntax error in every other.  Restricting the rewrite
+        to the real statement keeps the import behaviour and drops the
+        accidental one.
+        """
+        inside: set[int] = set()
+        i = 0
+        n = len(toks)
+        while i < n:
+            if toks[i].type == 'IMPORT':
+                j = i
+                while j < n and toks[j].type != 'SEMICOLON':
+                    inside.add(j)
+                    j += 1
+                i = j
+            i += 1
+        return inside
 
     def _transform(self, toks):
         """Rewrite the raw token list to resolve context-sensitive ambiguity.
@@ -312,6 +439,7 @@ class Lexer:
                 like `field :`) becomes LBRACE_STRUCT.
         """
         # --- Pass A: contextual keywords -------------------------------
+        import_span = self._import_statement_spans(toks)
         for i, tok in enumerate(toks):
             prev = toks[i - 1] if i > 0 else None
             nxt = toks[i + 1] if i + 1 < len(toks) else None
@@ -320,9 +448,18 @@ class Lexer:
                 # Member access (thread.spawn), relative paths (..vector),
                 # mode names (@mut/@const), and function names
                 # (fn spawn[...]) may reuse keywords.
+                #
+                # After FN this DEFINES a name that only the `.name` position
+                # can reach again — which is exactly what an effect operation
+                # `fn spawn[T](..)` called as `perform Thread.spawn(..)`
+                # needs (examples/effect_mapping.mx), and what makes
+                # `fn if(x) {..}` a function nothing can call.  See
+                # docs/token_reachability.md; @-mode names are validated in
+                # the parser (Parser.p_mode_annotation), so `@moot` is a
+                # loud error rather than a silently dropped mode.
                 tok.type = 'IDENTIFIER'
-            elif tok.type in self._KEYWORD_TYPES and prev is not None and \
-                    prev.type in ('COMMA', 'IMPORT') and \
+            elif tok.type in self._KEYWORD_TYPES and i in import_span and \
+                    prev is not None and prev.type in ('COMMA', 'IMPORT') and \
                     nxt is not None and nxt.type in ('COMMA', 'SEMICOLON') and \
                     tok.type != 'HANDLE':
                 # Imported names may shadow keywords:
@@ -345,8 +482,7 @@ class Lexer:
                 angle_positions = [i]
                 j = i + 1
                 matched = -1
-                limit = min(n, i + 1 + self._GENERIC_SCAN_LIMIT)
-                while j < limit:
+                while j < n:
                     tt = toks[j].type
                     if tt == 'LESS':
                         depth += 1
@@ -448,3 +584,200 @@ class Lexer:
     def lexpos(self) -> int:
         tok = self.current_token
         return getattr(tok, 'lexpos', 0) if tok is not None else 0
+
+
+# =====================================================================
+# Token reachability triage
+# =====================================================================
+#
+# The worst bug of this project's history lived one layer ABOVE the AST:
+# `!` was never a lexer token at all, and `t_error` merely logged-and-
+# skipped characters it did not know, so `!e` compiled as `e` — silently,
+# for the entire life of the compiler.  `hir.AST_NODE_TRIAGE` pins the
+# AST->HIR layer against the same failure; this table pins the
+# source->token->grammar layer.
+#
+# Every token name in `Lexer.tokens` is classified into EXACTLY ONE bucket
+# with a reason.  `test_token_coverage.py` recomputes the GRAMMAR bucket
+# from PLY's own production table on the live parser, so the table cannot
+# rot: adding a token without classifying it fails, and moving a token
+# into or out of the grammar without moving it in this table fails too.
+
+#: (a) The token appears in at least one grammar production.
+GRAMMAR = "grammar"
+
+#: (b) No grammar production names the token, but the FEATURE it spells is
+#: reachable by another route, which the reason must state.
+CONTEXTUAL = "contextual"
+
+#: (c) No grammar production names the token and there is no other route:
+#: the word is reserved and unusable.  Every token in this bucket must have
+#: an entry in `RESERVED_WITHOUT_GRAMMAR` so the parser answers with a route
+#: instead of a bare "Syntax error at 'use'".
+RESERVED_ONLY = "reserved-only"
+
+#: Tokens no regex rule produces — the `_transform` passes synthesize them.
+SYNTHESIZED_TOKENS = frozenset({'LGENERIC', 'RGENERIC', 'LBRACE_STRUCT'})
+
+TOKEN_TRIAGE: dict[str, tuple[str, str]] = {
+    # -- literals and names --------------------------------------------
+    'IDENTIFIER': (GRAMMAR, "every name: bindings, calls, fields, types"),
+    'NUMBER': (GRAMMAR, "integer literal; also const generic arguments"),
+    'FLOAT': (GRAMMAR, "float literal"),
+    'STRING': (GRAMMAR, "string literal; also an extern block's ABI string"),
+    'FSTRING': (GRAMMAR, "f-string literal (desugared at parse time)"),
+
+    # -- operators ------------------------------------------------------
+    'PLUS': (GRAMMAR, "addition; also `+` in type bounds and const generics"),
+    'MINUS': (GRAMMAR, "subtraction and unary negation"),
+    'TIMES': (GRAMMAR, "multiplication; also `*T` pointer types"),
+    'DIVIDE': (GRAMMAR, "division"),
+    'MOD': (GRAMMAR, "remainder"),
+    'NOT': (GRAMMAR, "logical negation `!e` (unary_expression)"),
+    'ANDAND': (GRAMMAR, "short-circuit `&&`"),
+    'OROR': (GRAMMAR, "short-circuit `||`; also the empty-parameter lambda"),
+    'AMPERSAND': (GRAMMAR, "address-of `&x` and reference types"),
+    'PIPE': (GRAMMAR, "effect-set union `E | F`"),
+    'LESS': (GRAMMAR, "`<` comparison (generic `<` is retagged LGENERIC)"),
+    'GREATER': (GRAMMAR, "`>` comparison (generic `>` is retagged RGENERIC)"),
+    'LESSEQUAL': (GRAMMAR, "`<=` comparison"),
+    'GREATEREQUAL': (GRAMMAR, "`>=` comparison"),
+    'EQUALEQUAL': (GRAMMAR, "`==` comparison"),
+    'NOTEQUAL': (GRAMMAR, "`!=` comparison"),
+    'EQUALS': (GRAMMAR, "binding and assignment `=`"),
+
+    # -- punctuation ----------------------------------------------------
+    'LPAREN': (GRAMMAR, "grouping, calls, parameter lists"),
+    'RPAREN': (GRAMMAR, "grouping, calls, parameter lists"),
+    'LBRACE': (GRAMMAR, "blocks, handler arms, module bodies"),
+    'RBRACE': (GRAMMAR, "blocks, handler arms, module bodies"),
+    'LBRACKET': (GRAMMAR, "indexing, list literals, bracket-form type args"),
+    'RBRACKET': (GRAMMAR, "indexing, list literals, bracket-form type args"),
+    'SEMICOLON': (GRAMMAR, "statement and item separator"),
+    'COLON': (GRAMMAR, "type ascription, struct-literal fields, type bounds"),
+    'COMMA': (GRAMMAR, "list separator"),
+    'DOT': (GRAMMAR, "field access, module paths"),
+    'DOTDOT': (GRAMMAR, "range `a..b`; also relative import paths"),
+    'TRIPLE_DOT': (GRAMMAR, "list spread `...xs`; also relative import paths"),
+    'DOUBLECOLON': (GRAMMAR, "path separator in postfix and index positions"),
+    'ARROW': (GRAMMAR, "return types, lambda bodies, comprehension targets"),
+    'FATARROW': (GRAMMAR, "match and handler arm `=>`"),
+    'BACKSLASH': (GRAMMAR, "function type `fn\\(T) -> U`"),
+    'AT': (GRAMMAR, "mode annotation `@mut` (mode_annotation)"),
+
+    # -- synthesized by _transform --------------------------------------
+    'LGENERIC': (GRAMMAR, "synthesized `<` of a type argument list (Pass B)"),
+    'RGENERIC': (GRAMMAR, "synthesized `>` of a type argument list (Pass B)"),
+    'LBRACE_STRUCT': (GRAMMAR, "synthesized `{` of a struct literal (Pass C)"),
+
+    # -- control flow and declarations -----------------------------------
+    'IF': (GRAMMAR, "`if` / `if let`"),
+    'ELSE': (GRAMMAR, "`else`"),
+    'WHILE': (GRAMMAR, "`while` / `while let`"),
+    'FOR': (GRAMMAR, "`for` loops, comprehensions, `implement T for S`"),
+    'IN': (GRAMMAR, "`for x in xs`, comprehensions, `handle .. in ..`"),
+    'FN': (GRAMMAR, "function declarations, lambdas, method signatures"),
+    'RETURN': (GRAMMAR, "`return`"),
+    'LET': (GRAMMAR, "`let` bindings, `if let`, `while let`"),
+    'MUT': (GRAMMAR, "`let mut`, `&mut`, `@mut` type positions"),
+    'CONST': (GRAMMAR, "`const N: int` generic params and `const T` types"),
+    'MATCH': (GRAMMAR, "`match` expressions"),
+    'STRUCT': (GRAMMAR, "struct definitions"),
+    'ENUM': (GRAMMAR, "enum definitions"),
+    'TYPE': (GRAMMAR, "type aliases and extern type declarations"),
+    'PRINT': (GRAMMAR, "`print(..)` (expands to a `__builtin$` call)"),
+    'MOVE': (GRAMMAR, "`move e`"),
+    'EXCLAVE': (GRAMMAR, "`exclave e`"),
+    'BORROW': (GRAMMAR, "`borrow x` / `borrow x as T`"),
+    'AS': (GRAMMAR, "casts, import aliases, `borrow x as T`"),
+    'SOME': (GRAMMAR, "`Some(e)` builtin option constructor"),
+    'NONE': (GRAMMAR, "`None` builtin option constructor"),
+    'VECTOR': (GRAMMAR, "`vector[T, N]` types and vector literals"),
+    'VOID': (GRAMMAR, "`void` (FFI type)"),
+    'SIZE_T': (GRAMMAR, "`size_t` (FFI type)"),
+    'UNSAFE': (GRAMMAR, "`unsafe { .. }` blocks"),
+    'EXTERN': (GRAMMAR, "`extern` blocks and extern type statements"),
+    'COMPTIME': (GRAMMAR, "`comptime` blocks and `comptime fn`"),
+    'SPAWN': (GRAMMAR, "`spawn(e)`"),
+    'TO_DEVICE': (GRAMMAR, "`to_device(x)`"),
+    'FROM_DEVICE': (GRAMMAR, "`from_device(x)`"),
+    'TRY': (GRAMMAR, "`try`/`catch` expressions"),
+    'CATCH': (GRAMMAR, "`try`/`catch` expressions"),
+
+    # -- effects ---------------------------------------------------------
+    'EFFECT': (GRAMMAR, "`effect E { .. }` declarations"),
+    'PERFORM': (GRAMMAR, "`perform E.op(..)`"),
+    'PERFORMS': (GRAMMAR, "`performs E` effect rows on signatures"),
+    'HANDLE': (GRAMMAR, "`handle e { .. }` / `handle e with { .. } in ..`"),
+    'RESUME': (GRAMMAR, "`resume(v)` inside a handler arm"),
+    'WITH': (GRAMMAR, "`handle .. with { .. }`, `effect .. with ..`"),
+
+    # -- traits ----------------------------------------------------------
+    'TRAIT': (GRAMMAR, "`trait T { .. }` (trait_keyword)"),
+    'INTERFACE': (GRAMMAR, "`interface T { .. }`, a spelling of `trait`"),
+    'IMPLEMENT': (GRAMMAR, "`implement .. { .. }` (implement_keyword)"),
+    'IMPL': (GRAMMAR, "`impl .. { .. }`, a spelling of `implement`"),
+    'IMPLEMENTS': (GRAMMAR, "`implements T: S { .. }` and `T implements B`"),
+    'EXTENDS': (GRAMMAR, "trait supertraits and `T extends B` constraints"),
+    'WHERE': (GRAMMAR, "`where` clauses"),
+
+    # -- modes in type position -------------------------------------------
+    'UNIQUE': (GRAMMAR, "`unique T` type expression"),
+    'EXCLUSIVE': (GRAMMAR, "`exclusive T` type expression"),
+
+    # -- modules -----------------------------------------------------------
+    'IMPORT': (GRAMMAR, "`import ..` / `from .. import ..`"),
+    'FROM': (GRAMMAR, "`from .. import ..`"),
+    'MODULE': (GRAMMAR, "`module m { .. }`"),
+    'EXPORT': (GRAMMAR, "`export { .. }`"),
+    'PUBLIC': (GRAMMAR, "visibility modifier and `public import`"),
+    'PRIVATE': (GRAMMAR, "visibility modifier"),
+    'PROTECTED': (GRAMMAR, "visibility modifier"),
+    'VISIBILITY': (GRAMMAR, "`visibility { .. }` blocks"),
+
+    # -- (b) reachable only through a lexer rewrite -------------------------
+    'ONCE': (CONTEXTUAL,
+             "no production names ONCE, but the linearity mode is reachable "
+             "as the annotation `@once`: Pass A retags any keyword after `@` "
+             "as IDENTIFIER, and `mode_annotation : AT IDENTIFIER` accepts "
+             "it, so `let @once f = ..` really does bind a once-callable "
+             "(frozen_borrow_checker.check_linearity enforces it)"),
+    'SEPARATE': (CONTEXTUAL,
+                 "same route as ONCE: `@separate` reaches the grammar as "
+                 "`AT IDENTIFIER` and _split_mode reads it as a linearity"),
+    'MANY': (CONTEXTUAL,
+             "same route as ONCE: `@many` reaches the grammar as "
+             "`AT IDENTIFIER` and _split_mode reads it as a linearity"),
+
+    # -- (c) reserved, no feature ------------------------------------------
+    'USE': (RESERVED_ONLY,
+            "there is no `use` statement and never has been "
+            "(docs/modules_implementation.md); the word stays reserved "
+            "because `use std.math;` is the likely mistake, and p_error "
+            "routes it to `import`"),
+    'KERNEL': (RESERVED_ONLY,
+               "GPU kernel annotations have no syntax and no runtime "
+               "(docs/v1_gap_analysis.md); the word stays reserved so it "
+               "reads as unimplemented rather than as a free identifier, "
+               "matching its siblings `to_device`/`from_device`, which "
+               "parse and then raise UnsupportedConstruct"),
+}
+
+#: Guidance `Parser.p_error` attaches when one of these tokens is what the
+#: parse choked on.  Since no production names them, EVERY appearance is a
+#: syntax error, so this covers the token completely.  Keyed by token type.
+RESERVED_WITHOUT_GRAMMAR: dict[str, list[str]] = {
+    'USE': ["`use` is a reserved word with no statement form in Metaxu",
+            "To bring names into scope write `import std.math;` or "
+            "`from std.math import abs;`"],
+    'KERNEL': ["`kernel` is reserved for GPU kernel annotations, which are "
+               "not implemented (see docs/v1_gap_analysis.md)",
+               "`to_device(x)` and `from_device(x)` parse but have no runtime"],
+    'ONCE': ["`once` is a linearity mode, not a bare keyword",
+             "Write it as a mode annotation: `let @once f = fn(x: int) -> "
+             "int { x };`"],
+    'SEPARATE': ["`separate` is a linearity mode, not a bare keyword",
+                 "Write it as a mode annotation: `let @separate x = ..;`"],
+    'MANY': ["`many` is a linearity mode, not a bare keyword",
+             "Write it as a mode annotation: `let @many f = ..;`"],
+}

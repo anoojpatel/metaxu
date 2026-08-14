@@ -234,10 +234,13 @@ while building it (status as of this port):
    is what defers `enumerate`/`zip` in `std.stream`: they would emit
    pairs no consumer could take apart. (Zip *comprehensions* do work:
    `f(a, b) for (a, b) in (xs, ys)` iterates two vectors in lockstep.)
-9. **Unqualified keywords**: `try`, `catch`, `some`, `none`, `option`
-   are reserved and unusable as function names, even where the grammar
-   would be unambiguous (contextual-keyword handling already exists for
-   the `x.keyword` position).
+9. **Unqualified keywords**: `try`, `catch`, `some`, `none` are reserved
+   and unusable as function names, even where the grammar would be
+   unambiguous (contextual-keyword handling already exists for the
+   `x.keyword` position). `option` is no longer among them: the token
+   reachability audit (`docs/token_reachability.md`) found it reserved
+   with no production, no AST node and no mention in the docs, and
+   de-reserved it along with `box` and `async`.
 
 Items 3, 4, 5, 6 and 7 are fixed (regression tests:
 `src/metaxu/compiler/tests/test_silent_seams.py`); the remaining gaps
