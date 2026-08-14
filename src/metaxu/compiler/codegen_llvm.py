@@ -1517,6 +1517,17 @@ def _is_word_kind(kind: str) -> bool:
     return kind in (I64, F64, STR) or _is_vec(kind) or _is_fvec(kind)
 
 
+def _vec_slot_boxable(kind: str) -> bool:
+    """Aggregate kinds that occupy a native Vec element slot as an ELEMENT
+    BOX pointer (increment 20): the writer mallocs a fresh write-once copy
+    and stores its POINTER as the 8-byte word; every read copies the
+    aggregate back OUT into the reader's own storage.  Exactly the enum
+    payload / effect boundary contract, and the same exclusion: a closure
+    PAIR does not box (its env pointer may aim at a frame the vec
+    outlives), and kont/rawptr/conflict never box."""
+    return _is_struct(kind) or _is_enum(kind)
+
+
 def _is_agg(kind: str) -> bool:
     """Aggregate kinds: stored in own allocas, cross calls by pointer."""
     return _is_struct(kind) or _is_enum(kind) or _is_closure(kind)
@@ -4195,6 +4206,29 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
         elif _is_agg(kind) and _kind_size(kind, structs, variants) is None:
             probs.append(f"{what} has an infinite layout")
 
+    def check_vec_slot(elem: str, what: str) -> bool:
+        """A native Vec element slot is ONE 8-byte word.  Word kinds sit in
+        it directly; struct/enum AGGREGATES sit in it as a pointer to an
+        immortal write-once ELEMENT BOX (increment 20 — push / set malloc
+        a fresh copy of the aggregate and store the pointer; every read
+        copies the aggregate back out into the reader's own storage).
+        Closures, konts, rawptrs, conflicts and infinite layouts still
+        demote honestly.  Returns True when the slot is representable."""
+        if _is_word_kind(elem):
+            return True
+        if _vec_slot_boxable(elem):
+            if _kind_size(elem, structs, variants) is None:
+                probs.append(
+                    f"{what} of {elem} elements: the element box has an "
+                    "infinite layout")
+                return False
+            return True
+        probs.append(
+            f"{what} of {elem} elements (a Vec slot holds an 8-byte word "
+            "kind directly or a struct/enum aggregate as an element-box "
+            "pointer; nothing else fits)")
+        return False
+
     def check_builtin(name: str, dst: str, args: Tuple[str, ...]) -> None:
         """Validate a native-runtime builtin call's final kinds."""
         if name == "Vec.new":
@@ -4210,10 +4244,8 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                 probs.append(
                     f"push receiver {args[0]!r} has kind {ty(args[0])}, "
                     "not a Vec (fixed vectors are immutable)")
-            elif not _is_word_kind(_vec_elem(ty(args[0]))):
-                probs.append(
-                    f"Vec of {_vec_elem(ty(args[0]))} elements (only 8-byte "
-                    "word kinds fit native Vec slots)")
+            elif not check_vec_slot(_vec_elem(ty(args[0])), "Vec"):
+                pass  # check_vec_slot reported it
             elif ty(args[1]) != _vec_elem(ty(args[0])):
                 probs.append(
                     f"push of {ty(args[1])} into a Vec of "
@@ -4225,10 +4257,8 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                 probs.append(
                     f"pop receiver {args[0]!r} has kind {ty(args[0])}, "
                     "not a Vec (fixed vectors are immutable)")
-            elif not _is_word_kind(_vec_elem(ty(args[0]))):
-                probs.append(
-                    f"Vec of {_vec_elem(ty(args[0]))} elements (only 8-byte "
-                    "word kinds fit native Vec slots)")
+            elif not check_vec_slot(_vec_elem(ty(args[0])), "Vec"):
+                pass  # check_vec_slot reported it
             elif ty(dst) != _vec_elem(ty(args[0])):
                 probs.append(
                     f"pop result {dst!r} is {ty(dst)}, Vec elements are "
@@ -4247,10 +4277,15 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                     "interpreted)")
             elif ty(args[1]) != I64:
                 probs.append(f"__index_get index {args[1]!r} is {ty(args[1])}")
-            elif not _is_word_kind(elem):
-                probs.append(
-                    f"vector of {elem} elements (only 8-byte word kinds fit "
-                    "native element slots)")
+            elif not (check_vec_slot(elem, "Vec") if _is_vec(rk0)
+                      else _is_word_kind(elem)):
+                # Fixed vectors keep the word-kinds-only rule: an mx_fvec
+                # block feeds the SIMD/arith/repr paths, which read the
+                # words as numbers — element boxes belong to Vec only.
+                if not _is_vec(rk0):
+                    probs.append(
+                        f"vector of {elem} elements (only 8-byte word kinds "
+                        "fit native element slots)")
             elif ty(dst) != elem:
                 probs.append(
                     f"__index_get result {dst!r} is {ty(dst)}, elements are "
@@ -4276,10 +4311,12 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
             elif ty(args[1]) != I64:
                 probs.append(
                     f"__index_store index {args[1]!r} is {ty(args[1])}")
-            elif not _is_word_kind(elem):
-                probs.append(
-                    f"vector of {elem} elements (only 8-byte word kinds fit "
-                    "native element slots)")
+            elif not (check_vec_slot(elem, "Vec") if _is_vec(rk0)
+                      else _is_word_kind(elem)):
+                if not _is_vec(rk0):
+                    probs.append(
+                        f"vector of {elem} elements (only 8-byte word kinds "
+                        "fit native element slots)")
             elif ty(args[2]) != elem:
                 probs.append(
                     f"__index_store of {ty(args[2])} into elements of {elem}")
@@ -4309,10 +4346,8 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
             elif ty(args[1]) != I64:
                 probs.append(
                     f"__index_set index {args[1]!r} is {ty(args[1])}")
-            elif not _is_word_kind(_vec_elem(rk0)):
-                probs.append(
-                    f"Vec of {_vec_elem(rk0)} elements (only 8-byte word "
-                    "kinds fit native Vec slots)")
+            elif not check_vec_slot(_vec_elem(rk0), "Vec"):
+                pass  # check_vec_slot reported it
             elif ty(args[2]) != _vec_elem(rk0):
                 probs.append(
                     f"__index_set of {ty(args[2])} into a Vec of "
@@ -7252,10 +7287,12 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                 src: Optional[str] = None) -> str:
         """Reinterpret a value of word kind k as the opaque i64 element word
         the native Vec ABI stores (the runtime never inspects elements).
-        Aggregate kinds (effect-boundary senders, increment 14, and
-        indirect closure-call arguments/returns, increment 16 — every
-        other word position demotes aggregates in the checks) box: a
-        fresh malloc'd write-once copy, its pointer as the word
+        Aggregate kinds box: a fresh malloc'd write-once copy, its
+        pointer as the word.  Three word positions do this — effect-
+        boundary senders (increment 14), indirect closure-call
+        arguments/returns (increment 16) and Vec element slots
+        (increment 20); every other word position still demotes
+        aggregates in the checks
         (immortal, leaks by design — it can never dangle across coroutine
         switches or across an indirect call).
 
@@ -7335,6 +7372,26 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
         else:
             setval(dst, from_word(k, w, lines), lines)
 
+    def vec_elem_into(dst: str, elem: str, w: str, lines: List[str]) -> None:
+        """Decode one Vec/vector ELEMENT WORD into dst's own storage.
+
+        Word kinds unpack with from_word.  An aggregate element word is an
+        ELEMENT BOX pointer (increment 20 — pushed/stored by to_word as a
+        fresh malloc'd write-once copy): the reader copies the aggregate
+        OUT of the box into its own alloca, so both edges keep MIR's value
+        semantics while the vec itself keeps mx_vec identity semantics.
+        The box is immortal (leaks by design, exactly like an enum payload
+        or effect-boundary box), so the copy-out can never read freed
+        memory and mx_vec_free on a provably-dead vec — which frees only
+        the word buffer — stays sound."""
+        if _is_agg(elem):
+            p = fresh()
+            lines.append(f"  {p} = inttoptr i64 {w} to ptr"
+                         f"  ; element box: {elem} (write-once, immortal)")
+            agg_copy(_agg_ty(elem), p, struct_ref(dst), lines)
+        else:
+            setval(dst, from_word(elem, w, lines), lines)
+
     def emit_direct_call(dst: str, callee: str, opargs: Tuple[str, ...],
                          lines: List[str]) -> None:
         """A direct call to another emitted module function (also the target
@@ -7378,6 +7435,10 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
         elif name == "push":
             recv = use(opargs[0], lines)
             elem = _vec_elem(kind(opargs[0]))
+            # An aggregate element becomes an immortal write-once ELEMENT
+            # BOX and the slot holds its pointer (to_word); the vec itself
+            # keeps its identity semantics, so the push is visible through
+            # every alias exactly as in the interpreter.
             w = to_word(elem, use(opargs[1], lines), lines)
             mod.runtime_syms.add("mx_vec_push")
             lines.append(f"  call void @mx_vec_push(ptr {recv}, i64 {w})")
@@ -7388,7 +7449,7 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
             mod.runtime_syms.add("mx_vec_pop")
             w = fresh()
             lines.append(f"  {w} = call i64 @mx_vec_pop(ptr {recv})")
-            setval(dst, from_word(elem, w, lines), lines)
+            vec_elem_into(dst, elem, w, lines)
         elif name == "__index_get":
             recv = use(opargs[0], lines)
             rk0 = kind(opargs[0])
@@ -7404,7 +7465,7 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                 mod.runtime_syms.add("mx_vec_get")
                 lines.append(
                     f"  {w} = call i64 @mx_vec_get(ptr {recv}, i64 {idx})")
-            setval(dst, from_word(elem, w, lines), lines)
+            vec_elem_into(dst, elem, w, lines)
         elif name == "__index_store":
             # Store-back index assignment `place = __index_store(place, i,
             # x)`.  Vec receiver: mx_vec_set mutates the one shared vector
