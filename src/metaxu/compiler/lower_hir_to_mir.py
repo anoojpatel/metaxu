@@ -8,6 +8,17 @@ from .mir import MirFunc, MirBlock
 from .borrow_analysis import plan_drops
 
 
+def _span_location(span: Any) -> Any:
+    """errors.SourceLocation for a HIR span (None when position-less).
+
+    Only whole functions carry a location into MIR; see MirFunc.location.
+    """
+    try:
+        return span.location()
+    except AttributeError:
+        return None
+
+
 class _ANFState:
     def __init__(self) -> None:
         self.counter = 0
@@ -680,7 +691,8 @@ def lower_hir_to_mir(funcs: Sequence[HFun], borrow_errors: List[Any] | None = No
         out.append(MirFunc(name=str(f.sym), ty_sig=f.ret_ty, blocks=fl.blocks,
                            suspending=bool(f.body.suspends),
                            globals_decl=tuple(getattr(f, "globals_decl", ()) or ()),
-                           mut_params=_mut_param_names(f)))
+                           mut_params=_mut_param_names(f),
+                           location=_span_location(f.body.span)))
         # Emit any lambdas that were compiled during lowering
         out.extend(fl._pending_lambdas)
     return out

@@ -66,6 +66,12 @@ placeholder, never wrong code. The standard library lives in `std/*.mx`
 - Effects: classes (`stack`/`suspend`) checked in the emitter;
   runtime semantics in `mir_interp.py`; CPS state machines for
   suspending functions in `codegen_clif.py`.
+- Diagnostics (`docs/diagnostics_locations.md`): the parser attaches a
+  `SourceLocation` to every node it builds (PLY `tracking=True` plus one
+  wrapper around every grammar action), the frozen `Span` carries it
+  through, and `errors.format_diagnostic` / `source_excerpt` render
+  `file:line:column` plus the source line with a caret. `Span.start`/`end`
+  are 0-based character offsets; `line`/`column` are 1-based.
 - Name precedence (`docs/name_precedence.md`): plain calls resolve a
   USER function before a same-named builtin; method position
   (`x.len()`) resolves impl -> builtin -> plain fn and is marked

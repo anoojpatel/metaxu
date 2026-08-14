@@ -114,14 +114,27 @@ class SimpleSubFacade:
     class TypeConflict:
         """Structured hard type error from constraint-graph conflict
         detection. Carries kind="type-conflict" so the pipeline can promote
-        it to TypeCheckError without string matching."""
+        it to TypeCheckError without string matching, and `node_id` so
+        frozen_borrow_checker.locate_errors can give it a source position."""
         kind = "type-conflict"
 
-        def __init__(self, message: str) -> None:
+        def __init__(self, message: str, node_id: int | None = None) -> None:
             self.message = message
+            self.node_id = node_id
+            self.location = None
 
         def __str__(self) -> str:
-            return self.message
+            if self.location is not None:
+                from metaxu.errors import format_location
+                return f"{format_location(self.location)}: {self.message}"
+            where = f" at node {self.node_id}" if self.node_id is not None else ""
+            return f"{self.message}{where}"
+
+        def excerpt(self):
+            if self.location is None:
+                return None
+            from metaxu.errors import source_excerpt
+            return source_excerpt(self.location)
 
     def _detect_class_conflicts(self) -> list[str]:
         """Union type vars along *unify* edges and flag components that carry
@@ -171,14 +184,18 @@ class SimpleSubFacade:
             rep = find(k)
             merged.setdefault(rep, set()).update(cls_set)
             if k in nodes:
-                rep_node.setdefault(rep, nodes[k])
+                # Report the LAST of the conflicting values. Frozen node ids
+                # are assigned in source order, so the highest id is the value
+                # that made the conflict apparent (`a + "s"` points at the
+                # string, not at the `let a = 1` that typed `a` as Int).
+                rep_node[rep] = max(rep_node.get(rep, -1), nodes[k])
         errors = []
         for rep, cls_set in merged.items():
             if len(cls_set) > 1:
-                where = f" at node {rep_node[rep]}" if rep in rep_node else ""
                 errors.append(self.TypeConflict(
                     "type mismatch: one value is required to be "
-                    + " and ".join(sorted(cls_set)) + where
+                    + " and ".join(sorted(cls_set)),
+                    node_id=rep_node.get(rep),
                 ))
         return errors
 

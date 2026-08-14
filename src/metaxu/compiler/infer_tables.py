@@ -87,6 +87,14 @@ def build_tables_from_frozen_via_simplesub(frozen_root: Any) -> InferSideTables:
     _, borrow_errors = emit_constraints(frozen_root, types, ss)
     ss.solve()
 
+    # Resolve the node ids the checkers recorded into source positions, once,
+    # from the frozen AST that owns the spans. Every consumer of these
+    # diagnostics (strict-mode exceptions, tooling reading the tables) then
+    # sees "file:line:column: message".
+    from .frozen_borrow_checker import locate_errors  # type: ignore
+    locate_errors(borrow_errors, frozen_root)
+    locate_errors(ss.errors, frozen_root)
+
     constraints: Dict[int, Any] = {0: ss.constraints}
     if ss.errors:
         constraints[-1] = tuple(ss.errors)

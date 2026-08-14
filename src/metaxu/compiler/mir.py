@@ -26,6 +26,12 @@ class MirFunc:
     # write a rebound struct param back to the caller ONLY for these names;
     # plain params keep value semantics (rebinding stays callee-local).
     mut_params: tuple = ()
+    # errors.SourceLocation of the function's DECLARATION, carried so a
+    # runtime error can name the function it happened in. Individual ops
+    # have no locations: MIR ops are positional tuples (and are dumped
+    # verbatim into the golden MIR text), so per-op spans would mean
+    # reshaping every op — see docs/diagnostics_locations.md.
+    location: Any = None
 
     def param_names(self) -> tuple:
         """Parameter names from the entry block's params op (empty if none)."""
