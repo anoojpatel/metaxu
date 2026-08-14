@@ -1,6 +1,8 @@
 # Example of ownership and borrowing
 struct Buffer {
-    data: unique vector[Int,N]
+    # Buffer is not generic, so its capacity is a literal (the only other
+    # legal spelling would be a declared `const N: int` parameter).
+    data: unique vector[Int,3]
 }
 
 fn process(buf: @mut Buffer) {

@@ -361,6 +361,19 @@ def _type_display(t: Any) -> str | None:
         return None
     if isinstance(t, str):
         return t
+    # Mode-annotated types (`unique vector[Int,3]`, `@local Foo`) wrap the
+    # type they annotate; the modes travel in their own payload keys, so the
+    # display is the display of the annotated type.  Falling through to the
+    # str() fallback produced "ModeTypeAnnotationat 0x7f..." — a display no
+    # field-level check could read, which is how an ill-formed field type
+    # slipped past the checker.
+    if isinstance(t, fast.ModeTypeAnnotation):
+        return _type_display(getattr(t, "base_type", None))
+    # `vector[T, N]` written directly as a type: base type plus size.
+    if isinstance(t, fast.VectorTypeExpression):
+        base = _type_display(getattr(t, "base_type", None)) or "?"
+        size = _type_display(getattr(t, "size", None)) or "?"
+        return f"vector[{base}, {size}]"
     name = getattr(t, "name", None)
     if isinstance(name, str):
         return name
