@@ -82,6 +82,15 @@ class ModuleInfo:
     nodes: list = field(default_factory=list)   # fast.Module nodes merged into this path
     external: bool = False          # unresolved std.* placeholder
     functions: dict = field(default_factory=dict)   # name -> FunctionDeclaration
+    # Names of `fn`s declared INSIDE another function's body.  They are not
+    # module symbols (never exported, never renamed to a dotted path), but
+    # HIRBuilder.build's hoisting walk lifts every FunctionDeclaration
+    # anywhere in the tree into a real MIR function under its bare name, so
+    # the resolver must know they exist: without this a nested `fn len`
+    # had its own call sites rewritten to `__builtin$len` (NAME PRECEDENCE,
+    # docs/name_precedence.md), and the same source returned 99 with no
+    # import and died with "len: unsupported receiver type 'Int'" with one.
+    nested_functions: set = field(default_factory=set)
     # module-level `let` bindings (module constants). Like types/traits/
     # effects they live in ONE global namespace (they are never renamed);
     # declaring the same constant in two modules is a loud CompileError.
@@ -212,7 +221,62 @@ class ModuleResolver:
                     op_name = getattr(op, "name", None)
                     if op_name:
                         self.effect_ops.add(str(op_name))
+        self._collect_nested_functions(statements, info)
         return info
+
+    # Declaration forms whose inner `fn`s are NOT hoisted under their bare
+    # name: impl/trait methods are mangled to `__impl$Trait$Type$m` by the
+    # desugar pass and effect-op defaults to `__effect_default$E$op`, so
+    # they never occupy the flat namespace a nested `fn` does.
+    _NON_HOISTING_DECLS = (fast.Implementation, fast.InterfaceDefinition,
+                           fast.MethodDefinition, fast.EffectDeclaration)
+
+    def _collect_nested_functions(self, statements, info: ModuleInfo) -> None:
+        """Record every `fn` declared somewhere other than module top level.
+
+        Mirrors HIRBuilder.build's hoisting walk, which lifts EVERY
+        FunctionDeclaration in the tree into a real MIR function keyed by
+        its bare name — so the walk collects every such name and then
+        subtracts the module's own top-level functions (those are renamed to
+        dotted paths and handled by `info.functions`).  What is left is the
+        set `_rewrite_call` must treat as "this module provides that name".
+
+        Nested modules and the non-hoisting declaration forms above are
+        boundaries; a `ComptimeFunction` is rejected later by HIR, so it is
+        skipped here too.
+        """
+        seen: set[int] = set()
+        found: set[str] = set()
+
+        def walk(value) -> None:
+            if isinstance(value, (list, tuple)):
+                for item in value:
+                    walk(item)
+                return
+            if isinstance(value, dict):
+                for item in value.values():
+                    walk(item)
+                return
+            if not isinstance(value, fast.Node):
+                return
+            if id(value) in seen:
+                return
+            seen.add(id(value))
+            if isinstance(value, (fast.Module,) + self._NON_HOISTING_DECLS):
+                return              # registered / mangled elsewhere
+            if isinstance(value, fast.FunctionDeclaration):
+                if isinstance(value, fast.ComptimeFunction):
+                    return
+                fname = str(getattr(value, "name", "") or "")
+                if fname:
+                    found.add(fname)
+            for attr, v in list(vars(value).items()):
+                if attr in self._SKIP_FIELDS:
+                    continue
+                walk(v)
+
+        walk(list(statements))
+        info.nested_functions |= (found - set(info.functions))
 
     # ------------------------------------------------------------------
     # Import resolution / file loading
@@ -511,6 +575,15 @@ class ModuleResolver:
                     return          # std.* placeholder: leave for builtins
                 if fname in final.functions:
                     node.name = self._final_name(final.path, fname)
+                return
+            if name in info.nested_functions:
+                # A `fn` declared inside a function body of THIS module.
+                # HIR's hoisting walk turns it into a real MIR function
+                # under this exact bare name, so the module DOES provide
+                # the name and it shadows a same-named builtin — the same
+                # result a file with no imports gets, where the resolver
+                # never runs at all.  Leave the call alone: nested
+                # functions are not renamed to dotted paths.
                 return
             # Nothing in THIS module's scope provides the name.  MIR's
             # function namespace is flat and module functions are renamed
