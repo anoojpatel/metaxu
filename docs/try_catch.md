@@ -58,3 +58,22 @@ remains the way to give an effect real semantics.
   on `InterpError` (and only `InterpError` — scope-teardown control
   exceptions pass through untouched) it calls the catch subfunction with
   the message string. `mir_interp.py`.
+
+## What the catch binding is, exactly
+
+The value bound to `e` is `InterpError.message`: the **plain failure text
+as raised**, and nothing else. It carries no compiler context and no
+filesystem paths, so the same program produces the same caught string on
+every machine and every backend. It is a language-visible value, not a
+diagnostic.
+
+The compiler's own "[in function 'f' declared at f.mx:3:1]" context lives
+in `InterpError.note` / `str(exc)` instead, where uncaught failures and
+tracebacks still show it (see docs/diagnostics_locations.md). Appending
+that note to the caught value — which `locate` used to do by rewriting
+`args[0]` — made a caught message depend on the absolute path the file
+happened to be compiled from, and diverged from the native backend.
+
+The native backend has no try/catch yet (it demotes `try_scope` to a
+placeholder); when it grows one, the catch binding must be this same plain
+text.

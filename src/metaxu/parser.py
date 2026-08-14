@@ -7,6 +7,11 @@ from metaxu.unsafe_ast import (UnsafeBlock, PointerType, TypeCast,
                        PointerDereference, AddressOf)
 from metaxu.type_defs import (SharedType, BoxType, ReferenceType, NoneType)
 from metaxu.errors import CompileError, SourceLocation, register_source
+# The `__builtin$` marker for compiler-synthesized builtin calls
+# (docs/name_precedence.md).  `metaxu.compiler.desugar` is a leaf module —
+# it imports only metaxu.metaxu_ast — so this cannot cycle back into the
+# parser.
+from metaxu.compiler.desugar import IMPL_SEP
 import bisect
 import functools
 import traceback
@@ -20,6 +25,17 @@ scoped_nodes = (ast.FunctionDeclaration, ast.LambdaExpression, ast.Block, ast.Wh
 # (see Parser._parse_fstring_expr).  Module-level so the ~0.5s PLY table
 # build happens at most once per process.
 _FSTRING_SEGMENT_PARSER = None
+
+# Callee-name marker for a COMPILER-SYNTHESIZED builtin call.  Kept equal to
+# `compiler.hir.BUILTIN_CALL_PREFIX` (pinned by a test); spelled here from
+# the same IMPL_SEP so the parser does not have to import the HIR builder.
+#
+# NAME PRECEDENCE (docs/name_precedence.md): surface syntax that the
+# compiler expands into a builtin call — `print(...)`, `-x`/`!x`, the
+# `for` loop's length bound, and f-string interpolation — carries this
+# marker so a user function of the same name cannot capture it.  Without
+# it a user `fn to_string` silently rewrote every `f"{x}"` in the program.
+BUILTIN_CALL_PREFIX = f"__builtin{IMPL_SEP}"
 
 
 class _GrammarNamespace:
@@ -843,15 +859,26 @@ class Parser:
         contain a nested f-string, so this parser is never re-entered).
         A segment that fails to parse — or parses to anything other than a
         single expression — is a clear CompileError naming the segment.
+
+        The wrapper is parsed under a SYNTHETIC file key
+        (``<fstring in foo.mx>``), never under the enclosing file's own path.
+        ``Parser.parse`` registers its source text for diagnostic excerpts
+        (``errors.register_source``), and registering the wrapper under the
+        real path replaced the file's registered text with
+        ``fn __fstring_expr__() { x }`` — every later diagnostic for that
+        file then quoted the wrapper as if it were the user's line 1, or
+        showed no excerpt at all.  A synthetic key cannot collide with a
+        real path (``<`` is not a path character here), so the enclosing
+        file's registered source is left intact.
         """
         global _FSTRING_SEGMENT_PARSER
         if _FSTRING_SEGMENT_PARSER is None:
             _FSTRING_SEGMENT_PARSER = Parser()
         wrapper = "fn __fstring_expr__() { " + text + " }"
+        enclosing = getattr(self.lexer, 'source_file', None)
+        segment_key = f"<fstring in {enclosing}>" if enclosing else "<fstring>"
         try:
-            module = _FSTRING_SEGMENT_PARSER.parse(
-                wrapper, file_path=getattr(self.lexer, 'source_file', None)
-                or "<fstring>")
+            module = _FSTRING_SEGMENT_PARSER.parse(wrapper, file_path=segment_key)
         except CompileError as exc:
             self._fstring_error(
                 f"f-string: cannot parse expression segment '{{{text}}}' in "
@@ -896,7 +923,12 @@ class Parser:
                 parts.append(ast.Literal(text))
             else:
                 expr = self._parse_fstring_expr(text, raw, lineno)
-                parts.append(ast.FunctionCall("to_string", [expr]))
+                # A compiler-synthesized builtin call: marked so a user
+                # `fn to_string` cannot capture `f"{x}"`
+                # (docs/name_precedence.md).  The user function stays
+                # directly callable as `to_string(x)`.
+                parts.append(ast.FunctionCall(
+                    BUILTIN_CALL_PREFIX + "to_string", [expr]))
         if not parts:
             return ast.Literal("")
         result = parts[0]

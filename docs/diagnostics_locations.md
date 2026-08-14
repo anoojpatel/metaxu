@@ -49,6 +49,16 @@ real file). `_parse_fstring_expr` drops them and lets the segment inherit
 the f-string literal's own span instead — a coarse location beats a wrong
 one.
 
+That wrapper is also parsed under a **synthetic file key**,
+`<fstring in foo.mx>`, never under the enclosing file's own path. Every
+`Parser.parse` call registers its source text (see `register_source`
+below), so parsing the wrapper under the real path replaced that file's
+registered text with `fn __fstring_expr__() { x }`: every later diagnostic
+for the file then had no excerpt at all (its line is past the end of the
+one-line wrapper) or quoted the wrapper as the user's line 1. A key
+beginning with `<` cannot collide with a real path, and the wrapper stays
+registered under it so a diagnostic about the segment itself still renders.
+
 ## Position semantics
 
 `errors.SourceLocation` and `mutaxu_ast.Span` agree, and both are explicit
@@ -99,9 +109,30 @@ Diagnostics that carry locations:
   per-op span would mean reshaping every op constructor, every consumer
   (interpreter, LLVM and CLIF backends) and every MIR golden. Instead
   `MirFunc.location` carries the function's declaration site and
-  `InterpError.locate` appends `[in function 'f' declared at f.mx:3:1]` to
-  the innermost frame's message — worded so it cannot be misread as the
-  failing operation's line.
+  `InterpError.locate` records `[in function 'f' declared at f.mx:3:1]` for
+  the innermost frame — worded so it cannot be misread as the failing
+  operation's line.
+
+  **That context is diagnostic-only.** `InterpError` keeps two texts:
+
+  | attribute | audience | contents |
+  |---|---|---|
+  | `.message` | the *language* | the plain failure text, exactly as raised |
+  | `.note` | the *compiler* | `" [in function 'f' declared at f.mx:3:1]"` |
+  | `str(exc)` | the *compiler* | `.message` + `.note` |
+
+  The split exists because the message is not purely a diagnostic: a
+  `try { } catch e { }` binds it to `e` as an ordinary string value
+  (docs/try_catch.md), so it is part of the program's observable
+  semantics. `locate` used to rewrite `args[0]`, which changed that value
+  and leaked the *host machine's* absolute source path into it — a program
+  that printed a caught error printed a different string depending on where
+  it was compiled, and differently again on a backend with no such note.
+  `mir_interp`'s `try_scope` therefore passes `exc.message`, while
+  tracebacks and the example gate go through `str(exc)` and keep naming the
+  function. `args` is never rewritten. The native backend currently demotes
+  `try_scope` (no native try/catch yet); when it grows one it must bind the
+  same plain `.message` text.
 * **Advisory `-1` diagnostics** from `frozen_constraint_checker`
   ("Unresolved callee ...", "Invalid capture mode ...") are plain strings
   that still say `at node N`. They are advisories, never promoted to a

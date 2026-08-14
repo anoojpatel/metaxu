@@ -290,18 +290,47 @@ class EffectHandler:
 class InterpError(Exception):
     """A run-time error from the MIR interpreter.
 
+    TWO MESSAGES, ON PURPOSE — they have different audiences:
+
+    * ``.message`` is the LANGUAGE-VISIBLE failure text: exactly what the
+      raiser wrote, with no compiler context and no host filesystem paths.
+      This is the value a user's ``catch e`` binds (docs/try_catch.md §
+      "the error value in v1 is the failure's message string"), so it is
+      part of the program's observable semantics and must stay stable
+      across compilations, machines and backends.  The native backend has
+      no try/catch yet (it demotes ``try_scope``); when it grows one it
+      must hand the catch binding this same plain text.
+    * ``str(exc)`` is the DEVELOPER-FACING diagnostic: ``.message`` plus
+      ``.note``, the " [in function 'f' declared at f.mx:3:1]" context
+      that ``locate`` attaches.  Tracebacks, the example gate and every
+      compiler-side report go through ``str()``, so they keep naming the
+      function the failure happened in.
+
     Granularity note: `location` is the DECLARATION site of the function the
     error happened in, not the individual operation — MIR ops are positional
-    tuples with no span field (see mir.MirFunc.location). The message keeps
-    its original text and gains a " [in function 'f' declared at f.mx:3:1]"
-    suffix, so the location can never be misread as the failing op's line.
+    tuples with no span field (see mir.MirFunc.location).  The note is worded
+    so the location can never be misread as the failing op's line.
+
+    ``args`` is never rewritten: mutating ``args[0]`` is what leaked the
+    compiler context (and absolute host paths) into the caught value.
     """
     location = None
+    note = ""
     _located = False
+
+    def __init__(self, message: str = "", *rest: Any) -> None:
+        super().__init__(message, *rest)
+        self.message = message
+
+    def __str__(self) -> str:
+        return f"{self.message}{self.note}"
 
     def locate(self, func_name: str, location) -> None:
         """Attach the innermost enclosing function once (outer frames are
-        annotated first-wins, so the deepest frame is the one reported)."""
+        annotated first-wins, so the deepest frame is the one reported).
+
+        Diagnostic context only: `.message` — the value `catch` binds — is
+        deliberately left alone."""
         if self._located:
             return
         self._located = True
@@ -309,8 +338,7 @@ class InterpError(Exception):
         from metaxu.errors import format_location
         where = (f" declared at {format_location(location)}"
                  if location is not None else "")
-        base = self.args[0] if self.args else ""
-        self.args = (f"{base} [in function {func_name!r}{where}]",) + self.args[1:]
+        self.note = f" [in function {func_name!r}{where}]"
 
 
 class _ScopeAbort(BaseException):
@@ -932,7 +960,11 @@ class MirInterpreter:
             try:
                 return self._call_func(body_fn, [], captured)
             except InterpError as exc:
-                return self._call_func(catch_fn, [str(exc)], captured)
+                # `.message`, NOT `str(exc)`: the catch binding is a
+                # LANGUAGE-VISIBLE value, so it gets the plain failure text
+                # without the compiler's " [in function 'f' declared at
+                # /abs/host/path:2:1]" diagnostic note (see InterpError).
+                return self._call_func(catch_fn, [exc.message], captured)
         elif kind == "handle_scope":
             # ("handle_scope", body_fn, effect_name, ((op, param, handler_fn), ...)),
             # args = ((name, val_name), ...) captured environment
