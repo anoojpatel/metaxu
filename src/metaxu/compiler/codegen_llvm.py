@@ -176,9 +176,9 @@ caveat:
   * element-wise arithmetic (+ - * / % with scalar broadcasting, nested
     matrices included) -> mx_fvec_binop; vector operands and the result
     share one vector kind, a broadcast scalar unifies with the LEAF
-    element kind.  Int elements use the backend's C-truncating sdiv/srem
-    convention (the interpreter floors; they agree for non-negative
-    operands); integer division by zero aborts.  ==/!= on vectors demote
+    element kind.  Int elements use the C-truncating sdiv/srem convention,
+    which the interpreter now matches exactly (it used to floor like
+    Python); integer division by zero aborts.  ==/!= on vectors demote
     (the interpreter compares structurally).
   * ``__slice_get`` -> mx_fvec_slice, a FRESH COPY with CPython
     slice.indices() semantics; a bound must be statically None (a
@@ -464,9 +464,11 @@ Type model (documented conventions):
   * logical &&/|| normalize both operands with ``icmp ne 0`` before
     and/or (truthiness semantics, matching the MIR interpreter, not
     bitwise-and like a naive lowering).
-  * int / and % use ``sdiv``/``srem`` (C truncating semantics).  The MIR
-    interpreter uses Python floor semantics; these agree for non-negative
-    operands.  Division by zero is UB natively (the interpreter raises).
+  * int / and % use ``sdiv``/``srem`` (C truncating semantics), which the
+    MIR interpreter matches exactly: it truncates toward zero and takes
+    the sign of the dividend rather than flooring like Python, so the two
+    engines agree on negative operands too.  Division by zero is UB
+    natively (the interpreter raises).
   * LOCAL (default / @local) structs: a named ``%struct.T`` per struct
     type, one entry-block ``alloca`` per struct-typed MIR variable,
     ``getelementptr`` + load/store for fields.  MIR struct ops have value
@@ -982,7 +984,7 @@ _HEADER = (
     "; conventions: ints/bools/unit -> i64 (unit = 0); floats -> double;\n"
     ";   strings -> ptr to private constant byte arrays; cmp results zext to i64;\n"
     ";   &&/|| normalize operands with icmp ne 0 (truthiness, not bitwise);\n"
-    ";   / and % are sdiv/srem (trunc toward zero; interpreter floors);\n"
+    ";   / and % are sdiv/srem (trunc toward zero; interpreter matches);\n"
     ";   local structs -> %struct.T entry allocas + GEP (value semantics,\n"
     ";   whole-aggregate copies; zero heap management -- the frame owns them);\n"
     ";   @global structs -> entry-block malloc(recursive layout size) + GEP\n"
