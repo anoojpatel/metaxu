@@ -195,6 +195,24 @@ def _pattern_descriptor(p: Any) -> dict[str, Any]:
             if isinstance(v, (int, float)) and not isinstance(v, bool):
                 return {"kind": "literal", "value": -v}
         return {"kind": "unknown"}
+    if isinstance(p, fast.TupleLiteral):
+        # `(_, _)` is a CATCH-ALL: a tuple pattern's shape carries no runtime
+        # test (an arity mismatch is a loud missing-field error, not a failed
+        # match — see hir.TUPLE_STRUCT_PREFIX), so an all-wildcard tuple
+        # pattern is irrefutable exactly like `_`.
+        #
+        # Every other tuple pattern is reported OPAQUE, deliberately.  A bare
+        # element name freezes as {"kind": "name"}, and only the emitter's
+        # variant table can say whether it is an irrefutable binding (`x`) or
+        # a nullary constructor (`None`) — guessing "binding" here would make
+        # a refutable arm claim to be a catch-all and could silence a real
+        # non-exhaustive-match error.  Opaque keeps the check permissive,
+        # which is the safe direction.
+        subs = [_pattern_descriptor(e)
+                for e in (getattr(p, "elements", None) or [])]
+        if len(subs) >= 2 and all(s.get("kind") == "wildcard" for s in subs):
+            return {"kind": "wildcard"}
+        return {"kind": "unknown"}
     if isinstance(p, fast.NoneExpression):
         return {"kind": "ctor", "name": "None", "enum": "Option", "subpatterns": []}
     if isinstance(p, fast.SomeExpression):

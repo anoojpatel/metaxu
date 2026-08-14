@@ -31,7 +31,17 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 from .mir import MirBlock, MirFunc
 from .desugar import IMPL_SEP, parse_impl_method_name
 from .hir import (BUILTIN_CALL_PREFIX, EFFECT_RUNTIME_CALL_PREFIX,
-                  STATIC_CALL_PREFIX, TRAIT_CALL_PREFIX)
+                  STATIC_CALL_PREFIX, TRAIT_CALL_PREFIX,
+                  TUPLE_STRUCT_PREFIX as _TUPLE_STRUCT_PREFIX,
+                  tuple_field_name as _tuple_field)
+
+
+def _tuple_field_arity(field_name: str) -> "int | None":
+    """The arity a tuple field name encodes (`_0of2` -> 2), else None."""
+    head, sep, tail = field_name.partition("of")
+    if not sep or not tail.isdigit() or not head.startswith("_"):
+        return None
+    return int(tail) if head[1:].isdigit() else None
 
 
 # ---------------------------------------------------------------------------
@@ -82,6 +92,15 @@ class MxStruct:
 
     def get(self, field_name: str) -> Any:
         if field_name not in self.fields:
+            # Tuples are anonymous structs whose field names carry the arity
+            # (hir.TUPLE_STRUCT_PREFIX), so an arity-mismatched destructuring
+            # lands HERE rather than silently binding a prefix.  Say what
+            # actually went wrong instead of naming a synthetic field.
+            want = _tuple_field_arity(field_name)
+            if self.is_tuple and want is not None:
+                raise InterpError(
+                    f"tuple arity mismatch: a {want}-element tuple pattern "
+                    f"cannot destructure a {self.tuple_arity}-element tuple")
             raise KeyError(f"Struct '{self.name}' has no field '{field_name}'")
         return self.fields[field_name]
 
@@ -92,8 +111,34 @@ class MxStruct:
         return MxStruct(name=self.name, fields=new_fields, locality=self.locality)
 
     def __repr__(self) -> str:
+        n = self.tuple_arity
+        if n is not None:
+            # A tuple is an anonymous struct (hir.TUPLE_STRUCT_PREFIX), but
+            # it must READ like a tuple: `(1, 2)`, not
+            # `__tuple2 { _0of2=1, _1of2=2 }`.
+            return "(" + ", ".join(
+                repr(self.fields[_tuple_field(i, n)]) for i in range(n)) + ")"
         fields_str = ", ".join(f"{k}={v!r}" for k, v in self.fields.items())
         return f"{self.name} {{ {fields_str} }}"
+
+    @property
+    def is_tuple(self) -> bool:
+        """True for the anonymous struct a tuple literal lowers to."""
+        return self.tuple_arity is not None
+
+    @property
+    def tuple_arity(self) -> "int | None":
+        """This value's tuple arity, or None when it is an ordinary struct."""
+        if not self.name.startswith(_TUPLE_STRUCT_PREFIX):
+            return None
+        digits = self.name[len(_TUPLE_STRUCT_PREFIX):]
+        if not digits.isdigit():
+            return None
+        n = int(digits)
+        if len(self.fields) != n or any(
+                _tuple_field(i, n) not in self.fields for i in range(n)):
+            return None
+        return n
 
 
 @dataclass

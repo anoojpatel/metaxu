@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Sequence, List, Dict
 
 from .desugar import IMPL_PREFIX
-from .hir import HFun, HExpr, HPattern
+from .hir import HFun, HExpr, HPattern, tuple_field_name
 from .mir import MirFunc, MirBlock
 from .borrow_analysis import plan_drops
 
@@ -198,6 +198,22 @@ class _FuncLowerer:
             ok_bb = self.new_block()
             self.terminate(("br_if", cond, ok_bb, fail_bb))
             self.switch_to(ok_bb)
+            return
+        if pat.kind == "tuple":
+            # A tuple is an anonymous struct (hir.TUPLE_STRUCT_PREFIX), so
+            # destructuring is a positional field_get per element and NO tag
+            # test.  The arity is not branched on because it is not a
+            # runtime choice: the field names carry it (`_0of2` exists only
+            # on a `__tuple2`), so a pattern whose arity disagrees with the
+            # value is a loud missing-field error, not a quietly-failing arm
+            # and not a quietly-succeeding prefix bind.  Refutable
+            # subpatterns still branch to fail_bb.
+            arity = len(pat.subpatterns)
+            for i, sub in enumerate(pat.subpatterns):
+                fv = self.state.fresh("pt")
+                self.emit(("let", fv, ("field_get", tuple_field_name(i, arity)),
+                           (val_name,)))
+                self.compile_pattern(sub, fv, fail_bb)
             return
         if pat.kind == "ctor":
             tag = self.state.fresh("tag")

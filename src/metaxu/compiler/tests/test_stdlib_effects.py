@@ -689,7 +689,7 @@ fn main() -> int {
 
 _ITER_HELPERS = """
 from std.stream import Emit, iota, emit_vec, collect, sum, count;
-from std.iter import Pair, pair, enumerate, zip, zip_with, take_while,
+from std.iter import enumerate, zip, zip_with, take_while,
                      drop_while, step_by, windows, chunks;
 from std.vec import of3;
 
@@ -703,11 +703,15 @@ fn show_ints(v: Vec) -> string {
     s
 }
 
+# The adapters emit real TUPLES (they used to emit a hand-rolled `Pair`
+# struct), so the consumer destructures — which is the point of the
+# rewrite: this is the code `p.first` / `p.second` stood in for.
 fn show_pairs(v: Vec) -> string {
     let @mut s = "";
     let @mut i = 0;
     while i < len(v) {
-        s = s + "(" + to_string(v[i].first) + " " + to_string(v[i].second) + ")";
+        let (a, b) = v[i];
+        s = s + "(" + to_string(a) + " " + to_string(b) + ")";
         i = i + 1
     }
     s

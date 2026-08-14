@@ -352,14 +352,18 @@ fn main() -> int {
     assert result == 9
 
 
-def test_nonempty_tuple_literal_is_loud():
-    with pytest.raises(NotImplementedError, match="tuple"):
-        compile_source("""
+def test_nonempty_tuple_literal_is_a_real_value():
+    """Gap 8 (std/README.md) closed: a non-empty tuple used to be a LOUD
+    NotImplementedError because it had no runtime representation.  It is an
+    anonymous struct now; `test_tuples.py` owns the full contract."""
+    result, _ = run_main("""
 fn main() -> int {
     let t = (1, 2);
-    0
+    let (a, b) = t;
+    a + b
 }
 """)
+    assert result == 3
 
 
 # ----------------------------------------------------------------------

@@ -382,7 +382,10 @@ def test_unsupported_expression_constructs_are_loud(label, source, needle):
 
 @pytest.mark.parametrize("label,arm,needle", [
     ("list", "[] => 1", "ListLiteral"),
-    ("tuple", "(1, 2) => 1", "TupleLiteral"),
+    # `(1, 2) => 1` is a SUPPORTED tuple pattern now (see test_tuples.py);
+    # the shapes that remain unsupported are the ones with no tuple to
+    # destructure, kept here so they cannot regress to a silent catch-all.
+    ("unit tuple", "() => 1", "a tuple pattern needs two or more"),
     ("range", "1..5 => 1", "RangeExpression"),
     ("arithmetic", "1 + 2 => 1", "BinaryOperation"),
     ("lambda", "fn(y) -> y * y => 1", "LambdaExpression"),

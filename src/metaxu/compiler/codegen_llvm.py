@@ -787,7 +787,8 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 from .mir import MirFunc
 from .cps_frames import is_suspending
 from .desugar import IMPL_SEP, parse_impl_method_name
-from .hir import BUILTIN_CALL_PREFIX, STATIC_CALL_PREFIX, TRAIT_CALL_PREFIX
+from .hir import (BUILTIN_CALL_PREFIX, STATIC_CALL_PREFIX, TRAIT_CALL_PREFIX,
+                  is_tuple_struct as _is_tuple_struct)
 
 # Value kinds -----------------------------------------------------------------
 
@@ -3692,12 +3693,30 @@ def _infer_kinds(info: _Info, sigs: Dict[str, _Sig], structs: _StructTable,
                 elif rk == "alloc_struct":
                     sname = rhs[1]
                     changed = mark(dst, _STRUCT_PREFIX + sname) or changed
+                    # A DECLARED struct's field has one source type, so every
+                    # store site agrees and the join flows BOTH ways: the
+                    # field learns from the store and the store learns from
+                    # the field (that back-propagation is what lets a fresh
+                    # `Vec.new()` element pick up the field's refinement).
+                    #
+                    # A TUPLE struct (hir.TUPLE_STRUCT_PREFIX) has no
+                    # declaration: `__tuple2` is every 2-tuple in the module,
+                    # so `(1, 2)` and `(1.0, 2.5)` share one layout even
+                    # though they are different source types.  Back-
+                    # propagating there would silently RETYPE the int literal
+                    # as a double (i64 is the lattice bottom, so the join
+                    # picks f64) — a wrong-code path, not a demotion.  So the
+                    # join is ONE-WAY for tuples, exactly as it is for enum
+                    # payload cells, and the driver demotes the struct
+                    # post-fixpoint when a store disagrees with the join.
+                    two_way = not _is_tuple_struct(sname)
                     for (fn_, fv) in args:
                         fk = structs.field_kind(sname, fn_)
                         nk = _join(fk, get(fv))
                         if structs.mark_field(sname, fn_, nk):
                             changed = global_changed = True
-                        changed = mark(fv, nk) or changed
+                        if two_way:
+                            changed = mark(fv, nk) or changed
                 elif rk == "field_get":
                     bk = get(args[0])
                     if bk == I64 and field_owner.get(rhs[1]):
@@ -8757,6 +8776,34 @@ def emit_llvm(funcs: Sequence[MirFunc]) -> str:
                     if _strip_refinement(kinds.get(a, I64)) != \
                             variants.cell_kind(ename, vname, i):
                         variants.mixed.add((ename, vname, i))
+
+    # Same rule for TUPLE structs, whose field joins are one-way for the
+    # same reason (see the alloc_struct branch of _infer_kinds).  `__tuple2`
+    # is EVERY 2-tuple in the module, so a module building both `(1, 2)` and
+    # `(1.0, 2.5)` gives `_1of2` one native layout that not every store
+    # site actually uses.  Emitting through the join would retype an int
+    # literal as a double; the struct is marked bad instead, so every
+    # function that touches a tuple of that arity demotes with a reason.
+    for info in candidates:
+        kinds = kind_sets.get(info.f.name, {})
+        for b in info.f.blocks:
+            for op in b.ops:
+                if op[0] != "let" or len(op) != 4 or op[2][0] != "alloc_struct":
+                    continue
+                sname = op[2][1]
+                if sname in structs.bad or not _is_tuple_struct(sname):
+                    continue
+                for (fn_, fv) in op[3]:
+                    fk = structs.field_kind(sname, fn_)
+                    vk = kinds.get(fv, I64)
+                    if vk != fk:
+                        structs.bad[sname] = (
+                            f"tuple struct {sname!r} has conflicting element "
+                            f"representations: field {fn_!r} is {fk} module-"
+                            f"wide but {fv!r} is {vk} here (tuples of the "
+                            "same arity share one native layout, and this "
+                            "module builds two different tuple types)")
+                        break
 
     # Post-fixpoint consistency; anything wrong becomes a placeholder reason.
     for info in candidates:

@@ -1,11 +1,14 @@
 # std.iter — the stream adapters std.stream defers.
 #
 # std.stream ports Ante's Stream.an but stops short of `enumerate`, `zip`
-# and friends, because those emit PAIRS and Metaxu has no tuple type or
-# tuple destructuring. This module supplies the missing piece the honest
-# way: a real `Pair` struct. `p.first` / `p.second` is what `let (a, b)`
-# would have been, and it is a plain value that closures, Vecs and
-# handlers already carry.
+# and friends, because those emit PAIRS. This module supplies them over
+# real TUPLES: `enumerate` emits `(index, element)` and the consumer
+# writes `let (i, x) = p;` or matches `(i, x) => ...`.
+#
+# It did not always. Until the language grew tuples (std/README.md gap 8)
+# this module carried a hand-rolled `struct Pair<A, B>` and callers wrote
+# `p.first` / `p.second`; the struct and its `pair` constructor are gone
+# now, because a tuple is exactly that struct without the name.
 #
 # Everything here is a std.stream transformer: a function answering a
 # thunk that installs an Emit handler and re-emits, so adapters chain
@@ -22,8 +25,6 @@
 from std.stream import Emit, collect;
 
 export {
-    Pair,
-    pair,
     enumerate,
     zip,
     zip_with,
@@ -34,23 +35,13 @@ export {
     chunks
 };
 
-# What `let (a, b) = ...` would destructure. Both halves are generic.
-struct Pair<A, B> {
-    first: A,
-    second: B
-}
-
-fn pair(a, b) -> Pair {
-    Pair { first: a, second: b }
-}
-
-# Re-emit Pair { first: index, second: element }, indices from 0.
+# Re-emit `(index, element)`, indices from 0.
 fn enumerate(producer) -> fn() -> Unit {
     fn() {
         let @mut index = 0;
         handle Emit with {
             emit(x) -> {
-                perform Emit.emit(Pair { first: index, second: x });
+                perform Emit.emit((index, x));
                 index = index + 1;
                 resume(())
             }
@@ -61,10 +52,10 @@ fn enumerate(producer) -> fn() -> Unit {
     }
 }
 
-# Emit Pair { first: a, second: b } for elements taken in lockstep, and
-# stop at the end of the SHORTER stream. `second` is realized into a Vec
-# first (see the header) — so prefer it as the finite one, and never pass
-# an unbounded stream as `second`.
+# Emit `(a, b)` for elements taken in lockstep, and stop at the end of
+# the SHORTER stream. `second` is realized into a Vec first (see the
+# header) — so prefer it as the finite one, and never pass an unbounded
+# stream as `second`.
 fn zip(first, second) -> fn() -> Unit {
     fn() {
         let items = collect(second);
@@ -72,7 +63,7 @@ fn zip(first, second) -> fn() -> Unit {
         handle Emit with {
             emit(x) -> {
                 if i < len(items) {
-                    perform Emit.emit(Pair { first: x, second: items[i] });
+                    perform Emit.emit((x, items[i]));
                     i = i + 1;
                     resume(())
                 } else {
@@ -86,7 +77,7 @@ fn zip(first, second) -> fn() -> Unit {
     }
 }
 
-# `zip` without the Pair: emit `f(a, b)` per lockstep pair. Ante's map2.
+# `zip` without the tuple: emit `f(a, b)` per lockstep pair. Ante's map2.
 fn zip_with(first, second, f) -> fn() -> Unit {
     fn() {
         let items = collect(second);

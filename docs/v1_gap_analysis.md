@@ -195,6 +195,20 @@ a one-line reason; `tests/test_hir_coverage.py` fails if a newly added node
 class is left unclassified. The authoritative list lives in that table — this
 is the summary of what is deliberately NOT supported and errors loudly:
 
+`TupleLiteral` moved OUT of the unsupported buckets (in both tables) when
+tuples landed: `(a, b)` / `(a, b, c)` are values, `(A, B)` is a type, and
+`let (a, b) = p;`, `match p { (x, y) => .. }` and `for (k, v) in ps { .. }`
+destructure. A tuple **is an anonymous struct** — `alloc_struct "__tuple2"
+{ _0of2, _1of2 }` plus a `field_get` per element — so MIR gained no op, the
+interpreter gained no value class and native codegen inherited the struct
+path unchanged. The field name repeats the arity because inference has no
+tuple type: `_0of2` does not exist on a `__tuple3`, which is what makes a
+mismatched destructuring a loud error rather than a silent prefix bind.
+See `std/README.md` gap 8 and `tests/test_tuples.py` for the full contract,
+including the two shapes that demote natively with a reason (two different
+tuple types of one arity in a module; a tuple nested directly inside a
+same-arity tuple).
+
 - **GPU**: `to_device(x)`, `from_device(x)`, kernel annotations — no runtime.
 - **Comptime**: `comptime { }` blocks, `comptime fn`, compile-time values,
   `typeof`-style type reflection, compile-time matching on types — compile-time
@@ -206,10 +220,13 @@ is the summary of what is deliberately NOT supported and errors loudly:
   function has no value representation; call it directly (`ident<int>(x)`).
 - **Bare comprehensions**: `f(e for x in it)` — only the vector-literal form
   `vector[T,N](e for x in it)` has a value representation.
-- **Non-unit tuples**: `(a, b)` — no runtime representation (`()` is unit).
+- **1-tuples**: `(e)` is parenthesized grouping and `(e,)` is a syntax
+  error, so `let (a) = e` and a `()` *pattern* are rejected by name rather
+  than given a `__tuple1` layout. (Tuples of two or more elements are
+  supported — see below.)
 - **`vector[T,N]` in value position** — it is a TYPE; the value forms are
   `vector[T,N]()`, `vector[T,N](e, ...)` and `vector[T,N].filled(e)`.
-- **Pattern forms**: list patterns (`[]`, `[x, ...xs]`), tuple patterns,
+- **Pattern forms**: list patterns (`[]`, `[x, ...xs]`),
   struct patterns, range patterns (`1..5`), guards, arbitrary expressions,
   matching on the structure of a function, and matching against a field's or
   an indexed value. Each of these used to degrade to a match-anything
