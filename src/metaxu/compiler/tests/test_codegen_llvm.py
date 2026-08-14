@@ -159,6 +159,25 @@ mx_fvec_zip_map through a two-word thunk; length mismatches abort with
 the interpreter's message).  Cells and fvec blocks leak by design
 (detect_leaks=0); index-stored local Vecs and scalar-global programs run
 FULLY leak-checked.
+
+Increment 14 (aggregates across the effect boundary) adds: structs, enums
+and closure pairs as perform arguments, resume values, handler-case /
+body results and handle-scope results cross as BOUNDARY BOXES — a fresh
+malloc'd write-once copy whose pointer is the 8-byte word (the enum
+payload box contract at the effect boundary); receivers copy out per
+their kind (case params byval-copy straight from the box), the per-site
+shims malloc the box for aggregate body/case results and call sret-style
+into it, and every member lambda of a boundary-crossing closure kind is
+forced heap-env.  Boxes are immortal (leak by design, detect_leaks=0
+proves no-UAF/no-double-free with aggregates in flight across
+park/resume); std.stream's `find` (Option-valued handle result) emits
+and runs natively both paths.  Still demoted honestly: konts, rawptr
+words, conflicting same-named-op cells (aggregate or scalar — the
+coarseness rule is unchanged), infinite layouts, and performs of ops
+with a `with SYMBOL` C-runtime mapping (effect_mapping.mx's EFFECT_*
+threads/mutex primitives have no native runtime; the interpreter routes
+unscoped performs to them, so mx_perform's abort would diverge — demote,
+never guess).
 """
 from __future__ import annotations
 
@@ -2250,10 +2269,7 @@ def test_resume_outside_its_handler_case_demotes():
     assert "resume outside its own handler case" in ir
 
 
-def test_closure_crossing_effect_boundary_demotes():
-    # effect_mapping.mx's shape: performing with a closure argument has no
-    # sound word encoding (the handler side would need the pair + env).
-    ir = llvm_from_source("""
+_FX_CLOSURE_ARG_SRC = """
 effect Apply { app(f: fn(int) -> int) -> int }
 fn main() -> int {
     handle Apply with { app(f) -> resume(f(2)) } in {
@@ -2261,8 +2277,25 @@ fn main() -> int {
         perform Apply.app(double)
     }
 }
-""")
-    assert "cannot cross the effect boundary" in ir
+"""
+
+
+def test_closure_crossing_effect_boundary_boxes():
+    # Increment 14: performing with a closure argument crosses as a boxed
+    # {fn, env} pair word.  The member lambda is forced heap-env (the
+    # boxed pair may outlive the creating frame; an immortal env can
+    # never dangle), the sender boxes the 16-byte pair, and the
+    # dispatcher hands the case fn the box pointer to byval-copy from.
+    ir = llvm_from_source(_FX_CLOSURE_ARG_SRC)
+    assert count_placeholders(ir) == 0
+    assert "cannot cross the effect boundary" not in ir
+    assert re.search(
+        r"call ptr @malloc\(i64 16\)"
+        r"  ; boundary box: closure:\S+ \(write-once, leaks by design\)", ir)
+    assert re.search(r"heap env for \w+ -> \S+ \(leaks by design\)", ir)
+    assert re.search(
+        r"inttoptr i64 %c0\.a0w to ptr"
+        r"  ; boundary box: case param closure:", ir)
 
 
 @needs_clang
@@ -2837,13 +2870,22 @@ def test_examples_define_census_does_not_regress():
     # lambdas emit through the word-uniform ABI — landing at 88; 06's map
     # keeps demoting honestly on GENUINE polymorphism (one `map` receives
     # f64-valued AND str-valued lambdas, so its parameter kinds conflict
-    # for real).
+    # for real).  Increment 14 (boundary boxes) REMOVED one fake define:
+    # effect_mapping.mx's main$lambda3 previously emitted with raw
+    # mx_perform calls for the runtime-mapped Mutex.lock/unlock ops —
+    # native code that would ABORT where the interpreter's EFFECT_*
+    # primitives succeed (unobservable only because the demoted main
+    # never called it).  Runtime-mapped performs now demote explicitly
+    # (never wrong code), landing at 87; no example gains defines from
+    # the boxing itself (their remaining demotions are other gaps —
+    # std.stream's find, the increment's real win, is census'd in
+    # test_std_stream_full_surface_census).
     total_defines = 0
     for path in _example_files():
         ir = llvm_from_source(path.read_text())
         total_defines += len(re.findall(
             r"^define (?:i64|double|ptr|void) @mx_\w+\(", ir, re.M))
-    assert total_defines >= 88
+    assert total_defines >= 87
 
 
 # ---------------------------------------------------------------------------
@@ -4695,8 +4737,17 @@ fn main() -> int {
 
 _STD_STREAM_FULL_SRC = """
 from std.stream import Emit, Loop, iota, emit_vec, iter, for_, fold, sum,
-    product, count, collect, all_of, any_of, map, filter, take, skip, chain;
+    product, count, collect, all_of, any_of, find, map, filter, take, skip,
+    chain;
 fn main() -> int {
+    match find(iota(9), fn(x: int) -> x > 6) {
+        Some(v) => { print(v) },
+        None => { print(0 - 1) }
+    };
+    match find(iota(4), fn(x: int) -> x > 40) {
+        Some(v) => { print(v) },
+        None => { print(0 - 1) }
+    };
     let s = filter(map(chain(iota(6), take(iota(9), 3)), fn(x: int) -> x * 2),
                    fn(x: int) -> x > 4);
     print(sum(s));
@@ -4721,23 +4772,23 @@ fn main() -> int {
 
 def test_std_stream_full_surface_census():
     # When a program exercises the whole stdlib surface, EVERY std.stream
-    # function emits except `find` (its Option handle value is an enum
-    # crossing the effect boundary — aggregate boxing across scopes stays
-    # honestly demoted).
+    # function emits — increment 14's boundary boxes lifted `find` (its
+    # Option handle value crosses the effect boundary as a boxed enum:
+    # the body thunk and the Some-arm case malloc the box, the owner
+    # copies the Option out of it).  ZERO placeholders.
     ir = llvm_from_source(_STD_STREAM_FULL_SRC)
     for fn in ("iota", "emit_range", "emit_vec", "iter", "for_", "fold",
                "sum", "product", "count", "collect", "all_of", "any_of",
-               "map", "filter", "take", "skip", "chain"):
+               "find", "map", "filter", "take", "skip", "chain"):
         assert re.search(
             rf"^define (?:i64|void|ptr|double) @mx_std_stream_{fn}\(",
             ir, re.M), fn
-    # The module carries every std.stream function; the only placeholders
-    # are find + its two handle subfunctions (Option across the boundary).
-    assert count_placeholders(ir) == 3
-    assert re.search(r"@mx_std_stream_find: placeholder", ir)
+    assert count_placeholders(ir) == 0
+    # find's handle value is a boxed Option at the boundary.
     assert re.search(
-        r"handle value .* of kind enum:Option.* cannot cross the effect "
-        r"boundary", ir)
+        r"call ptr @malloc\(i64 \d+\)"
+        r"  ; boundary box: (?:body|case) result enum:Option", ir)
+    assert re.search(r"; boundary box: enum:Option", ir)
 
 
 @needs_clang
@@ -4796,3 +4847,262 @@ fn main() -> int {
     0
 }
 """, tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Increment 14: aggregates across the effect boundary (boundary boxes) —
+# perform args / resume values / case results / handle results box into a
+# fresh write-once malloc'd copy whose pointer is the boundary word;
+# receivers copy out per kind.  Boxes are immortal (leak by design:
+# detect_leaks=0 proves no-UAF/no-double-free with aggregates in flight
+# across park/resume).  Same-named-op conflicts, konts, rawptr and
+# C-runtime-mapped ops (effect_mapping.mx) stay honestly demoted.
+# ---------------------------------------------------------------------------
+
+_FX_STRUCT_ROUNDTRIP_SRC = """
+struct Point { x: int, y: int }
+effect Geo { reflect(p: Point) -> Point }
+fn flip() performs Geo -> Point {
+    let p = Point { x: 3, y: 9 };
+    perform Geo.reflect(p)
+}
+fn main() -> int {
+    let q = handle Geo with {
+        reflect(p) -> resume(Point { x: p.y, y: p.x })
+    } in {
+        flip()
+    };
+    print(q.x);
+    print(q.y);
+    0
+}
+"""
+
+
+def test_struct_across_effect_boundary_boxes_structurally():
+    # The perform arg is boxed at the sender (16-byte Point), the case
+    # param arrives as the box pointer (byval-copied by the case fn), the
+    # resume value is boxed by the case, and the perform result / handle
+    # value copy out of their boxes.  Zero placeholders.
+    ir = llvm_from_source(_FX_STRUCT_ROUNDTRIP_SRC)
+    assert count_placeholders(ir) == 0
+    assert "cannot cross the effect boundary" not in ir
+    # sender-side boxes: the perform argument and the resume value
+    assert len(re.findall(
+        r"call ptr @malloc\(i64 16\)"
+        r"  ; boundary box: struct:Point \(write-once, leaks by design\)",
+        ir)) >= 2
+    # receiver-side copy-outs: inttoptr the word, aggregate load/store
+    assert re.search(
+        r"inttoptr i64 %t\d+ to ptr  ; boundary box: struct:Point", ir)
+    # dispatcher hands the case fn the box pointer for its byval-copy
+    assert re.search(
+        r"inttoptr i64 %c0\.a0w to ptr  ; boundary box: case param "
+        r"struct:Point", ir)
+
+
+@needs_clang
+def test_native_struct_perform_arg_and_resume_value(tmp_path):
+    # THE INCREMENT-14 ROUNDTRIP: a struct crosses perform -> handler
+    # (field reads) -> resume -> performer, through a suspending helper.
+    assert_native_matches_interp(_FX_STRUCT_ROUNDTRIP_SRC, tmp_path)
+
+
+@needs_clang
+def test_native_effectful_fn_returns_struct_through_handle_scope(tmp_path):
+    # A handle-scope RESULT that is a struct: the body returns it (sret
+    # into the body thunk's box), an abort-style case can also produce it
+    # (sret into the dispatcher's box), and the owner copies it out of
+    # whichever box won.  Both completion paths are exercised.
+    assert_native_matches_interp("""
+struct Acc { total: int, stopped: int }
+effect Tick { tick(n: int) -> int }
+fn run(limit: int) -> Acc {
+    handle Tick with {
+        tick(n) -> {
+            if n > limit { Acc { total: 0 - n, stopped: 1 } }
+            else { resume(n * 10) }
+        }
+    } in {
+        let a = perform Tick.tick(1);
+        let b = perform Tick.tick(2);
+        let c = perform Tick.tick(3);
+        Acc { total: a + b + c, stopped: 0 }
+    }
+}
+fn main() -> int {
+    let done = run(5);
+    print(done.total);
+    print(done.stopped);
+    let cut = run(2);
+    print(cut.total);
+    print(cut.stopped);
+    0
+}
+""", tmp_path)
+
+
+@needs_clang
+def test_native_enum_option_across_boundary_both_paths(tmp_path):
+    # An enum as the handle value without the stdlib: the Hit arm
+    # (case-result box) and the Miss arm (body-result box) both cross.
+    assert_native_matches_interp("""
+enum Found { Hit(int), Miss }
+effect Probe { probe(x: int) -> Unit }
+fn scan(stop: int) -> Found {
+    handle Probe with {
+        probe(x) -> {
+            if x == stop { Hit(x * 100) } else { resume(()) }
+        }
+    } in {
+        perform Probe.probe(1);
+        perform Probe.probe(2);
+        perform Probe.probe(3);
+        Miss
+    }
+}
+fn main() -> int {
+    match scan(2) { Hit(v) => { print(v) }, Miss => { print(0 - 1) } };
+    match scan(9) { Hit(v) => { print(v) }, Miss => { print(0 - 1) } };
+    0
+}
+""", tmp_path)
+
+
+@needs_clang
+def test_native_struct_resume_result_chains_fold_style(tmp_path):
+    # Aggregate RESUME RESULT under deep semantics: resume's value is the
+    # WHOLE delimited body's completion (a struct box), which each case
+    # copies out, extends and re-boxes through its own sret — the
+    # std.stream fold shape with a struct accumulator.
+    assert_native_matches_interp("""
+struct Acc { v: int }
+effect Emit2 { emit2(x: int) -> Unit }
+fn main() -> int {
+    let r = handle Emit2 with {
+        emit2(x) -> {
+            let rest = resume(());
+            Acc { v: rest.v + x }
+        }
+    } in {
+        perform Emit2.emit2(5);
+        perform Emit2.emit2(7);
+        Acc { v: 100 }
+    };
+    print(r.v);
+    0
+}
+""", tmp_path)
+
+
+@needs_clang
+def test_native_closure_as_perform_argument(tmp_path):
+    # The flipped increment-7 demotion: a closure crossing as a perform
+    # argument (boxed {fn, env} pair, member forced heap-env), applied by
+    # the handler and its result resumed back.
+    assert_native_matches_interp(_FX_CLOSURE_ARG_SRC, tmp_path)
+
+
+_FX_STD_FIND_SRC = """
+from std.stream import Emit, iota, find;
+fn main() -> int {
+    let r = find(iota(10), fn(x: int) -> x > 6);
+    match r { Some(v) => { print(v) }, None => { print(0 - 1) } };
+    let r2 = find(iota(5), fn(x: int) -> x > 40);
+    match r2 { Some(v) => { print(v) }, None => { print(0 - 1) } };
+    0
+}
+"""
+
+
+@needs_clang
+def test_native_std_stream_find_both_paths(tmp_path):
+    # THE INCREMENT-14 TARGET: std.stream's find — an Option-valued
+    # handle result over a real stream — natively, Some AND None paths,
+    # matched against the interpreter.
+    ir = assert_native_matches_interp(_FX_STD_FIND_SRC, tmp_path)
+    assert re.search(r"^define \w+ @mx_std_stream_find\(", ir, re.M)
+
+
+@needs_asan
+def test_native_aggregates_across_boundary_asan_no_uaf(tmp_path):
+    # Boundary boxes leak by design (immortal, write-once), so
+    # detect_leaks=0; ASan proves no use-after-free / no double-free with
+    # structs, Options and closure pairs in flight across park/resume —
+    # including a double perform roundtrip reusing a received aggregate.
+    src = """
+from std.stream import Emit, iota, find;
+struct Pair { a: int, b: int }
+effect Swap { swap(p: Pair) -> Pair }
+fn main() -> int {
+    match find(iota(10), fn(x: int) -> x > 6) {
+        Some(v) => { print(v) }, None => { print(0 - 1) }
+    };
+    match find(iota(5), fn(x: int) -> x > 40) {
+        Some(v) => { print(v) }, None => { print(0 - 1) }
+    };
+    let q = handle Swap with {
+        swap(p) -> resume(Pair { a: p.b, b: p.a })
+    } in {
+        let s = perform Swap.swap(Pair { a: 1, b: 2 });
+        let t = perform Swap.swap(s);
+        t
+    };
+    print(q.a);
+    print(q.b);
+    0
+}
+"""
+    result, expected_out = interp_run(src)
+    ir = llvm_from_source(src)
+    exit_code, stdout = compile_and_run(
+        ir, "main", workdir=str(tmp_path),
+        clang_args=("-fsanitize=address",),
+        run_env={"ASAN_OPTIONS": "detect_leaks=0"})
+    assert stdout == expected_out
+    assert exit_code == int(result) % 256
+
+
+def test_conflicting_aggregate_kinds_across_same_named_ops_demote():
+    # The coarseness rule is unchanged: op cells are keyed by op NAME
+    # (routing is dynamic), so two same-named ops carrying different
+    # struct kinds join to conflict and demote — for aggregates exactly
+    # as for scalars.
+    ir = llvm_from_source("""
+struct A { x: int }
+struct B { y: float }
+effect E1 { get() -> A }
+effect E2 { get() -> B }
+fn main() -> int {
+    let a = handle E1 with { get() -> resume(A { x: 1 }) }
+            in { perform E1.get() };
+    let b = handle E2 with { get() -> resume(B { y: 2.0 }) }
+            in { perform E2.get() };
+    a.x
+}
+""")
+    assert count_placeholders(ir) >= 1
+    assert "effect op 'get' has conflicting result kinds" in ir
+
+
+def test_effect_mapping_runtime_mapped_ops_demote_precisely():
+    # effect_mapping.mx after increment 14: the closure-boundary demotion
+    # is GONE (pairs box now); what remains is the real gap — its ops map
+    # to the C effect runtime (`with EFFECT_*`), which the interpreter
+    # serves through simulated thread/mutex primitives with no native
+    # counterpart.  mx_perform would abort where the interpreter
+    # succeeds, so every performing function demotes with that exact
+    # reason (never wrong code).
+    ir = llvm_from_source(
+        (REPO_ROOT / "examples" / "effect_mapping.mx").read_text())
+    assert "cannot cross the effect boundary" not in ir
+    assert re.search(
+        r"reason: effect op 'create' maps to the C effect runtime "
+        r"\('__effect_runtime\$Mutex\$create'\)", ir)
+    assert re.search(
+        r"reason: effect op 'lock' maps to the C effect runtime", ir)
+    # main (create/spawn/join) and its thread lambda (lock/unlock) both
+    # demote; the five __effect_runtime$ thunks stay placeholders on
+    # their unlinkable primitive callees.
+    assert re.search(r"@mx_main: placeholder", ir)
+    assert re.search(r"@mx_main_lambda\d+: placeholder", ir)

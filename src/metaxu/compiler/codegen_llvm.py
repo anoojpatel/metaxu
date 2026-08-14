@@ -320,6 +320,41 @@ added (index assignment, mutable captures, module constants, zip):
     declared-size mismatch like mx_fvec_map).  Non-pair zips and Vec
     sources demote.
 
+Increment 14 lifts AGGREGATES ACROSS THE EFFECT BOUNDARY via boundary
+boxes — the same write-once box contract as enum payloads:
+  * a struct / enum / closure-pair value used as a perform argument,
+    resume value, handler-case result, body result or handle-scope result
+    crosses as a POINTER WORD to a fresh malloc'd BOUNDARY BOX: the sender
+    copies the aggregate into the box (the fill is the box's only write),
+    the word travels through mx_perform/mx_resume/mx_handle untouched, and
+    the receiver copies the aggregate OUT into its own storage (case
+    params receive the box pointer directly — the aggregate-param
+    byval-copy convention IS the copy-out).  Boxes are IMMORTAL (leak by
+    design, exactly like payload boxes): a heap box can never dangle
+    across coroutine switches, parks, or scope teardown, which is what
+    makes the lifetime argument need no escape analysis at all.
+  * the module-wide op-name/site cells (perform args ⊔ case params,
+    perform results ⊔ resume values, handle value ⊔ body/case returns ⊔
+    resume results) now carry aggregate kinds; the same-named-op
+    coarseness rule stays — two same-named ops with irreconcilable kinds
+    (aggregate or scalar) still conflict and demote.
+  * body/case subfunctions with aggregate results keep their ordinary
+    sret convention; the per-site shims box: the body thunk mallocs the
+    box and calls the body fn sret-style into it, the dispatcher does the
+    same per aggregate-returning case (an alloca would die with the shim
+    frame while the word outlives it — hence malloc).
+  * closure pairs cross as {fn, env} two-word boxes; every member lambda
+    of a boundary-crossing closure kind is forced HEAP-ENV (the
+    increment-13 env-capture rule), so the boxed pair's env pointer aims
+    at an immortal block wherever the word travels.
+  * still demoted honestly: konts (resume must run on its scope's owner
+    stack), rawptr words, infinite layouts, closures of unknown or
+    non-module lambdas, conflicting cells, and performs of ops with a
+    `with SYMBOL` C-runtime mapping (__effect_runtime$E$op — the
+    interpreter routes unscoped performs to the EFFECT_* primitives;
+    natively mx_perform would abort instead, so effect_mapping.mx's
+    threads/mutex ops demote with that exact reason).
+
 Everything else — try_scope, `type_of` (no interpreter builtin exists),
 comprehensions over Vecs, string slicing/indexing — is emitted as a
 clearly marked, comment-only placeholder carrying the reasons, never as
@@ -360,9 +395,10 @@ ALGEBRAIC EFFECTS (increment 7):
     resume values; and per SITE: handle value ⊔ body return ⊔ case
     returns ⊔ resume results.  Two same-named ops with irreconcilable
     types conflict and demote (a sound over-approximation of the dynamic
-    routing).  Aggregates crossing the boundary demote (no boxing across
-    scopes this increment); a continuation captured into a nested scope
-    env or closure demotes (resume must run on its scope's owner stack).
+    routing).  Aggregates crossing the boundary travel as boundary-box
+    pointer words since increment 14 (see above); a continuation captured
+    into a nested scope env or closure demotes (resume must run on its
+    scope's owner stack).
   * `__k` continuation values get the dedicated non-word kind ``kont``
     (an opaque `mx_k*`); it may only flow from a case's param into its
     own resume ops.
@@ -1641,6 +1677,17 @@ def _analyze_inner(info: _Info, module_names: Set[str],
                         f"effect op {pop_name!r} has a declared default and "
                         "also appears in a handle scope (dynamic default "
                         "routing has no native lowering)")
+                if runtime_fn in module_names:
+                    # The op declares a `with SYMBOL` C-runtime mapping:
+                    # the interpreter routes unscoped performs to the
+                    # EFFECT_* primitive thunk (__effect_runtime$E$op),
+                    # while mx_perform would abort — demote, never guess
+                    # (the native threads/mutex runtime is a separate gap).
+                    info.add_reason(
+                        f"effect op {pop_name!r} maps to the C effect "
+                        f"runtime ({runtime_fn!r}); the interpreter routes "
+                        "unhandled performs to its EFFECT_* primitives, "
+                        "which have no native runtime")
                 if len(pargs) > _MAX_EFFECT_ARGS:
                     info.add_reason(
                         f"perform with {len(pargs)} arguments (native limit "
@@ -3508,12 +3555,26 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
         return kinds.get(n, I64)
 
     def check_boundary(kind: str, what: str) -> None:
-        """A value crossing the effect boundary must be an 8-byte word."""
-        if not _is_word_kind(kind):
-            probs.append(
-                f"{what} of kind {kind} cannot cross the effect boundary "
-                "(only i64/f64/str/vec word kinds; no aggregate boxing "
-                "across scopes)")
+        """A value crossing the effect boundary travels as one 8-byte
+        word: word kinds directly; struct/enum/closure aggregates as a
+        pointer to a fresh write-once BOUNDARY BOX (increment 14 — the
+        immortal-box contract, so the word can never dangle across
+        coroutine switches).  Still demoted: konts, rawptr, conflicts,
+        infinite layouts, and closures of unknown/non-heap-env lambdas
+        (the driver marks boundary-crossing members heap-env before this
+        runs, so that arm is defensive)."""
+        if _is_word_kind(kind):
+            return
+        if _is_closure(kind):
+            check_closure_cell(kind, f"{what} crossing the effect boundary")
+            return
+        if (_is_struct(kind) or _is_enum(kind)) \
+                and _kind_size(kind, structs, variants) is not None:
+            return
+        probs.append(
+            f"{what} of kind {kind} cannot cross the effect boundary "
+            "(i64/f64/str/vec word kinds and finite-layout boxed "
+            "aggregates only)")
 
     def check_closure_cell(kind: str, what: str) -> bool:
         """A closure kind stored in an env field (handle-site capture or
@@ -5572,13 +5633,30 @@ def _word_decode(val: str, kind: str, dst: str) -> Tuple[List[str], str]:
 
 
 def _emit_scope_artifacts(site: str, rec: _ScopeSite, sigs: Dict[str, _Sig],
+                          structs: _StructTable, variants: _VariantTable,
                           mod: _ModuleState) -> None:
     """Per-handle-site shims for the effects runtime: the op-name /
     case-arity constant tables, the body thunk (`i64 (ptr env)`) and the
     dispatcher (`i64 (ptr env, i64 op_index, ptr args, ptr k)`).  Op
-    indices are DENSE in the site's case order (documented per arm)."""
+    indices are DENSE in the site's case order (documented per arm).
+
+    Aggregate body/case results (increment 14) keep their ordinary sret
+    convention; the shim mallocs a BOUNDARY BOX, calls sret-style into
+    it, and returns the box pointer as the word.  malloc, never alloca:
+    the word outlives the shim's frame (it crosses mx_handle/mx_perform
+    back to a different stack).  The box is write-once (the sret fill)
+    and immortal (leaks by design, like every boundary box).  Aggregate
+    case PARAMS receive the sender's box pointer directly — the ordinary
+    aggregate-param byval-copy convention is exactly the copy-out."""
     if site in mod.scope_thunks:
         return
+
+    def box_size(kind: str) -> int:
+        s = _kind_size(kind, structs, variants)
+        if s is None:  # unreachable: checks demote infinite layouts
+            raise _Unsupported(f"boundary box of {kind} has infinite layout")
+        return max(s, 8)
+
     n = len(rec.cases)
     op_ptrs, nps = [], []
     for (opn, cparams, _hfn) in rec.cases:
@@ -5593,13 +5671,22 @@ def _emit_scope_artifacts(site: str, rec: _ScopeSite, sigs: Dict[str, _Sig],
         f"[{n} x i64] [{', '.join(nps)}]")
 
     bsig = sigs[rec.body_fn]
-    brty = _llscalar(bsig.ret)
     bl = [f"define internal i64 @{_scope_body_sym(site)}(ptr %env) {{",
-          "entry:",
-          f"  %r = call {brty} @{mangle(rec.body_fn)}(ptr %env)"]
-    enc, v = _word_encode("%r", bsig.ret, "%w")
-    bl += enc
-    bl.append(f"  ret i64 {v}")
+          "entry:"]
+    if _is_agg(bsig.ret):
+        mod.uses_malloc = True
+        bl.append(f"  %rbox = call ptr @malloc(i64 {box_size(bsig.ret)})"
+                  f"  ; boundary box: body result {bsig.ret} "
+                  "(write-once, leaks by design)")
+        bl.append(f"  call void @{mangle(rec.body_fn)}(ptr %rbox, ptr %env)")
+        bl.append("  %w = ptrtoint ptr %rbox to i64")
+        bl.append("  ret i64 %w")
+    else:
+        brty = _llscalar(bsig.ret)
+        bl.append(f"  %r = call {brty} @{mangle(rec.body_fn)}(ptr %env)")
+        enc, v = _word_encode("%r", bsig.ret, "%w")
+        bl += enc
+        bl.append(f"  ret i64 {v}")
     bl.append("}")
 
     dl = [f"define internal i64 @{_scope_disp_sym(site)}"
@@ -5620,10 +5707,28 @@ def _emit_scope_artifacts(site: str, rec: _ScopeSite, sigs: Dict[str, _Sig],
             dl.append(
                 f"  {wp} = getelementptr inbounds i64, ptr %args, i64 {j}")
             dl.append(f"  {wv} = load i64, ptr {wp}")
-            enc, v = _word_decode(wv, pk, f"%c{i}.a{j}")
-            dl += enc
-            avals.append(f"{_llscalar(pk)} {v}")
+            if _is_agg(pk):
+                # The word is the sender's boundary-box pointer; the case
+                # fn byval-copies the aggregate out in its prelude.
+                dl.append(f"  %c{i}.a{j} = inttoptr i64 {wv} to ptr"
+                          f"  ; boundary box: case param {pk}")
+                avals.append(f"ptr %c{i}.a{j}")
+            else:
+                enc, v = _word_decode(wv, pk, f"%c{i}.a{j}")
+                dl += enc
+                avals.append(f"{_llscalar(pk)} {v}")
         avals.append("ptr %k")
+        if _is_agg(csig.ret):
+            mod.uses_malloc = True
+            dl.append(
+                f"  %c{i}.rbox = call ptr @malloc(i64 {box_size(csig.ret)})"
+                f"  ; boundary box: case result {csig.ret} "
+                "(write-once, leaks by design)")
+            dl.append(f"  call void @{mangle(hfn)}"
+                      f"({', '.join([f'ptr %c{i}.rbox'] + avals)})")
+            dl.append(f"  %c{i}.w = ptrtoint ptr %c{i}.rbox to i64")
+            dl.append(f"  ret i64 %c{i}.w")
+            continue
         crty = _llscalar(csig.ret)
         dl.append(f"  %c{i}.r = call {crty} @{mangle(hfn)}({', '.join(avals)})")
         enc, v = _word_encode(f"%c{i}.r", csig.ret, f"%c{i}.w")
@@ -6106,7 +6211,24 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
 
     def to_word(k: str, v: str, lines: List[str]) -> str:
         """Reinterpret a value of word kind k as the opaque i64 element word
-        the native Vec ABI stores (the runtime never inspects elements)."""
+        the native Vec ABI stores (the runtime never inspects elements).
+        Aggregate kinds (only reachable from effect-boundary senders —
+        every other word position demotes aggregates in the checks) box:
+        a fresh malloc'd write-once copy, its pointer as the word
+        (increment 14; immortal, leaks by design — it can never dangle
+        across coroutine switches)."""
+        if _is_agg(k):
+            size = _kind_size(k, structs, variants)
+            if size is None:  # unreachable: checks demote infinite layouts
+                raise _Unsupported(f"boundary box of {k} has infinite layout")
+            mod.uses_malloc = True
+            box = fresh()
+            lines.append(f"  {box} = call ptr @malloc(i64 {max(size, 8)})"
+                         f"  ; boundary box: {k} (write-once, leaks by design)")
+            agg_copy(_agg_ty(k), v, box, lines)
+            t = fresh()
+            lines.append(f"  {t} = ptrtoint ptr {box} to i64")
+            return t
         if k == I64:
             return v
         t = fresh()
@@ -6126,6 +6248,20 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
         else:
             lines.append(f"  {t} = inttoptr i64 {v} to ptr")
         return t
+
+    def word_into(dst: str, w: str, lines: List[str]) -> None:
+        """Decode an effect-boundary word into dst per dst's kind: word
+        kinds via from_word; aggregate kinds copy OUT of the sender's
+        boundary box into dst's own storage (the box stays immortal and
+        write-once — value semantics at both edges, increment 14)."""
+        k = kind(dst)
+        if _is_agg(k):
+            p = fresh()
+            lines.append(f"  {p} = inttoptr i64 {w} to ptr"
+                         f"  ; boundary box: {k}")
+            agg_copy(_agg_ty(k), p, struct_ref(dst), lines)
+        else:
+            setval(dst, from_word(k, w, lines), lines)
 
     def emit_direct_call(dst: str, callee: str, opargs: Tuple[str, ...],
                          lines: List[str]) -> None:
@@ -6712,7 +6848,7 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                     f"  {w} = call i64 @mx_perform(ptr {eg}, ptr {og}, "
                     f"ptr %perform.args, i64 {len(pargs)})"
                     f"  ; perform {peffect or '?'}.{pop}")
-                setval(pdst, from_word(kind(pdst), w, lines), lines)
+                word_into(pdst, w, lines)
                 continue
             # opk == "let" (analysis guarantees this)
             _, dst, rhs, opargs = op
@@ -7414,7 +7550,7 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                 mod.runtime_syms.add("mx_resume")
                 v = fresh()
                 lines.append(f"  {v} = call i64 @mx_resume(ptr {kp}, i64 {w})")
-                setval(dst, from_word(kind(dst), v, lines), lines)
+                word_into(dst, v, lines)
             elif rk == "handle_scope":
                 site = rhs[1]
                 rec = scopes.sites.get(site)
@@ -7426,14 +7562,13 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                     raise _Unsupported(
                         f"handle site {site!r} has non-emitted subfunctions")
                 bsig = sigs[rec.body_fn]
-                if bsig.params or _is_agg(bsig.ret):
+                if bsig.params:
                     raise _Unsupported(
                         f"handle body {rec.body_fn!r} has an unexpected "
                         "signature")
                 for (_opn, cparams, hfn) in rec.cases:
                     csig = sigs[hfn]
-                    if len(csig.params) != len(cparams) + 1 \
-                            or _is_agg(csig.ret):
+                    if len(csig.params) != len(cparams) + 1:
                         raise _Unsupported(
                             f"handler case {hfn!r} has an unexpected "
                             "signature")
@@ -7465,7 +7600,7 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                         lines.append(
                             f"  store {_llscalar(ck)} {use(vn, lines)}, "
                             f"ptr {p}")
-                _emit_scope_artifacts(site, rec, sigs, mod)
+                _emit_scope_artifacts(site, rec, sigs, structs, variants, mod)
                 eg = mod.intern_string(rec.effect)
                 mod.runtime_syms.add("mx_handle")
                 v = fresh()
@@ -7476,7 +7611,7 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                     f"ptr {eg}, ptr @{_scope_ops_sym(site)}, "
                     f"ptr @{_scope_np_sym(site)}, i64 {len(rec.cases)})"
                     f"  ; handle {rec.effect or '(any)'}")
-                setval(dst, from_word(kind(dst), v, lines), lines)
+                word_into(dst, v, lines)
             else:  # unreachable given analysis
                 raise _Unsupported(f"op {rk!r} slipped past analysis")
 
@@ -8028,6 +8163,20 @@ def emit_llvm(funcs: Sequence[MirFunc]) -> str:
         ms = _closure_members(env_kind)
         participants.update(ms)
         closures.heap_env.update(m for m in ms if m in module_names)
+
+    # BOUNDARY-CROSSING CLOSURES (increment 14): a closure kind reaching
+    # any effect-boundary cell (perform args ⊔ case params, perform
+    # results ⊔ resume values, handle value ⊔ body/case returns) crosses
+    # scopes as a boxed {fn, env} pair, so every member lambda is forced
+    # heap-env — the same rule as env-captured pairs: the boxed pair may
+    # outlive the creating frame, and an immortal env can never dangle.
+    # (No word-uniform participation is implied: a pinned member keeps its
+    # typed signature; dynamic boundary kinds were already marked above.)
+    for bk in (list(scopes.op_args.values())
+               + list(scopes.op_results.values())
+               + list(scopes.value_cells.values())):
+        closures.heap_env.update(
+            m for m in _closure_members(bk) if m in module_names)
 
     def _word_eligible(m: str) -> bool:
         s = sigs.get(m)
