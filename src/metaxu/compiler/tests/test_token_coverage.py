@@ -605,12 +605,16 @@ def test_integer_literal_beyond_i64_is_loud():
 
 
 def test_i64_boundary_literals_are_accepted():
-    # 2**63 is allowed so the most negative i64 can be written at all
-    # (`-9223372036854775808` is unary minus applied to that literal).
+    # 2**63 is accepted ONLY as the operand of a unary minus, which the
+    # lexer folds into the single constant -2**63 so the most negative i64
+    # stays writable without the bare positive slipping through
+    # (test_round7_regressions pins both directions).
     parse("fn main() -> int { 9223372036854775807 }")
     parse("fn main() -> int { -9223372036854775808 }")
     with pytest.raises(CompileError):
         parse("fn main() -> int { 9223372036854775809 }")
+    with pytest.raises(CompileError):
+        parse("fn main() -> int { 9223372036854775808 }")
 
 
 def test_float_literal_beyond_f64_is_loud():

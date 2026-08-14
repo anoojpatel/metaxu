@@ -76,7 +76,7 @@ class MxContinuation:
         self.used = True
         env = dict(self.env)
         env[self.result_slot] = value
-        return interp._run_blocks(self.func, self.block_idx, env)
+        return interp._run_blocks(self.func, self.block_idx, env, resumed=True)
 
 
 @dataclass
@@ -584,7 +584,8 @@ class MirInterpreter:
             out_env["__mut_params__"] = tuple(getattr(f, "mut_params", ()) or ())
         return result
 
-    def _run_blocks(self, f: MirFunc, start: int, env: Dict[str, Any]) -> Any:
+    def _run_blocks(self, f: MirFunc, start: int, env: Dict[str, Any],
+                    resumed: bool = False) -> Any:
         bi = start
         while True:
             if bi >= len(f.blocks):
@@ -594,12 +595,16 @@ class MirInterpreter:
             # Process terminator
             term = block.term
             if term[0] == "ret":
-                # NOTE: ret keeps a legacy fallback to the last op's value for
-                # effect-continuation frames: a resumed MxContinuation re-enters
-                # at a block whose ret var may only be bound on the
-                # non-suspended path (see stack-effect tests). All other
-                # operand lookups are strict.
-                if (isinstance(term[1], str) and term[1] not in env
+                # NOTE: ret keeps a fallback to the last op's value for
+                # effect-continuation frames ONLY: a resumed MxContinuation
+                # re-enters at a block whose ret var may only be bound on the
+                # non-suspended path (see stack-effect tests). Everywhere else
+                # the lookup is strict, because returning the previous op's
+                # value for an absent slot is a SILENT WRONG ANSWER: it is how
+                # `fn inner() -> int { secret }` answered `()` instead of
+                # raising `Unbound variable 'secret'`. Ordinary calls enter
+                # through `_call_func` with resumed=False, so they are loud.
+                if (resumed and isinstance(term[1], str) and term[1] not in env
                         and term[1] not in self._globals):
                     return result
                 return self._lookup(term[1], env, f)

@@ -172,10 +172,24 @@ class Lexer:
     #: DIFFERENT THINGS in the two backends — the interpreter answered with
     #: the exact bignum while native code wrapped — which is precisely the
     #: interpreter/native divergence the differential tests exist to prevent.
-    #: The bound is `2**63` rather than `2**63 - 1` because the most negative
-    #: i64 is written `-9223372036854775808`, i.e. unary minus applied to the
-    #: literal `9223372036854775808`.
-    _INT_LITERAL_MAX = 2 ** 63
+    #: The largest POSITIVE literal is `2**63 - 1`.  The bound used to be
+    #: `2**63` so that the most negative i64 — written `-9223372036854775808`,
+    #: i.e. unary minus applied to the literal `9223372036854775808` — stayed
+    #: writable, but that let the BARE positive `9223372036854775808` through
+    #: as well, which reintroduced exactly the divergence above (the
+    #: interpreter answered the exact bignum; `emit_llvm` demoted the function
+    #: with "integer constant ... outside i64 range").
+    #:
+    #: Both halves are solved by making the negation part of the literal:
+    #: `_fold_most_negative_int` (Pass 0 of the token-stream transform) accepts
+    #: `2**63` ONLY as the operand of a unary minus and folds the pair into the
+    #: single constant `-2**63`, so the backends see an in-range i64 and every
+    #: other occurrence is a loud LexError.  Folding also fixes the OLD
+    #: behaviour of the negative form: `-9223372036854775808` reached
+    #: codegen_llvm as `neg(const 9223372036854775808)` and demoted the whole
+    #: function to a placeholder.
+    _INT_LITERAL_MAX = 2 ** 63 - 1
+    _INT_LITERAL_MIN = -(2 ** 63)
 
     def _reject_numeric_junk(self, t) -> None:
         """Reject a numeric literal glued to a letter, `_`, or a second dot.
@@ -250,13 +264,23 @@ class Lexer:
         self._reject_numeric_junk(t)
         t.endlexpos = t.lexpos + len(t.value)
         value = int(t.value)
-        if value > self._INT_LITERAL_MAX:
-            self._numeric_error(
-                t, f"integer literal {t.value} is out of range for a 64-bit int",
-                [f"Metaxu's `int` is a signed 64-bit integer: "
-                 f"-{self._INT_LITERAL_MAX} .. {self._INT_LITERAL_MAX - 1}"])
+        # `2**63` is not rejected here: it is the magnitude of the most
+        # negative i64 and may still turn out to be the operand of a unary
+        # minus.  The decision needs the neighbouring tokens, so it is made in
+        # `_fold_most_negative_int` once the whole stream exists — which is
+        # also where the bare positive form gets its error.
+        if value > self._INT_LITERAL_MAX and value != -self._INT_LITERAL_MIN:
+            self._int_range_error(t, t.value)
         t.value = value
         return t
+
+    def _int_range_error(self, t, text) -> None:
+        self._numeric_error(
+            t, f"integer literal {text} is out of range for a 64-bit int",
+            [f"Metaxu's `int` is a signed 64-bit integer: "
+             f"{self._INT_LITERAL_MIN} .. {self._INT_LITERAL_MAX}",
+             f"{-self._INT_LITERAL_MIN} is writable only as the operand of a "
+             f"unary minus ({self._INT_LITERAL_MIN})"])
 
     #: Recognised backslash escapes in string and f-string literals.
     #: Anything else after a backslash is a LOUD error rather than a
@@ -388,7 +412,17 @@ class Lexer:
     #: Tokens that may directly follow the closing ``>`` of a generic
     #: argument list (call ``identity<Int>(..)``, struct literal
     #: ``Stack<Int>{..}``, type positions ``: Stack<Int> =``, ``-> Opt<T>``,
-    #: trait clauses ``where``/``with``/``for``, nesting ``>>``, etc.).
+    #: trait clauses ``where``/``with``/``for``, etc.).
+    #:
+    #: ``GREATER`` used to be a member, justified as "nesting ``>>``".  That
+    #: justification was false — the scan below counts nesting with ``depth``
+    #: and closes ``Map<String, Vec<Int>>`` on the SECOND ``>`` — and the
+    #: entry was what made ``a < b >> c`` match ``a<b>`` and leave a stray
+    #: ``>``, reporting an unrelated "uncalled generic instantiation" for a
+    #: plain shift.  Nothing legal reaches the follow test with a ``>``
+    #: either: an adjacent ``>>`` is now refused by the closer guard, and a
+    #: SPACED ``X<T> > y`` would be an uncalled generic instantiation, which
+    #: has no value representation in the first place.
     #: A token outside this set — in particular an identifier or a literal,
     #: as in ``f(a < b, c > d)`` — means the angle brackets were comparison
     #: operators, so they are left as LESS/GREATER.  When ambiguous we
@@ -397,7 +431,7 @@ class Lexer:
     _GENERIC_FOLLOW = frozenset({
         'LPAREN', 'LBRACE', 'LBRACE_STRUCT', 'RPAREN', 'RBRACKET',
         'COMMA', 'SEMICOLON', 'COLON', 'DOT', 'DOUBLECOLON', 'EQUALS',
-        'ARROW', 'GREATER', 'RGENERIC', 'WHERE', 'WITH', 'FOR',
+        'ARROW', 'RGENERIC', 'WHERE', 'WITH', 'FOR',
     })
 
     # NOTE: there is deliberately no scan limit here.  An earlier
@@ -435,9 +469,61 @@ class Lexer:
             i += 1
         return inside
 
+    #: Tokens that END a value, so a `-` directly after one is the BINARY
+    #: subtraction operator rather than a unary sign.  Operators are
+    #: deliberately absent — `a > -9223372036854775808` and
+    #: `a >> -9223372036854775808` (still two GREATERs when Pass 0 runs) both
+    #: take the unary reading.
+    _VALUE_END = frozenset({
+        'IDENTIFIER', 'NUMBER', 'FLOAT', 'STRING', 'FSTRING',
+        'RPAREN', 'RBRACKET', 'RBRACE',
+    })
+
+    def _fold_most_negative_int(self, toks):
+        """Fold `- 9223372036854775808` into the single constant `-2**63`.
+
+        `2**63` is one past the largest positive i64, so it is legal in
+        exactly one place: as the magnitude of the most negative i64.  Folding
+        it into the NUMBER token (rather than leaving `neg(const 2**63)` for
+        the parser) means every consumer below the lexer sees a constant that
+        really fits in i64 — the interpreter and `emit_llvm` agree, and the
+        LLVM backend stops demoting the enclosing function.
+
+        Everything else is a loud LexError, including a doubled unary minus:
+        `--9223372036854775808` is `+2**63`, which does not fit.
+        """
+        out = []
+        i = 0
+        n = len(toks)
+        while i < n:
+            tok = toks[i]
+            if tok.type != 'NUMBER' or tok.value != -self._INT_LITERAL_MIN:
+                out.append(tok)
+                i += 1
+                continue
+            prev = out[-1] if out else None
+            prev2 = out[-2] if len(out) > 1 else None
+            unary_minus = (
+                prev is not None and prev.type == 'MINUS'
+                and (prev2 is None or (prev2.type not in self._VALUE_END
+                                       and prev2.type != 'MINUS')))
+            if not unary_minus:
+                self._int_range_error(tok, -self._INT_LITERAL_MIN)
+            minus = out.pop()
+            tok.value = self._INT_LITERAL_MIN
+            tok.lexpos = minus.lexpos
+            tok.lineno = minus.lineno
+            if hasattr(minus, 'column'):
+                tok.column = minus.column
+            out.append(tok)
+            i += 1
+        return out
+
     def _transform(self, toks):
         """Rewrite the raw token list to resolve context-sensitive ambiguity.
 
+        Pass 0: `- 9223372036854775808` becomes one NUMBER token holding the
+                most negative i64; the bare literal is an error.
         Pass A: keywords used as plain names (after '.', '@', 'fn', and a
                 contextual rule for 'handle') become IDENTIFIER tokens.
         Pass B: '<' ... '>' pairs that enclose type arguments become
@@ -449,6 +535,9 @@ class Lexer:
         Pass D: an ADJACENT pair of LESS/LESS or GREATER/GREATER that Pass B
                 did not claim for a generic argument list becomes SHL/SHR.
         """
+        # --- Pass 0: the most negative integer literal ------------------
+        toks = self._fold_most_negative_int(toks)
+
         # --- Pass A: contextual keywords -------------------------------
         import_span = self._import_statement_spans(toks)
         for i, tok in enumerate(toks):
@@ -507,6 +596,20 @@ class Lexer:
                         depth += 1
                         angle_positions.append(j)
                     elif tt == 'GREATER':
+                        if depth == 1 and self._adjacent(toks, j, 'GREATER'):
+                            # The mirror image of the `<<` guard above, and
+                            # the reason `>>` needs one of its own: a `>`
+                            # that would close the OUTERMOST bracket while
+                            # another `>` is glued to it is the shift
+                            # operator, not a closer.  Nesting is unaffected
+                            # because `Map<String, Vec<Int>>` closes the
+                            # outermost bracket on the SECOND `>` of the pair
+                            # (the first one only drops depth 2 -> 1), so
+                            # this test never fires for it.  Without the
+                            # guard `a < b >> c` matched `a<b>` and left a
+                            # stray GREATER, turning a shift into an
+                            # "uncalled generic instantiation" error.
+                            break
                         depth -= 1
                         angle_positions.append(j)
                         if depth == 0:
