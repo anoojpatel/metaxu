@@ -214,12 +214,65 @@ front-end bugs, all fixed on this branch:
    (skipping names shadowed by a local binding, whose arity is its own).
    Tests for 2 and 3: `test_silent_seams.py`.
 
-Limitation found and NOT fixed (no silent wrongness, so it is a capacity
-issue rather than a bug): the MIR interpreter recurses on the host Python
-stack, so a calc program whose evaluation nests deeper than ~45 user
-frames (e.g. a 50-term left-associative sum) exits with a raw
-`RecursionError` instead of a Metaxu diagnostic. Raising the ceiling needs
-a trampolined interpreter.
+4. **Recursion depth: ~45 user frames, and a host traceback at the
+   bottom.** A calc program whose evaluation nested deeper than ~45 levels
+   (a 50-term left-associative sum was enough) exited with a raw Python
+   `RecursionError` — no location, no function name, the host language
+   leaking through the boundary. Fixed on this branch; the ceiling, the
+   numbers behind it and the remaining interpreter/native divergence are
+   the section below.
+
+## Recursion depth (interpreter/native divergence)
+
+The MIR interpreter recurses on the host Python stack, and a Metaxu call
+frame costs SEVERAL Python frames — `_call_func` -> `_run_blocks` ->
+`_run_ops` -> `_eval_rhs` -> the next `_call_func`. Measured on this tree:
+
+| shape | Python frames per Metaxu frame | depth at the stock 1000 limit |
+|---|---|---|
+| bare `f(n) -> f(n - 1)` | ~4 | 247 |
+| `examples/app`'s evaluator (match + closure + `perform` + std helper per AST node) | ~24 | ~45 |
+
+`compiler/recursion.py` now installs a 100_000-frame budget for the extent
+of one entry-point call and puts the host's limit back afterwards (scoped,
+because this package is a library — pytest, the LSP server and
+`scripts/run_examples.py` all import it). That buys ~24_700 frames of the
+cheap shape and ~4_100 nodes of the expensive one, both measured, and the
+same budget covers the compile-time phases, which walk the AST recursively
+too (~200 nested binary operators used to overflow during compilation, and
+PLY reported it as `ParseError: maximum recursion depth exceeded` —
+blaming a syntax error that was not there).
+
+Raising `sys.setrecursionlimit` does not protect the C stack, so the number
+is not free-floating. It rests on two CPython properties, both pinned by
+subprocess tests that assert the child's exit status (a stack smash is a
+negative returncode no `except` clause could hide): CPython >= 3.11 keeps
+Python frames on the heap and pushes no C frame for a Python-to-Python
+call (a 20_000-frame Metaxu recursion completes on a thread given a 128 KiB
+stack), and CPython >= 3.12 guards genuinely C-recursive work — nested
+`repr`, comparison, deallocation — with a SEPARATE limit `setrecursionlimit`
+does not move. `handle` bodies, which run on their own threads, are started
+with a 16 MiB stack (`mir_interp._start_with_stack_size`) so the effect path
+is no more fragile than the main thread.
+
+**The divergence.** The ceiling is an interpreter property only: the native
+backend uses the real machine stack and has no equivalent limit (nor any
+diagnostic — it would fault). Exceeding the interpreter's ceiling is
+`mir_interp.RecursionLimitExceeded`, an `InterpError` naming the innermost
+Metaxu function, and it is deliberately NOT catchable by `try`/`catch`
+(docs/try_catch.md): a catch arm would run with the stack still exhausted,
+and the native backend has no recoverable equivalent to diverge from.
+Tests: `test_recursion_depth.py`.
+
+Not planned for v1: a trampolined / explicit-stack interpreter, which would
+remove the ceiling entirely by holding the Metaxu frame stack in a heap list
+instead of the Python stack. It is a rewrite of the interpreter's core, not
+a refactor — every `_eval_rhs` recursion, the delimited-continuation
+machinery (which currently IS a parked Python stack on a thread) and
+`try_scope` would all have to become explicit states — and it would buy
+depth this budget already provides at ~1/100th of the cost. Revisit if a
+program needs more than ~20_000 frames, or if the effect scheduler is
+rebuilt for other reasons.
 
 ## Loudly-unsupported surface constructs (HIR triage)
 
