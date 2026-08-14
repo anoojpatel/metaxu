@@ -84,6 +84,61 @@ one asymmetry, `match_fail` (its message embeds the MIR function name that
 monomorphization renames), demotes the try instead of guessing.
 See docs/try_catch.md § "Native lowering".
 
+Native Vec element boxes (2026-08-14): a native Vec slot is one 8-byte
+word, so any struct/enum element demoted the containing function. Struct
+and enum aggregates now occupy a slot as a pointer to an immortal
+write-once ELEMENT BOX (the same machinery as effect-boundary and enum
+payload boxes): the write mallocs a fresh copy, the read copies back out,
+so both edges keep MIR's value semantics while the vec keeps mx_vec
+identity semantics. Closures stay excluded (an env pointer may aim at a
+frame the vec outlives) and fixed vectors keep the word-kinds-only rule
+(an mx_fvec block feeds the SIMD/arith paths, which read words as
+numbers).
+
+### What actually blocks native coverage (measured 2026-08-14)
+
+`scripts/native_census.py` counts real `define`s, demoted functions and
+demotion reasons with instance detail normalized away, so reasons group
+into CAUSES. Counting instances has misled this branch twice; the census
+exists to stop that.
+
+On `examples/app/main.mx` (39 defines / 125 demoted), 99 of the 125 are
+root demotions rather than cascade ("calls a function that is itself a
+placeholder"), and the smallest carry exactly one reason:
+`irreconcilable value kinds`. The dominant root cause is a single
+mechanism:
+
+> **Monomorphization does not specialize a function whose polymorphism
+> flows through a closure-typed parameter.** `std.throw.catch_` has four
+> call sites at four different return types and exactly ONE MIR function
+> — no clones — because the pass keys on concrete argument signatures and
+> a lambda argument offers none. The backend then joins all four return
+> kinds into `conflict` and demotes.
+
+Six lines reproduce it, and isolate it from every other variable:
+
+```
+fn apply(f) { f() }
+fn main() -> int {
+    let a = apply(fn() -> 1);
+    let b = apply(fn() -> 2);      # both int  -> 5 defines, 0 placeholders
+    ...
+}
+```
+
+Change the second lambda to `fn() -> "s"` and `apply` demotes with
+`irreconcilable value kinds`, taking its callers with it. The fix is to
+key specialization on the closure argument (per distinct lambda, or on
+its inferred return type), not on nominal type arguments.
+
+This is worth stating because the previous two hypotheses were both
+wrong, and both were wrong the same way — counting instances instead of
+finding causes. Vec-of-aggregate elements looked like the biggest lever
+(175 + 41 + 38 downstream reason instances sat under it); boxing them
+removed exactly 6 reason instances and left the demoted-function count
+unchanged at 148. Before that, 18 "irreconcilable kinds" reasons in
+example 06 turned out to be one trait-dispatched call site.
+
 Roadmap items completed on this branch beyond the v1 criteria:
 - Item 5 (deep field-mode validation): transitive @global/@local ownership
   rules enforced as kind="deep-locality" diagnostics.
