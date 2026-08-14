@@ -1,0 +1,196 @@
+# app.syntax — the vocabulary every stage of the calc language shares.
+#
+# `calc` is the little language this application implements:
+#
+#     let radius = 7;
+#     let area = 3 * radius * radius;
+#     print area;
+#     print if area > 100 then area - 100 else 0;
+#
+# Statements are `let name = expr;` and `print expr;`. Expressions are
+# integer arithmetic, comparisons, a conditional, and three builtin calls
+# (`abs`, `min`, `max`). Everything downstream of the lexer speaks the
+# three types declared here: Token, Expr and Stmt.
+#
+# The module also owns the presentation layer: the `Show` trait plus its
+# impls for the two enums a user ever sees in a message (a token and a
+# value), and the generic `render`/`describe_at` helpers the lexer, the
+# parser and the evaluator all use to build error text. Keeping the
+# rendering here is what keeps the pipeline stages free of string
+# formatting.
+
+export {
+    Token,
+    Expr,
+    Stmt,
+    Value,
+    Spanned,
+    Show,
+    render,
+    describe_at,
+    show_expr,
+    value_type_name,
+    same_value
+}
+
+# --- tokens ---------------------------------------------------------------
+#
+# Four shapes cover the whole grammar: an integer literal, a name (an
+# identifier OR a keyword — the parser decides which by looking at the
+# text), an operator, and a piece of punctuation. Operators and
+# punctuation carry their spelling so the parser and the evaluator can
+# stay table-driven instead of growing a variant per symbol.
+enum Token {
+    TInt(int),
+    TName(string),
+    TOp(string),
+    TPunct(string)
+}
+
+# --- the abstract syntax tree --------------------------------------------
+#
+# Expr is recursive: EBinary/EIf/EUnary hold Exprs, and ECall holds a Vec
+# of them. Every match over an Expr in this program is exhaustive over
+# these six variants.
+enum Expr {
+    ENum(int),
+    EVar(string),
+    EUnary(string, Expr),
+    EBinary(string, Expr, Expr),
+    EIf(Expr, Expr, Expr),
+    ECall(string, Vec)
+}
+
+enum Stmt {
+    SLet(string, Expr),
+    SPrint(Expr)
+}
+
+# --- runtime values -------------------------------------------------------
+#
+# calc is typed at run time: arithmetic wants VInt, `if` wants VBool, and
+# a mismatch is an error the evaluator throws rather than a coercion.
+enum Value {
+    VInt(int),
+    VBool(bool)
+}
+
+# --- source positions -----------------------------------------------------
+#
+# A generic wrapper attaching a source offset to something, so a stage
+# can carry positions without a second parallel Vec. The lexer spans
+# tokens with it and the parser spans statements — the position
+# machinery has nothing to do with either, which is why it is generic.
+struct Spanned<T> {
+    item: T,
+    pos: int
+}
+
+trait Show {
+    fn show(self) -> string
+}
+
+# The three impls the program dispatches between at run time (the third,
+# for Stmt, is with the pretty-printer below): `render` is handed tokens
+# by the parser's error paths, values by the evaluator's, and statements
+# by the driver — the receiver's runtime type picks the body.
+implement Show for Token {
+    fn show(self) -> string {
+        match self {
+            TInt(n) => n.to_string(),
+            TName(s) => s,
+            TOp(s) => "'" + s + "'",
+            TPunct(s) => "'" + s + "'"
+        }
+    }
+}
+
+implement Show for Value {
+    fn show(self) -> string {
+        match self {
+            VInt(n) => n.to_string(),
+            VBool(b) => bool_text(b)
+        }
+    }
+}
+
+# Anything showable, rendered. The bound is what lets the lexer hand this
+# a Token and the evaluator a Value through one definition.
+fn render<T>(x: T) -> string where T: Show {
+    x.show()
+}
+
+# A spanned thing, rendered with its source offset — the shape every
+# diagnostic in this program ends with.
+fn describe_at<T>(s: Spanned<T>) -> string where T: Show {
+    render(s.item) + " at offset " + s.pos.to_string()
+}
+
+# --- pretty-printing the tree --------------------------------------------
+#
+# A structural walk of Expr, fully parenthesized. The evaluator quotes it
+# back in error messages ("division by zero in (10 / d)"), which is the
+# whole reason it exists.
+fn show_expr(e: Expr) -> string {
+    match e {
+        ENum(n) => n.to_string(),
+        EVar(name) => name,
+        EUnary(op, operand) => "(" + op + show_expr(operand) + ")",
+        EBinary(op, lhs, rhs) =>
+            "(" + show_expr(lhs) + " " + op + " " + show_expr(rhs) + ")",
+        EIf(cond, then_branch, else_branch) =>
+            "(if " + show_expr(cond) + " then " + show_expr(then_branch)
+                + " else " + show_expr(else_branch) + ")",
+        ECall(name, args) => name + "(" + show_args(args) + ")"
+    }
+}
+
+implement Show for Stmt {
+    fn show(self) -> string {
+        match self {
+            SLet(name, value) => "let " + name + " = " + show_expr(value),
+            SPrint(value) => "print " + show_expr(value)
+        }
+    }
+}
+
+# The name of a value's type, for "expected int, got bool" messages.
+fn value_type_name(v: Value) -> string {
+    match v {
+        VInt(n) => "int",
+        VBool(b) => "bool"
+    }
+}
+
+# Structural equality of two values. `==` on variants compares by
+# identity in the interpreter, so equality that means what a calc user
+# expects has to be spelled out over the variants.
+fn same_value(a: Value, b: Value) -> bool {
+    match a {
+        VInt(x) => match b {
+            VInt(y) => x == y,
+            VBool(y) => false
+        },
+        VBool(x) => match b {
+            VInt(y) => false,
+            VBool(y) => x == y
+        }
+    }
+}
+
+# --- private helpers (deliberately absent from the export list) ----------
+
+fn bool_text(b: bool) -> string {
+    if b { "true" } else { "false" }
+}
+
+fn show_args(args: Vec) -> string {
+    let @mut out = "";
+    let @mut i = 0;
+    while i < len(args) {
+        if i > 0 { out = out + ", " } else { () };
+        out = out + show_expr(args[i]);
+        i = i + 1
+    }
+    out
+}

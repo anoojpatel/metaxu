@@ -33,6 +33,7 @@ NEGATIVE = {
 
 # Files that must EXECUTE (entry found and runs without error).
 MUST_RUN = [
+    "examples/app/main.mx",
     "examples/01_modes_and_references.mx",
     "examples/02_effects_and_handlers.mx",
     "examples/03_modules_and_imports.mx",
@@ -53,16 +54,23 @@ MUST_RUN = [
 
 
 def all_targets() -> list[str]:
+    # examples/app/ is a multi-file application: only its ENTRY file is a
+    # target (its sibling modules are reached through imports, and compiling
+    # one on its own would just be the same code with no main).
     return sorted(
         os.path.relpath(p, REPO_ROOT)
         for p in glob.glob(os.path.join(REPO_ROOT, "examples", "*.mx"))
+        + glob.glob(os.path.join(REPO_ROOT, "examples", "app", "main.mx"))
         + glob.glob(os.path.join(REPO_ROOT, "test_*.mx"))
     )
 
 
 def execute(rel_path: str):
-    source = open(os.path.join(REPO_ROOT, rel_path)).read()
-    ctx = build_context_from_source(source)
+    # file_path matters: multi-file imports resolve relative to the entry
+    # file's directory.
+    path = os.path.join(REPO_ROOT, rel_path)
+    source = open(path).read()
+    ctx = build_context_from_source(source, file_path=path)
     hir = HIRBuilder(ctx.tables, id_map=ctx.id_map).build(ctx.frozen_root)
     interp = MirInterpreter()
     interp.load(lower_hir_to_mir(hir))
@@ -76,13 +84,14 @@ def execute(rel_path: str):
 
 @pytest.mark.parametrize("rel_path", all_targets())
 def test_pipeline_gate(rel_path):
-    source = open(os.path.join(REPO_ROOT, rel_path)).read()
+    path = os.path.join(REPO_ROOT, rel_path)
+    source = open(path).read()
     expected = NEGATIVE.get(os.path.basename(rel_path))
     if expected is not None:
         with pytest.raises(expected):
-            run_pipeline_from_source(source)
+            run_pipeline_from_source(source, file_path=path)
     else:
-        run_pipeline_from_source(source)
+        run_pipeline_from_source(source, file_path=path)
 
 
 @pytest.mark.parametrize("rel_path", MUST_RUN)
