@@ -21,6 +21,20 @@ Covered:
 - `%` is a real modulo operator through the whole pipeline;
 - zip comprehensions (`f(a, b) for (a, b) in (xs, ys)`) iterate in
   lockstep instead of silently dropping the vector literal.
+
+Round 2 (std/state, std/log, std/random, std/parse, std/test, std/iter)
+added, at the bottom of this file:
+- `!e` is a real token and grammar rule (it used to be an illegal
+  character the lexer warned about and SKIPPED, so `!cond` compiled as
+  `cond`), and an unknown character is now a loud LexError;
+- `&&` / `||` exist at all, and short-circuit;
+- string/f-string literals decode `\\n`/`\\t`/`\\r`/`\\0`/`\\\\`/`\\"`/`\\'`,
+  an escaped quote does not end the literal, and an unknown escape is
+  loud;
+- an assignment is typed Unit, not as the variable it writes (an
+  if/else assigning differently-typed variables was a spurious error);
+- `/` and `%` truncate toward zero in the interpreter, matching the
+  sdiv/srem both backends emit.
 """
 from __future__ import annotations
 
@@ -550,3 +564,262 @@ fn main() -> int {
 """)
     with pytest.raises(InterpError, match="length"):
         interp.call("main", [])
+
+
+# ======================================================================
+# Round 2 (found writing std/state, std/log, std/random, std/parse,
+# std/test and std/iter).  Same rule: work, or be loud.
+# ======================================================================
+
+# ----------------------------------------------------------------------
+# `!` was an ILLEGAL CHARACTER the lexer warned about and SKIPPED, so
+# `!cond` compiled as `cond` -- the wrong answer, no diagnostic.  hir has
+# always lowered UnaryOperation('!') to __builtin$not; only the token and
+# the grammar rule were missing.
+# ----------------------------------------------------------------------
+
+def test_logical_not_negates():
+    result, prints = run_main("""
+fn main() -> int {
+    let t = true;
+    let f = false;
+    print("not", !t, !f, !!t);
+    if !f { 42 } else { 0 }
+}
+""")
+    assert result == 42
+    assert prints == ["not False True True"]
+
+
+def test_logical_not_does_not_break_not_equal():
+    result, _ = run_main("""
+fn main() -> int {
+    let a = if 1 != 2 { 1 } else { 0 };
+    let b = if !(1 != 1) { 10 } else { 0 };
+    a + b
+}
+""")
+    assert result == 11
+
+
+def test_unknown_character_is_loud_not_skipped():
+    from metaxu.errors import CompileError
+    with pytest.raises(CompileError, match="illegal character"):
+        compile_source("""
+fn main() -> int {
+    let x = 1 $ 2;
+    x
+}
+""")
+
+
+# ----------------------------------------------------------------------
+# `&&` / `||` did not exist in the grammar at all (the MIR interpreter and
+# both backends have always had the binops).  They are parsed as
+# SHORT-CIRCUIT `if`, so a guard may protect the operand after it.
+# ----------------------------------------------------------------------
+
+def test_logical_and_or_evaluate():
+    result, _ = run_main("""
+fn main() -> int {
+    let a = if true && true { 1 } else { 0 };
+    let b = if true && false { 0 } else { 10 };
+    let c = if false || true { 100 } else { 0 };
+    let d = if false || false { 0 } else { 1000 };
+    a + b + c + d
+}
+""")
+    assert result == 1111
+
+
+def test_logical_operators_short_circuit():
+    result, prints = run_main("""
+fn boom() -> bool {
+    print("evaluated");
+    true
+}
+
+fn main() -> int {
+    let a = false && boom();
+    let b = true || boom();
+    if a { 0 } else { if b { 1 } else { 0 } }
+}
+""")
+    assert result == 1
+    assert prints == []          # neither boom() ran
+
+
+def test_logical_and_guards_its_right_operand():
+    """The whole point of short-circuiting: `i < len(s) && s[i] == c` must
+    not index past the end when the first test fails."""
+    result, _ = run_main("""
+fn main() -> int {
+    let s = "ab";
+    let @mut i = 0;
+    let @mut n = 0;
+    while i < len(s) && s[i] != "z" {
+        n = n + 1;
+        i = i + 1
+    }
+    n
+}
+""")
+    assert result == 2
+
+
+def test_logical_operators_bind_looser_than_comparison():
+    result, _ = run_main("""
+fn main() -> int {
+    if 1 + 1 == 2 && 3 < 4 { 7 } else { 0 }
+}
+""")
+    assert result == 7
+
+
+def test_logical_and_on_non_bool_is_loud():
+    with pytest.raises(Exception, match="[Bb]ool"):
+        compile_source("""
+fn main() -> int {
+    if 1 && 2 { 1 } else { 0 }
+}
+""")
+
+
+def test_empty_parameter_lambda_still_parses():
+    """`||` is also the empty-parameter lambda opener; adding the binary
+    operator must not have taken that away."""
+    result, _ = run_main("""
+fn main() -> int {
+    let f = || { 5 };
+    f()
+}
+""")
+    assert result == 5
+
+
+# ----------------------------------------------------------------------
+# String literals kept their backslashes verbatim: `"a\\nb"` was four
+# characters and printed as `a\\nb`, and `"\\""` could not be written.
+# ----------------------------------------------------------------------
+
+def test_string_escapes_are_decoded():
+    result, prints = run_main(r"""
+fn main() -> int {
+    let s = "a\nb";
+    print(s);
+    print("tab\there");
+    print("say \"hi\"");
+    print("back\\slash");
+    len(s)
+}
+""")
+    assert result == 3
+    assert prints == ["a\nb", "tab\there", 'say "hi"', "back\\slash"]
+
+
+def test_escaped_quote_does_not_end_the_literal():
+    result, _ = run_main(r"""
+fn main() -> int {
+    len("\"\"")
+}
+""")
+    assert result == 2
+
+
+def test_fstring_escapes_are_decoded():
+    _, prints = run_main(r"""
+fn main() -> int {
+    let n = 3;
+    print(f"n={n}\tok");
+    0
+}
+""")
+    assert prints == ["n=3\tok"]
+
+
+def test_unknown_escape_is_loud():
+    from metaxu.errors import CompileError
+    with pytest.raises(CompileError, match="unknown escape"):
+        compile_source(r"""
+fn main() -> int {
+    len("oops \q")
+}
+""")
+
+
+# ----------------------------------------------------------------------
+# An assignment's own type was unified with the ASSIGNED VARIABLE's type,
+# so an if/else whose branches assigned differently-typed variables was a
+# spurious "Bool and Int" type error on a perfectly well-typed program.
+# An assignment is a statement: its type is Unit.
+# ----------------------------------------------------------------------
+
+def test_if_branches_may_assign_differently_typed_variables():
+    result, _ = run_main("""
+fn main() -> int {
+    let @mut flag = true;
+    let @mut n = 0;
+    if n < 5 {
+        flag = false
+    } else {
+        n = n + 1
+    };
+    if flag { n } else { n + 100 }
+}
+""")
+    assert result == 100
+
+
+def test_assignment_still_checks_the_assigned_value_type():
+    with pytest.raises(Exception, match="[Tt]ype|Bool|Int"):
+        compile_source("""
+fn main() -> int {
+    let @mut n = 0;
+    n = true;
+    n
+}
+""")
+
+
+# ----------------------------------------------------------------------
+# `/` and `%` on negative operands: the interpreter floored (Python) while
+# both backends emit sdiv/srem (truncate toward zero), so the same program
+# had two answers and no diagnostic.  The interpreter -- the semantics
+# reference -- now matches the backends.
+# ----------------------------------------------------------------------
+
+def test_integer_division_truncates_toward_zero():
+    result, prints = run_main("""
+fn main() -> int {
+    print("div", (0 - 7) / 2, 7 / 2, (0 - 7) / (0 - 2));
+    (0 - 7) / 2
+}
+""")
+    assert result == -3
+    assert prints == ["div -3 3 3"]
+
+
+def test_modulo_takes_the_sign_of_the_dividend():
+    result, prints = run_main("""
+fn main() -> int {
+    print("mod", (0 - 7) % 5, 7 % (0 - 5), (0 - 7) % (0 - 5));
+    (0 - 7) % 5
+}
+""")
+    assert result == -2
+    assert prints == ["mod -2 2 -2"]
+
+
+def test_division_identity_holds_for_negative_operands():
+    """(a / b) * b + a % b == a, the invariant truncating division and
+    sign-of-dividend remainder are defined to satisfy together."""
+    result, _ = run_main("""
+fn check(a: int, b: int) -> int {
+    if (a / b) * b + a % b == a { 1 } else { 0 }
+}
+
+fn main() -> int {
+    check(0 - 7, 2) + check(7, 0 - 2) + check(0 - 7, 0 - 2) + check(7, 2)
+}
+""")
+    assert result == 4

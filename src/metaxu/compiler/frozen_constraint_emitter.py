@@ -1551,14 +1551,19 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
                                 variable=value_name,
                             ))
             binding_ty = lookup(target_name)
-            if binding_ty is not None:
-                simplesub.add_unify(node_ty, binding_ty)
+            # An assignment is a STATEMENT: its own type is Unit, NOT the
+            # type of the variable it writes.  Unifying node_ty with
+            # binding_ty (as this did) made `if c { flag = false } else
+            # { n = n + 1 }` a spurious "Bool and Int" type error, because
+            # IfExpression unifies its two branch types and the branches
+            # here were the two assignments.  The value still has to match
+            # the binding (the add_unify below), which is the real check.
+            simplesub.add_class_constraint("Unit", [node_ty], node.node_id)
             for child in children:
                 child_ty = types.get(child.node_id)
                 if child_ty is not None:
                     if binding_ty is not None:
                         simplesub.add_unify(binding_ty, child_ty)
-                    simplesub.add_class_constraint("Unit", [node_ty], node.node_id)
                     # Check locality if assigning a variable
                     if child.kind == "Variable":
                         var_name = payload_dict(child).get("name")

@@ -68,8 +68,8 @@ fn ok_if(cond: bool) performs Fail {
 }
 
 # Run `f` for its side effects, discarding both its result and any failure.
-# (The arm body is a block: a bare `-> ()` arm is dropped by the parser —
-# see the language-gaps section of std/README.md.)
+# (The arm body is a block for readability; a bare `-> ()` arm works too
+# now — see gap 3 in std/README.md, which this module first exposed.)
 fn ignore_fail(f) {
     handle Fail with {
         fail() -> { () }

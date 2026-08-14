@@ -26,3 +26,10 @@ public from std.result import is_ok, is_err;
 
 # numbers
 public from std.math import pi, abs, min, max, clamp;
+
+# state, logging, parsing (the effect-shaped modules; only the names that
+# do not collide with a sibling — `with_seed`/`run_tests`/the adapters
+# stay in std.random / std.test / std.iter)
+public from std.state import State, eval_state, exec_state, run_state, modify;
+public from std.log import Log, log_info, log_warn, log_error, with_collected_logs;
+public from std.parse import parse_int, parse_int_or, trim;

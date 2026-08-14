@@ -1,0 +1,253 @@
+# std.iter — the stream adapters std.stream defers.
+#
+# std.stream ports Ante's Stream.an but stops short of `enumerate`, `zip`
+# and friends, because those emit PAIRS and Metaxu has no tuple type or
+# tuple destructuring. This module supplies the missing piece the honest
+# way: a real `Pair` struct. `p.first` / `p.second` is what `let (a, b)`
+# would have been, and it is a plain value that closures, Vecs and
+# handlers already carry.
+#
+# Everything here is a std.stream transformer: a function answering a
+# thunk that installs an Emit handler and re-emits, so adapters chain
+# lazily and compose with std.stream's consumers unchanged:
+#
+#     sum(map(take_while(iota(100), fn(x: int) -> x < 10), double))
+#
+# One adapter is NOT lazy and says so: `zip` realizes its SECOND stream
+# into a Vec before pulling the first. Metaxu's continuations are
+# single-shot and delimited, so two producers cannot be stepped in
+# lockstep without one of them being materialized; collecting the second
+# is the honest version of that, not a hidden one.
+
+from std.stream import Emit, collect;
+
+export {
+    Pair,
+    pair,
+    enumerate,
+    zip,
+    zip_with,
+    take_while,
+    drop_while,
+    step_by,
+    windows,
+    chunks
+};
+
+# What `let (a, b) = ...` would destructure. Both halves are generic.
+struct Pair<A, B> {
+    first: A,
+    second: B
+}
+
+fn pair(a, b) -> Pair {
+    Pair { first: a, second: b }
+}
+
+# Re-emit Pair { first: index, second: element }, indices from 0.
+fn enumerate(producer) -> fn() -> Unit {
+    fn() {
+        let @mut index = 0;
+        handle Emit with {
+            emit(x) -> {
+                perform Emit.emit(Pair { first: index, second: x });
+                index = index + 1;
+                resume(())
+            }
+        } in {
+            producer();
+            ()
+        }
+    }
+}
+
+# Emit Pair { first: a, second: b } for elements taken in lockstep, and
+# stop at the end of the SHORTER stream. `second` is realized into a Vec
+# first (see the header) — so prefer it as the finite one, and never pass
+# an unbounded stream as `second`.
+fn zip(first, second) -> fn() -> Unit {
+    fn() {
+        let items = collect(second);
+        let @mut i = 0;
+        handle Emit with {
+            emit(x) -> {
+                if i < len(items) {
+                    perform Emit.emit(Pair { first: x, second: items[i] });
+                    i = i + 1;
+                    resume(())
+                } else {
+                    ()
+                }
+            }
+        } in {
+            first();
+            ()
+        }
+    }
+}
+
+# `zip` without the Pair: emit `f(a, b)` per lockstep pair. Ante's map2.
+fn zip_with(first, second, f) -> fn() -> Unit {
+    fn() {
+        let items = collect(second);
+        let @mut i = 0;
+        handle Emit with {
+            emit(x) -> {
+                if i < len(items) {
+                    perform Emit.emit(f(x, items[i]));
+                    i = i + 1;
+                    resume(())
+                } else {
+                    ()
+                }
+            }
+        } in {
+            first();
+            ()
+        }
+    }
+}
+
+# Re-emit elements while `pred` holds, then stop pulling the source
+# (the handler case declines to resume — the same shape as std.stream's
+# `take`, and the reason this is not just `filter`).
+fn take_while(producer, pred) -> fn() -> Unit {
+    fn() {
+        handle Emit with {
+            emit(x) -> {
+                if pred(x) {
+                    perform Emit.emit(x);
+                    resume(())
+                } else {
+                    ()
+                }
+            }
+        } in {
+            producer();
+            ()
+        }
+    }
+}
+
+# Drop the leading run of elements satisfying `pred`, re-emit the rest
+# (including later elements that satisfy it — only the prefix is dropped).
+fn drop_while(producer, pred) -> fn() -> Unit {
+    fn() {
+        let @mut dropping = true;
+        handle Emit with {
+            emit(x) -> {
+                if dropping {
+                    if pred(x) {
+                        ()
+                    } else {
+                        dropping = false;
+                        perform Emit.emit(x)
+                    }
+                } else {
+                    perform Emit.emit(x)
+                };
+                resume(())
+            }
+        } in {
+            producer();
+            ()
+        }
+    }
+}
+
+# Re-emit every nth element, starting with the first. `n <= 1` re-emits
+# everything.
+fn step_by(producer, n: int) -> fn() -> Unit {
+    fn() {
+        let stride = if n < 1 { 1 } else { n };
+        let @mut seen = 0;
+        handle Emit with {
+            emit(x) -> {
+                if seen % stride == 0 { perform Emit.emit(x) } else { () };
+                seen = seen + 1;
+                resume(())
+            }
+        } in {
+            producer();
+            ()
+        }
+    }
+}
+
+# Emit each sliding window of `size` consecutive elements, as a fresh Vec
+# (one per window, so holding on to them is safe). A stream shorter than
+# `size`, or `size <= 0`, emits nothing.
+fn windows(producer, size: int) -> fn() -> Unit {
+    fn() {
+        let @mut buffer = Vec.new();
+        handle Emit with {
+            emit(x) -> {
+                if size > 0 {
+                    buffer.push(x);
+                    if len(buffer) > size { drop_front(buffer) } else { () };
+                    if len(buffer) == size {
+                        perform Emit.emit(copy_vec(buffer))
+                    } else {
+                        ()
+                    }
+                } else {
+                    ()
+                };
+                resume(())
+            }
+        } in {
+            producer();
+            ()
+        }
+    }
+}
+
+# Emit consecutive NON-overlapping runs of `size` elements as fresh Vecs.
+# A trailing partial chunk is emitted too, so no element is dropped.
+fn chunks(producer, size: int) -> fn() -> Unit {
+    fn() {
+        let @mut buffer = Vec.new();
+        handle Emit with {
+            emit(x) -> {
+                if size > 0 {
+                    buffer.push(x);
+                    if len(buffer) == size {
+                        perform Emit.emit(copy_vec(buffer));
+                        buffer = Vec.new()
+                    } else {
+                        ()
+                    }
+                } else {
+                    ()
+                };
+                resume(())
+            }
+        } in {
+            producer();
+            ()
+        };
+        if len(buffer) > 0 { perform Emit.emit(copy_vec(buffer)) } else { () }
+    }
+}
+
+# private: a fresh Vec with the same elements.
+fn copy_vec(v: Vec) -> Vec {
+    let @mut out = Vec.new();
+    let @mut i = 0;
+    while i < len(v) {
+        out.push(v[i]);
+        i = i + 1
+    }
+    out
+}
+
+# private: remove v's first element, shifting the rest down (in place).
+fn drop_front(v: Vec) -> () {
+    let @mut i = 1;
+    while i < len(v) {
+        v[i - 1] = v[i];
+        i = i + 1
+    }
+    v.pop();
+    ()
+}
