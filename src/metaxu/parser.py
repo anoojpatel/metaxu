@@ -518,12 +518,44 @@ class Parser:
     # ------------------------------------------------------------------
 
     def p_expression(self, p):
-        '''expression : comparison_expression
-                      | comparison_expression DOTDOT comparison_expression'''
+        '''expression : logical_or_expression
+                      | logical_or_expression DOTDOT logical_or_expression'''
         if len(p) == 2:
             p[0] = p[1]
         else:
             p[0] = ast.RangeExpression(p[1], p[3])
+
+    # `||` and `&&` SHORT-CIRCUIT, so they desugar to `if` rather than to a
+    # BinaryOperation: `a && b` is `if a { b } else { false }` and `a || b`
+    # is `if a { true } else { b }`.  Two consequences follow for free and
+    # are the reason for the shape:
+    #
+    #   * the right operand is not evaluated when the left decides the
+    #     answer, which is what makes guards like
+    #     `i < len(s) && s[i] == c` safe (and what a MIR-level `&&` binop
+    #     could NOT give: MIR binops take two already-evaluated operands);
+    #   * IfExpression already constrains its condition to Bool and unifies
+    #     its branches, so `1 && 2` is a loud type error and the result is
+    #     a bool, with no new typing rules.
+    #
+    # `||` is also the empty-parameter lambda opener (`|| { ... }`); the two
+    # uses never collide because one is at expression START and this one only
+    # follows a complete operand.
+    def p_logical_or_expression(self, p):
+        '''logical_or_expression : logical_and_expression
+                                 | logical_or_expression OROR logical_and_expression'''
+        if len(p) == 2:
+            p[0] = p[1]
+        else:
+            p[0] = ast.IfExpression(p[1], ast.Literal(True), p[3])
+
+    def p_logical_and_expression(self, p):
+        '''logical_and_expression : comparison_expression
+                                  | logical_and_expression ANDAND comparison_expression'''
+        if len(p) == 2:
+            p[0] = p[1]
+        else:
+            p[0] = ast.IfExpression(p[1], p[3], ast.Literal(False))
 
     def p_comparison_expression(self, p):
         '''comparison_expression : additive_expression
@@ -576,6 +608,7 @@ class Parser:
     def p_unary_expression(self, p):
         '''unary_expression : postfix_expression
                             | MINUS unary_expression
+                            | NOT unary_expression
                             | AMPERSAND MUT unary_expression
                             | AMPERSAND unary_expression
                             | mode_annotation unary_expression'''
@@ -583,6 +616,9 @@ class Parser:
             p[0] = p[1]
         elif p[1] == '-':
             p[0] = ast.UnaryOperation('-', p[2])
+        elif p[1] == '!':
+            # `!e` -> the `not` builtin (hir lowers UnaryOperation('!')).
+            p[0] = ast.UnaryOperation('!', p[2])
         elif p[1] == '&':
             if len(p) == 4:  # &mut x
                 operand = p[3]

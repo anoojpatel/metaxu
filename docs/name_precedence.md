@@ -184,3 +184,12 @@ programs declare a function whose name collides with a builtin:
 
 No other program in the corpus changed behaviour; gates stayed 19/19
 pipeline and 19/19 run.
+
+Since then, one module shadows a builtin **on purpose**:
+
+* `std/test.mx` — `fn assert_eq(actual, expected, name)`.  The builtin
+  `assert_eq` aborts the program on the first mismatch; the module's
+  version reports through its `Report` effect so a suite runs to the end
+  and a handler tallies.  `from std.test import assert_eq;` is therefore
+  an intentional upgrade of every plain `assert_eq(...)` call in the
+  importing file, and rule 1 is what makes it reachable at all.

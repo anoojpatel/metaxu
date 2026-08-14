@@ -2,24 +2,54 @@
 #
 # Design lineage: the State idiom every effect system demonstrates
 # (Ante folds it into user code; Metaxu's example 02 sketches it).
-# `get`/`put` are effect operations; `with_state` interprets them over a
+# `get`/`put` are effect operations; the runners interpret them over a
 # handler-local cell, so stateful code stays pure at its interface and
 # tests can install their own handlers.
 #
-# Payloads are unannotated (like std.throw): ints, strings, structs all
-# work through the same ops.
+# Three runners, the classic trio:
+#
+#     eval_state(init, f)  -> f's result           (`with_state` is an alias)
+#     exec_state(init, f)  -> the FINAL state
+#     run_state(init, f)   -> StateResult { value, state }  (both)
+#
+# All three are deep handlers: every get/put performed anywhere inside
+# `f` — including in functions f calls — routes to the running handler.
+# The state lives in a mutable capture cell shared by both handler arms
+# and by the runner's own frame, which is how `exec_state`/`run_state`
+# read the final value back out after the handled block completes.
+#
+# The state itself is `int` (the ops are declared that way). Values of
+# other types round-trip through `run_state`'s generic `value` field,
+# so `f` may return anything.
 
-export { State, with_state, modify };
+export {
+    State,
+    StateResult,
+    with_state,
+    eval_state,
+    exec_state,
+    run_state,
+    modify,
+    gets,
+    update,
+    increment
+};
 
 effect State {
     fn get() -> int
     fn put(value: int) -> ()
 }
 
-# Run `f` with an initial state; returns f's result. Deep handler: every
-# get/put in f (including in called functions) routes here. The state
-# lives in a mutable capture cell shared by both handler arms.
-fn with_state(init: int, f: fn() -> int) -> int {
+# Both halves of a state computation: `f`'s result and the final state.
+struct StateResult<T> {
+    value: T,
+    state: int
+}
+
+# Run `f` with an initial state; returns f's result (Ante/Haskell's
+# evalState). Deep handler: every get/put in f, including in called
+# functions, routes here.
+fn eval_state(init: int, f) {
     let @mut current = init;
     handle State with {
         get() -> resume(current),
@@ -32,7 +62,63 @@ fn with_state(init: int, f: fn() -> int) -> int {
     }
 }
 
+# The original name for eval_state, kept as the readable default.
+fn with_state(init: int, f) {
+    eval_state(init, f)
+}
+
+# Run `f` and return the FINAL state, discarding f's result
+# (Haskell's execState). The handled block's value is dropped; the
+# capture cell holds the state the last `put` left behind.
+fn exec_state(init: int, f) -> int {
+    let @mut current = init;
+    handle State with {
+        get() -> resume(current),
+        put(value) -> {
+            current = value;
+            resume(())
+        }
+    } in {
+        f()
+    };
+    current
+}
+
+# Run `f` and return both its result and the final state
+# (Haskell's runState). `value` is generic, so `f` may return any type.
+fn run_state(init: int, f) -> StateResult {
+    let @mut current = init;
+    let result = handle State with {
+        get() -> resume(current),
+        put(value) -> {
+            current = value;
+            resume(())
+        }
+    } in {
+        f()
+    };
+    StateResult { value: result, state: current }
+}
+
 # Apply a function to the current state and store the result.
-fn modify(f: fn(int) -> int) -> () {
+fn modify(f) -> () {
     perform State.put(f(perform State.get()))
+}
+
+# Read the state through a projection: `gets(f)` is `f(get())`.
+fn gets(f) {
+    f(perform State.get())
+}
+
+# Like `modify`, but also answers the NEW state — handy in expression
+# position (`let n = update(fn(s: int) -> s + 1);`).
+fn update(f) -> int {
+    let next = f(perform State.get());
+    perform State.put(next);
+    next
+}
+
+# Add `n` to the state; answers the new state.
+fn increment(n: int) -> int {
+    update(fn(s: int) -> s + n)
 }

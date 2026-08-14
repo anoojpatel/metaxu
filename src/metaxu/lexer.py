@@ -93,8 +93,9 @@ class Lexer:
         'LPAREN', 'RPAREN', 'LBRACE', 'RBRACE', 'LBRACKET', 'RBRACKET',
         'EQUALS', 'SEMICOLON', 'COLON', 'COMMA', 'DOT', 'DOTDOT', 'TRIPLE_DOT',
         'DOUBLECOLON', 'ARROW', 'FATARROW', 'BACKSLASH', 'AT', 'AMPERSAND',
-        'PIPE', 'OROR',
+        'PIPE', 'OROR', 'ANDAND',
         'LESS', 'GREATER', 'LESSEQUAL', 'GREATEREQUAL', 'EQUALEQUAL', 'NOTEQUAL',
+        'NOT',
         # Synthesized by the token-stream disambiguation filter (never produced
         # directly by a regex): generic type argument brackets and the opening
         # brace of a struct literal.
@@ -110,6 +111,13 @@ class Lexer:
     t_EQUALS = r'='
     t_EQUALEQUAL = r'=='
     t_NOTEQUAL = r'!='
+    # Logical negation.  `!=` out-ranks it automatically (PLY orders string
+    # token rules by decreasing regex length).  Without this rule `!` was an
+    # ILLEGAL CHARACTER that t_error merely warned about and skipped, so
+    # `!cond` silently compiled as `cond` — with the wrong answer and no
+    # diagnostic — even though `hir` has always lowered `!e` to
+    # `__builtin$not` and docs/name_precedence.md documents it.
+    t_NOT = r'!'
     t_LESSEQUAL = r'<='
     t_GREATEREQUAL = r'>='
     t_LESS = r'<'
@@ -131,6 +139,10 @@ class Lexer:
     t_FATARROW = r'=>'
     t_BACKSLASH = r'\\'  # Used in function type annotations (fn\(T) -> U)
     t_AT = r'@'
+    # `&&` must out-rank `&` (PLY orders string token rules by decreasing
+    # regex length, so this is automatic) — otherwise `a && b` lexes as two
+    # borrows.
+    t_ANDAND = r'&&'
     t_AMPERSAND = r'&'
     t_OROR = r'\|\|'
     t_PIPE = r'\|'
@@ -154,16 +166,69 @@ class Lexer:
         t.value = int(t.value)
         return t
 
+    #: Recognised backslash escapes in string and f-string literals.
+    #: Anything else after a backslash is a LOUD error rather than a
+    #: silently-kept backslash: `"\d"` is far more likely a typo than an
+    #: intended two-character string, and a silent pass-through is exactly
+    #: the kind of seam this compiler refuses elsewhere.
+    _ESCAPES = {
+        'n': '\n', 't': '\t', 'r': '\r', '0': '\0',
+        '\\': '\\', '"': '"', "'": "'",
+    }
+
+    def _decode_escapes(self, raw: str, t) -> str:
+        """Interpret backslash escapes in a string literal's inner text.
+
+        Before this existed the lexer kept the raw characters, so `"a\\nb"`
+        was the four-character string `a`, `\\`, `n`, `b` — it printed as
+        `a\\nb` with no diagnostic, and `"\\""` could not be written at all
+        (the old `"[^"]*"` pattern stopped at the escaped quote).
+        """
+        if '\\' not in raw:
+            return raw
+        out: List[str] = []
+        i = 0
+        n = len(raw)
+        while i < n:
+            ch = raw[i]
+            if ch != '\\':
+                out.append(ch)
+                i += 1
+                continue
+            if i + 1 >= n:
+                self._string_error(t, "string literal ends with a lone backslash")
+            nxt = raw[i + 1]
+            decoded = self._ESCAPES.get(nxt)
+            if decoded is None:
+                self._string_error(
+                    t, f"unknown escape sequence '\\{nxt}' in string literal")
+            out.append(decoded)
+            i += 2
+        return "".join(out)
+
+    def _string_error(self, t, message: str):
+        line_start = self.line_starts[min(t.lineno - 1, len(self.line_starts) - 1)]
+        raise CompileError(
+            message=message,
+            error_type="LexError",
+            location=SourceLocation(
+                file=self.source_file, line=t.lineno,
+                column=t.lexpos - line_start + 1),
+            notes=["Valid escapes are \\n \\t \\r \\0 \\\\ \\\" \\'"],
+        )
+
     def t_FSTRING(self, t):
-        r'f"[^"]*"'
+        r'f"([^"\\]|\\.)*"'
         t.endlexpos = t.lexpos + len(t.value)
-        t.value = (t.value[2:-1], 'string')  # Tuple with (value, type)
+        # Tuple with (value, type)
+        t.value = (self._decode_escapes(t.value[2:-1], t), 'string')
         return t
 
     def t_STRING(self, t):
-        r'"[^"]*"'
+        r'"([^"\\]|\\.)*"'
         t.endlexpos = t.lexpos + len(t.value)
-        t.value = (t.value[1:-1], 'string')  # Tuple with (value, type)
+        # Tuple with (value, type)
+        t.value = (self._decode_escapes(t.value[1:-1], t), 'string')
         return t
 
     def t_IDENTIFIER(self, t):
@@ -181,12 +246,20 @@ class Lexer:
 
     # Error handling rule
     def t_error(self, t):
+        # LOUD, not skipped.  This used to log a warning and `skip(1)`, which
+        # made every unlexable character vanish from the token stream: `!cond`
+        # (before `!` had a token) compiled as `cond`, with the wrong answer
+        # and nothing on stderr that a test would notice.  A character the
+        # lexer does not know is a compile error.
         line_start = self.line_starts[min(t.lineno - 1, len(self.line_starts) - 1)]
         column = t.lexpos - line_start + 1
-        logger.warning(
-            "Illegal character %r at line %d, column %d", t.value[0], t.lineno, column
+        raise CompileError(
+            message=f"illegal character {t.value[0]!r}",
+            error_type="LexError",
+            location=SourceLocation(
+                file=self.source_file, line=t.lineno, column=column),
+            notes=["Remove it, or quote it inside a string literal"],
         )
-        t.lexer.skip(1)
 
     # ------------------------------------------------------------------
     # Token-stream disambiguation

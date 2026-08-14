@@ -1,0 +1,179 @@
+# std.random — randomness as an algebraic effect.
+#
+# `next()` is an effect operation, so the SOURCE of randomness is a
+# handler choice rather than a global generator. That is the whole point:
+#
+#     with_seed(42, fn() -> simulation())        # reproducible
+#     with_sequence(Vec of [3, 1, 4], fn() -> f) # scripted, for tests
+#
+# Ante has no Random module; this one is Metaxu's own.
+#
+# NO real-entropy default. The `with SYMBOL` runtime-mapping mechanism
+# (examples/effect_mapping.mx) is the way a seed-from-the-OS default
+# would be declared, but the interpreter's shim table currently offers
+# only EFFECT_MUTEX_*/EFFECT_SPAWN/EFFECT_JOIN — there is no entropy
+# shim, and a mapped symbol with no shim fails loudly. So `Random.next`
+# is declared WITHOUT a default: performing it outside a handler is a
+# loud unhandled-effect error, never a silently constant "random" number.
+# Adding an EFFECT_RANDOM_SEED shim later is a one-line change here.
+#
+# The generator is a Lehmer/ANSI-C style linear congruential generator
+# written in Metaxu:
+#
+#     state' = (1103515245 * state + 12345) % 2147483648
+#
+# and `next()` returns two successive draws' bits 30..16 concatenated,
+# which is the classic way to get a usable spread out of an LCG's high
+# bits (the low bits of an LCG have very short periods). Products stay
+# under 2^61, so the arithmetic is exact in i64 on every backend.
+#
+# A stronger generator would want xorshift, which needs `^` and `<<`;
+# Metaxu has no bitwise operators yet (see std/README.md). This is
+# adequate for tests, sampling and shuffling, and it is NOT
+# cryptographic.
+
+export {
+    Random,
+    with_seed,
+    with_sequence,
+    next_below,
+    next_range,
+    next_bool,
+    next_sign,
+    choose,
+    take_random,
+    shuffle,
+    random_max
+};
+
+# Answer a non-negative int below `random_max`. Declared with no default:
+# unhandled, this is a loud error (see the header).
+effect Random {
+    fn next() -> int
+}
+
+# `next()` answers a value in [0, random_max).
+let random_max = 1073741824;
+
+# LCG parameters (ANSI C's; modulus 2^31).
+let lcg_multiplier = 1103515245;
+let lcg_increment = 12345;
+let lcg_modulus = 2147483648;
+
+# ---------------------------------------------------------------------
+# Handlers (the sources)
+# ---------------------------------------------------------------------
+
+# Run `f` with a deterministic LCG seeded by `seed`; answers f's result.
+# The same seed always produces the same sequence, on every backend —
+# that is what makes randomized tests reproducible.
+#
+# Negative and huge seeds are folded into range first. `%` truncates
+# toward zero (C semantics), so the fold adds the modulus back when the
+# remainder came out negative.
+fn with_seed(seed: int, f) {
+    let @mut state = normalize_seed(seed);
+    handle Random with {
+        next() -> {
+            state = (lcg_multiplier * state + lcg_increment) % lcg_modulus;
+            let high = (state / 65536) % 32768;
+            state = (lcg_multiplier * state + lcg_increment) % lcg_modulus;
+            let low = (state / 65536) % 32768;
+            resume(high * 32768 + low)
+        }
+    } in {
+        f()
+    }
+}
+
+# Run `f` answering the elements of `values` in order, cycling when they
+# run out. A scripted generator: the way to pin the exact draws a test
+# depends on without depending on the LCG's internals at all.
+# An empty `values` answers 0 forever.
+fn with_sequence(values: Vec, f) {
+    let @mut i = 0;
+    handle Random with {
+        next() -> {
+            let n = len(values);
+            if n == 0 {
+                resume(0)
+            } else {
+                let v = values[i % n];
+                i = i + 1;
+                resume(v)
+            }
+        }
+    } in {
+        f()
+    }
+}
+
+# ---------------------------------------------------------------------
+# Draws (plain functions over the effect)
+# ---------------------------------------------------------------------
+
+# A draw in [0, n). `n <= 0` answers 0 rather than dividing by zero.
+fn next_below(n: int) -> int {
+    if n <= 0 { 0 } else { perform Random.next() % n }
+}
+
+# A draw in [lo, hi). An empty or inverted range answers `lo`.
+fn next_range(lo: int, hi: int) -> int {
+    lo + next_below(hi - lo)
+}
+
+# A fair coin.
+fn next_bool() -> bool {
+    next_below(2) == 1
+}
+
+# -1 or 1, with equal probability.
+fn next_sign() -> int {
+    if next_bool() { 1 } else { 0 - 1 }
+}
+
+# Some(a uniformly chosen element of v), or None when v is empty.
+fn choose(v: Vec) {
+    if len(v) == 0 {
+        None
+    } else {
+        Some(v[next_below(len(v))])
+    }
+}
+
+# A fresh Vec of `n` draws below `bound` (empty when n <= 0).
+fn take_random(n: int, bound: int) -> Vec {
+    let @mut out = Vec.new();
+    let @mut i = 0;
+    while i < n {
+        out.push(next_below(bound));
+        i = i + 1
+    }
+    out
+}
+
+# A fresh Vec holding v's elements in a uniformly random order
+# (Fisher-Yates, drawing from the unshuffled prefix). `v` is untouched.
+fn shuffle(v: Vec) -> Vec {
+    let @mut out = Vec.new();
+    let @mut i = 0;
+    while i < len(v) {
+        out.push(v[i]);
+        i = i + 1
+    }
+    let @mut k = len(out) - 1;
+    while k > 0 {
+        let j = next_below(k + 1);
+        let tmp = out[k];
+        out[k] = out[j];
+        out[j] = tmp;
+        k = k - 1
+    }
+    out
+}
+
+# private: fold an arbitrary int into [0, lcg_modulus).
+fn normalize_seed(seed: int) -> int {
+    let r = seed % lcg_modulus;
+    if r < 0 { r + lcg_modulus } else { r }
+}

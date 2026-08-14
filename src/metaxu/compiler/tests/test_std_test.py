@@ -52,7 +52,7 @@ fn main() -> int {
 }
 """)
     assert result == 1  # one failure -> exit-code style return
-    assert any("expected 5 got 4" in p for p in prints)
+    assert any("expected 5, got 4" in p for p in prints)
     assert any("arith" in p and "2 passed" in p and "1 failed" in p for p in prints)
 
 
