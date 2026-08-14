@@ -127,9 +127,28 @@ fn main() -> int {
 ```
 
 Change the second lambda to `fn() -> "s"` and `apply` demotes with
-`irreconcilable value kinds`, taking its callers with it. The fix is to
-key specialization on the closure argument (per distinct lambda, or on
-its inferred return type), not on nominal type arguments.
+`irreconcilable value kinds`, taking its callers with it.
+
+**Implemented (2026-08-14): per-call-site cloning.** monomorphize.py now
+rewrites a call site passing a lambda LITERAL to a known non-generic
+function into a clone of that function unique to the site (`apply$ho1`).
+The clone body is byte-identical, so behavior cannot change — the
+rejected alternative, inferring the lambda's return type, could
+miscompile — while the backend's kind cells see one lambda per clone.
+Callees with a single call site are left alone (nothing joins), recursive
+calls keep the original, `__`-prefixed names never clone (their spelling
+is their dispatch), and dead originals are erased by a reference scan.
+The six-line repro above now emits both callers cleanly, and three shapes
+that demoted BY CONTRACT at shared sites (@mut aggregate write-back
+through an indirect call, struct-vs-enum kind disagreement, closure pairs
+as indirect arguments) emit and match the interpreter when routed through
+literal sites. Var-routed lambdas still share the original and keep the
+word-uniform/demotion machinery.
+
+Result on app/main.mx: 39 → 41 real defines, reasons 482 → 465. The next
+blocker in the chain is now visible per-site instead of joined: clones of
+`catch_`/`run_state` inherit `conflict` from `run_program`'s own return
+kinds — the chase continues one level deeper.
 
 This is worth stating because the previous two hypotheses were both
 wrong, and both were wrong the same way — counting instances instead of
