@@ -1268,6 +1268,10 @@ class MirInterpreter:
         self._builtins["int_to_str"] = lambda x: str(x)
         self._builtins["neg"] = lambda x: -x
         self._builtins["not"] = lambda x: not x
+        # `~x`: bitwise complement on i64.  Python's `~` is already
+        # two's-complement on unbounded ints, so for an in-range operand it
+        # equals the native `xor i64 %x, -1`.
+        self._builtins["bnot"] = lambda x: _wrap_i64(~_bit_operand("~", x, "left"))
         # Builtin methods (receiver passed as first argument by HIR)
         self._builtins["to_string"] = lambda x: "()" if x is UNIT else str(x)
         self._builtins["len"] = _builtin_len
@@ -1705,6 +1709,73 @@ def _mod(a: Any, b: Any) -> Any:
     return math.fmod(a, b)
 
 
+#: Metaxu's `int` is a signed 64-bit machine integer; Python's is unbounded.
+#: Every bitwise result is normalised back into that range so the
+#: interpreter and the backends' i64 `and`/`or`/`xor`/`shl`/`ashr` agree bit
+#: for bit — without this, `x ^ (x << 13)` (the xorshift `std.random` now
+#: uses) grows without bound here and wraps natively, i.e. one program with
+#: two answers and no diagnostic.
+_I64_MIN = -(2 ** 63)
+_I64_MOD = 2 ** 64
+
+
+def _wrap_i64(v: int) -> int:
+    return ((v - _I64_MIN) % _I64_MOD) + _I64_MIN
+
+
+def _bit_operand(op: str, v: Any, side: str) -> int:
+    """An `int` operand for a bitwise operator, or a loud error.
+
+    `bool` is rejected on purpose: `&`/`|`/`^`/`~`/`<<`/`>>` are Int-only
+    (the constraint emitter classes them `Int`, so a Bool/Float/String
+    operand is a compile error), and accepting `true & 1` here would make
+    the interpreter more permissive than the checker.
+    """
+    if isinstance(v, bool) or not isinstance(v, int):
+        raise InterpError(
+            f"bitwise {op!r}: {side} operand must be an Int, got "
+            f"{_runtime_type_name(v)!r}")
+    return v
+
+
+def _shift_amount(op: str, v: Any) -> int:
+    """A shift count in 0..63, or a loud error.
+
+    LLVM's `shl`/`ashr` are POISON for counts outside the bit width and
+    Python's `<<` happily builds a 10000-bit integer, so an unchecked shift
+    is exactly the interpreter/native divergence this compiler refuses.
+    Both sides raise instead (natively: `mx_shift_check` aborts).
+    """
+    n = _bit_operand(op, v, "right")
+    if n < 0 or n >= 64:
+        raise InterpError(
+            f"shift amount {n} out of range for {op!r} on a 64-bit int "
+            "(must be 0..63)")
+    return n
+
+
+def _band(a: Any, b: Any) -> int:
+    return _bit_operand("&", a, "left") & _bit_operand("&", b, "right")
+
+
+def _bor(a: Any, b: Any) -> int:
+    return _bit_operand("|", a, "left") | _bit_operand("|", b, "right")
+
+
+def _bxor(a: Any, b: Any) -> int:
+    return _bit_operand("^", a, "left") ^ _bit_operand("^", b, "right")
+
+
+def _shl(a: Any, b: Any) -> int:
+    return _wrap_i64(_bit_operand("<<", a, "left") << _shift_amount("<<", b))
+
+
+def _shr(a: Any, b: Any) -> int:
+    # ARITHMETIC shift right (LLVM `ashr`): Python's `>>` on a negative int
+    # already sign-extends, so `-8 >> 1 == -4` on both sides.
+    return _bit_operand(">>", a, "left") >> _shift_amount(">>", b)
+
+
 _BINOPS: Dict[str, Callable[[Any, Any], Any]] = {
     "+":  lambda a, b: a + b,
     "-":  lambda a, b: a - b,
@@ -1721,6 +1792,12 @@ _BINOPS: Dict[str, Callable[[Any, Any], Any]] = {
     "||": lambda a, b: bool(a) or bool(b),
     "and": lambda a, b: bool(a) and bool(b),
     "or":  lambda a, b: bool(a) or bool(b),
+    # Bitwise, i64, two's complement (see _wrap_i64 / _shift_amount).
+    "&":  _band,
+    "|":  _bor,
+    "^":  _bxor,
+    "<<": _shl,
+    ">>": _shr,
 }
 
 

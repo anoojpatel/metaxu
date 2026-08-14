@@ -257,6 +257,12 @@ def _value_of(node: Any) -> Any | None:
         return {"operator": getattr(node, "operator", None)}
     if isinstance(node, fast.ComparisonExpression):
         return {"operator": getattr(node, "operator", None)}
+    if isinstance(node, fast.UnaryOperation):
+        # The operator was NOT carried before, so every unary node froze as
+        # an anonymous "some unary op" and no checker could tell `-e` from
+        # `~e`. `~` is Int-only, which the constraint emitter can only
+        # enforce if it can see which operator this is.
+        return {"operator": getattr(node, "operator", None)}
     if isinstance(node, fast.LetBinding):
         return {
             "name": getattr(node, "identifier", None),

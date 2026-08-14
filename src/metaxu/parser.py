@@ -592,14 +592,31 @@ class Parser:
         else:
             p[0] = ast.IfExpression(p[1], p[3], ast.Literal(False))
 
+    # -- bitwise operators ---------------------------------------------
+    #
+    # SPELLING (docs/token_reachability.md).  The C/Rust spelling, with
+    # Rust's precedence rather than C's: `<<`/`>>` bind tighter than `&`,
+    # `&` tighter than `^`, `^` tighter than `|`, and all four bind TIGHTER
+    # than the comparisons — so `flags & MASK == 0` reads as
+    # `(flags & MASK) == 0`, not C's famous `flags & (MASK == 0)`.
+    #
+    # Four of the six spellings are strict extensions: `^` and `~` were
+    # illegal characters (a loud LexError), `|` in expression position was
+    # a syntax error, and `<<`/`>>` are synthesized by the lexer's Pass D
+    # from adjacent angle brackets Pass B did not claim for generics, which
+    # were syntax errors too.  Only binary `&` overlaps something that
+    # parsed before: two juxtaposed statements `a` and `&b`.  That reading
+    # is unreachable now, exactly as `a` `-b` has always been read as
+    # subtraction rather than as a statement pair — the same shift/reduce
+    # resolution, on the same grammar shape.
     def p_comparison_expression(self, p):
-        '''comparison_expression : additive_expression
-                               | comparison_expression EQUALEQUAL additive_expression
-                               | comparison_expression NOTEQUAL additive_expression
-                               | comparison_expression LESS additive_expression
-                               | comparison_expression LESSEQUAL additive_expression
-                               | comparison_expression GREATER additive_expression
-                               | comparison_expression GREATEREQUAL additive_expression'''
+        '''comparison_expression : bitor_expression
+                               | comparison_expression EQUALEQUAL bitor_expression
+                               | comparison_expression NOTEQUAL bitor_expression
+                               | comparison_expression LESS bitor_expression
+                               | comparison_expression LESSEQUAL bitor_expression
+                               | comparison_expression GREATER bitor_expression
+                               | comparison_expression GREATEREQUAL bitor_expression'''
         if len(p) == 2:
             p[0] = p[1]
         else:
@@ -612,6 +629,39 @@ class Parser:
                 '>=': ast.ComparisonOperator.GREATER_EQUAL
             }
             p[0] = ast.ComparisonExpression(p[1], operator_map[p[2]], p[3])
+
+    def p_bitor_expression(self, p):
+        '''bitor_expression : bitxor_expression
+                            | bitor_expression PIPE bitxor_expression'''
+        if len(p) == 2:
+            p[0] = p[1]
+        else:
+            p[0] = ast.BinaryOperation(p[1], '|', p[3])
+
+    def p_bitxor_expression(self, p):
+        '''bitxor_expression : bitand_expression
+                             | bitxor_expression CARET bitand_expression'''
+        if len(p) == 2:
+            p[0] = p[1]
+        else:
+            p[0] = ast.BinaryOperation(p[1], '^', p[3])
+
+    def p_bitand_expression(self, p):
+        '''bitand_expression : shift_expression
+                             | bitand_expression AMPERSAND shift_expression'''
+        if len(p) == 2:
+            p[0] = p[1]
+        else:
+            p[0] = ast.BinaryOperation(p[1], '&', p[3])
+
+    def p_shift_expression(self, p):
+        '''shift_expression : additive_expression
+                            | shift_expression SHL additive_expression
+                            | shift_expression SHR additive_expression'''
+        if len(p) == 2:
+            p[0] = p[1]
+        else:
+            p[0] = ast.BinaryOperation(p[1], p[2], p[3])
 
     def p_additive_expression(self, p):
         '''additive_expression : multiplicative_expression
@@ -644,6 +694,7 @@ class Parser:
         '''unary_expression : postfix_expression
                             | MINUS unary_expression
                             | NOT unary_expression
+                            | TILDE unary_expression
                             | AMPERSAND MUT unary_expression
                             | AMPERSAND unary_expression
                             | mode_annotation unary_expression'''
@@ -654,6 +705,9 @@ class Parser:
         elif p[1] == '!':
             # `!e` -> the `not` builtin (hir lowers UnaryOperation('!')).
             p[0] = ast.UnaryOperation('!', p[2])
+        elif p[1] == '~':
+            # `~e` -> the `bnot` builtin (bitwise complement, Int only).
+            p[0] = ast.UnaryOperation('~', p[2])
         elif p[1] == '&':
             if len(p) == 4:  # &mut x
                 operand = p[3]
