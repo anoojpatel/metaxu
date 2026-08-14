@@ -44,12 +44,25 @@
  * Error philosophy
  * ----------------
  * Matching the interpreter's strict InterpError philosophy, every invalid
- * operation prints a clear one-line message to stderr and calls abort().
- * There are no error codes and no silent fallbacks.  Messages reuse the
- * interpreter's wording where one exists:
+ * operation reports a clear one-line message and terminates.  There are no
+ * error codes and no silent fallbacks.  Messages reuse the interpreter's
+ * wording where one exists:
  *   - pop on empty:      "pop: Vec is empty"
  *   - out-of-bounds get/set: "index out of bounds: <idx> (length <len>)"
  *   - NULL receiver / NULL string argument / allocation failure also abort.
+ *
+ * Since native try/catch landed, that split matters: a contract violation
+ * whose wording reproduces an InterpError byte for byte is CATCHABLE (it
+ * goes through mx_raise in metaxu_effects.c, so `try { ... } catch e` binds
+ * exactly this text, and with no `try` installed it prints and aborts as
+ * before) -- pop on empty, index out of bounds, index assignment out of
+ * bounds, slice step, vector size mismatch, zip length mismatch,
+ * comprehension length, as_ptr byte range, shift count range.  Everything
+ * else stays FATAL because the interpreter does not raise InterpError for
+ * it either (integer division by zero is ZeroDivisionError there) or it has
+ * no interpreter counterpart at all (allocation failure, NULL receivers,
+ * capacity overflow, internal formatting invariants) and must never become
+ * a program value.  See metaxu_effects.h for the full contract.
  *
  * Memory ownership
  * ----------------

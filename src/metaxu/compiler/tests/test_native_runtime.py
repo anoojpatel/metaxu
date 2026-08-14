@@ -70,6 +70,13 @@ def compile_and_run(tmp_path: Path, driver_src: str, *,
     Normal mode links the cached metaxu_rt.o from the build recipe;
     sanitize mode recompiles the runtime source together with the driver
     under -fsanitize=address so the whole binary is instrumented.
+
+    metaxu_effects.c comes along either way: metaxu_rt.c's CATCHABLE
+    contract violations (pop on empty, index out of bounds, ...) are raised
+    through mx_raisef, which lives there with the try/catch landing pads.
+    With no `try` installed -- as in every driver here -- a raise prints the
+    same line and abort()s, so these tests observe exactly what they did
+    before the split.
     """
     driver = tmp_path / "driver.c"
     driver.write_text(driver_src)
@@ -77,10 +84,10 @@ def compile_and_run(tmp_path: Path, driver_src: str, *,
     cmd = ["clang", "-std=c11", "-Wall", f"-I{NATIVE_DIR}"]
     if sanitize:
         cmd += ["-g", "-fsanitize=address",
-                str(driver), str(build.RUNTIME_C)]
+                str(driver), str(build.RUNTIME_C), str(build.EFFECTS_C)]
     else:
         obj = build.compile_runtime()
-        cmd += [str(driver), str(obj)]
+        cmd += [str(driver), str(obj), str(build.compile_effects_runtime())]
     cmd += ["-o", str(exe), "-lm"]
     cc = subprocess.run(cmd, capture_output=True, text=True)
     assert cc.returncode == 0, f"driver compile failed:\n{cc.stderr}"

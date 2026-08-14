@@ -402,10 +402,10 @@ answers a perform is decided AT THE PERFORM by the runtime scope stack
     irreconcilable same-named ops; an arity disagreement between a perform
     and its default demotes too (only the SCOPE path pads with UNIT).
 
-Everything else — try_scope, `type_of` (no interpreter builtin exists),
-comprehensions over Vecs, string slicing/indexing — is emitted as a
-clearly marked, comment-only placeholder carrying the reasons, never as
-silently wrong code.  Functions that call a placeholder function are
+Everything else — `type_of` (no interpreter builtin exists), comprehensions
+over Vecs, string slicing/indexing — is emitted as a clearly marked,
+comment-only placeholder carrying the reasons, never as silently wrong
+code.  Functions that call a placeholder function are
 themselves demoted (the module must link), with an explicit reason.
 
 MONOMORPHIZED INPUT (increment 18).  The kind cells below are PER FUNCTION
@@ -463,6 +463,40 @@ ALGEBRAIC EFFECTS (increment 7):
     and continuation records at scope completion/abort (leak-clean, ASan
     fiber-annotated); the site env is a frame alloca (the enclosing frame
     outlives `mx_handle`, which returns only after the scope ends).
+
+TRY/CATCH (increment 19) — delimited failure recovery, docs/try_catch.md:
+  * `try { body } catch e { handler }` lowers (in MIR) to a `try_scope` op
+    naming a body subfunction and a catch subfunction, exactly the shape of
+    a handle site with no cases.  It REUSES the handle-site machinery here:
+    one shared `%henv.<site>` env struct filled by the owner, free-name
+    fixpoint, one value cell (try value ⊔ body return ⊔ catch return), and
+    the boundary-word return ABI for aggregate results.
+  * natively it becomes `mx_try(body_thunk, env, catch_thunk, env)` over
+    per-site `mxtc.body.<site>` / `mxtc.catch.<site>` shims.  The runtime
+    (metaxu_effects.c) installs a setjmp LANDING PAD, whose chain is
+    per-fiber and saved/restored across every coroutine switch — so a try
+    inside a handle body survives a perform/resume round trip, and a
+    failure raised on a body coroutine escapes to its owner stack (the
+    interpreter's ("error", exc) message) instead of longjmping into a
+    parked frame.  Catching also tears down every effect scope the failure
+    escaped, which is the interpreter's `finally: _abort_scope(...)`.
+  * the CATCH PARAMETER is always kind `str`: the runtime hands it the
+    failure's plain text, which must be byte-identical to the interpreter's
+    `InterpError.message` (it is a language value, not a diagnostic).  Any
+    other kind on that parameter conflicts and demotes.
+  * WHAT IS CATCHABLE is a contract shared with the runtime
+    (metaxu_effects.h): every InterpError the native backend can produce
+    inside a delimited extent is raised through mx_raise with the
+    interpreter's own wording.  ONE exception: `match_fail`, whose message
+    embeds the MIR function name that monomorphization renames — a try
+    whose extent can reach one DEMOTES (see _compute_try_extent_blockers)
+    rather than binding a different string than the interpreter binds.
+    Failures the interpreter does NOT raise InterpError for stay fatal on
+    both sides (assert -> AssertionError, division by zero ->
+    ZeroDivisionError, double resume -> RuntimeError).
+  * memory: the pad is a stack object; the caught message is a fresh heap
+    copy that LEAKS BY DESIGN (an ordinary produced `str`).  The scheduler
+    itself stays leak-clean across a caught failure.
 
 Type model (documented conventions):
   * ints, bools and unit are all ``i64``; unit is the constant 0.
@@ -1048,6 +1082,8 @@ _RT_SIGS = {
     "mx_perform_or_default": ("i64", ("ptr", "ptr", "ptr", "i64", "ptr",
                                       "ptr")),
     "mx_resume": ("i64", ("ptr", "i64")),
+    # Delimited failure recovery (try/catch, metaxu_effects.c).
+    "mx_try": ("i64", ("ptr", "ptr", "ptr", "ptr")),
 }
 
 # Native effect-op argument/parameter limit (metaxu_effects.h
@@ -1120,6 +1156,14 @@ _HEADER = (
     ";   array), resume -> mx_resume; boundary values travel as opaque\n"
     ";   8-byte words; scope bodies run on ucontext coroutines with the\n"
     ";   interpreter's deep/single-shot/abort semantics;\n"
+    ";   TRY/CATCH (increment 19): try_scope -> env fill + mx_try over a\n"
+    ";   per-site body thunk + catch thunk; the runtime installs a setjmp\n"
+    ";   landing pad whose chain is per-fiber (so it composes with the\n"
+    ";   coroutine scheduler), binds the failure's PLAIN message text --\n"
+    ";   byte-identical to the interpreter's InterpError.message -- and\n"
+    ";   tears down every effect scope the failure escaped.  A try whose\n"
+    ";   extent can reach a match_fail demotes (that message embeds the\n"
+    ";   MIR function name, which monomorphization renames);\n"
     ";   RECLAMATION (increment 8): owned strings (produced, provably\n"
     ";   non-retained) are freed at redefinition + frame exit via shadow\n"
     ";   slots (literals never freed); unique payload boxes (entry-block\n"
@@ -2139,7 +2183,25 @@ def _analyze_inner(info: _Info, module_names: Set[str],
                         add_use(site_rec.cap_vals.get(n, n), bi)
                 add_def(dst, bi)
             elif rk == "try_scope":
-                info.add_reason("uses try/catch (try_scope)")
+                # ("try_scope", body_fn, catch_fn), captures: env fill +
+                # mx_try over a per-site body thunk and catch thunk.  The
+                # catch fn's single parameter receives the failure message
+                # (a `str`), exactly the interpreter's `exc.message`.
+                site_rec = scopes.sites.get(rhs[1])
+                if site_rec is None or site_rec.kind != "try" \
+                        or site_rec.owner != f.name:
+                    info.add_reason(
+                        f"try site {rhs[1]!r} unresolved (not this "
+                        "function's try_scope)")
+                elif f.name in scopes.bad:
+                    info.add_reason(scopes.bad[f.name])
+                else:
+                    blocker = scopes.try_blocked.get(rhs[1])
+                    if blocker:
+                        info.add_reason(f"try/catch demoted: {blocker}")
+                    for n in scopes.env_fields.get(rhs[1], ()):
+                        add_use(site_rec.cap_vals.get(n, n), bi)
+                add_def(dst, bi)
             else:
                 info.add_reason(f"unsupported op {rk!r}")
 
@@ -2711,7 +2773,7 @@ def _build_global_table(funcs: Sequence[MirFunc]) -> _GlobalTable:
 
 @dataclass
 class _ScopeSite:
-    site: str                 # site id == body fn name (unique per handle)
+    site: str                 # site id == body fn name (unique per handle/try)
     owner: str                # function containing the handle_scope op
     body_fn: str
     effect: str               # '' matches any effect at routing time
@@ -2719,8 +2781,18 @@ class _ScopeSite:
     # site's dense op-index order (the dispatcher switches on this index).
     cases: Tuple[Tuple[str, Tuple[str, ...], str], ...]
     cap_vals: Dict[str, str] = field(default_factory=dict)  # cap name -> value var
+    # "handle" (handle_scope: body + handler cases over mx_handle) or
+    # "try" (try_scope: body + ONE catch fn over mx_try).  A try site reuses
+    # this record wholesale — same shared env struct, same free-name
+    # fixpoint, same value cell — because the two constructs are the same
+    # shape: a delimited body subfunction plus recovery subfunctions, all
+    # reading the owner's captured names out of one env block.
+    kind: str = "handle"
+    catch_fn: str = ""        # try sites only
 
     def member_fns(self) -> Tuple[str, ...]:
+        if self.kind == "try":
+            return (self.body_fn, self.catch_fn)
         return (self.body_fn,) + tuple(hfn for (_o, _p, hfn) in self.cases)
 
 
@@ -2747,6 +2819,11 @@ class _ScopeTable:
     op_args: Dict[Tuple[str, int], str] = field(default_factory=dict)
     sites_of_owner: Dict[str, List[str]] = field(default_factory=dict)
     bad: Dict[str, str] = field(default_factory=dict)  # fn name -> reason
+    # try site -> why its owner must demote: a failure its DYNAMIC EXTENT
+    # can produce that the interpreter catches but the native runtime keeps
+    # fatal (see _compute_try_extent_blockers).  Empty = the extent's whole
+    # failure surface is catchable with the interpreter's exact messages.
+    try_blocked: Dict[str, str] = field(default_factory=dict)
 
     def _mark(self, store, key, kind: str) -> bool:
         cur = store.get(key, I64)
@@ -2815,9 +2892,9 @@ def _fn_defs_uses_sites(
                 _, dst, rhs, args = op
                 defs.add(dst)
                 rk = rhs[0]
-                if rk in ("alloc_struct", "make_closure", "try_scope"):
+                if rk == "alloc_struct" or rk == "make_closure":
                     uses.update(v for (_n, v) in args if isinstance(v, str))
-                elif rk == "handle_scope":
+                elif rk == "handle_scope" or rk == "try_scope":
                     sites.append(rhs[1])
                     # capture VALUES are used only as far as the site's
                     # members need them (the lowering captures every env
@@ -2842,7 +2919,30 @@ def _build_scope_table(funcs: Sequence[MirFunc]) -> _ScopeTable:
     for f in funcs:
         for b in f.blocks:
             for op in b.ops:
-                if op[0] != "let" or len(op) != 4 or op[2][0] != "handle_scope":
+                if op[0] != "let" or len(op) != 4:
+                    continue
+                if op[2][0] == "try_scope":
+                    # ("try_scope", body_fn, catch_fn), captures.  Same
+                    # record shape as a handle site with no cases: one
+                    # delimited body plus one recovery subfunction sharing
+                    # the owner's env block (docs/try_catch.md).
+                    tbody, tcatch = op[2][1], op[2][2]
+                    trec = _ScopeSite(
+                        site=tbody, owner=f.name, body_fn=tbody, effect="",
+                        cases=(), kind="try", catch_fn=tcatch,
+                        cap_vals={cn: vn for (cn, vn) in op[3]
+                                  if isinstance(vn, str)})
+                    if tbody in table.sites:
+                        table.mark_bad(trec, f"try site {tbody!r} appears at "
+                                             "multiple try_scope ops")
+                        table.mark_bad(table.sites[tbody],
+                                       f"try site {tbody!r} appears at "
+                                       "multiple try_scope ops")
+                        continue
+                    table.sites[tbody] = trec
+                    table.sites_of_owner.setdefault(f.name, []).append(tbody)
+                    continue
+                if op[2][0] != "handle_scope":
                     continue
                 body_fn, effect = op[2][1], op[2][2]
                 cases: List[Tuple[str, Tuple[str, ...], str]] = []
@@ -2866,8 +2966,12 @@ def _build_scope_table(funcs: Sequence[MirFunc]) -> _ScopeTable:
                 table.sites_of_owner.setdefault(f.name, []).append(body_fn)
     # 2. Register members.
     for site, rec in table.sites.items():
-        roles = [(rec.body_fn, "body", None)] + [
-            (hfn, "case", op_name) for (op_name, _p, hfn) in rec.cases]
+        if rec.kind == "try":
+            roles = [(rec.body_fn, "trybody", None),
+                     (rec.catch_fn, "trycatch", None)]
+        else:
+            roles = [(rec.body_fn, "body", None)] + [
+                (hfn, "case", op_name) for (op_name, _p, hfn) in rec.cases]
         for (fname, role, op_name) in roles:
             if fname not in by_name:
                 table.mark_bad(rec, f"handle-scope subfunction {fname!r} "
@@ -2947,9 +3051,149 @@ def _build_scope_table(funcs: Sequence[MirFunc]) -> _ScopeTable:
         table.env_fields[site] = tuple(sorted(union))
         missing = sorted(n for n in union if n not in rec.cap_vals)
         if missing:
-            table.mark_bad(rec, "handle-scope subfunctions reference names "
+            what = "try" if rec.kind == "try" else "handle-scope"
+            table.mark_bad(rec, f"{what} subfunctions reference names "
                                 f"absent from the site's captures: {missing}")
+    # 5. Try sites: is every failure their extent can raise CATCHABLE
+    # natively, with the interpreter's exact message?
+    table.try_blocked = _compute_try_extent_blockers(funcs, table)
     return table
+
+
+def _compute_try_extent_blockers(funcs: Sequence[MirFunc],
+                                 table: _ScopeTable) -> Dict[str, str]:
+    """Per try site: the reason (if any) its owner must demote.
+
+    A native `try` must catch EXACTLY what the interpreter's `try_scope`
+    catches — never more, never less (docs/try_catch.md).  The runtime side
+    of that is settled in metaxu_effects.h: every InterpError the native
+    backend can actually produce inside a delimited extent is raised through
+    mx_raise with the interpreter's own message text, EXCEPT ONE.
+
+    That one is ``match_fail``.  The interpreter raises
+    ``match failure in 'F': no pattern matched`` — the message embeds the
+    MIR function name, and the native lane runs the MONOMORPHIZATION pass,
+    which renames a specialized generic (``classify`` -> ``classify$Int``).
+    Emitting the message with the name codegen sees would bind a DIFFERENT
+    string than the interpreter binds; emitting nothing would silently fail
+    to catch what the interpreter catches.  Both are divergences, so a try
+    whose extent can reach a match_fail demotes instead, and the fix (when
+    someone wants it) is to carry the pre-monomorphization name into MIR.
+
+    The extent is the transitive callee closure of the try's BODY function
+    (a failure in the CATCH body escapes this try — an enclosing try's own
+    extent covers it, since that walk descends into both subfunctions of a
+    nested try site).  Edges: direct module calls, handle-site bodies and
+    handler cases, nested try bodies and catches, and an op's declared
+    default / runtime-mapping thunk.  Callees outside the module (builtins,
+    extern C) are leaves: none of them can match_fail.  Two shapes make the
+    extent UNKNOWABLE and therefore block as well — an indirect closure call
+    (the target set is not statically fixed here) and a trait/static
+    dispatch with no candidate implementation in the module.
+    """
+    if not any(rec.kind == "try" for rec in table.sites.values()):
+        return {}   # no try in the module: nothing to decide
+    by_name = {f.name: f for f in funcs}
+    impls_by_method: Dict[str, List[str]] = {}
+    impls_by_type_method: Dict[Tuple[str, str], List[str]] = {}
+    for name in by_name:
+        parsed = parse_impl_method_name(name)
+        if parsed is None:
+            continue
+        _trait, tyname, method = parsed
+        impls_by_method.setdefault(method, []).append(name)
+        impls_by_type_method.setdefault((tyname, method), []).append(name)
+
+    local: Dict[str, str] = {}
+    edges: Dict[str, Set[str]] = {}
+    for f in funcs:
+        defined: Set[str] = set()
+        for b in f.blocks:
+            for op in b.ops:
+                if op[0] == "params":
+                    defined.update(op[1])
+                elif op[0] == "let" and len(op) == 4:
+                    defined.add(op[1])
+                elif op[0] == "perform" and len(op) >= 7:
+                    defined.add(op[1])
+        why = ""
+        out: Set[str] = set()
+        for b in f.blocks:
+            for op in b.ops:
+                k = op[0]
+                if k == "match_fail":
+                    why = why or (
+                        f"its extent can reach the match failure in "
+                        f"{f.name!r}, which stays fatal natively (the "
+                        "interpreter's message embeds the MIR function "
+                        "name, which monomorphization renames)")
+                elif k == "perform" and len(op) >= 7:
+                    for pref in ("__effect_default", "__effect_runtime"):
+                        cand = f"{pref}${op[2]}${op[3]}"
+                        if cand in by_name:
+                            out.add(cand)
+                elif k == "let" and len(op) == 4:
+                    rhs = op[2]
+                    rk = rhs[0]
+                    if rk == "call":
+                        callee = rhs[1]
+                        if callee in defined:
+                            why = why or (
+                                f"its extent contains an indirect closure "
+                                f"call in {f.name!r}, whose target set is "
+                                "not statically fixed")
+                        elif callee.startswith("__trait$"):
+                            m = callee[len("__trait$"):]
+                            cands = list(impls_by_method.get(m, ()))
+                            if m in by_name:
+                                cands.append(m)
+                            if not cands:
+                                why = why or (
+                                    f"its extent contains the dynamic trait "
+                                    f"call {callee!r} in {f.name!r} with no "
+                                    "candidate implementation in the module")
+                            out.update(cands)
+                        elif callee.startswith("__static$"):
+                            parts = callee.split("$")
+                            cands: List[str] = []
+                            if len(parts) >= 4:
+                                cands = list(impls_by_type_method.get(
+                                    (parts[2], parts[3]), ()))
+                                dotted = f"{parts[2]}.{parts[3]}"
+                                if dotted in by_name:
+                                    cands.append(dotted)
+                            if not cands:
+                                why = why or (
+                                    f"its extent contains the static call "
+                                    f"{callee!r} in {f.name!r} with no "
+                                    "candidate implementation in the module")
+                            out.update(cands)
+                        elif callee in by_name:
+                            out.add(callee)
+                    elif rk == "handle_scope":
+                        out.add(rhs[1])
+                        out.update(hfn for (_o, _p, hfn) in rhs[3])
+                    elif rk == "try_scope":
+                        out.add(rhs[1])
+                        out.add(rhs[2])
+        local[f.name] = why
+        edges[f.name] = {c for c in out if c in by_name}
+
+    blocked: Dict[str, str] = {n: r for n, r in local.items() if r}
+    changed = True
+    while changed:
+        changed = False
+        for name in by_name:
+            if name in blocked:
+                continue
+            for c in edges.get(name, ()):
+                if c in blocked:
+                    blocked[name] = blocked[c]
+                    changed = True
+                    break
+    return {site: blocked[rec.body_fn]
+            for site, rec in table.sites.items()
+            if rec.kind == "try" and rec.body_fn in blocked}
 
 
 # ---------------------------------------------------------------------------
@@ -3555,6 +3799,15 @@ def _infer_kinds(info: _Info, sigs: Dict[str, _Sig], structs: _StructTable,
                         if scopes.mark_op_arg(opn, i, nk):
                             changed = global_changed = True
                         changed = mark(p, nk) or changed
+            elif info.scope_role == "trycatch":
+                # The catch parameter is the FAILURE MESSAGE: always a `str`
+                # (mx_try hands the catch thunk a `const char *`, the
+                # interpreter hands it `InterpError.message`).  Seeding the
+                # kind here makes any other use of it a CONFLICT, which
+                # demotes — never a silent reinterpretation of the pointer.
+                for i, p in enumerate(info.params):
+                    if i == 0:
+                        changed = mark(p, STR) or changed
         for b in info.f.blocks:
             for op in b.ops:
                 if op[0] == "perform" and len(op) >= 7:
@@ -3849,7 +4102,10 @@ def _infer_kinds(info: _Info, sigs: Dict[str, _Sig], structs: _StructTable,
                             if scopes.mark_value(site, nk):
                                 changed = global_changed = True
                             changed = mark(dst, nk) or changed
-                elif rk == "handle_scope":
+                elif rk == "handle_scope" or rk == "try_scope":
+                    # Both sites share one value cell (the delimited result:
+                    # handle dst ⊔ body ret ⊔ case ret, try dst ⊔ body ret ⊔
+                    # catch ret) and one env-field cell per capture.
                     site = rhs[1]
                     site_rec = scopes.sites.get(site)
                     if site_rec is not None:
@@ -5236,11 +5492,27 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
     # Handle-scope subfunctions: env fields and the scope's boundary values.
     if info.is_scope_member:
         site = info.scope_site
+        is_try = (site in scopes.sites and scopes.sites[site].kind == "try")
+        what = "try-site" if is_try else "handle-site"
         for cap in info.env_captures:
             check_env_cell(scopes.cell_kind(site, cap),
-                           f"handle-site capture {cap!r}")
+                           f"{what} capture {cap!r}")
         check_boundary(scopes.value_kind(site),
-                       f"handle value of site {site!r}")
+                       f"{'try' if is_try else 'handle'} value of site "
+                       f"{site!r}")
+        if info.scope_role == "trycatch":
+            # Exactly one parameter, and it must have stayed a `str`: the
+            # catch binding is the failure message and nothing else.
+            if len(info.params) != 1:
+                probs.append(
+                    f"catch subfunction {info.f.name!r} declares "
+                    f"{len(info.params)} parameters (expected exactly the "
+                    "failure message)")
+            elif ty(info.params[0]) != STR:
+                probs.append(
+                    f"catch parameter {info.params[0]!r} has kind "
+                    f"{ty(info.params[0])}, but the caught failure message "
+                    "is a str")
         if info.scope_role == "case":
             opn = scopes.case_op.get(info.f.name)
             if opn is not None:
@@ -6142,6 +6414,73 @@ def _emit_scope_artifacts(site: str, rec: _ScopeSite, sigs: Dict[str, _Sig],
     dl.append("}")
     mod.uses_abort = True
     mod.scope_thunks[site] = "\n".join(bl) + "\n\n" + "\n".join(dl)
+    mod.scope_sites[site] = (rec.owner, rec.member_fns())
+
+
+def _try_body_sym(site: str) -> str:
+    return "mxtc.body." + _sanitize(site)
+
+
+def _try_catch_sym(site: str) -> str:
+    return "mxtc.catch." + _sanitize(site)
+
+
+def _emit_try_artifacts(site: str, rec: _ScopeSite, sigs: Dict[str, _Sig],
+                        mod: _ModuleState) -> None:
+    """Per-try-site shims for mx_try: the body thunk (`i64 (ptr env)`) and
+    the catch thunk (`i64 (ptr env, ptr msg)`).
+
+    Same conventions as the handle-site shims (_emit_scope_artifacts): the
+    subfunctions read their free names out of the site's shared env struct,
+    and an aggregate result travels as a BOUNDARY WORD (the subfunction
+    boxes it itself — `is_boundary_ret`), because the try value is produced
+    on one side of a non-local control transfer and consumed on the other.
+
+    The catch thunk's `msg` is the runtime's failure text — a plain
+    NUL-terminated `char *`, i.e. exactly the backend's `str` kind, and
+    exactly the interpreter's `InterpError.message`.  It is passed straight
+    through: no copy, no formatting, no compiler context (docs/try_catch.md
+    "What the catch binding is, exactly").
+    """
+    if site in mod.scope_thunks:
+        return
+    bsig = sigs[rec.body_fn]
+    bl = [f"define internal i64 @{_try_body_sym(site)}(ptr %env) {{",
+          f"  ; mx_try body thunk for @{mangle(rec.body_fn)}",
+          "entry:"]
+    if _is_agg(bsig.ret):
+        bl.append(f"  %w = call i64 @{mangle(rec.body_fn)}(ptr %env)"
+                  f"  ; boundary-word try body result {bsig.ret}")
+        bl.append("  ret i64 %w")
+    else:
+        brty = _llscalar(bsig.ret)
+        bl.append(f"  %r = call {brty} @{mangle(rec.body_fn)}(ptr %env)")
+        enc, v = _word_encode("%r", bsig.ret, "%w")
+        bl += enc
+        bl.append(f"  ret i64 {v}")
+    bl.append("}")
+
+    csig = sigs[rec.catch_fn]
+    cl = [f"define internal i64 @{_try_catch_sym(site)}"
+          "(ptr %env, ptr %msg) {",
+          f"  ; mx_try catch thunk for @{mangle(rec.catch_fn)}: %msg is the",
+          "  ; failure text the interpreter binds (InterpError.message)",
+          "entry:"]
+    if _is_agg(csig.ret):
+        cl.append(f"  %w = call i64 @{mangle(rec.catch_fn)}"
+                  "(ptr %env, ptr %msg)"
+                  f"  ; boundary-word catch result {csig.ret}")
+        cl.append("  ret i64 %w")
+    else:
+        crty = _llscalar(csig.ret)
+        cl.append(f"  %r = call {crty} @{mangle(rec.catch_fn)}"
+                  "(ptr %env, ptr %msg)")
+        enc, v = _word_encode("%r", csig.ret, "%w")
+        cl += enc
+        cl.append(f"  ret i64 {v}")
+    cl.append("}")
+
+    mod.scope_thunks[site] = "\n".join(bl) + "\n\n" + "\n".join(cl)
     mod.scope_sites[site] = (rec.owner, rec.member_fns())
 
 
@@ -7487,19 +7826,21 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                 env_entry.append(
                     f"  {name} = alloca %env.{_sanitize(lname)}"
                     f"  ; closure env for {op[1]} -> {lname}")
-            elif op[0] == "let" and len(op) == 4 and op[2][0] == "handle_scope":
-                # One frame alloca per handle site: the frame outlives
-                # mx_handle (it returns only after the scope completes or
-                # aborts), so a stack env is always safe here — the body
-                # coroutine reads it through a pointer into this parked
-                # frame.
+            elif op[0] == "let" and len(op) == 4 \
+                    and op[2][0] in ("handle_scope", "try_scope"):
+                # One frame alloca per handle/try site: the frame outlives
+                # mx_handle / mx_try (both return only after the delimited
+                # scope completes, aborts or is caught), so a stack env is
+                # always safe here — the body coroutine reads it through a
+                # pointer into this parked frame.
                 site = op[2][1]
                 name = f"%henv.site{env_seq}"
                 env_seq += 1
                 env_allocas[id(op)] = name
+                kindword = "try" if op[2][0] == "try_scope" else "handle"
                 env_entry.append(
                     f"  {name} = alloca %henv.{_sanitize(site)}"
-                    f"  ; handle-site env for {op[1]}")
+                    f"  ; {kindword}-site env for {op[1]}")
     if info.has_perform:
         env_entry.append(
             f"  %perform.args = alloca [{_MAX_EFFECT_ARGS} x i64]"
@@ -8431,6 +8772,67 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                     f"ptr @{_scope_np_sym(site)}, i64 {len(rec.cases)})"
                     f"  ; handle {rec.effect or '(any)'}")
                 word_into(dst, v, lines)
+            elif rk == "try_scope":
+                # DELIMITED FAILURE RECOVERY (docs/try_catch.md): fill the
+                # site's env, then mx_try(body, env, catch, env).  The
+                # runtime installs a setjmp landing pad, runs the body, and
+                # on a catchable failure anywhere in its dynamic extent
+                # (including across coroutine boundaries) calls the catch
+                # thunk with the failure's plain message — the interpreter's
+                # `exc.message`, byte for byte.
+                site = rhs[1]
+                rec = scopes.sites.get(site)
+                if rec is None or rec.kind != "try":
+                    raise _Unsupported(f"try site {site!r} unresolved")
+                if rec.body_fn not in emitted_names \
+                        or rec.catch_fn not in emitted_names:
+                    raise _Unsupported(
+                        f"try site {site!r} has non-emitted subfunctions")
+                bsig = sigs[rec.body_fn]
+                if bsig.params:
+                    raise _Unsupported(
+                        f"try body {rec.body_fn!r} has an unexpected "
+                        "signature")
+                csig = sigs[rec.catch_fn]
+                if len(csig.params) != 1 or csig.params[0] != STR:
+                    raise _Unsupported(
+                        f"catch subfunction {rec.catch_fn!r} does not take "
+                        "exactly the failure message")
+                fields = list(scope_fields(site))
+                mod.scope_env_types[site] = tuple(fields)
+                envp = env_allocas.get(id(op))
+                if envp is None:  # unreachable: prescan covers every site
+                    raise _Unsupported("try site missing env storage")
+                ety = f"%henv.{_sanitize(site)}"
+                for i, (cn, ck) in enumerate(fields):
+                    vn = rec.cap_vals.get(cn, cn)
+                    p = fresh()
+                    lines.append(
+                        f"  {p} = getelementptr inbounds {ety}, ptr {envp}, "
+                        f"i32 0, i32 {i}")
+                    if _is_cell_marker(ck):
+                        if vn not in cellset:
+                            raise _Unsupported(
+                                f"cell capture {cn!r} of non-cell "
+                                f"variable {vn!r}")
+                        lines.append(
+                            f"  store ptr {cellp_ref(vn)}, ptr {p}"
+                            f"  ; mutable capture: cell pointer for {cn}")
+                    elif _is_agg(ck):
+                        agg_copy(_agg_ty(ck), use(vn, lines), p, lines)
+                    else:
+                        lines.append(
+                            f"  store {_llscalar(ck)} {use(vn, lines)}, "
+                            f"ptr {p}")
+                _emit_try_artifacts(site, rec, sigs, mod)
+                mod.runtime_syms.add("mx_try")
+                v = fresh()
+                lines.append(
+                    f"  {v} = call i64 @mx_try("
+                    f"ptr @{_try_body_sym(site)}, ptr {envp}, "
+                    f"ptr @{_try_catch_sym(site)}, ptr {envp})"
+                    f"  ; try/catch: {rec.body_fn} / {rec.catch_fn}")
+                word_into(dst, v, lines)
             else:  # unreachable given analysis
                 raise _Unsupported(f"op {rk!r} slipped past analysis")
 
@@ -9329,7 +9731,9 @@ def emit_llvm(funcs: Sequence[MirFunc]) -> str:
         chunks.append("\n".join(glines))
     chunks.extend(_emit_runtime(mod))
     for site in sorted(live_scope_shims):
-        chunks.append(mod.scope_tables[site])
+        # A try site has no op-name / arity tables (nothing is dispatched).
+        if site in mod.scope_tables:
+            chunks.append(mod.scope_tables[site])
         chunks.append(mod.scope_thunks[site])
     # Dynamic-default thunks: kept when the default fn itself emitted AND
     # at least one performer that hands the thunk to mx_perform_or_default
