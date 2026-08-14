@@ -72,6 +72,14 @@ placeholder, never wrong code. The standard library lives in `std/*.mx`
   through, and `errors.format_diagnostic` / `source_excerpt` render
   `file:line:column` plus the source line with a caret. `Span.start`/`end`
   are 0-based character offsets; `line`/`column` are 1-based.
+- Token/grammar reachability (`docs/token_reachability.md`): every lexer
+  token is triaged in `lexer.TOKEN_TRIAGE` (grammar / contextual /
+  reserved-only) and `test_token_coverage.py` recomputes the grammar
+  bucket from PLY's live production table, so a token cannot be added,
+  wired up or orphaned without a decision. Tokens with no production
+  carry guidance in `lexer.RESERVED_WITHOUT_GRAMMAR`, which `p_error`
+  attaches. Mode annotation names are validated in
+  `Parser.p_mode_annotation` against `Parser.MODE_NAMES`.
 - Name precedence (`docs/name_precedence.md`): plain calls resolve a
   USER function before a same-named builtin; method position
   (`x.len()`) resolves impl -> builtin -> plain fn and is marked
