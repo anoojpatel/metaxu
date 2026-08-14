@@ -569,7 +569,18 @@ class StructInstantiation(Node):
     def __init__(self, struct_name, field_assignments):
         super().__init__()
         self.struct_name = struct_name  # QualifiedName
-        self.field_assignments = [self.add_child(StructField(field[0], value=field[1])) for field in field_assignments] if field_assignments else field_assignments  # List of (field_name, value) tuples
+        # List of (field_name, value) tuples -> StructField children. These
+        # fields are synthesized here rather than by a grammar production, so
+        # they inherit the location of the value they hold; without it a
+        # per-field diagnostic ("type mismatch for field 'data'") could name
+        # no line at all.
+        self.field_assignments = [self._field(field) for field in field_assignments] \
+            if field_assignments else field_assignments
+
+    def _field(self, assignment):
+        field = StructField(assignment[0], value=assignment[1])
+        field.location = getattr(assignment[1], 'location', None)
+        return self.add_child(field)
 
     def __str__(self):
         fields_str = ", ".join(f"{field}={value}" for field, value in self.field_assignments)

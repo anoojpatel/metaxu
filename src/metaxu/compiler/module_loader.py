@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from typing import Any
 
 import metaxu.metaxu_ast as fast
 from metaxu.errors import CompileError
@@ -62,9 +63,17 @@ def _stdlib_dir() -> str | None:
     return cand if os.path.isdir(cand) else None
 
 
-def _module_error(message: str, notes: list[str] | None = None) -> CompileError:
+def _module_error(message: str, notes: list[str] | None = None,
+                  node: Any = None) -> CompileError:
+    """A located ModuleError.
+
+    `node` is the AST node the error is about (the import statement, the
+    duplicate declaration, ...); CompileError reads the parser-attached
+    SourceLocation off it, so the message names `file:line:column` and shows
+    the offending line.
+    """
     return CompileError(message=message, error_type="ModuleError",
-                        notes=notes or [])
+                        notes=notes or [], node=node)
 
 
 @dataclass
@@ -183,7 +192,8 @@ class ModuleResolver:
                 fname = str(getattr(stmt, "name", "") or "")
                 if fname in info.functions and info.functions[fname] is not stmt:
                     raise _module_error(
-                        f"duplicate function '{fname}' in module '{path}'")
+                        f"duplicate function '{fname}' in module '{path}'",
+                        node=stmt)
                 info.functions[fname] = stmt
             elif isinstance(stmt, fast.LetStatement):
                 # module-level constants (initialized before the entry point
@@ -209,7 +219,8 @@ class ModuleResolver:
     # ------------------------------------------------------------------
 
     def _resolve_import_path(self, importer: ModuleInfo,
-                             raw_path: list[str], relative_level: int) -> str:
+                             raw_path: list[str], relative_level: int,
+                             node: Any = None) -> str:
         parts = [str(p) for p in raw_path]
         if relative_level:
             # `.x`  (level 1) = child of the current module,
@@ -221,12 +232,14 @@ class ModuleResolver:
             if drop > len(base):
                 raise _module_error(
                     f"relative import in module '{importer.path}' escapes the "
-                    f"module root ({'.' * relative_level}{'.'.join(parts)})")
+                    f"module root ({'.' * relative_level}{'.'.join(parts)})",
+                    node=node)
             base = base[: len(base) - drop] if drop else base
             parts = base + parts
         return ".".join(parts)
 
-    def _load_module(self, path: str, importer: ModuleInfo) -> ModuleInfo:
+    def _load_module(self, path: str, importer: ModuleInfo,
+                     node: Any = None) -> ModuleInfo:
         """Ensure `path` is present in the registry, loading it from a file
         if necessary."""
         info = self.registry.get(path)
@@ -249,7 +262,8 @@ class ModuleResolver:
             raise _module_error(
                 f"cannot resolve import of module '{path}' from module "
                 f"'{importer.path}': the source has no on-disk location "
-                f"(compiled from memory) and '{path}' is not declared in-file")
+                f"(compiled from memory) and '{path}' is not declared in-file",
+                node=node)
         rel = os.path.join(*path.split(".")) + ".mx"
         candidate = os.path.join(self.root_dir, rel)
         if not os.path.isfile(candidate):
@@ -258,7 +272,8 @@ class ModuleResolver:
                 f"'{importer.path}')",
                 notes=[f"looked for {candidate}",
                        f"module paths resolve relative to the root file's "
-                       f"directory: {self.root_dir}"])
+                       f"directory: {self.root_dir}"],
+                node=node)
         return self._load_module_file(os.path.abspath(candidate), path)
 
     def _load_module_file(self, candidate: str, path: str) -> ModuleInfo:
@@ -298,7 +313,7 @@ class ModuleResolver:
                 before = set(self.registry)
                 if isinstance(imp, fast.Import):
                     target_path = ".".join(str(p) for p in imp.module_path)
-                    target = self._load_module(target_path, info)
+                    target = self._load_module(target_path, info, node=imp)
                     local = imp.alias or str(imp.module_path[-1])
                     binding = ("module", target.path)
                     info.bindings[local] = binding
@@ -307,8 +322,9 @@ class ModuleResolver:
                     self.import_edges.append((info.path, target.path))
                 elif isinstance(imp, fast.FromImport):
                     target_path = self._resolve_import_path(
-                        info, imp.module_path, getattr(imp, "relative_level", 0))
-                    target = self._load_module(target_path, info)
+                        info, imp.module_path, getattr(imp, "relative_level", 0),
+                        node=imp)
+                    target = self._load_module(target_path, info, node=imp)
                     self.import_edges.append((info.path, target.path))
                     for (name, alias) in imp.names:
                         name = str(name)
@@ -320,7 +336,7 @@ class ModuleResolver:
                             # be empty here. Checking after the worklist
                             # drains sees the complete picture.
                             self.pending_import_checks.append(
-                                (target.path, name, info.path))
+                                (target.path, name, info.path, imp))
                         binding = ("symbol", target.path, name)
                         info.bindings[local] = binding
                         if getattr(imp, "is_public", False):
@@ -328,9 +344,9 @@ class ModuleResolver:
                 # newly loaded modules need their own imports processed
                 for new_path in set(self.registry) - before:
                     worklist.append(self.registry[new_path])
-        for (target_path, name, importer_path) in self.pending_import_checks:
+        for (target_path, name, importer_path, imp) in self.pending_import_checks:
             self._check_importable(self.registry[target_path], name,
-                                   self.registry[importer_path])
+                                   self.registry[importer_path], node=imp)
 
     def _chase_symbol(self, target: ModuleInfo, name: str,
                       _seen: set[tuple[str, str]] | None = None):
@@ -355,13 +371,14 @@ class ModuleResolver:
         return self._chase_symbol(nxt, b[2], seen)
 
     def _check_importable(self, target: ModuleInfo, name: str,
-                          importer: ModuleInfo) -> None:
+                          importer: ModuleInfo, node: Any = None) -> None:
         if target.declares(name):
             if not target.is_public(name):
                 raise _module_error(
                     f"cannot import private symbol '{name}' from module "
                     f"'{target.path}' (imported by module '{importer.path}')",
-                    notes=[f"'{name}' is not exported by '{target.path}'"])
+                    notes=[f"'{name}' is not exported by '{target.path}'"],
+                    node=node)
             return
         # re-exported names (public import / public from-import), possibly
         # through a chain of re-exporting modules (e.g. std.prelude)
@@ -371,7 +388,7 @@ class ModuleResolver:
             return
         raise _module_error(
             f"module '{target.path}' has no symbol '{name}' "
-            f"(imported by module '{importer.path}')")
+            f"(imported by module '{importer.path}')", node=node)
 
     # ------------------------------------------------------------------
     # Cycle detection
@@ -535,12 +552,12 @@ class ModuleResolver:
                     raise _module_error(
                         f"module '{target.path}' has no symbol '{head}' "
                         f"(referenced from module '{info.path}' as "
-                        f"'{'.'.join(parts)}')")
+                        f"'{'.'.join(parts)}')", node=node)
             if target.path != info.path and not target.is_public(head):
                 raise _module_error(
                     f"symbol '{head}' of module '{target.path}' is private "
                     f"(referenced from module '{info.path}' as "
-                    f"'{'.'.join(parts)}')")
+                    f"'{'.'.join(parts)}')", node=node)
             if head in target.functions and len(rest) == 1:
                 # `mod.fn(args)` -> plain call of the final symbol name
                 node.parts = [self._final_name(target.path, head)]

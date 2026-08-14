@@ -288,7 +288,29 @@ class EffectHandler:
 # ---------------------------------------------------------------------------
 
 class InterpError(Exception):
-    pass
+    """A run-time error from the MIR interpreter.
+
+    Granularity note: `location` is the DECLARATION site of the function the
+    error happened in, not the individual operation — MIR ops are positional
+    tuples with no span field (see mir.MirFunc.location). The message keeps
+    its original text and gains a " [in function 'f' declared at f.mx:3:1]"
+    suffix, so the location can never be misread as the failing op's line.
+    """
+    location = None
+    _located = False
+
+    def locate(self, func_name: str, location) -> None:
+        """Attach the innermost enclosing function once (outer frames are
+        annotated first-wins, so the deepest frame is the one reported)."""
+        if self._located:
+            return
+        self._located = True
+        self.location = location
+        from metaxu.errors import format_location
+        where = (f" declared at {format_location(location)}"
+                 if location is not None else "")
+        base = self.args[0] if self.args else ""
+        self.args = (f"{base} [in function {func_name!r}{where}]",) + self.args[1:]
 
 
 class _ScopeAbort(BaseException):
@@ -477,7 +499,12 @@ class MirInterpreter:
         env: Dict[str, Any] = dict(outer_env)
         for name, val in zip(f.param_names(), args):
             env[name] = val
-        result = self._run_blocks(f, 0, env)
+        try:
+            result = self._run_blocks(f, 0, env)
+        except InterpError as exc:
+            # Name the function the error happened in (innermost wins).
+            exc.locate(f.name, getattr(f, "location", None))
+            raise
         if out_env is not None:
             out_env.update(env)
             out_env["__params__"] = tuple(f.param_names())
