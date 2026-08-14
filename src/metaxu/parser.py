@@ -809,6 +809,7 @@ class Parser:
 
     def p_lambda_expression(self, p):
         '''lambda_expression : FN LPAREN param_list_opt RPAREN block
+                             | FN LPAREN param_list_opt RPAREN ARROW block
                              | FN LPAREN param_list_opt RPAREN ARROW expression
                              | FN LPAREN param_list_opt RPAREN ARROW expression block
                              | FN LPAREN param_list_opt RPAREN ARROW expression PERFORMS effect_seq block
@@ -817,7 +818,15 @@ class Parser:
             p[0] = self._make_lambda([], p[2])
         elif len(p) == 6:
             p[0] = self._make_lambda(p[3], p[5])
-        elif len(p) == 7:  # fn(params) -> expr   (expression-bodied)
+        elif len(p) == 7:
+            # fn(params) -> expr (expression-bodied) or fn(params) -> { ... }
+            # (block-bodied: the block's tail expression is the result, same
+            # as function bodies -- p[6] is an ast.Block in that case). No
+            # ambiguity with `-> Type { body }` or struct literals: a bare
+            # `{` right after ARROW is never rewritten to LBRACE_STRUCT (the
+            # lexer only rewrites `{` after an identifier/`]`/`>`), while a
+            # struct-literal body like `-> Point { x: 1 }` arrives as
+            # IDENTIFIER LBRACE_STRUCT and parses as an expression.
             p[0] = self._make_lambda(p[3], p[6])
         elif len(p) == 8:  # fn(params) -> Type { body }
             p[0] = self._make_lambda(p[3], p[7], return_type=p[6])
