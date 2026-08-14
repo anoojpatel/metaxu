@@ -72,7 +72,7 @@ row.
 | parameters | `fn f(a, b)`, `fn(x) -> …`, `x -> …` |
 | local bindings | `let x = e` — bound **after** its own initializer, so `let x = x + 1` shadows an outer `x` |
 | loop variables | `for x in it { }` |
-| pattern bindings | `match`, `if let`, `while let`, including nested subpatterns and the mode-annotated forms (`Ok(@mut v)`, `Some(&r)`, `move(x)`) |
+| pattern bindings | `match`, `if let`, `while let`, including nested subpatterns, tuple patterns (`(x, y) => …`) and the mode-annotated forms (`Ok(@mut v)`, `Some(&r)`, `move(x)`) |
 | catch bindings | `try { } catch e { }` |
 | handler-arm parameters | `perform Eff.op(p, q) => …` in both the `handle e { … }` and `handle e with { … } in …` forms |
 | comprehension targets | `vector[T,N](e for x in it)` |

@@ -72,6 +72,65 @@ EFFECT_RUNTIME_CALL_PREFIX = f"__mx_effect_runtime{IMPL_SEP}"
 # user impl still wins.
 BUILTIN_CALL_PREFIX = f"__builtin{IMPL_SEP}"
 
+# ---------------------------------------------------------------------------
+# Tuples ARE anonymous structs.
+#
+# `(a, b)` lowers to `alloc_struct "__tuple2" { _0of2: a, _1of2: b }` and a
+# tuple pattern reads its elements back with `field_get "_0of2"` /
+# `"_1of2"`.  Nothing else in the pipeline learns a new concept: MIR gains
+# no op, the interpreter gains no value class (an MxStruct IS the tuple),
+# and native codegen inherits the whole struct path — layout, GEPs, byval
+# parameter copies, sret returns, field kinds, the module-wide struct table
+# built from `alloc_struct` sites rather than from declarations — which is
+# why a tuple lowers natively with no backend change at all.
+#
+# WHY THE FIELD NAME REPEATS THE ARITY.  Metaxu's inference has no tuple
+# type, so nothing upstream can reject `let (a, b) = triple`.  With plain
+# `_0`/`_1` field names that program would SILENTLY bind the first two
+# elements of a 3-tuple — a positional pattern quietly meaning something
+# other than what it says, which is the exact bug family
+# `docs/token_reachability.md` exists to prevent.  Because the names carry
+# the arity, `_0of2` simply does not exist on a `__tuple3`, so the mismatch
+# is a loud missing-field error in the interpreter (see
+# `MxStruct.get`) and a demotion — never wrong code — natively, with no new
+# MIR op, builtin or runtime check.  The names are an implementation
+# detail — the surface way to reach an element is a pattern, not a field
+# access; there is no `p.0`.
+#
+# The struct name carries the ARITY only, so every 2-tuple in a module is
+# one layout.  The visible cost: a module that builds both `(1, 2)` and
+# `(1, "s")` joins `_1of2`'s native kind across them, the join conflicts,
+# and the affected functions demote to the interpreter with a reason.  The
+# interpreter is unaffected (its fields are dynamically typed), and the
+# alternative — a distinct struct name per element-kind tuple — cannot be
+# computed in HIR, which runs before native kinds are inferred.
+TUPLE_STRUCT_PREFIX = "__tuple"
+
+# The smallest tuple.  `(e)` is parenthesized grouping and `(e,)` is a
+# syntax error, so the language has NO 1-tuples: a tuple is 2+ elements,
+# and `()` is the unit value (not a 0-tuple).
+TUPLE_MIN_ARITY = 2
+
+
+def tuple_struct_name(arity: int) -> str:
+    """Struct name for an `arity`-element tuple (`(a, b)` -> `__tuple2`)."""
+    return f"{TUPLE_STRUCT_PREFIX}{arity}"
+
+
+def tuple_field_name(index: int, arity: int) -> str:
+    """Field name for element `index` (0-based) of an `arity`-tuple.
+
+    The arity is part of the NAME, not just the struct name, so reading a
+    2-tuple's element out of a 3-tuple cannot silently succeed.
+    """
+    return f"_{index}of{arity}"
+
+
+def is_tuple_struct(name: str) -> bool:
+    """True for a struct name a tuple literal generated (`__tuple2`)."""
+    return (isinstance(name, str) and name.startswith(TUPLE_STRUCT_PREFIX)
+            and name[len(TUPLE_STRUCT_PREFIX):].isdigit())
+
 # Every BARE (non-dotted, non-reserved) builtin function name the runtime
 # provides — the shadowable surface of the precedence rule.  Pinned equal to
 # mir_interp._register_builtins by test_name_precedence; the module resolver
@@ -191,7 +250,7 @@ AST_NODE_TRIAGE: dict[str, tuple[str, str]] = {
     "SomeExpression": (LOWERED, "`Some(e)`"),
     "StructInstantiation": (LOWERED, "`S { f: e }`"),
     "TryCatch": (LOWERED, "`try { } catch e { }`"),
-    "TupleLiteral": (LOWERED, "`()` is unit; a non-unit tuple raises (no runtime representation)"),
+    "TupleLiteral": (LOWERED, "`()` is unit; `(a, b)` is the anonymous struct `__tuple2 { _0of2, _1of2 }`"),
     "TypeCast": (LOWERED, "`e as T` -> __cast"),
     "UnaryOperation": (LOWERED, "`-e` / `!e` / `~e` -> neg / not / bnot"),
     "UnsafeBlock": (LOWERED, "`unsafe { }` — an ordinary block (unsafe is a static permission)"),
@@ -344,7 +403,7 @@ PATTERN_TRIAGE: dict[str, tuple[str, str]] = {
     "QualifiedName": (LOWERED, "`Enum.Variant` (nullary); a non-variant dotted name raises"),
     "FieldAccess": (LOWERED, "`Enum.Variant` (nullary, the shape the parser actually builds); any other dotted form raises"),
     "ListLiteral": (UNSUPPORTED, "list patterns (`[]`, `[x, ...xs]`) need a pattern kind MIR cannot test yet"),
-    "TupleLiteral": (UNSUPPORTED, "tuple patterns need a tuple runtime representation"),
+    "TupleLiteral": (LOWERED, "`(x, y)` destructures the anonymous tuple struct positionally (arity-exact; `()` in pattern position raises)"),
     "StructInstantiation": (UNSUPPORTED, "struct patterns (`S { f: p }`) are not implemented"),
     "RangeExpression": (UNSUPPORTED, "range patterns (`1..5`) are not implemented"),
     "BinaryOperation": (UNSUPPORTED, "an arbitrary expression is not a pattern"),
@@ -397,6 +456,12 @@ class HPattern:
       'literal'   matches when scrutinee == value
       'ctor'      matches enum variant `name` (of enum `enum_name` when known),
                   recursively matching `subpatterns` against the payload fields
+      'tuple'     destructures an anonymous tuple struct positionally,
+                  matching `subpatterns` against `_0ofN`, `_1ofN`, ...
+                  The shape itself carries no tag test: the ARITY-BEARING
+                  field names make a mismatched arity a loud missing-field
+                  error rather than a branch, so only refutable
+                  subpatterns can make the arm fail.
     """
     kind: str
     name: str | None = None          # binding name (var) or variant name (ctor)
@@ -822,18 +887,42 @@ class HIRBuilder:
             return self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span, op="Literal", literal=getattr(orig, 'value', None))
 
         # TupleLiteral: `()` is the unit value (an empty Block lowers to the
-        # unit constant). Non-empty tuples have no runtime representation yet;
-        # dropping them silently (the old None fallback) turned handler arms
-        # like `op() -> ()` into vanished arms, so fail loudly instead.
+        # unit constant); `(a, b)` is an anonymous struct — see
+        # TUPLE_STRUCT_PREFIX for why that representation and not a new
+        # runtime value. An element that cannot lower is a LOUD error, never
+        # a short tuple (the same rule StructInstantiation enforces).
         if isinstance(orig, fast.TupleLiteral):
             elements = getattr(orig, 'elements', []) or []
             if not elements:
                 ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, "Unit"))
                 return self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span,
                                       op="Block", operands=())
-            raise NotImplementedError(
-                f"tuple literals are not supported yet (got a {len(elements)}-element "
-                "tuple); only the unit literal `()` lowers")
+            arity = len(elements)
+            if arity < TUPLE_MIN_ARITY:
+                # The grammar cannot build this (`(e)` is grouping and `(e,)`
+                # is a syntax error), so reaching it means a pass synthesized
+                # a 1-tuple; say so instead of inventing a `__tuple1` layout
+                # nothing else in the compiler knows about.
+                raise UnsupportedConstruct(
+                    f"tuple literal: {arity}-element tuples do not exist — "
+                    "`(e)` is parenthesized grouping and a tuple has two or "
+                    "more elements",
+                    location=self._loc(frozen_ctx.span, orig))
+            field_exprs: list[tuple[str, HExpr]] = []
+            for i, el in enumerate(elements):
+                he = self._from_orig_expr(el, ctx_for(el))
+                if he is None:
+                    raise UnsupportedConstruct(
+                        f"tuple literal: could not lower element {i} "
+                        f"({type(el).__name__}) — refusing to build a short "
+                        "tuple", location=self._loc(frozen_ctx.span, orig))
+                field_exprs.append((tuple_field_name(i, arity), he))
+            ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, "Unknown"))
+            return self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span,
+                                  op="Struct",
+                                  struct_name=tuple_struct_name(arity),
+                                  fields=tuple(field_exprs),
+                                  locality="local")
 
         # Variables
         if isinstance(orig, fast.Variable):
@@ -2373,6 +2462,23 @@ class HIRBuilder:
                 f"[{self._pat_where(p)}] unsupported pattern: `{getattr(p, 'operator', '?')}"
                 f"{type(operand).__name__}` — only a negative numeric literal "
                 "(`-1`) is a valid unary pattern", location=self._loc(None, p))
+        # `(x, y) => ...` — positional destructuring of the anonymous tuple
+        # struct.  ARITY-EXACT: the field names carry the arity
+        # (TUPLE_STRUCT_PREFIX), so a 2-element pattern cannot read a
+        # 3-tuple.  `()` is REJECTED in pattern position: it has no elements
+        # to read, so it would match every value — a silent catch-all, which
+        # is precisely the degradation PATTERN_TRIAGE exists to stop.
+        if isinstance(p, fast.TupleLiteral):
+            elements = list(getattr(p, 'elements', []) or [])
+            if len(elements) < TUPLE_MIN_ARITY:
+                raise UnsupportedConstruct(
+                    f"[{self._pat_where(p)}] unsupported pattern: "
+                    f"`({', '.join('_' for _ in elements)})` has "
+                    f"{len(elements)} elements — a tuple pattern needs two or "
+                    "more (write `_` for a catch-all)",
+                    location=self._loc(None, p))
+            subs = tuple(self._convert_pattern(el) for el in elements)
+            return HPattern(kind="tuple", subpatterns=subs)
         if isinstance(p, fast.NoneExpression):
             return HPattern(kind="ctor", name="None",
                             enum_name=self._variant_to_enum.get("None"), subpatterns=())

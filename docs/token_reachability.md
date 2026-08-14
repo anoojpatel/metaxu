@@ -109,6 +109,40 @@ statement position still works after a `;`.
 the frozen AST now carries a `UnaryOperation`'s operator, which it did not
 before, so a checker can tell the three apart.
 
+## Tuples added productions but no tokens
+
+`(a, b)` already lexed and parsed — `primary_expression : LPAREN
+expression COMMA expression_seq RPAREN` has built a `TupleLiteral` for as
+long as the grammar has existed; what it lacked was a lowering, so every
+non-unit tuple raised. Making tuples real therefore added **no token**:
+`LPAREN`, `COMMA` and `RPAREN` were already in the `GRAMMAR` bucket, and
+the triage table is unchanged.
+
+Three productions were added, and none of them adds a conflict (the
+shift/reduce count below is unmoved at 164, reduce/reduce still zero):
+
+* `let_statement : LET binding_prefix LPAREN identifier_seq RPAREN EQUALS
+  expression` and `for_statement : FOR LPAREN identifier_seq RPAREN IN
+  expression LBRACE statement_list RBRACE`. Both share their whole prefix
+  with the existing `IDENTIFIER` forms up to the token that distinguishes
+  them (`LPAREN` vs `IDENTIFIER`), which one lookahead settles.
+* `type_postfix : LPAREN type_expression COMMA type_list RPAREN` — the
+  tuple TYPE. Nothing else in type position starts with `LPAREN` except
+  `fn (..) -> ..`, which is preceded by `FN`.
+
+The **1-tuple** is the grammar hazard this feature had to answer, because
+`(e)` is parenthesized grouping and has been since the beginning. The rule
+is that Metaxu has no 1-tuples at all: `(e)` stays grouping, `(e,)` stays
+a syntax error (the alternative — accepting Rust's spelling — would mean
+inventing a `__tuple1` layout no other pass understands), `()` stays the
+unit value, and the two shapes that would need one are rejected by name:
+`let (a) = e` reports "a 1-element tuple, which does not exist" and a
+`()` *pattern* is a loud `UnsupportedConstruct` rather than a match-
+anything arm. The other two spellings tuples might have claimed keep their
+old meanings, and both are pinned by tests: `f(a, b) for (a, b) in (xs,
+ys)` is still lockstep zip iteration over two sequences, and `(a, b) -> e`
+is still a two-parameter lambda.
+
 ## Grammar reachability (the reverse direction)
 
 Checked on the live grammar and currently clean: every nonterminal is
