@@ -864,7 +864,28 @@ class Parser:
             self._fstring_error(
                 f"f-string: segment '{{{text}}}' in f\"{raw}\" is not a "
                 "single expression", lineno)
+        # The segment was parsed out of a synthetic wrapper
+        # ("fn __fstring_expr__() { <text> }"), so its positions describe
+        # that wrapper, not this file — they would claim line 1 no matter
+        # where the f-string is.  Drop them; _attach_location then gives the
+        # whole segment the enclosing f-string literal's real span.
+        self._clear_locations(body[0])
         return body[0]
+
+    def _clear_locations(self, node, depth: int = 0, seen: set | None = None) -> None:
+        """Remove locations from a subtree parsed out of a synthetic source."""
+        if depth > 60 or not isinstance(node, ast.Node):
+            return
+        seen = seen if seen is not None else set()
+        if id(node) in seen:
+            return
+        seen.add(id(node))
+        node.location = None
+        for attr, value in vars(node).items():
+            if attr in self._NON_CHILD_ATTRS:
+                continue
+            for item in (value if isinstance(value, (list, tuple)) else [value]):
+                self._clear_locations(item, depth + 1, seen)
 
     def _desugar_fstring(self, raw: str, lineno: int):
         """Desugar f-string text into `lit + to_string(expr) + ...`."""
