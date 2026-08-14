@@ -80,6 +80,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
+from .hir import BUILTIN_CALL_PREFIX
 from .mir import MirFunc
 from .cps_frames import (RESULT_OFFSET, STATE_OFFSET, compute_frame_layouts,
                          is_suspending, var_offset)
@@ -295,8 +296,10 @@ def _analyze_inner(info: _Info, module_names: Set[str]) -> None:
     for (_bi, _dst, callee, _args) in info.calls:
         if callee in info.def_count:
             info.add_reason(f"indirect call through local {callee!r} (closures)")
-        elif _is_runtime_builtin(callee):
-            info.add_reason(f"calls runtime builtin {callee!r} (vec/string/trait)")
+        elif _is_runtime_builtin(_clif_callee(callee)):
+            info.add_reason(
+                f"calls runtime builtin {_clif_callee(callee)!r} "
+                "(vec/string/trait)")
 
     # Every used name must be defined somewhere in the function.  Names with
     # no local definition are captured-environment references (handler/lambda
@@ -325,8 +328,26 @@ def _analyze_inner(info: _Info, module_names: Set[str]) -> None:
 # Type inference (i64 by default, monotone promotion to f64)
 # ---------------------------------------------------------------------------
 
+def _clif_callee(callee: str) -> str:
+    """External symbol name for a call op's callee.
+
+    A method-position builtin call carries the ``__builtin$`` marker the
+    front end adds so plain calls can prefer a same-named user function
+    (NAME PRECEDENCE, docs/name_precedence.md).  CLIF has no builtin
+    runtime -- these are plain externals -- so the marker is stripped for
+    the symbol name, and the callee never resolves to a module function
+    that happens to share the bare name."""
+    if callee.startswith(BUILTIN_CALL_PREFIX):
+        return callee[len(BUILTIN_CALL_PREFIX):]
+    return callee
+
+
 def _callee_sig(callee: str, sigs: Dict[str, Tuple[Tuple[str, ...], str]],
                 ) -> Optional[Tuple[Tuple[str, ...], str]]:
+    if callee.startswith(BUILTIN_CALL_PREFIX):
+        # Builtin marker: an external, never the module function that may
+        # share the bare name.
+        return _MATH_EXTERNS.get(_clif_callee(callee))
     if callee in sigs:
         return sigs[callee]
     return _MATH_EXTERNS.get(callee)
@@ -589,7 +610,7 @@ def _emit_direct(info: _Info, f64s: Set[str],
                 sig = _callee_sig(callee, sigs)
                 if sig is None:  # plain external: signature from observed types
                     sig = (tuple(ty(a) for a in opargs), ty(dst))
-                fnref = declare(callee, sig)
+                fnref = declare(_clif_callee(callee), sig)
                 avals = [use(a, lines) for a in opargs]
                 v = fresh()
                 lines.append(f"    {v} = call {fnref}({', '.join(avals)})")
@@ -878,7 +899,7 @@ def _emit_cps(info: _Info, layout: Dict[str, Any],
                     sig = (tuple(I64 for _ in opargs), I64)
                 else:
                     sig = csig
-                fnref = declare(callee, sig)
+                fnref = declare(_clif_callee(callee), sig)
                 avals = [use(a, lines) for a in opargs]
                 v = fresh()
                 lines.append(f"    {v} = call {fnref}({', '.join(avals)})")

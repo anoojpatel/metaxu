@@ -170,6 +170,28 @@ class IfDesugarPass(DesugarPass):
 # names themselves contain underscores.
 IMPL_SEP = "$"
 
+# The compiler's own name space.  EVERY symbol the compiler synthesizes or
+# emits calls to lives behind a leading double underscore:
+#   __impl$T$Ty$m, __trait$m, __static$Ty$m          (trait/static dispatch)
+#   __effect_default$E$op, __effect_runtime$E$op,
+#   __mx_effect_runtime$SYMBOL                       (effect lowering)
+#   __module_init                                    (module constants)
+#   __builtin$m                                      (method-position builtins)
+#   __index_get/__index_set/__index_store/__slice_get/__range/__zip/__cast/
+#   __vec_lit/__vec_dim/__vec_zeros/__vec_filled/__vec_comprehension/
+#   __list_lit/__list_concat                         (compiler intrinsics)
+# Reserving the whole prefix (rather than an enumerated list) is what makes
+# "a user function wins over a same-named builtin" safe: the names the
+# compiler generates or emits calls to can never be shadowed, and a user
+# declaration that tries is a loud error instead of a silent override.
+# See docs/name_precedence.md.
+RESERVED_NAME_PREFIX = "__"
+
+
+def is_reserved_name(name: str) -> bool:
+    """True for names in the compiler's reserved namespace (see above)."""
+    return isinstance(name, str) and name.startswith(RESERVED_NAME_PREFIX)
+
 
 class CoherenceError(Exception):
     """Two distinct implement blocks define the same (trait, type, method)."""
