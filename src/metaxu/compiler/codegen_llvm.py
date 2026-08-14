@@ -408,6 +408,16 @@ clearly marked, comment-only placeholder carrying the reasons, never as
 silently wrong code.  Functions that call a placeholder function are
 themselves demoted (the module must link), with an explicit reason.
 
+MONOMORPHIZED INPUT (increment 18).  The kind cells below are PER FUNCTION
+and monomorphic: a generic function reached at two different types joins
+both kinds into `conflict` and demotes with "irreconcilable value kinds".
+`pipeline.emit_llvm_from_source` therefore runs compiler/monomorphize.py
+before lowering, so each resolvable instantiation arrives here as its own
+function (`identity$Int`, `identity$String`) with its own cells.  Call
+sites whose type arguments that pass cannot resolve keep their generic
+callee and still join here — the demotion is the honest answer, not a
+gap to paper over.
+
 ALGEBRAIC EFFECTS (increment 7):
   * `handle ... with {cases} in {body}` lowers (in MIR) to per-site body /
     handler-case subfunctions plus a `handle_scope` op capturing the
