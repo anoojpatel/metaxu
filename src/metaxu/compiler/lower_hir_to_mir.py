@@ -281,8 +281,7 @@ class _FuncLowerer:
             return last_val if last_val is not None else self.unit_value()
         if e.op == "Block" and e.operands is not None:
             last: str | None = None
-            n = len(e.operands)
-            for i, sube in enumerate(e.operands):
+            for sube in e.operands:
                 last = self.lower_expr(sube)
                 # A bare name read emits NO instruction: `lower_expr("Var")`
                 # just answers the slot name. In value position the consumer
@@ -296,7 +295,18 @@ class _FuncLowerer:
                 # ("Unbound variable ...") instead of vanishing. Every other
                 # expression form already emits its own instruction, so its
                 # evaluation survives statement position unaided.
-                if i != n - 1 and sube.op == "Var" and sube.var_name and last:
+                #
+                # The TAIL is not exempt. It used to be (`i != n - 1`), on the
+                # theory that the block's value is consumed by the caller —
+                # but a function body's tail is consumed by `ret <slot>`, and
+                # `mir_interp`'s ret keeps a legacy fallback for slots that
+                # are absent from the environment. So `fn inner() -> int {
+                # secret }` returned the PREVIOUS op's value (`()`) instead of
+                # raising: a silent wrong answer, the very shape this fix
+                # exists to remove. The copy is emitted for every position and
+                # `last` still names the source slot, so the MIR is unchanged
+                # apart from the forced read.
+                if sube.op == "Var" and sube.var_name and last:
                     dst = self.state.fresh("r")
                     self.emit(("let", dst, ("copy",), (last,)))
             return last if last is not None else self.unit_value()
