@@ -759,6 +759,60 @@ boundary:
     pointer, which is a box the caller drops, so the mutation would be
     silently lost.
 
+BOUNDARY-BOX TRAFFIC REDUCTION (increment 17) — a pure optimization over
+the two rounds above.  Boxing at every crossing was correct but wasteful:
+an aggregate resume result was boxed by the dispatcher, copied out, then
+boxed AGAIN at the next hop, and a perform in a loop malloc'd once per
+iteration.  Three elisions remove the waste; anything not provable keeps
+boxing, because a leaked box is sound where a dangling pointer is not.
+The whole argument rests on the WRITE-ONCE BOX INVARIANT: a boundary box
+is malloc'd, filled once before its pointer leaves the producer, never
+written again, and never freed by any emitted path (``emit_frees``
+releases only @global blocks, provably local Vecs, unique enum payload
+boxes and owned strings).
+
+  * (1) DOUBLE-BOX ELISION.  A value whose single def RECEIVES a boundary
+    word — a perform result, a resume result, a handle value, or the
+    result of a word-uniform indirect call — keeps the producer's pointer
+    as a BOX VIEW (``bbox_view``) instead of copying the aggregate out,
+    and handing that value to the NEXT boundary passes the same pointer
+    through instead of malloc'ing a byte-identical second box.  Sound
+    because the box is immortal (so it cannot dangle, not even when an
+    abort tears down a parked coroutine stack), write-once (handle-scope
+    subfunctions never copy out through a param pointer, and the word ABI
+    refuses @mut aggregate params), and the receiver is read-only
+    (``read_only_agg``: one def, never at a callee write-back position),
+    so the box's bytes ARE this value, forever.
+    Handler cases and handle bodies with an aggregate result now RETURN
+    that word themselves (the BOUNDARY-WORD ABI, ``i64 (...)``) instead
+    of sret-filling a box the site shim malloc'd, so the shims allocate
+    nothing at all and the fold-shaped ``resume(...)`` case — whose value
+    is already a box — allocates nothing either.
+    THE GUARD: views of enum PAYLOAD boxes (elision (b), from
+    ``variant_field``) are never re-exported across a boundary.  Those
+    boxes are freed at frame exit when ``_unique_box_enums`` proves sole
+    ownership, so their pointer must not outlive this frame; they read
+    through the box and box a copy when they cross.
+  * (2) READ-ONLY AGGREGATE ARGUMENTS.  An aggregate argument at an
+    indirect closure call passes a pointer to the CALLER'S existing
+    storage rather than a fresh box, whenever every statically-possible
+    callee (one pinned member, or every member of a dynamic kind) is
+    word-uniform and leaves that position out of its write-back set —
+    reusing ``writeback_map``, the analysis the direct-call elide-copy
+    pass already runs, rather than a second one.  Sound because nothing
+    writes through the pointer and an indirect call is an ordinary
+    synchronous call on this stack, so the storage outlives the callee's
+    frame; the callee cannot re-export the pointer either, since a
+    parameter is never a ``bbox_view``.  Effect-boundary arguments do NOT
+    get this: they cross to another coroutine stack that an abort may
+    tear down, so they keep their immortal box.
+  * (3) LOOP-INVARIANT BOXES.  A value whose only def is a block-0 op (or
+    a parameter), that no write-back can reach, and that is boxed at a
+    boundary site inside a CFG cycle gets ONE box, filled at the end of
+    block 0 (which dominates every block) and reused at every site.
+    Sharing is invisible: the bytes never change and the box is immortal.
+    A reassigned loop accumulator keeps its per-iteration box.
+
 Per-function value kinds (i64 / f64 / str / struct:T / enum:E /
 closure:L) are inferred exactly
 in the spirit of codegen_clif's i64->f64 promotion: every value defaults
@@ -1133,6 +1187,25 @@ _HEADER = (
     ";   pinned at every site keeps its typed ptr/sret signature.\n"
     ";   Closure pairs, konts, infinite layouts and @mut aggregate\n"
     ";   params (their write-back cannot travel back) stay demoted;\n"
+    ";   BOUNDARY-BOX TRAFFIC (increment 17): three elisions, all of\n"
+    ";   them semantics-preserving, all resting on the write-once box\n"
+    ";   invariant (a boundary box is malloc'd, filled once and never\n"
+    ";   freed).  (1) A value RECEIVING a boundary word (perform /\n"
+    ";   resume / handle value / word-uniform indirect result) keeps\n"
+    ";   the producer's pointer as a BOX VIEW instead of copying out,\n"
+    ";   and re-exports that pointer at the next boundary instead of\n"
+    ";   boxing a second copy; handler cases and handle bodies return\n"
+    ";   the word directly (the boundary-word ABI), so the site shims\n"
+    ";   allocate nothing.  (2) A read-only aggregate ARGUMENT of an\n"
+    ";   indirect closure call passes the caller's storage pointer --\n"
+    ";   no member writes through it (writeback_map) and the call is\n"
+    ";   synchronous on this stack.  (3) A boundary box whose value is\n"
+    ";   loop-invariant (single block-0 def, no write-back) is filled\n"
+    ";   once at the end of the entry block and reused every\n"
+    ";   iteration.  Views of enum PAYLOAD boxes are NOT re-exported\n"
+    ";   (those boxes can be freed at frame exit), and anything\n"
+    ";   unproven keeps its per-site box ('; elide-box:' marks the\n"
+    ";   elided allocations);\n"
     "; functions outside the subset appear as comment-only placeholders."
 )
 
@@ -5958,29 +6031,29 @@ def _word_decode(val: str, kind: str, dst: str) -> Tuple[List[str], str]:
 
 
 def _emit_scope_artifacts(site: str, rec: _ScopeSite, sigs: Dict[str, _Sig],
-                          structs: _StructTable, variants: _VariantTable,
                           mod: _ModuleState) -> None:
     """Per-handle-site shims for the effects runtime: the op-name /
     case-arity constant tables, the body thunk (`i64 (ptr env)`) and the
     dispatcher (`i64 (ptr env, i64 op_index, ptr args, ptr k)`).  Op
     indices are DENSE in the site's case order (documented per arm).
 
-    Aggregate body/case results (increment 14) keep their ordinary sret
-    convention; the shim mallocs a BOUNDARY BOX, calls sret-style into
-    it, and returns the box pointer as the word.  malloc, never alloca:
-    the word outlives the shim's frame (it crosses mx_handle/mx_perform
-    back to a different stack).  The box is write-once (the sret fill)
-    and immortal (leaks by design, like every boundary box).  Aggregate
-    case PARAMS receive the sender's box pointer directly — the ordinary
-    aggregate-param byval-copy convention is exactly the copy-out."""
+    Aggregate body/case results used to keep the ordinary sret convention,
+    with the shim malloc'ing a BOUNDARY BOX, calling sret-style into it and
+    returning the box pointer as the word — one unconditional malloc per
+    dispatch.  Increment 17 moves that boxing INTO the subfunction (the
+    BOUNDARY-WORD RETURN ABI, `i64 (...)`, see _emit_function): the value
+    always continues as a word anyway, and doing it there lets the
+    double-box elision drop the allocation whenever the returned value is
+    already an immortal write-once box — the fold-shaped `resume(...)`
+    case, where the box was allocated by whoever produced the resume
+    value.  Where boxing IS needed, to_word still mallocs (never alloca:
+    the word outlives the shim's frame, crossing mx_handle/mx_perform back
+    to a different stack) and the box stays write-once and immortal.
+    Aggregate case PARAMS receive the sender's box pointer directly — the
+    ordinary aggregate-param byval-copy convention is exactly the
+    copy-out."""
     if site in mod.scope_thunks:
         return
-
-    def box_size(kind: str) -> int:
-        s = _kind_size(kind, structs, variants)
-        if s is None:  # unreachable: checks demote infinite layouts
-            raise _Unsupported(f"boundary box of {kind} has infinite layout")
-        return max(s, 8)
 
     n = len(rec.cases)
     op_ptrs, nps = [], []
@@ -5999,12 +6072,10 @@ def _emit_scope_artifacts(site: str, rec: _ScopeSite, sigs: Dict[str, _Sig],
     bl = [f"define internal i64 @{_scope_body_sym(site)}(ptr %env) {{",
           "entry:"]
     if _is_agg(bsig.ret):
-        mod.uses_malloc = True
-        bl.append(f"  %rbox = call ptr @malloc(i64 {box_size(bsig.ret)})"
-                  f"  ; boundary box: body result {bsig.ret} "
-                  "(write-once, leaks by design)")
-        bl.append(f"  call void @{mangle(rec.body_fn)}(ptr %rbox, ptr %env)")
-        bl.append("  %w = ptrtoint ptr %rbox to i64")
+        # Boundary-word ABI: the body already returns the word (boxing
+        # only where it must), so the thunk just forwards it.
+        bl.append(f"  %w = call i64 @{mangle(rec.body_fn)}(ptr %env)"
+                  f"  ; boundary-word body result {bsig.ret}")
         bl.append("  ret i64 %w")
     else:
         brty = _llscalar(bsig.ret)
@@ -6044,14 +6115,10 @@ def _emit_scope_artifacts(site: str, rec: _ScopeSite, sigs: Dict[str, _Sig],
                 avals.append(f"{_llscalar(pk)} {v}")
         avals.append("ptr %k")
         if _is_agg(csig.ret):
-            mod.uses_malloc = True
-            dl.append(
-                f"  %c{i}.rbox = call ptr @malloc(i64 {box_size(csig.ret)})"
-                f"  ; boundary box: case result {csig.ret} "
-                "(write-once, leaks by design)")
-            dl.append(f"  call void @{mangle(hfn)}"
-                      f"({', '.join([f'ptr %c{i}.rbox'] + avals)})")
-            dl.append(f"  %c{i}.w = ptrtoint ptr %c{i}.rbox to i64")
+            # Boundary-word ABI: the case fn returns the word itself.
+            dl.append(f"  %c{i}.w = call i64 @{mangle(hfn)}"
+                      f"({', '.join(avals)})"
+                      f"  ; boundary-word case result {csig.ret}")
             dl.append(f"  ret i64 %c{i}.w")
             continue
         crty = _llscalar(csig.ret)
@@ -6225,7 +6292,18 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
     # A word-uniform lambda NEVER uses the sret convention: its aggregate
     # return travels as a boundary-box pointer word (increment 16), so the
     # native signature stays `i64 (ptr env, i64 args...)`.
-    sret = _is_agg(sig.ret) and not is_uniform_lambda
+    #
+    # BOUNDARY-WORD RETURN (increment 17, work item 1): a handle-scope
+    # subfunction with an aggregate result does the same.  Its value ALWAYS
+    # continues as a boundary word — the body thunk and the dispatcher used
+    # to malloc a box, sret-fill it and return its pointer — so returning
+    # the word directly lets the shared to_word do the boxing, which the
+    # double-box elision can then skip entirely when the returned value
+    # already IS an immortal box (the fold-shaped `resume(...)` case).
+    # Scope members are only ever called by their own site's shims, so no
+    # other caller's convention is involved.
+    is_boundary_ret = info.is_scope_member and _is_agg(sig.ret)
+    sret = _is_agg(sig.ret) and not is_uniform_lambda and not is_boundary_ret
 
     counter = 0
 
@@ -6501,6 +6579,42 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                         return True
         return False
 
+    def readonly_indirect_arg(members: Sequence[str], pos: int) -> bool:
+        """READ-ONLY AGGREGATE ARGUMENT (increment 17, work item 2): true
+        when an aggregate argument at parameter position `pos` of an
+        INDIRECT closure call may pass a pointer to the caller's existing
+        storage instead of a fresh boundary box.
+
+        This reuses the direct-call copy-elision reasoning (writeback_map)
+        rather than repeating it: the box exists only to give the callee
+        something it may not write through and that outlives the call, and
+        NEITHER worry applies here.
+
+          * NO WRITER.  writeback_map records exactly the positions a
+            callee copies back out through the caller's pointer.  Every
+            statically-possible callee (a pinned lambda is one member; a
+            dynamic kind is all of them) must be word-uniform and must
+            leave this position out of its write-back set.  Word-uniform
+            eligibility already rejects @mut aggregate params outright
+            (_word_eligible), so this is a belt-and-braces re-check, not a
+            new assumption.  A member with no entry in the map is unknown
+            and boxes.
+          * NO LIFETIME GAP.  Unlike an effect boundary, an indirect call
+            is an ordinary synchronous call on THIS stack: our storage
+            provably outlives the callee's frame.  The callee cannot
+            re-export the pointer either — a parameter is never a
+            bbox_view, so passing it onward to a perform re-boxes a copy.
+
+        The receiver is oblivious: it decodes the word to a `ptr` and then
+        byval-copies (or elide-copy reads through it) exactly as before."""
+        for m in members:
+            if m not in word_uniform:
+                return False
+            rb = writeback_map.get(m)
+            if rb is None or pos in rb:
+                return False
+        return True
+
     # COPY ELISION (a): an aggregate param never redefined needs no entry
     # byval copy — nothing ever writes its storage (its only def is the
     # param itself; rebound params keep the copy + write-back, and a struct
@@ -6532,7 +6646,69 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
             return False
         return True
 
-    boxview: Set[str] = set()
+    # COPY ELISION (c): BOUNDARY-BOX VIEWS (increment 17).  A value whose
+    # single def RECEIVES a boundary word — a perform result, a resume
+    # result, a handle value, or the result of a word-uniform indirect
+    # closure call — is handed a pointer to a box the producer freshly
+    # malloc'd, filled once and never frees.  Instead of copying out of it,
+    # keep the pointer: the value becomes a box view exactly like (b).
+    #
+    # SAFETY (the write-once box invariant, stated precisely):
+    #   1. IMMORTAL.  Every box reaching those four channels is malloc'd by
+    #      to_word, by a scope body/case thunk, by a dynamic-default thunk
+    #      or by a word-uniform lambda's ret — and NO emitted path ever
+    #      frees one (emit_frees releases only @global blocks, provably
+    #      local Vecs, unique enum payload boxes and owned strings).  So
+    #      the pointer cannot dangle, not even when a coroutine stack is
+    #      torn down under an abort.
+    #   2. WRITE-ONCE.  The producer fills the box before the word leaves
+    #      it and nothing writes it afterwards: handler cases are scope
+    #      members, which never copy out through a param pointer, and the
+    #      word-uniform ABI refuses @mut aggregate params outright.
+    #   3. UNCHANGED BY US.  read_only_agg pins the receiver to a single
+    #      def that never reaches a callee write-back position, so this
+    #      frame cannot write the value either.
+    # Hence the box's contents equal this value forever, and reading
+    # through the pointer is observationally identical to reading a copy.
+    def _is_boundary_result(op: tuple) -> bool:
+        """True when op's destination receives an IMMORTAL boundary-box
+        word.  A perform of an op no scope lists is NOT one: it lowers to
+        a direct sret call into our own storage instead."""
+        if op[0] == "perform":
+            return info.default_performs.get((op[2], op[3])) is None
+        if op[0] != "let" or len(op) != 4:
+            return False
+        rhs = op[2]
+        if rhs[0] in ("resume", "handle_scope"):
+            return True
+        if rhs[0] == "call" and rhs[1] in info.def_count:
+            ck = kinds.get(rhs[1], I64)
+            if _is_closure(ck):
+                # Only the word-uniform indirect path returns a box; a
+                # pinned closure call is sret into our own storage.
+                return _is_dyn_closure(ck) or any(
+                    m in word_uniform for m in _closure_members(ck))
+        return False
+
+    # bbox_view ⊆ boxview: the views whose box is provably IMMORTAL, so
+    # their pointer may also be handed straight back out to another
+    # boundary (see to_word).  Views from (b) alias enum PAYLOAD boxes,
+    # which _unique_box_enums may free at frame exit — they read through
+    # the box but must never re-export its pointer across a boundary.
+    bbox_view: Set[str] = set()
+    for b in f.blocks:
+        for op in b.ops:
+            if not _is_boundary_result(op):
+                continue
+            bdst = op[1]
+            if not _is_agg(kinds.get(bdst, I64)):
+                continue
+            if bdst in cellset or bdst in init_globals or bdst in heapset:
+                continue
+            if read_only_agg(bdst):
+                bbox_view.add(bdst)
+
+    boxview: Set[str] = set(bbox_view)
     bv_changed = True
     while bv_changed:
         bv_changed = False
@@ -6558,6 +6734,11 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                     if _is_agg(kinds.get(bdst, I64)) and read_only_agg(bdst) \
                             and bdst not in info.dead_results:
                         boxview.add(bdst)
+                        # A copy of a view aliases the SAME box, so it
+                        # inherits that box's immortality (and nothing
+                        # else): a copy of a payload view stays payload.
+                        if bargs[0] in bbox_view:
+                            bbox_view.add(bdst)
                         bv_changed = True
 
     # COPY-IN/COPY-OUT struct params: the interpreter WRITES BACK a struct
@@ -6585,6 +6766,87 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
     writeback_params = [] if info.is_scope_member else [
         p for p in info.params
         if p in _mut_set and _is_struct(kinds.get(p, I64))]
+
+    # LOOP-INVARIANT BOXES (increment 17, work item 3).  A boundary box is
+    # a write-once copy of a value; when that value provably does not
+    # change, every iteration's box holds the same bytes, so ONE box can
+    # serve them all.  The cheap proof, deliberately narrow:
+    #   * the value's ONLY def is a block-0 op (or it is a parameter), and
+    #     block 0 is not itself in a CFG cycle, so it is filled exactly
+    #     once per invocation and block 0 dominates every other block;
+    #   * def_count == 1 and passed_to_rebound is false, so nothing —
+    #     neither this frame nor a callee's write-back — ever writes its
+    #     storage after that def (the same invariant elisions (a)/(b) rest
+    #     on);
+    #   * none of its boxing sites is in block 0 itself, so the hoisted
+    #     register (emitted at the END of block 0) dominates all of them;
+    #   * at least one boxing site is inside a cycle, i.e. there is
+    #     actually a per-iteration malloc to remove.
+    # Sharing one box is invisible: boxes are immortal and never written
+    # after the fill, so two receivers holding the same pointer read the
+    # same unchanging bytes they would have read from two identical
+    # copies.  Anything not matching keeps its per-site box.
+    _cycle_blocks = _blocks_in_cycles(f)
+
+    def _boxing_sites(b) -> List[str]:
+        """Values this block turns into a boundary box via to_word.  Only
+        the effect-boundary senders box now — indirect-call aggregate
+        arguments pass the caller's storage pointer instead."""
+        out: List[str] = []
+        for op in b.ops:
+            if op[0] == "perform" and info.default_performs.get(
+                    (op[2], op[3])) is None:
+                out.extend(a for a in op[4] if isinstance(a, str))
+            elif op[0] == "let" and len(op) == 4 and op[2][0] == "resume" \
+                    and len(op[3]) > 1:
+                out.append(op[3][1])
+        if b.term and b.term[0] == "ret" and (
+                is_uniform_lambda or is_boundary_ret):
+            out.append(b.term[1])
+        return out
+
+    hoist_box: Set[str] = set()
+    if f.blocks and 0 not in _cycle_blocks:
+        block0_defs = {op[1] for op in f.blocks[0].ops
+                       if op[0] in ("let", "perform") and len(op) >= 2
+                       and isinstance(op[1], str)}
+        in_block0 = set(_boxing_sites(f.blocks[0]))
+        for bi, b in enumerate(f.blocks):
+            if bi == 0 or bi not in _cycle_blocks:
+                continue
+            for v in _boxing_sites(b):
+                if v in hoist_box or v in in_block0:
+                    continue
+                vk = kinds.get(v, I64)
+                if not _is_agg(vk) or _kind_size(vk, structs, variants) is None:
+                    continue
+                if v in boxview or v in cellset or v in init_globals:
+                    continue  # already a pointer, or not plain storage
+                if not (v in info.params or v in block0_defs):
+                    continue
+                if info.def_count.get(v, 0) != 1 or passed_to_rebound(v):
+                    continue
+                hoist_box.add(v)
+
+    # value -> the i64 word of its hoisted box (filled at the end of bb0).
+    hoisted_word: Dict[str, str] = {}
+
+    def emit_hoisted_box(v: str, lines: List[str]) -> None:
+        k = kinds.get(v, I64)
+        size = _kind_size(k, structs, variants)
+        if size is None:  # unreachable: hoist_box screens infinite layouts
+            return
+        mod.uses_malloc = True
+        box = fresh()
+        lines.append(
+            f"  {box} = call ptr @malloc(i64 {max(size, 8)})"
+            f"  ; loop-invariant boundary box: {v} ({k}) — {v} never changes "
+            "after this point, so one write-once box serves every iteration "
+            "(immortal, leaks by design)")
+        agg_copy(_agg_ty(k), use(v, lines), box, lines)
+        w = fresh()
+        lines.append(f"  {w} = ptrtoint ptr {box} to i64")
+        hoisted_word[v] = w
 
     def emit_writebacks(lines: List[str]) -> None:
         for p in writeback_params:
@@ -6637,7 +6899,8 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
             lines.append(f"  store ptr {cur}, ptr {strown_ref(v)}"
                          f"  ; owned string {v}: fresh malloc now owned")
 
-    def to_word(k: str, v: str, lines: List[str]) -> str:
+    def to_word(k: str, v: str, lines: List[str],
+                src: Optional[str] = None) -> str:
         """Reinterpret a value of word kind k as the opaque i64 element word
         the native Vec ABI stores (the runtime never inspects elements).
         Aggregate kinds (effect-boundary senders, increment 14, and
@@ -6645,8 +6908,27 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
         other word position demotes aggregates in the checks) box: a
         fresh malloc'd write-once copy, its pointer as the word
         (immortal, leaks by design — it can never dangle across coroutine
-        switches or across an indirect call)."""
+        switches or across an indirect call).
+
+        DOUBLE-BOX ELISION (increment 17): when `src` names a value that is
+        ALREADY an immortal boundary box (a bbox_view — see copy elision
+        (c)), the pointer passes straight through instead of malloc'ing a
+        second box and copying the same bytes into it.  Sound because the
+        box is immortal, write-once and unmodified since it was filled, so
+        the copy would be byte-identical and just as long-lived."""
         if _is_agg(k):
+            if src is not None and src in bbox_view:
+                t = fresh()
+                lines.append(
+                    f"  {t} = ptrtoint ptr {v} to i64"
+                    f"  ; elide-box: {src} already IS an immortal write-once "
+                    f"boundary box ({k}); its pointer passes through")
+                return t
+            if src is not None and src in hoisted_word:
+                lines.append(
+                    f"  ; elide-box: {src} ({k}) reuses its loop-invariant "
+                    "box, filled once in the entry block")
+                return hoisted_word[src]
             size = _kind_size(k, structs, variants)
             if size is None:  # unreachable: checks demote infinite layouts
                 raise _Unsupported(f"boundary box of {k} has infinite layout")
@@ -6682,9 +6964,21 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
         """Decode an effect-boundary word into dst per dst's kind: word
         kinds via from_word; aggregate kinds copy OUT of the sender's
         boundary box into dst's own storage (the box stays immortal and
-        write-once — value semantics at both edges, increment 14)."""
+        write-once — value semantics at both edges, increment 14).
+
+        A bbox_view destination (copy elision (c)) skips the copy-out
+        entirely: it KEEPS the producer's box pointer and reads through
+        it, which is where the double-boxing on aggregate resume results
+        disappears."""
         k = kind(dst)
-        if _is_agg(k):
+        if dst in bbox_view:
+            p = fresh()
+            lines.append(f"  {p} = inttoptr i64 {w} to ptr")
+            lines.append(
+                f"  store ptr {p}, ptr {bp_ref(dst)}"
+                f"  ; elide-copy: {dst} views the producer's write-once "
+                f"boundary box ({k}) instead of copying out of it")
+        elif _is_agg(k):
             p = fresh()
             lines.append(f"  {p} = inttoptr i64 {w} to ptr"
                          f"  ; boundary box: {k}")
@@ -7270,7 +7564,7 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                 # exact point and returns the resumed value.
                 _, pdst, peffect, pop, pargs = op[0], op[1], op[2], op[3], op[4]
                 for i, a in enumerate(pargs):
-                    w = to_word(kind(a), use(a, lines), lines)
+                    w = to_word(kind(a), use(a, lines), lines, src=a)
                     p = fresh()
                     lines.append(
                         f"  {p} = getelementptr inbounds "
@@ -7583,11 +7877,29 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                     lines.append(f"  {envv} = load ptr, ptr {envpp}")
                     if is_word:
                         avals = [f"ptr {envv}"]
-                        for a in opargs:
+                        for ai, a in enumerate(opargs):
+                            ak = kind(a)
+                            # READ-ONLY AGGREGATE ARGUMENT (increment 17):
+                            # pass a pointer to OUR existing storage
+                            # instead of a fresh box — the same reasoning
+                            # the direct-call elide-copy pass uses.
+                            if _is_agg(ak) and readonly_indirect_arg(
+                                    members, ai):
+                                av = use(a, lines)
+                                t = fresh()
+                                lines.append(
+                                    f"  {t} = ptrtoint ptr {av} to i64"
+                                    f"  ; elide-box: read-only aggregate "
+                                    f"argument {a} ({ak}) passes the caller's "
+                                    "storage pointer (no member writes "
+                                    "through it, and the call is synchronous "
+                                    "on this stack)")
+                                avals.append(f"i64 {t}")
+                                continue
                             # to_word boxes struct/enum args (malloc +
                             # write-once copy in, pointer as the word);
                             # scalars pass raw, with no allocation.
-                            w = to_word(kind(a), use(a, lines), lines)
+                            w = to_word(ak, use(a, lines), lines, src=a)
                             avals.append(f"i64 {w}")
                         v = fresh()
                         lines.append(
@@ -8042,7 +8354,8 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                 # runtime unparks the body and returns its completion value
                 # (deep semantics) — or never returns on abort unwinding.
                 kp = use(opargs[0], lines)
-                w = to_word(kind(opargs[1]), use(opargs[1], lines), lines)
+                w = to_word(kind(opargs[1]), use(opargs[1], lines), lines,
+                            src=opargs[1])
                 mod.runtime_syms.add("mx_resume")
                 v = fresh()
                 lines.append(f"  {v} = call i64 @mx_resume(ptr {kp}, i64 {w})")
@@ -8096,7 +8409,7 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                         lines.append(
                             f"  store {_llscalar(ck)} {use(vn, lines)}, "
                             f"ptr {p}")
-                _emit_scope_artifacts(site, rec, sigs, structs, variants, mod)
+                _emit_scope_artifacts(site, rec, sigs, mod)
                 eg = mod.intern_string(rec.effect)
                 mod.runtime_syms.add("mx_handle")
                 v = fresh()
@@ -8122,6 +8435,17 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                 is_lit = rk == "const" or (
                     rk == "copy" and opargs and opargs[0] in str_lit_temps)
                 owned_str_update(dst, is_lit, lines)
+
+        if bi == 0 and not terminated and hoist_box:
+            # LOOP-INVARIANT BOXES: fill them once, here at the end of the
+            # entry block (which dominates every other block), so the
+            # boundary sites inside the loop reuse one box instead of
+            # malloc'ing a fresh copy of the same unchanging bytes each
+            # iteration.  Every hoisted value is defined by then (its only
+            # def is a block-0 op or a parameter) and none of its boxing
+            # sites is in block 0, so the register dominates all its uses.
+            for hv in sorted(hoist_box):
+                emit_hoisted_box(hv, lines)
 
         if not terminated:
             t = b.term
@@ -8149,7 +8473,7 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                     agg_copy(_agg_ty(sig.ret), src, "%agg.ret", lines)
                     emit_frees(lines)
                     lines.append("  ret void")
-                elif is_uniform_lambda:
+                elif is_uniform_lambda or is_boundary_ret:
                     if _is_agg(sig.ret) and kind(t[1]) != sig.ret:
                         raise _Unsupported(
                             f"return value {t[1]!r} is {kind(t[1])}, "
@@ -8158,12 +8482,15 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                     emit_writebacks(lines)
                     # Encode BEFORE the frees: an aggregate return boxes a
                     # copy (to_word), and the value may live in a heap
-                    # block emit_frees is about to release.
-                    rw = to_word(sig.ret, rv, lines)
+                    # block emit_frees is about to release.  When the value
+                    # already IS an immortal boundary box, to_word passes
+                    # its pointer through and no box is allocated at all.
+                    rw = to_word(sig.ret, rv, lines, src=t[1])
                     emit_frees(lines)
+                    what = ("word-uniform lambda return" if is_uniform_lambda
+                            else "handle-scope boundary-word return")
                     lines.append(
-                        f"  ret i64 {rw}  ; word-uniform lambda return "
-                        f"({sig.ret} encoded)")
+                        f"  ret i64 {rw}  ; {what} ({sig.ret} encoded)")
                 else:
                     rv = use(t[1], lines)
                     emit_writebacks(lines)
@@ -8219,9 +8546,12 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                     for ln in dec)
         else:
             pdecls.append(f"{_llparam(pk)} %a.{_sanitize(p)}")
-    rty = "i64" if is_uniform_lambda else ("void" if sret else _llscalar(sig.ret))
+    rty = ("i64" if (is_uniform_lambda or is_boundary_ret)
+           else ("void" if sret else _llscalar(sig.ret)))
     out = [f"define {rty} @{mangle(f.name)}({', '.join(pdecls)}) {{"
-           + ("  ; word-uniform lambda ABI" if is_uniform_lambda else "")]
+           + ("  ; word-uniform lambda ABI" if is_uniform_lambda else
+              ("  ; handle-scope boundary-word ABI" if is_boundary_ret
+               else ""))]
     entry: List[str] = list(uniform_decodes)
     for n in slots:
         entry.append(f"  {slot_ref(n)} = alloca {llty(n)}  ; mir slot: {n}")
