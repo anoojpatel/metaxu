@@ -44,6 +44,7 @@ for what is deliberately out of scope.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from typing import Any, Iterable, Iterator
 
 import metaxu.metaxu_ast as fast
@@ -378,6 +379,11 @@ class _Resolver:
         # (hir.build's `_const_dims`), and a plain type parameter is the
         # argument of the `type_of` reflection intrinsic.
         self.type_params: list[set[str]] = [set()]
+        # How many named-function bodies enclose the walk. A `fn` inside one
+        # is a NESTED function, which `visit_function` isolates from the
+        # enclosing locals; an `implement`-block method is visited at depth 0
+        # and keeps its block's type parameters.
+        self._fn_depth = 0
         self._reported: set[int] = set()
 
     # -- scope helpers --------------------------------------------------
@@ -386,6 +392,29 @@ class _Resolver:
 
     def pop(self) -> None:
         self.scopes.pop()
+
+    @contextmanager
+    def isolated(self) -> Iterator[None]:
+        """Walk a body that `hir` compiles into its OWN top-level function.
+
+        Such a body is not a closure: `HIRBuilder.build` emits it as a
+        separate `HFun` whose only bindings are its own parameters, so it
+        cannot see any enclosing function's locals or type parameters.  The
+        walk must match, or the pass reports nothing and the program dies at
+        run time with `Unbound variable` — the exact failure it exists to
+        prevent.
+
+        `scopes[0]` survives: it holds the module-level `let` constants, which
+        `hir.build` really does hoist into `__module_init` and publish as
+        globals before any function runs.
+        """
+        saved_scopes, saved_type_params = self.scopes, self.type_params
+        self.scopes = [saved_scopes[0]]
+        self.type_params = [saved_type_params[0]]
+        try:
+            yield
+        finally:
+            self.scopes, self.type_params = saved_scopes, saved_type_params
 
     def bind(self, name: Any) -> None:
         if isinstance(name, str) and name:
@@ -778,11 +807,20 @@ class _Resolver:
                 for op in getattr(node, "operations", None) or []:
                     default = getattr(op, "_default_expr", None)
                     if default is not None:
-                        self.push()
-                        for p in getattr(op, "params", None) or []:
-                            self.bind(getattr(p, "name", None))
-                        self.visit(default)
-                        self.pop()
+                        # `hir.build` compiles the default into a standalone
+                        # `__effect_default$Eff$op` function taking exactly the
+                        # operation's parameters, so it is isolated for the
+                        # same reason a nested `fn` is: an `effect` declared
+                        # INSIDE a function body used to let its default read
+                        # the enclosing locals here and then die at run time
+                        # with `Unbound variable` inside
+                        # `__effect_default$Eff$op`.
+                        with self.isolated():
+                            self.push()
+                            for p in getattr(op, "params", None) or []:
+                                self.bind(getattr(p, "name", None))
+                            self.visit(default)
+                            self.pop()
             return
 
         # ---------- everything else: structural recursion ----------
@@ -815,17 +853,37 @@ class _Resolver:
         self.bind_pattern(pattern)
 
     def visit_function(self, node: Any) -> None:
-        self.push()
-        self.type_params.append(self._type_param_names(node))
-        for p in getattr(node, "params", None) or []:
-            self.bind(p if isinstance(p, str) else getattr(p, "name", None))
-        # A method body may read `self` even when the receiver is implicit.
-        self.bind("self")
-        self.visit_body(getattr(node, "body", None))
-        self.type_params.pop()
-        self.pop()
+        # A NESTED `fn` does not close over the enclosing function.
+        # `HIRBuilder.build`'s hoisting walk lifts every FunctionDeclaration —
+        # at any depth — into the flat MIR namespace as its own HFun whose
+        # only bindings are its own parameters; nothing captures an
+        # environment (only a LambdaExpression does, and `visit_lambda` below
+        # is deliberately left extending the enclosing scope). Extending the
+        # scope stack here therefore made the pass MISS the exact defect it
+        # exists to catch: `fn main() { let secret = 5; fn inner() -> int {
+        # secret + 1 } inner() }` compiled clean and died at run time with
+        # `Unbound variable 'secret'`.
+        #
+        # Only a nested function is isolated. An `implement`-block method is
+        # visited at function depth 0, so it keeps the block's type
+        # parameters, which hir's `_const_dims` and `type_of` really do bind.
+        with self.isolated() if self._fn_depth else _nothing():
+            self._fn_depth += 1
+            self.push()
+            self.type_params.append(self._type_param_names(node))
+            for p in getattr(node, "params", None) or []:
+                self.bind(p if isinstance(p, str) else getattr(p, "name", None))
+            # A method body may read `self` even when the receiver is implicit.
+            self.bind("self")
+            self.visit_body(getattr(node, "body", None))
+            self.type_params.pop()
+            self.pop()
+            self._fn_depth -= 1
 
     def visit_lambda(self, node: Any) -> None:
+        # Lambdas DO capture: `hir` lowers a LambdaExpression to a closure
+        # over the enclosing environment, so extending the scope stack is
+        # correct here and only here.
         self.push()
         for p in getattr(node, "params", None) or []:
             self.bind(p if isinstance(p, str) else getattr(p, "name", None))
@@ -839,6 +897,12 @@ class _Resolver:
         for m in getattr(node, "methods", None) or []:
             self.visit(m)
         self.type_params.pop()
+
+
+@contextmanager
+def _nothing() -> Iterator[None]:
+    """A do-nothing `with` body (a TOP-LEVEL function is already isolated)."""
+    yield
 
 
 def _as_list(value: Any) -> list[Any]:
