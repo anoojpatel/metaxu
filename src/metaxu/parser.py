@@ -14,6 +14,8 @@ from metaxu.errors import CompileError, SourceLocation, register_source
 from metaxu.compiler.desugar import IMPL_SEP
 import bisect
 import functools
+import os
+import re
 import traceback
 import logging
 
@@ -36,6 +38,19 @@ _FSTRING_SEGMENT_PARSER = None
 # marker so a user function of the same name cannot capture it.  Without
 # it a user `fn to_string` silently rewrote every `f"{x}"` in the program.
 BUILTIN_CALL_PREFIX = f"__builtin{IMPL_SEP}"
+
+# Tuples are anonymous structs (see compiler/hir.py's TUPLE_STRUCT_PREFIX
+# for the representation and why).  Spelled here rather than imported so
+# the parser stays free of the HIR builder; a test pins the two equal.
+# `(A, B)` in type position names the same struct `(a, b)` builds in
+# expression position, and `let (a, b) = ..` reads its `_0of2` / `_1of2`
+# fields back.
+TUPLE_TYPE_PREFIX = "__tuple"
+
+
+def tuple_field_name(index: int, arity: int) -> str:
+    """Field name for element `index` of an `arity`-tuple (`_0of2`)."""
+    return f"_{index}of{arity}"
 
 
 class _GrammarNamespace:
@@ -462,6 +477,83 @@ class Parser:
         else:
             p[1].bindings.append(p[1].add_child(p[3]))
             p[0] = p[1]
+
+    # -- tuple destructuring --------------------------------------------
+    #
+    # `let (a, b) = e;` and `for (a, b) in e { .. }` DESUGAR AT PARSE TIME
+    # into a `__`-prefixed temporary plus one ordinary field read per name:
+    #
+    #     let __tuple_at12 = e, a = __tuple_at12._0of2, b = __tuple_at12._1of2;
+    #
+    # A tuple is an anonymous struct whose fields are `_0of2`, `_1of2`, ...
+    # (hir.TUPLE_STRUCT_PREFIX), so the halves are plain field accesses and
+    # NOTHING downstream learns a new concept: binding modes, the borrow
+    # checker, HIR, MIR and both backends see exactly what
+    # `let p = e; let a = p._0of2;` would produce — including the
+    # arity-mismatch error, since `_0of2` does not exist on a `__tuple3`.
+    #
+    # The temp name is derived from the SOURCE FILE and OFFSET rather than
+    # from a counter: one Parser instance is shared across files
+    # (compiler/shared_parser.py), so a counter would make the generated
+    # name depend on how many files had been parsed before — i.e. on test
+    # ordering, which the frozen-AST and MIR goldens would see.  The file
+    # half is not decoration: a MODULE-LEVEL `let (a, b) = ..` is hoisted
+    # into `__module_init` and published as a module constant, and module
+    # constants share ONE global namespace, so two modules destructuring at
+    # the same offset collided ("constant '__tuple_at4' is declared in both
+    # module 'ma' and module 'mb'") on perfectly good code.  Every `__` name
+    # is the compiler's (module_loader.check_reserved_names), so no user
+    # name can collide with either half.
+
+    def _tuple_temp_name(self, offset: int) -> str:
+        stem = re.sub(r"[^0-9A-Za-z_]", "_",
+                      os.path.basename(
+                          getattr(self.lexer, "source_file", "") or "mem"
+                      ).rsplit(".", 1)[0]) or "mem"
+        return f"__tuple_{stem}_at{offset}"
+
+    def _tuple_destructure_bindings(self, names, source_expr, temp, mode,
+                                    kw, start_pos, end_pos):
+        """The `[temp = source] + [name_i = temp._iofN]` binding list.
+
+        Raises on the shapes that have no tuple to destructure: a single
+        name (there are no 1-tuples — `(e)` is grouping) and a repeated
+        name (which would silently keep only the last element).
+        """
+        if len(names) < 2:
+            raise CompileError(
+                message=f"`{kw} ({names[0] if names else ''}) ..` destructures "
+                        "a 1-element tuple, which does not exist",
+                error_type="ParseError",
+                location=self.location_for_offsets(start_pos, end_pos),
+                notes=["`(e)` is parenthesized grouping; a tuple has two or "
+                       "more elements",
+                       f"To bind one name, write `{kw} "
+                       f"{names[0] if names else 'x'} ..`"])
+        if len(names) != len(set(names)):
+            dupes = sorted({n for n in names if names.count(n) > 1})
+            raise CompileError(
+                message="duplicate name in tuple destructuring: "
+                        + ", ".join(dupes),
+                error_type="ParseError",
+                location=self.location_for_offsets(start_pos, end_pos),
+                notes=[f"Each element of `{kw} (a, b) ..` binds a distinct "
+                       "name; write `_`-suffixed names to keep both"])
+        bindings = []
+        if source_expr is not None:
+            bindings.append(ast.LetBinding(temp, source_expr, mode=mode))
+        n = len(names)
+        for i, name in enumerate(names):
+            bindings.append(ast.LetBinding(
+                name, ast.FieldAccess(temp, [tuple_field_name(i, n)]),
+                mode=mode))
+        return bindings
+
+    def p_let_statement_destructuring(self, p):
+        '''let_statement : LET binding_prefix LPAREN identifier_seq RPAREN EQUALS expression'''
+        temp = self._tuple_temp_name(p.lexpos(3))
+        p[0] = ast.LetStatement(bindings=self._tuple_destructure_bindings(
+            p[4], p[7], temp, p[2], "let", p.lexpos(1), p.lexpos(5) + 1))
 
     def p_let_binding(self, p):
         '''let_binding : LET binding_prefix IDENTIFIER EQUALS expression
@@ -1202,6 +1294,17 @@ class Parser:
         '''for_statement : FOR IDENTIFIER IN expression LBRACE statement_list RBRACE'''
         p[0] = ast.ForStatement(p[2], p[4], p[6] or [])
 
+    def p_for_statement_destructuring(self, p):
+        '''for_statement : FOR LPAREN identifier_seq RPAREN IN expression LBRACE statement_list RBRACE'''
+        # `for (a, b) in pairs { .. }` makes the loop variable a
+        # `__`-prefixed temp and PREPENDS the same field reads that
+        # `let (a, b) = ..` desugars to, so the loop body sees ordinary
+        # bindings.  Nothing below the parser learns a new loop form.
+        temp = self._tuple_temp_name(p.lexpos(2))
+        unpack = ast.LetStatement(bindings=self._tuple_destructure_bindings(
+            p[3], None, temp, None, "for", p.lexpos(1), p.lexpos(4) + 1))
+        p[0] = ast.ForStatement(temp, p[6], [unpack] + (p[8] or []))
+
     def p_match_expression(self, p):
         '''match_expression : MATCH expression LBRACE arm_list RBRACE'''
         p[0] = ast.MatchExpression(p[2], p[4])
@@ -1535,6 +1638,16 @@ class Parser:
             p[0] = [self._effect_app_from_type(p[1])]
         else:
             p[0] = p[1] + [self._effect_app_from_type(p[3])]
+
+    def p_type_postfix_tuple(self, p):
+        '''type_postfix : LPAREN type_expression COMMA type_list RPAREN'''
+        # `(A, B)` is the type of `(a, b)`, which lowers to the anonymous
+        # struct `__tuple2` (hir.TUPLE_STRUCT_PREFIX), so the type is that
+        # struct applied to the element types.  A single parenthesized type
+        # `(A)` is deliberately NOT a 1-tuple — the comma is required, as it
+        # is in the expression form.
+        args = [p[2]] + list(p[4])
+        p[0] = ast.TypeApplication(f"{TUPLE_TYPE_PREFIX}{len(args)}", args)
 
     def p_type_postfix(self, p):
         '''type_postfix : IDENTIFIER

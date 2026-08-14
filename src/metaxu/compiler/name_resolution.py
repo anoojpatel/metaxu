@@ -562,7 +562,10 @@ class _Resolver:
             for a in getattr(p, "arguments", None) or []:
                 self.bind_pattern(a)
             return
-        if isinstance(p, fast.ListLiteral):
+        # A tuple pattern (`(x, y) => ..`) binds each element, exactly like a
+        # list pattern.  Without this every tuple-pattern binder read as an
+        # undefined variable in the arm body.
+        if isinstance(p, (fast.ListLiteral, fast.TupleLiteral)):
             for e in getattr(p, "elements", None) or []:
                 self.bind_pattern(e)
             return
