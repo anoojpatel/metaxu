@@ -58,7 +58,7 @@ object, a seeded RNG singleton, an aborting `assert`).
 | `std.random` | implemented (seeded only) | `effect Random { next }` with **no default** (see below); `with_seed` (xorshift64), `with_sequence` (scripted draws); `next_below`, `next_range`, `next_bool`, `next_sign`, `choose`, `take_random`, `shuffle` |
 | `std.parse` | implemented | `parse_int` (Option) / `parse_int_or` / `parse_int_or_fail` (Fail), `parse_bool`, `digit_value`, `is_digit`, `is_space`, `trim`, `split_on`, `parse_int_vec` |
 | `std.test` | implemented | `effect Report { passed, failed }`; `assert_true`/`assert_false`/`assert_eq`/`assert_ne`/`check`/`check_eq`; runners `run_suite` (failure count), `run_tests` (`TestReport`), `collect_failures` |
-| `std.iter` | implemented | the adapters `std.stream` defers, over a real `Pair` struct: `enumerate`, `zip`, `zip_with`, `take_while`, `drop_while`, `step_by`, `windows`, `chunks` |
+| `std.iter` | implemented | the adapters `std.stream` defers, over real tuples: `enumerate`, `zip`, `zip_with`, `take_while`, `drop_while`, `step_by`, `windows`, `chunks` |
 
 Design notes worth knowing before using them:
 
@@ -96,11 +96,13 @@ Design notes worth knowing before using them:
   and `run_tests` answers totals plus every failure's description. Plain
   calls prefer a user function (`docs/name_precedence.md`), so importing
   the module is all it takes.
-- **`std.iter` uses a `Pair` struct where a tuple would go.** Metaxu has
-  no tuple type or tuple destructuring (gap 8), which is exactly why
-  `std.stream` defers `enumerate`/`zip`. `p.first` / `p.second` is what
-  `let (a, b) = p` would have been, and it is a plain value closures,
-  Vecs and handlers already carry.
+- **`std.iter` emits real tuples.** It used to carry a hand-rolled
+  `struct Pair<A, B>` with `p.first` / `p.second` accessors, because
+  Metaxu had no tuples (gap 8) — which is also why `std.stream` defers
+  `enumerate`/`zip`. Gap 8 is fixed, so the struct and its `pair`
+  constructor are gone: `enumerate` emits `(index, element)`, `zip`
+  emits `(a, b)`, and consumers write `let (i, x) = p;`,
+  `for (i, x) in ps { .. }` or `match p { (i, x) => .. }`.
 - **`std.iter.zip`/`zip_with` realize their SECOND stream eagerly** (into
   a Vec) before pulling the first. Metaxu's continuations are single-shot
   and delimited, so two producers cannot be stepped in lockstep without
@@ -177,8 +179,8 @@ Deferred inside the round-2 modules, with the blocker:
 - No `Stream` trait / implicit impls: producers are explicitly thunks.
 - `panic_on_fail`, `or_panic`, `retry_until_success` (Fail.an) are
   deferred — see gaps below for the specific blockers.
-- `enumerate`, `zip`, `map2` (Stream.an) live in **`std.iter`**, over a
-  `Pair` struct standing in for the tuple Metaxu does not have.
+- `enumerate`, `zip`, `map2` (Stream.an) live in **`std.iter`**, and
+  emit real tuples (they emitted a `Pair` struct until gap 8 was fixed).
   `intersperse` is still deferred (see the round-2 deferrals above).
 
 ## Language gaps this library exposed
@@ -205,8 +207,9 @@ while building it (status as of this port):
    the arm was silently skipped downstream of the parser. `()` now
    lowers as the unit value — `op() -> ()` is a valid ABORT-style arm
    (returns unit without resuming) — and an arm whose body cannot lower
-   is a loud compile error instead of a vanished arm. Non-empty tuple
-   literals are a loud error too (still no tuple runtime).
+   is a loud compile error instead of a vanished arm. (Non-empty tuple
+   literals were a loud error at the time for want of a runtime
+   representation; they are real values now — gap 8.)
 4. **FIXED — mutations of captured scalars write back.** A binding that
    a closure, handler arm, or delimited handle body assigns to is boxed
    into one shared cell, so the write is visible in every frame that
@@ -234,10 +237,36 @@ while building it (status as of this port):
    reached through another index, a string, a slice target) is a loud
    error, never a no-op. `std.map.remove` now shifts elements in place
    instead of rebuilding through pop/push (still O(n), as documented).
-8. **No tuple destructuring** (`let (a, b) = p` is a parse error), which
-   is what defers `enumerate`/`zip` in `std.stream`: they would emit
-   pairs no consumer could take apart. (Zip *comprehensions* do work:
-   `f(a, b) for (a, b) in (xs, ys)` iterates two vectors in lockstep.)
+8. **FIXED — tuples exist.** `(a, b)` / `(a, b, c)` are values, `(A, B)`
+   is a type, and `let (a, b) = p;`, `match p { (x, y) => .. }` and
+   `for (k, v) in pairs { .. }` all destructure. A tuple **is an
+   anonymous struct**: `(a, b)` lowers to
+   `alloc_struct "__tuple2" { _0of2: a, _1of2: b }` and a pattern reads
+   its elements with `field_get`, so MIR gained no op, the interpreter
+   gained no value class, and native codegen inherited the whole struct
+   path (layout, GEPs, byval params, sret returns) with no backend
+   change of its own.
+   The field name repeats the arity on purpose: inference has no tuple
+   type, so nothing upstream can reject `let (a, b) = triple`, and with
+   plain `_0`/`_1` names that would silently bind a *prefix*. Because
+   `_0of2` does not exist on a `__tuple3`, an arity mismatch is a loud
+   error in either direction with no new runtime check.
+   There are **no 1-tuples**: `(e)` is parenthesized grouping (it always
+   was), `(e,)` is a syntax error, `()` is unit, and `let (a) = e` /
+   `()` in pattern position are rejected by name rather than given a
+   `__tuple1` layout.
+   Zip *comprehensions* keep their old meaning:
+   `f(a, b) for (a, b) in (xs, ys)` is still lockstep iteration over two
+   sequences, not a tuple value. A shorthand lambda `(a, b) -> e` is
+   still a two-parameter lambda, so lambda parameters are the one
+   position that does not destructure.
+   Still open: nested destructuring in a `let`/`for` binder list
+   (`let ((a, b), c) = ..` — a match arm nests fine), tuple element
+   access without a pattern (there is no `p.0`), and two *different*
+   tuple types of the same arity in one module, or a tuple nested
+   directly inside a same-arity tuple, which demote to the interpreter
+   with a reason instead of miscompiling.
+   Tests: `src/metaxu/compiler/tests/test_tuples.py`.
 9. **Unqualified keywords**: `try`, `catch`, `some`, `none` are reserved
    and unusable as function names, even where the grammar would be
    unambiguous (contextual-keyword handling already exists for the
@@ -246,9 +275,10 @@ while building it (status as of this port):
    with no production, no AST node and no mention in the docs, and
    de-reserved it along with `box` and `async`.
 
-Items 3, 4, 5, 6 and 7 are fixed (regression tests:
-`src/metaxu/compiler/tests/test_silent_seams.py`); the remaining gaps
-(8, 9) are parse-time-loud, not silent.
+Items 3, 4, 5, 6, 7 and 8 are fixed (regression tests:
+`src/metaxu/compiler/tests/test_silent_seams.py`, and
+`test_tuples.py` for 8); the remaining gap (9) is parse-time-loud, not
+silent.
 
 10. Block-bodied lambdas (`fn() -> { stmt; stmt }`) do not parse in
     expression position — only expression-bodied lambdas work. Found
