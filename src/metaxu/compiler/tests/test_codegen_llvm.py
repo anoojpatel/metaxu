@@ -4794,9 +4794,15 @@ fn main() -> int { pick(true) }
 
 def test_aggregate_args_through_indirect_call_now_box():
     # Increment 16: two lambdas taking a STRUCT parameter reach one site.
-    # The struct arg boxes (malloc + write-once copy in) and travels as a
-    # pointer word; both lambdas take `i64 %aw.p` and copy out.  This
-    # replaces the increment-13 scalar-only demotion.
+    # The struct arg travels as a pointer word and both lambdas take
+    # `i64 %aw.p` and copy out.  This replaces the increment-13
+    # scalar-only demotion.
+    #
+    # Increment 17 (work item 2): the pointer word is now the CALLER'S
+    # STORAGE, not a fresh box — neither lambda writes through the
+    # position (writeback_map) and the call is synchronous on this stack,
+    # so the box bought nothing.  The receiving ABI is byte-for-byte the
+    # same; only the allocation is gone.
     ir = llvm_from_source("""
 struct P { a: int }
 fn apply(f: fn(P) -> int, p: P) -> int { f(p) }
@@ -4809,9 +4815,13 @@ fn main() -> int {
 """)
     assert count_placeholders(ir) == 0
     assert "scalar-only" not in ir
-    assert re.search(
+    # NO box for the argument any more.
+    assert not re.search(
         r"call ptr @malloc\(i64 \d+\)"
         r"  ; boundary box: struct:P \(write-once, leaks by design\)", ir)
+    assert re.search(
+        r"ptrtoint ptr %[\w.]+ to i64  ; elide-box: read-only aggregate "
+        r"argument \w+ \(struct:P\) passes the caller's storage pointer", ir)
     assert re.search(
         r"call i64 %\w+\(ptr %\w+, i64 %\w+\)"
         r"  ; indirect closure call \(.*\), word-uniform ABI", ir)
@@ -5048,11 +5058,23 @@ def test_std_stream_full_surface_census():
             rf"^define (?:i64|void|ptr|double) @mx_std_stream_{fn}\(",
             ir, re.M), fn
     assert count_placeholders(ir) == 0
-    # find's handle value is a boxed Option at the boundary.
+    # find's handle value is a boxed Option at the boundary.  The producer
+    # side boxes it inside the subfunction now (the boundary-word return
+    # ABI, increment 17) rather than in the shim, so the shim just
+    # forwards the word...
+    assert re.search(
+        r"call i64 @mx_std_stream_find\$?\w*\(ptr %env\)"
+        r"  ; boundary-word body result enum:Option", ir) or re.search(
+        r"; boundary-word (?:body|case) result enum:Option", ir)
     assert re.search(
         r"call ptr @malloc\(i64 \d+\)"
-        r"  ; boundary box: (?:body|case) result enum:Option", ir)
-    assert re.search(r"; boundary box: enum:Option", ir)
+        r"  ; boundary box: enum:Option[^\n]*\(write-once, leaks by design\)",
+        ir)
+    # ...and the RECEIVER now views that immortal write-once box instead
+    # of copying the Option out of it (increment 17, work item 1).
+    assert re.search(
+        r"; elide-copy: \w+ views the producer's write-once boundary box "
+        r"\(enum:Option", ir)
 
 
 @needs_clang
@@ -5156,9 +5178,12 @@ def test_struct_across_effect_boundary_boxes_structurally():
         r"call ptr @malloc\(i64 16\)"
         r"  ; boundary box: struct:Point \(write-once, leaks by design\)",
         ir)) >= 2
-    # receiver-side copy-outs: inttoptr the word, aggregate load/store
+    # receiver side: the perform result / handle value VIEW the producer's
+    # immortal write-once box instead of copying out of it (increment 17,
+    # work item 1) — the ABI word is unchanged, only the copy is gone.
     assert re.search(
-        r"inttoptr i64 %t\d+ to ptr  ; boundary box: struct:Point", ir)
+        r"; elide-copy: \w+ views the producer's write-once boundary box "
+        r"\(struct:Point\)", ir)
     # dispatcher hands the case fn the box pointer for its byval-copy
     assert re.search(
         r"inttoptr i64 %c0\.a0w to ptr  ; boundary box: case param "
@@ -5755,16 +5780,30 @@ def test_indirect_aggregate_param_and_return_box_at_the_site():
     for body in re.findall(r"^define i64 @mx_main_lambda\d+.*?^\}",
                            ir, re.M | re.S):
         assert "%agg.ret" not in body
-    # Caller side: box the argument in, call, copy the result box out.
+    # Caller side (increment 17): the ARGUMENT no longer boxes — it passes
+    # our storage pointer, since no member writes through it and the call
+    # is synchronous.  The RESULT box (the callee's ret) is unavoidable
+    # (the callee's storage dies), but the caller views it instead of
+    # copying it out.
     assert re.search(
-        r"call ptr @malloc\(i64 16\)"
-        r"  ; boundary box: struct:Point \(write-once, leaks by design\)", ir)
+        r"ptrtoint ptr %[\w.]+ to i64  ; elide-box: read-only aggregate "
+        r"argument \w+ \(struct:Point\)", ir)
+    # apply() itself allocates nothing: its argument box is gone
+    apply_body = re.search(r"^define void @mx_apply\(.*?^\}", ir,
+                           re.M | re.S).group(0)
+    assert "@malloc" not in apply_body, apply_body
     assert re.search(
         r"call i64 %\w+\(ptr %\w+, i64 %\w+\)"
         r"  ; indirect closure call \(main\$lambda\d+\|main\$lambda\d+\), "
         r"word-uniform ABI", ir)
     assert re.search(
-        r"inttoptr i64 %\w+ to ptr  ; boundary box: struct:Point", ir)
+        r"; elide-copy: \w+ views the producer's write-once boundary box "
+        r"\(struct:Point\)", ir)
+    # exactly one malloc per lambda remains: the returned box
+    assert len(re.findall(
+        r"call ptr @malloc\(i64 16\)"
+        r"  ; boundary box: struct:Point \(write-once, leaks by design\)",
+        ir)) == 2
     # Callee side: the param word decodes to a ptr, the return value boxes.
     assert len(re.findall(
         r"; word-uniform param q: boundary box struct:Point", ir)) == 2
@@ -5794,7 +5833,9 @@ fn main() -> int {
 
 def test_indirect_enum_return_boxes():
     # A lambda returning an ENUM through an indirect call: the tagged
-    # union boxes on the way out and is copied into the caller's slot.
+    # union boxes on the way out (the callee's storage dies, so this box
+    # is real) and the caller VIEWS the box instead of copying it out
+    # (increment 17, work item 1).
     ir = llvm_from_source(_IND_ENUM_RETURN_SRC)
     assert count_placeholders(ir) == 0
     assert re.search(
@@ -5804,7 +5845,8 @@ def test_indirect_enum_return_boxes():
     assert re.search(
         r"ret i64 %\w+  ; word-uniform lambda return \(enum:Opt", ir)
     assert re.search(
-        r"inttoptr i64 %\w+ to ptr  ; boundary box: enum:Opt", ir)
+        r"; elide-copy: \w+ views the producer's write-once boundary box "
+        r"\(enum:Opt", ir)
 
 
 _IND_AGG_CAPTURE_SRC = """
@@ -6146,6 +6188,319 @@ def test_indirect_aggregate_ir_passes_llvm_verifier(tmp_path):
                 _IND_AGG_CAPTURE_SRC, _IND_AGG_LOOP_SRC,
                 _STREAM_STRUCT_ELEM_SRC, _STREAM_ENUM_ELEM_SRC):
         ll = tmp_path / "ind_agg.ll"
+        ll.write_text(llvm_from_source(src))
+        proc = subprocess.run(
+            ["opt", "-passes=verify", "-disable-output", str(ll)],
+            capture_output=True, text=True)
+        assert proc.returncode == 0, proc.stderr
+
+
+# ---------------------------------------------------------------------------
+# Increment 17: BOUNDARY-BOX TRAFFIC REDUCTION (pure optimization).
+#
+# Three elisions, each with an explicit safety condition; anything not
+# provable keeps boxing.  The differential/ASan tests above are the
+# correctness net — these pin the mallocs that must NOT be emitted.
+#
+#   (1) DOUBLE-BOX ELISION.  A value whose single def receives a boundary
+#       word (perform / resume / handle value / word-uniform indirect call
+#       result) is a pointer to a box the producer malloc'd, filled once and
+#       never frees.  The receiver keeps that pointer (a bbox_view) instead
+#       of copying out, and handing it to the NEXT boundary passes the
+#       pointer straight through.  Safety: the box is immortal (no emitted
+#       path frees a boundary box), write-once (handle-scope subfunctions
+#       never copy out through a param pointer, and the word ABI refuses
+#       @mut aggregate params), and the receiver is read-only (single def,
+#       never at a callee write-back position).  Handler cases and handle
+#       bodies now RETURN that word directly (the boundary-word ABI), so
+#       the shims' unconditional box disappears too.
+#   (2) READ-ONLY AGGREGATE ARGUMENT.  An aggregate argument of an indirect
+#       closure call passes the caller's storage pointer when every
+#       statically-possible callee is word-uniform and leaves the position
+#       out of its write-back set (writeback_map — the same analysis the
+#       direct-call elide-copy pass uses).  Safety: nobody writes through
+#       the pointer, and an indirect call is synchronous on this stack, so
+#       the storage outlives it.
+#   (3) LOOP-INVARIANT BOX.  A value with a single block-0 def that no
+#       write-back can touch is boxed once at the end of block 0 and reused
+#       at every boundary site in the loop.
+# ---------------------------------------------------------------------------
+
+_FX17_CHAIN_SRC = """
+struct St { a: int, b: int }
+effect E { one(s: St) -> St two(s: St) -> St }
+fn main() -> int {
+    let out = handle E with {
+        one(s) -> resume(St { a: s.a + 1, b: s.b }),
+        two(s) -> resume(St { a: s.a, b: s.b + 1 })
+    } in {
+        let x = perform E.one(St { a: 0, b: 0 });
+        let y = perform E.two(x);
+        let z = perform E.one(y);
+        perform E.two(z)
+    };
+    print(out.a);
+    print(out.b);
+    0
+}
+"""
+
+
+def test_boundary_results_view_the_producers_box_instead_of_copying_out():
+    # Elision (1), receive side: every perform result and the handle value
+    # keep the producer's pointer; NOTHING copies an aggregate out of a
+    # boundary box any more in this program.
+    ir = llvm_from_source(_FX17_CHAIN_SRC)
+    assert count_placeholders(ir) == 0
+    assert len(re.findall(
+        r"; elide-copy: \w+ views the producer's write-once boundary box "
+        r"\(struct:St\)", ir)) == 7   # 4 performs + 2 resumes + the handle value
+    # the old copy-out shape (inttoptr the word, then load/store the
+    # aggregate into our own slot) is gone
+    assert "to ptr  ; boundary box: struct:St" not in ir
+
+
+def test_chained_perform_passes_the_received_box_straight_through():
+    # Elision (1), send side: `perform E.two(x)` where x came straight out
+    # of the previous perform re-uses that box; only the FRESH structs (the
+    # initial St and the two resume values) still box.
+    ir = llvm_from_source(_FX17_CHAIN_SRC)
+    assert len(re.findall(
+        r"; elide-box: \w+ already IS an immortal write-once boundary box "
+        r"\(struct:St\); its pointer passes through", ir)) == 6
+    assert len(re.findall(
+        r"call ptr @malloc\(i64 16\)"
+        r"  ; boundary box: struct:St \(write-once, leaks by design\)",
+        ir)) == 3
+    assert len(re.findall(r"call ptr @malloc\(", ir)) == 3
+
+
+def test_handle_shims_allocate_nothing_for_aggregate_results():
+    # Elision (1), the double box itself: the dispatcher used to malloc a
+    # box per dispatch and sret-fill it from the case fn, which then boxed
+    # again at the next hop.  Cases and bodies return the word directly, so
+    # both shims are allocation-free.
+    ir = llvm_from_source(_FX17_CHAIN_SRC)
+    shims = re.findall(r"^define internal i64 @mxfx\.(?:body|disp)\..*?^\}",
+                       ir, re.M | re.S)
+    assert shims
+    for shim in shims:
+        assert "@malloc" not in shim, shim
+    assert re.search(r"; boundary-word body result struct:St", ir)
+    assert len(re.findall(r"; boundary-word case result struct:St", ir)) == 2
+    assert len(re.findall(
+        r"^define i64 @mx___handler_E_\w+\(ptr %cl\.env, ptr %a\.s, "
+        r"ptr %a\.__k\) \{  ; handle-scope boundary-word ABI$", ir, re.M)) == 2
+
+
+@needs_clang
+def test_native_chained_perform_differential(tmp_path):
+    assert_native_matches_interp(_FX17_CHAIN_SRC, tmp_path)
+
+
+@needs_asan
+def test_native_chained_perform_asan_no_uaf(tmp_path):
+    # Boundary boxes leak by design, so detect_leaks=0: exit 0 proves the
+    # elisions never turned an immortal box into a use-after-free — the
+    # failure mode this whole round has to be guarded against, since a
+    # passed-through pointer is read on the OTHER coroutine stack.
+    assert_native_matches_interp_asan_boxes(_FX17_CHAIN_SRC, tmp_path)
+
+
+_FX17_PAYLOAD_VIEW_SRC = """
+struct Pt { x: int, y: int }
+enum Hold { Full(Pt), Empty }
+effect Sw { sw(p: Pt) -> Pt }
+fn main() -> int {
+    let b = Full(Pt { x: 1, y: 2 });
+    let r = handle Sw with { sw(p) -> resume(Pt { x: p.y, y: p.x }) } in {
+        match b {
+            Full(p) => { perform Sw.sw(p) },
+            Empty => { Pt { x: 0, y: 0 } }
+        }
+    };
+    print(r.x);
+    print(r.y);
+    0
+}
+"""
+
+
+def test_enum_payload_view_still_boxes_at_the_effect_boundary():
+    # THE GUARD on elision (1): a variant_field box view aliases an enum
+    # PAYLOAD box, and _unique_box_enums may free one of those at frame
+    # exit — so its pointer must never be re-exported across a boundary,
+    # where it could outlive this frame.  Only boxes proven immortal pass
+    # through; a payload view copies into a fresh box, as before.
+    ir = llvm_from_source(_FX17_PAYLOAD_VIEW_SRC)
+    assert count_placeholders(ir) == 0
+    assert re.search(
+        r"; elide-copy: variant_field \w+ reads through the box pointer", ir)
+    # the perform argument still allocates a box and copies into it
+    assert re.search(
+        r"call ptr @malloc\(i64 16\)"
+        r"  ; boundary box: struct:Pt \(write-once, leaks by design\)\n"
+        r"  %\w+ = load %struct\.Pt, ptr %\w+", ir)
+
+
+@needs_clang
+def test_native_enum_payload_view_boundary_differential(tmp_path):
+    assert_native_matches_interp(_FX17_PAYLOAD_VIEW_SRC, tmp_path)
+
+
+@needs_asan
+def test_native_enum_payload_view_boundary_asan_no_uaf(tmp_path):
+    # Payload boxes leak by design here (the enum is copied into the
+    # handle-site env, so it is not a unique box): detect_leaks=0, exit 0
+    # proves no use-after-free of the payload box across the boundary.
+    assert_native_matches_interp_asan_boxes(_FX17_PAYLOAD_VIEW_SRC, tmp_path)
+
+
+_FX17_RO_IND_ARG_SRC = """
+struct S { a: int, b: int }
+fn bump(s: S) -> int { s.a + s.b }
+fn keep(s: S) -> int { s.a }
+fn apply(f: fn(S) -> int, s: S) -> int { f(s) }
+fn main() -> int {
+    print(apply(fn(s: S) -> bump(s), S { a: 3, b: 4 }));
+    print(apply(fn(s: S) -> keep(s), S { a: 5, b: 6 }));
+    0
+}
+"""
+
+
+def test_readonly_aggregate_indirect_argument_needs_no_box():
+    # Elision (2): both members are word-uniform and neither writes back
+    # through the position, so the argument travels as a pointer to the
+    # caller's own storage.  apply() allocates NOTHING.
+    ir = llvm_from_source(_FX17_RO_IND_ARG_SRC)
+    assert count_placeholders(ir) == 0
+    assert re.search(
+        r"ptrtoint ptr %[\w.]+ to i64  ; elide-box: read-only aggregate "
+        r"argument \w+ \(struct:S\) passes the caller's storage pointer", ir)
+    apply_body = re.search(r"^define i64 @mx_apply\(.*?^\}", ir,
+                           re.M | re.S).group(0)
+    assert "@malloc" not in apply_body, apply_body
+    # the receiving ABI is untouched: still a word decoded to a ptr
+    assert len(re.findall(
+        r"; word-uniform param s: boundary box struct:S", ir)) == 2
+
+
+@needs_clang
+def test_native_readonly_aggregate_indirect_argument_differential(tmp_path):
+    assert_native_matches_interp(_FX17_RO_IND_ARG_SRC, tmp_path)
+
+
+@needs_asan
+def test_native_readonly_aggregate_indirect_argument_asan_no_uaf(tmp_path):
+    # Heap closure envs leak by design (detect_leaks=0); exit 0 proves the
+    # caller-storage pointer is never read after its frame died — the
+    # lifetime claim behind elision (2).
+    assert_native_matches_interp_asan_boxes(_FX17_RO_IND_ARG_SRC, tmp_path)
+
+
+_FX17_LOOP_INVARIANT_SRC = """
+struct Cfg { k: int, n: int }
+effect Q { ask(c: Cfg) -> int }
+fn main() -> int {
+    let total = handle Q with { ask(c) -> resume(c.k + c.n) } in {
+        let cfg = Cfg { k: 3, n: 4 };
+        let mut i = 0;
+        let mut s = 0;
+        while i < 10 { s = s + perform Q.ask(cfg); i = i + 1; };
+        s
+    };
+    print(total);
+    0
+}
+"""
+
+
+def test_loop_invariant_boundary_box_is_hoisted_out_of_the_loop():
+    # Elision (3): cfg never changes after its block-0 def, so ONE box
+    # serves all ten iterations.  The malloc must live in the entry block,
+    # not the loop body.
+    ir = llvm_from_source(_FX17_LOOP_INVARIANT_SRC)
+    assert count_placeholders(ir) == 0
+    body = re.search(r"^define i64 @mx___handle_body_Q_main\w*\(.*?^\}",
+                     ir, re.M | re.S).group(0)
+    assert len(re.findall(r"call ptr @malloc\(", body)) == 1
+    blocks = re.split(r"^(\w+):$", body, flags=re.M)
+    by_label = dict(zip(blocks[1::2], blocks[2::2]))
+    assert "@malloc" in by_label["bb0"], body
+    for label, text in by_label.items():
+        if label != "bb0":
+            assert "@malloc" not in text, (label, body)
+    assert re.search(
+        r"; loop-invariant boundary box: \w+ \(struct:Cfg\)", body)
+    assert re.search(
+        r"; elide-box: \w+ \(struct:Cfg\) reuses its loop-invariant box",
+        body)
+
+
+@needs_clang
+def test_native_loop_invariant_box_differential(tmp_path):
+    assert_native_matches_interp(_FX17_LOOP_INVARIANT_SRC, tmp_path)
+
+
+@needs_asan
+def test_native_loop_invariant_box_asan_no_uaf(tmp_path):
+    # The hoisted box is shared by every iteration and by the handler on
+    # the other stack: detect_leaks=0 (boundary boxes leak by design),
+    # exit 0 proves no use-after-free / double-free from that sharing.
+    assert_native_matches_interp_asan_boxes(_FX17_LOOP_INVARIANT_SRC, tmp_path)
+
+
+_FX17_MUT_LOOP_SRC = """
+struct P { a: int, b: int }
+effect Ask { ask(p: P) -> P }
+fn main() -> int {
+    let t = handle Ask with { ask(p) -> resume(P { a: p.a + 1, b: p.b }) } in {
+        let mut acc = P { a: 0, b: 5 };
+        let mut i = 0;
+        while i < 10 { acc = perform Ask.ask(acc); i = i + 1; };
+        acc
+    };
+    print(t.a);
+    print(t.b);
+    0
+}
+"""
+
+
+def test_reassigned_loop_accumulator_keeps_its_per_iteration_box():
+    # The NEGATIVE side of elision (3): acc is rebound every iteration, so
+    # its box contents change and nothing can be hoisted or shared.  It
+    # still mallocs inside the loop — correctness over speed.
+    ir = llvm_from_source(_FX17_MUT_LOOP_SRC)
+    assert count_placeholders(ir) == 0
+    assert "loop-invariant boundary box" not in ir
+    body = re.search(r"^define i64 @mx___handle_body_Ask_main\w*\(.*?^\}",
+                     ir, re.M | re.S).group(0)
+    blocks = re.split(r"^(\w+):$", body, flags=re.M)
+    by_label = dict(zip(blocks[1::2], blocks[2::2]))
+    assert any("@malloc" in t for lab, t in by_label.items() if lab != "bb0")
+
+
+@needs_clang
+def test_native_reassigned_loop_accumulator_differential(tmp_path):
+    assert_native_matches_interp(_FX17_MUT_LOOP_SRC, tmp_path)
+
+
+@needs_asan
+def test_native_reassigned_loop_accumulator_asan_no_uaf(tmp_path):
+    assert_native_matches_interp_asan_boxes(_FX17_MUT_LOOP_SRC, tmp_path)
+
+
+def test_increment17_ir_passes_llvm_verifier(tmp_path):
+    # Box views, passed-through pointers, the boundary-word ABI and the
+    # hoisted boxes all have to produce well-formed, dominance-correct IR.
+    if shutil.which("opt") is None:
+        pytest.skip("LLVM opt not installed")
+    for src in (_FX17_CHAIN_SRC, _FX17_PAYLOAD_VIEW_SRC, _FX17_RO_IND_ARG_SRC,
+                _FX17_LOOP_INVARIANT_SRC, _FX17_MUT_LOOP_SRC,
+                _FX_STRUCT_ROUNDTRIP_SRC, _FX_STD_FIND_SRC):
+        ll = tmp_path / "inc17.ll"
         ll.write_text(llvm_from_source(src))
         proc = subprocess.run(
             ["opt", "-passes=verify", "-disable-output", str(ll)],
