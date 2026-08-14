@@ -17,7 +17,7 @@ import pytest
 
 from metaxu.compiler.desugar import CoherenceError
 from metaxu.compiler.frozen_borrow_checker import BorrowCheckError, TypeCheckError
-from metaxu.compiler.hir import HIRBuilder, UnsupportedConstruct
+from metaxu.compiler.hir import BUILTIN_CALL_PREFIX, HIRBuilder, UnsupportedConstruct
 from metaxu.compiler.lower_hir_to_mir import lower_hir_to_mir
 from metaxu.compiler.mir_interp import InterpError, MirInterpreter
 from metaxu.compiler.mutaxu_ast import build_frozen_ast_with_map, dump_ast_json
@@ -319,8 +319,11 @@ def test_fstring_segment_reports_the_fstring_line_not_line_one():
                 walk(item)
 
     walk(module)
+    # The synthesized call carries the `__builtin$` marker
+    # (docs/name_precedence.md) so a user `fn to_string` cannot capture it.
     to_string_calls = [n for n in seen
-                       if isinstance(n, fast.FunctionCall) and n.name == "to_string"]
+                       if isinstance(n, fast.FunctionCall)
+                       and n.name == f"{BUILTIN_CALL_PREFIX}to_string"]
     assert to_string_calls, "f-string did not desugar to to_string(...)"
     for call in to_string_calls:
         assert call.location.line == 3, call.location
