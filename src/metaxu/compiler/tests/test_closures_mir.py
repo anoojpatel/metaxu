@@ -108,3 +108,49 @@ fn main() -> int {
 }
 """
     assert call(src, "main", []) == 42
+
+
+# ---------------------------------------------------------------------------
+# Lambda body forms (grammar): all four spellings, and the shapes they must
+# NOT capture (struct-literal bodies, typed returns)
+# ---------------------------------------------------------------------------
+
+def test_arrow_block_lambda_body():
+    """`fn(x) -> { stmts; tail }` — arrow with a block body; the block's tail
+    expression is the result, exactly like a function body."""
+    src = """
+fn main() -> int {
+    let f = fn(x: int) -> { let y = x * 2; y + 1 };
+    f(20)
+}
+"""
+    assert call(src, "main", []) == 41
+
+
+def test_arrow_expression_lambda_body_still_works():
+    src = "fn main() -> int { let f = fn(x: int) -> x + 1; f(41) }"
+    assert call(src, "main", []) == 42
+
+
+def test_bare_block_lambda_body_still_works():
+    src = "fn main() -> int { let f = fn(x: int) { x + 5 }; f(37) }"
+    assert call(src, "main", []) == 42
+
+
+def test_struct_literal_lambda_body_not_parsed_as_block():
+    """`-> P { x: v }` is a struct literal (IDENTIFIER LBRACE_STRUCT), not an
+    arrow-block body — the new production must not swallow it."""
+    src = """
+struct P { x: int }
+
+fn main() -> int {
+    let f = fn(v: int) -> P { x: v };
+    f(42).x
+}
+"""
+    assert call(src, "main", []) == 42
+
+
+def test_typed_return_with_block_body_still_works():
+    src = "fn main() -> int { let f = fn(x: int) -> int { x * 2 }; f(21) }"
+    assert call(src, "main", []) == 42
