@@ -140,16 +140,19 @@ def run_pipeline_ctx(ctx: PhaseContext, strict: bool = True,
     return ast_json, hir_txt, mir_txt, clif_txt
 
 
-def emit_llvm_from_source(source: str, strict: bool = True) -> str:
+def emit_llvm_from_source(source: str, strict: bool = True,
+                          file_path: str = "<mem>") -> str:
     """Parse, check, lower to MIR and emit an LLVM IR module (text).
 
     Separate entry point from run_pipeline_from_source (whose CLIF-returning
     signature is unchanged).  Raises BorrowCheckError / TypeCheckError in
-    strict mode exactly like the main pipeline.
+    strict mode exactly like the main pipeline.  Pass `file_path` when the
+    source lives on disk so multi-file imports resolve relative to its
+    directory (exactly like run_pipeline_from_source).
     """
     from .codegen_llvm import emit_llvm
 
-    ctx = build_context_from_source(source)
+    ctx = build_context_from_source(source, file_path=file_path)
     run_pipeline_ctx(ctx, strict=strict)  # strict type/borrow gate
     hir_funcs = HIRBuilder(ctx.tables, id_map=ctx.id_map).build(ctx.frozen_root)
     mir_funcs = lower_hir_to_mir(hir_funcs)

@@ -627,7 +627,11 @@ class Parser:
 
         `{{` and `}}` escape to literal braces; `{}` (or whitespace-only
         braces) and unbalanced braces are compile errors — never a silent
-        literal fallback.
+        literal fallback.  An expression segment ends at its BALANCING `}`
+        (nested braces are tracked), so struct literals and blocks inside
+        `{...}` stay whole instead of being mis-split at the first `}`.
+        (The FSTRING lexeme cannot contain a quote, so no string literal
+        inside a segment can carry a brace that would fool the counter.)
         """
         segments = []
         buf = []
@@ -639,8 +643,17 @@ class Parser:
                     buf.append('{')
                     i += 2
                     continue
-                end = raw.find('}', i + 1)
-                if end == -1:
+                depth = 1
+                end = i + 1
+                while end < n:
+                    if raw[end] == '{':
+                        depth += 1
+                    elif raw[end] == '}':
+                        depth -= 1
+                        if depth == 0:
+                            break
+                    end += 1
+                if depth != 0:
                     self._fstring_error(
                         f"f-string: unterminated '{{' in f\"{raw}\" "
                         "(use '{{' for a literal brace)", lineno)

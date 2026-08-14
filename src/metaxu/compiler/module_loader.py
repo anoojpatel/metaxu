@@ -451,10 +451,17 @@ class ModuleResolver:
                 return target, parts[j:]
         return None
 
-    def _rewrite_call(self, node, info: ModuleInfo) -> None:
+    def _rewrite_call(self, node, info: ModuleInfo,
+                      bound: frozenset = frozenset()) -> None:
         if isinstance(node, fast.FunctionCall):
             name = getattr(node, "name", None)
             if not isinstance(name, str):
+                return
+            if name in bound:
+                # A local binding (let / param / lambda param) in scope
+                # shadows the module's own function of the same name: the
+                # call must resolve to the local, exactly as it does in the
+                # entry module (where _final_name is the identity).
                 return
             if name in info.functions:
                 node.name = self._final_name(info.path, name)
@@ -516,28 +523,83 @@ class ModuleResolver:
                 # types/traits/effects live in the global namespace
                 node.parts = rest
 
-    _SKIP_FIELDS = frozenset({"parent", "scope", "location"})
+    # "children" is the Node base class's generic child list (mirror of the
+    # semantic attributes): walking it would reach body statements OUTSIDE
+    # the scope tracking below (empty `bound`), rewriting locally-shadowed
+    # calls. The semantic attributes cover the full tree.
+    _SKIP_FIELDS = frozenset({"parent", "scope", "location", "children"})
 
-    def _walk_and_rewrite(self, value, info: ModuleInfo, memo: set[int]) -> None:
+    @staticmethod
+    def _param_names_of(node) -> list[str]:
+        names = []
+        for p in (getattr(node, "params", None) or []):
+            pname = getattr(p, "name", None)
+            if pname is not None:
+                names.append(str(pname))
+        return names
+
+    def _walk_and_rewrite(self, value, info: ModuleInfo, memo: set[int],
+                          bound: frozenset = frozenset()) -> None:
+        """Rewrite references inside ``value``.
+
+        ``bound`` carries the local names in scope (params, lambda params
+        and preceding `let` bindings of the enclosing function bodies): an
+        unqualified call to a bound name is a call of the LOCAL binding and
+        must not be rewritten to the module's same-named function.  This is
+        a lightweight lexical walk mirroring the scoping the parser/HIR
+        apply — bindings become visible to the statements AFTER their let.
+        """
         if isinstance(value, fast.Module):
             return                  # nested modules are rewritten in their own scope
         if isinstance(value, fast.Node):
             if id(value) in memo:
                 return
             memo.add(id(value))
-            self._rewrite_call(value, info)
+            self._rewrite_call(value, info, bound)
+            # Function-like nodes open a scope: params (plus, statement by
+            # statement, let bindings) shadow module functions in the body.
+            if isinstance(value, (fast.FunctionDeclaration,
+                                  fast.LambdaExpression)):
+                inner = bound | frozenset(self._param_names_of(value))
+                body = getattr(value, "body", None)
+                for attr, v in list(vars(value).items()):
+                    if attr in self._SKIP_FIELDS or attr in ("body", "_body"):
+                        continue
+                    self._walk_and_rewrite(v, info, memo, bound)
+                stmts = body if isinstance(body, list) else \
+                    ([body] if body is not None else [])
+                self._walk_stmt_seq(stmts, info, memo, inner)
+                return
+            if isinstance(value, fast.Block):
+                self._walk_stmt_seq(getattr(value, "statements", None) or [],
+                                    info, memo, bound)
+                return
             for attr, v in list(vars(value).items()):
                 if attr in self._SKIP_FIELDS:
                     continue
-                self._walk_and_rewrite(v, info, memo)
+                self._walk_and_rewrite(v, info, memo, bound)
             return
         if isinstance(value, (list, tuple)):
             for item in value:
-                self._walk_and_rewrite(item, info, memo)
+                self._walk_and_rewrite(item, info, memo, bound)
             return
         if isinstance(value, dict):
             for item in value.values():
-                self._walk_and_rewrite(item, info, memo)
+                self._walk_and_rewrite(item, info, memo, bound)
+
+    def _walk_stmt_seq(self, stmts, info: ModuleInfo, memo: set[int],
+                       bound: frozenset) -> None:
+        """Walk a statement sequence, accumulating `let` bindings so they
+        shadow module functions for the statements that FOLLOW them (a let's
+        own initializer still sees the pre-binding scope)."""
+        names = set(bound)
+        for stmt in stmts:
+            self._walk_and_rewrite(stmt, info, memo, frozenset(names))
+            if isinstance(stmt, fast.LetStatement):
+                for b in (getattr(stmt, "bindings", None) or []):
+                    ident = getattr(b, "identifier", None)
+                    if ident is not None:
+                        names.add(str(ident))
 
     def _rewrite_references(self) -> None:
         for info in self.registry.values():

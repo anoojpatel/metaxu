@@ -125,6 +125,9 @@ class HExpr:
     field_val: 'HExpr | None' = None # for FieldSet: new value
     # Lambda/Closure: op="Lambda"
     lambda_params: tuple[str, ...] | None = None           # parameter names
+    # Lambda params declared @mut (write-back semantics, like @mut params of
+    # named functions); None/() for plain value-semantics params.
+    lambda_mut_params: tuple[str, ...] | None = None
     lambda_body: 'HExpr | None' = None                     # body expression
     captures: tuple[tuple[str, str], ...] | None = None    # ((name, mode), ...) captured vars
     # Call: explicit instantiation type args (`identity<Int>(x)`), as type
@@ -257,8 +260,9 @@ class HIRBuilder:
                     if pty is None:
                         pty = self.t.types.get(getattr(p, 'node_id', -1), "Unknown") if hasattr(p, 'node_id') else "Unknown"  # type: ignore[index]
                     params.append((pname, pty))
-                    # Extract modes if available
-                    pmode = self._extract_modeinfo(getattr(p, 'mode', None))
+                    # Extract modes if available (explicit mode field or a
+                    # @mut/@const-style ModeTypeAnnotation on the type)
+                    pmode = self._param_modeinfo(p)
                     if pname is not None:
                         param_modes[str(pname)] = pmode
                 # Const-generic receiver dimensions (recorded by the impl
@@ -302,8 +306,15 @@ class HIRBuilder:
                     param_modes=param_modes or None,
                 )
                 funcs.append(hfun)
-            # Recurse
-            inside = in_fn or isinstance(orig, fast.FunctionDeclaration)
+            # Recurse. Only DIRECT module-level LetStatements are module
+            # constants: entering any function-like body (named function or
+            # lambda) — or the subexpressions of a module-level let's own
+            # initializer — sets in_fn so nested lets stay local to their
+            # scope instead of being hoisted into __module_init (where their
+            # initializers referenced unbound locals and aborted).
+            inside = in_fn or isinstance(
+                orig, (fast.FunctionDeclaration, fast.LambdaExpression,
+                       fast.LetStatement))
             for c in n.children:
                 visit(c, inside)
 
@@ -1345,9 +1356,15 @@ class HIRBuilder:
                 for name in sorted(captured_vars | free)
             )
             ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, "Unknown"))
+            # Lambda params declared @mut get the same write-back semantics
+            # as @mut params of named functions (threaded to MirFunc.mut_params).
+            mut_names = tuple(
+                str(getattr(p, 'name', p)) for p in params
+                if self._param_modeinfo(p).uniqueness in ("mutable", "exclusive"))
             return self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span,
                                   op="Lambda",
                                   lambda_params=param_names,
+                                  lambda_mut_params=mut_names or None,
                                   lambda_body=body_he,
                                   captures=captures)
 
@@ -1645,6 +1662,16 @@ class HIRBuilder:
         elif tok in self._LINEARITY_TOKENS:
             mi.linearity = mi.linearity or tok
 
+    def _param_modeinfo(self, p: Any) -> ModeInfo:
+        """ModeInfo of a function/lambda parameter: merges the explicit
+        `mode` field with modes carried by a ModeTypeAnnotation type
+        (`c: @mut Counter` stores 'mut' on the annotation, not on mode)."""
+        ann = getattr(p, 'type_annotation', None)
+        return self._extract_modeinfo([
+            getattr(p, 'mode', None),
+            ann if isinstance(ann, fast.ModeTypeAnnotation) else None,
+        ])
+
     def _extract_modeinfo(self, mode: Any) -> ModeInfo:
         mi = ModeInfo()
         if mode is None:
@@ -1656,6 +1683,14 @@ class HIRBuilder:
                 mi.uniqueness = mi.uniqueness or sub.uniqueness
                 mi.locality = mi.locality or sub.locality
                 mi.linearity = mi.linearity or sub.linearity
+            return mi
+        # Mode-carrying type annotation (`c: @mut Counter` parses the modes
+        # onto a ModeTypeAnnotation wrapping the base type, with plain-string
+        # tokens like 'mut'/'const'/'local').
+        if isinstance(mode, fast.ModeTypeAnnotation):
+            self._absorb_mode_token(mi, getattr(mode, 'uniqueness', None))
+            self._absorb_mode_token(mi, getattr(mode, 'locality', None))
+            self._absorb_mode_token(mi, getattr(mode, 'linearity', None))
             return mi
         # UniquenessMode
         if isinstance(mode, fast.ModeAnnotation):
