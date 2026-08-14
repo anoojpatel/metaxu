@@ -97,7 +97,17 @@ before changes meaning:
   Pass B additionally refuses to *start* a generic scan at an adjacent
   `<<`: a type argument list can never open with `<`, and without that
   refusal `a << b >> (c)` (balanced angles, `(` in the follow set) would
-  have been retagged as generic arguments.
+  have been retagged as generic arguments. It refuses to *close* one on
+  an adjacent `>>` for the mirror-image reason: a `>` that would close the
+  OUTERMOST bracket with another `>` glued to it is the shift operator.
+  Without that half `a < b >> c` matched `a<b>` and left a stray `>`, so a
+  plain shift failed with an unrelated "uncalled generic instantiation"
+  (`g(a < b, c >> d)` broke the same way). Nesting is unaffected because it
+  is counted with `depth`: `Map<String, Vec<Int>>` closes the outermost
+  bracket on the *second* `>`, where the guard cannot fire. `GREATER` was
+  dropped from the follow set at the same time — it was justified there as
+  "nesting `>>`", which `depth` already handles, and a spaced `X<T> > y` is
+  an uncalled generic instantiation with no value representation anyway.
 
 Only binary `&` overlaps something the old grammar accepted: two juxtaposed
 statements, `a` followed by `&b`. That reading is gone, exactly as `a` `-b`
@@ -194,10 +204,22 @@ was written.
   whole literal.
 * **Integer literals outside i64.** `int(...)` yields an unbounded Python
   int, so a literal past the i64 range made the interpreter (exact bignum)
-  and native code (`i64`, wrapping) mean different things. Literals above
-  `2**63` are rejected; the bound is `2**63`, not `2**63 - 1`, because the
-  most negative i64 is written as unary minus applied to that literal.
-  Float literals that overflow to infinity are rejected too.
+  and native code (`i64`, wrapping) mean different things. The largest
+  positive literal is `2**63 - 1`. The bound used to be `2**63` so that the
+  most negative i64 — unary minus applied to the literal
+  `9223372036854775808` — stayed writable, but that let the *bare* positive
+  `9223372036854775808` through and reintroduced the very divergence
+  (interpreter: the exact bignum; `emit_llvm`: "integer constant … outside
+  i64 range", i.e. a demoted placeholder). Both halves are solved by making
+  the sign part of the literal: Pass 0 of `Lexer._transform`
+  (`_fold_most_negative_int`) accepts `2**63` **only** as the operand of a
+  unary minus and folds the pair into the single constant `-2**63`, so the
+  backends see an in-range i64 and every other occurrence — including
+  `x - 9223372036854775808` and the doubled `--9223372036854775808` — is a
+  loud `LexError`. Folding also removed the *negative* form's demotion:
+  `-9223372036854775808` used to reach codegen_llvm as
+  `neg(const 9223372036854775808)`. Float literals that overflow to
+  infinity are rejected too.
 * **Unknown mode annotations.** Pass A retags *any* keyword after `@` as an
   identifier, `mode_annotation` took whatever followed, and
   `_split_mode` keeps only the names it knows and **drops the rest** — so

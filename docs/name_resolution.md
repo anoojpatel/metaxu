@@ -67,6 +67,30 @@ row.
 
 ### Lexically scoped (a stack of scopes)
 
+A scope stack, but **not one stack for the whole program**. A body that
+`hir.HIRBuilder.build` compiles into its own top-level function is walked in
+an *isolated* stack (`_Resolver.isolated`), which keeps only `scopes[0]` —
+the module constants, which really are global — and drops every enclosing
+function's locals and type parameters. Two bodies qualify:
+
+* a **nested `fn`**. The hoisting walk lifts every `FunctionDeclaration`, at
+  any depth, into the flat MIR namespace as its own `HFun` bound to its own
+  parameters; nothing captures an environment. Extending the enclosing stack
+  here was a false negative of exactly the shape this pass exists to remove:
+  `fn main() { let secret = 5; fn inner() -> int { secret + 1 } inner() }`
+  compiled clean and died at run time with `Unbound variable 'secret'`.
+* an **effect operation's default expression**, which `build` compiles into
+  `__effect_default$Eff$op` taking exactly the operation's parameters. An
+  `effect` declared *inside* a function body had the identical false
+  negative.
+
+A **lambda** is the one construct that genuinely captures — `hir` lowers a
+`LambdaExpression` to a MIR `make_closure` over the enclosing slots — so
+`visit_lambda` extends the enclosing scope and must keep doing so.
+An `implement`-block method is not nested (it is visited at function depth
+0), so it keeps the block's type parameters, which `hir`'s `_const_dims`
+really does bind at method entry.
+
 | category | bound by |
 | --- | --- |
 | parameters | `fn f(a, b)`, `fn(x) -> …`, `x -> …` |
@@ -162,7 +186,18 @@ value position the consumer names that slot so the read is real, but in
 statement position the name was thrown away and the read disappeared —
 which is precisely how `undefined_thing; 42` compiled to `ret 42` with the
 undefined name nowhere in the MIR. `Block` lowering now emits an explicit
-`copy` for a statement-position `Var`, so the read happens.
+`copy` for a `Var`, so the read happens.
+
+**Including the tail.** The copy was originally emitted only for
+non-final operands (`i != n - 1`), on the theory that the block's value is
+consumed by whoever consumes the block. A function body's tail is consumed
+by `ret <slot>`, and `mir_interp`'s `ret` keeps a fallback to the last op's
+value for slots absent from the environment — so `fn inner() -> int {
+secret }` answered `()` instead of raising, a silent wrong value out of a
+function declared `int`. The tail is no longer exempt, and the `ret`
+fallback is now scoped to the resumed-continuation frames it was documented
+for (`MxContinuation.resume` passes `resumed=True`; every ordinary call
+enters through `_call_func` and is strict).
 
 ## Defence in depth
 
@@ -171,8 +206,8 @@ that ever misses must still fail loudly rather than silently:
 
 * `mir_interp` raises `Unknown callee: 'f'` for a call it cannot resolve;
 * `mir_interp._lookup` raises `Unbound variable 'x'` for a slot read that
-  finds nothing — which the statement-position fix above now makes
-  reachable for a discarded read too.
+  finds nothing — which the fix above now makes reachable for a discarded
+  read *and* for a bare-name tail.
 
 Both are pinned by tests that switch the front-end pass off and run the
 program anyway.
