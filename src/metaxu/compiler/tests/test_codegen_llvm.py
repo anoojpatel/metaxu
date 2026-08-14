@@ -214,14 +214,21 @@ def block(ops: list[tuple], term: tuple) -> MirBlock:
     return MirBlock(ops=ops, term=term)
 
 
-def mir_from_source(source: str) -> list[MirFunc]:
+def mir_from_source(source: str, monomorphize: bool = False) -> list[MirFunc]:
     ctx = build_context_from_source(source)
     hir = HIRBuilder(ctx.tables, id_map=ctx.id_map).build(ctx.frozen_root)
+    if monomorphize:
+        from metaxu.compiler.monomorphize import collect_signatures, monomorphize_hir
+        hir = monomorphize_hir(hir, collect_signatures(ctx.id_map))
     return lower_hir_to_mir(hir)
 
 
-def llvm_from_source(source: str) -> str:
-    return emit_llvm(mir_from_source(source))
+def llvm_from_source(source: str, monomorphize: bool = True) -> str:
+    """Emit LLVM the way pipeline.emit_llvm_from_source does — through the
+    monomorphization pass. `interp_run` deliberately stays on the
+    UNSPECIALIZED MIR, so every differential in this file compares native
+    monomorphized code against the unmonomorphized semantics reference."""
+    return emit_llvm(mir_from_source(source, monomorphize=monomorphize))
 
 
 def interp_run(source: str, entry: str = "main"):
@@ -1610,12 +1617,22 @@ def test_linked_list_example_emits_all_real_bodies():
     # front-end statement-rule fix (else-less if/if-let is unit-valued),
     # main's trailing if-let no longer merges unit with struct:Node, so the
     # whole example is fully native: zero placeholders.
+    #
+    # The native path monomorphizes (pipeline.emit_llvm_from_source), so
+    # push_front — whose T resolves to Int at all three call sites — emits
+    # under its specialized name and the fully-specialized original is
+    # erased. Every other generic here has a call site the pass cannot
+    # resolve (new_list() takes no arguments; get/get_mut/take_node take the
+    # list, whose T only appears inside the type application LinkedList[T]),
+    # so those keep their generic name.
     ir = llvm_from_source(
         (REPO_ROOT / "examples" / "linked_list.mx").read_text())
-    for fname in ("new_list", "push_front", "pop_front", "remove_next",
+    for fname in ("new_list", "push_front$Int", "pop_front", "remove_next",
                   "get", "get_mut", "take_node", "main"):
-        assert re.search(rf"^define (?:i64|double|ptr|void) @mx_{fname}\(",
+        assert re.search(rf"^define (?:i64|double|ptr|void) @{mangle(fname)}\(",
                          ir, re.M), f"{fname} did not emit"
+    # The erased original must be gone, not silently emitted alongside.
+    assert not re.search(r"^define .* @mx_push_front\(", ir, re.M)
     assert count_placeholders(ir) == 0
     # the IR documents the per-value nature of the shared Some slot
     assert ";   variant Some(boxed struct:Node (mixed per value))" in ir
@@ -6501,6 +6518,311 @@ def test_increment17_ir_passes_llvm_verifier(tmp_path):
                 _FX17_LOOP_INVARIANT_SRC, _FX17_MUT_LOOP_SRC,
                 _FX_STRUCT_ROUNDTRIP_SRC, _FX_STD_FIND_SRC):
         ll = tmp_path / "inc17.ll"
+        ll.write_text(llvm_from_source(src))
+        proc = subprocess.run(
+            ["opt", "-passes=verify", "-disable-output", str(ll)],
+            capture_output=True, text=True)
+        assert proc.returncode == 0, proc.stderr
+
+
+# ---------------------------------------------------------------------------
+# Increment 18: the native path runs on MONOMORPHIZED HIR
+# ---------------------------------------------------------------------------
+#
+# The backend's value-kind cells are per-function and monomorphic: one
+# generic function reached at two different types joins both kinds into
+# `conflict`, and the whole function (plus everything calling it) demotes to
+# a comment-only placeholder.  pipeline.emit_llvm_from_source now runs
+# compiler/monomorphize.py first, so each instantiation is a separate
+# function with its own kind cells.  The interpreter path deliberately does
+# NOT monomorphize -- it is the semantics reference -- so every differential
+# below compares native SPECIALIZED code against UNSPECIALIZED interpreted
+# semantics, which is exactly the contract the pass claims.
+#
+# The pass only rewrites call sites whose instantiation it can RESOLVE.
+# Unresolvable sites keep their generic callee and the generic original
+# stays loaded, so enabling it never changes what a program computes -- only
+# how much of it the backend can emit.
+
+_MONO_TWO_TYPES_SRC = """
+fn identity<T>(x: T) -> T { x }
+
+fn main() -> int {
+    print(identity("mono"))
+    return identity(7)
+}
+"""
+
+_MONO_LET_SRC = """
+fn identity<T>(x: T) -> T { x }
+
+fn main() -> int {
+    let a = 7
+    let b = "mono-let"
+    let c = identity(b)
+    print(c)
+    return identity(a)
+}
+"""
+
+_MONO_DECLARED_PARAM_SRC = """
+fn identity<T>(x: T) -> T { x }
+fn wrap_int(n: int) -> int { identity(n) }
+fn wrap_str(s: string) -> string { identity(s) }
+
+fn main() -> int {
+    print(wrap_str("mono-param"))
+    return wrap_int(9)
+}
+"""
+
+_MONO_RECURSION_SRC = """
+fn count_down<T>(x: T, n: int) -> int {
+    if n <= 0 { return 0 }
+    return count_down(x, n - 1) + 1
+}
+
+fn main() -> int {
+    print(count_down("s", 2).to_string())
+    return count_down(1, 5)
+}
+"""
+
+_MONO_STRUCT_SRC = """
+struct P { v: int }
+
+fn pick<T>(a: T, b: T) -> T { a }
+
+fn main() -> int {
+    let s = pick("x", "y")
+    print(s)
+    let p = pick(P { v: 5 }, P { v: 6 })
+    return pick(p.v, 0)
+}
+"""
+
+
+def test_mono_two_instantiations_undemote():
+    # WITHOUT the pass, identity's kind cells see both an i64 and a str
+    # argument and main demotes.  WITH it, each instantiation is its own
+    # function and the module emits completely.
+    plain = llvm_from_source(_MONO_TWO_TYPES_SRC, monomorphize=False)
+    assert count_placeholders(plain) == 1
+    assert "define i64 @mx_main(" not in plain
+
+    ir = llvm_from_source(_MONO_TWO_TYPES_SRC)
+    assert count_placeholders(ir) == 0
+    assert "define i64 @mx_identity_Int(" in ir
+    assert "define ptr @mx_identity_String(" in ir
+    assert "define i64 @mx_main(" in ir
+    # The fully specialized original is erased, not emitted alongside.
+    assert not re.search(r"^define .* @mx_identity\(", ir, re.M)
+
+
+def test_mono_resolves_through_let_bindings():
+    # `let a = 1; identity(a)` is the same instantiation as `identity(1)`;
+    # before let-resolution the pass could not see it and the module demoted.
+    plain = llvm_from_source(_MONO_LET_SRC, monomorphize=False)
+    assert count_placeholders(plain) == 1
+
+    ir = llvm_from_source(_MONO_LET_SRC)
+    assert count_placeholders(ir) == 0
+    assert "define i64 @mx_identity_Int(" in ir
+    assert "define ptr @mx_identity_String(" in ir
+
+
+def test_mono_resolves_through_declared_primitive_params():
+    plain = llvm_from_source(_MONO_DECLARED_PARAM_SRC, monomorphize=False)
+    assert count_placeholders(plain) == 1
+
+    ir = llvm_from_source(_MONO_DECLARED_PARAM_SRC)
+    assert count_placeholders(ir) == 0
+    assert "define i64 @mx_identity_Int(" in ir
+    assert "define ptr @mx_identity_String(" in ir
+
+
+def test_mono_rebound_names_are_not_trusted():
+    # A name that is REBOUND (assignment target, lambda parameter, pattern
+    # binder) is excluded from the let-environment wholesale: the pass would
+    # otherwise have to prove the shadow carries the same type, and picking
+    # the wrong clone is a miscompile.  Conservative == still correct: the
+    # call simply stays generic.
+    src = """
+fn identity<T>(x: T) -> T { x }
+
+fn main() -> int {
+    let mut a = 1
+    a = 2
+    return identity(a)
+}
+"""
+    from metaxu.compiler.monomorphize import _rebound_names
+    ctx = build_context_from_source(src)
+    hir = HIRBuilder(ctx.tables, id_map=ctx.id_map).build(ctx.frozen_root)
+    main = next(f for f in hir if str(f.sym) == "main")
+    assert "a" in _rebound_names(main.body)
+
+    ir = llvm_from_source(src)
+    assert "mx_identity_Int" not in ir        # stayed generic on purpose
+    assert "define i64 @mx_identity(" in ir   # ...and the original survives
+    assert count_placeholders(ir) == 0
+
+
+def test_mono_clone_is_memoized_not_duplicated():
+    # Code-growth guard: N call sites at the SAME instantiation must produce
+    # exactly ONE clone, not N.
+    src = """
+fn identity<T>(x: T) -> T { x }
+
+fn main() -> int {
+    return identity(1) + identity(2) + identity(3) + identity(4)
+}
+"""
+    ir = llvm_from_source(src)
+    assert len(re.findall(r"^define .* @mx_identity_Int\(", ir, re.M)) == 1
+    assert count_placeholders(ir) == 0
+
+
+def test_mono_growth_is_bounded_by_instantiation_count():
+    # One generic reached at three types yields exactly three clones and the
+    # original is erased: emitted-function growth is +2, not exponential.
+    src = """
+fn identity<T>(x: T) -> T { x }
+
+fn main() -> int {
+    print(identity("s"))
+    let f = identity(1.5)
+    print(f.to_string())
+    return identity(3)
+}
+"""
+    plain = llvm_from_source(src, monomorphize=False)
+    ir = llvm_from_source(src)
+
+    def defs(text):
+        # user functions only; runtime shims (metaxu_print_str) come and go
+        # with which builtins the module ends up lowering natively
+        return {n for n in re.findall(r"^define [^@]*@(\w+)\(", text, re.M)
+                if n.startswith("mx_")}
+
+    grown = defs(ir) - defs(plain)
+    assert grown == {"mx_identity_Int", "mx_identity_String",
+                     "mx_identity_Float", "mx_main"}, grown
+    assert "mx_identity" not in defs(ir)
+
+
+def test_mono_polymorphic_recursion_terminates():
+    # Polymorphic recursion (the classic non-termination hazard: each level
+    # instantiates at a STRICTLY LARGER type).  _known_type reports a struct
+    # by its bare name -- Box, not Box[Box[Int]] -- so the instantiation
+    # lattice is finite and the memo closes the loop after one clone.
+    src = """
+struct Box { v: int }
+
+fn depth<T>(x: T, n: int) -> int {
+    if n <= 0 { return 0 }
+    return depth(Box { v: n }, n - 1) + 1
+}
+
+fn main() -> int { return depth(1, 4) }
+"""
+    ir = llvm_from_source(src)
+    assert len(re.findall(r"^define .* @mx_depth_Box\(", ir, re.M)) == 1
+    assert len(re.findall(r"^define .* @mx_depth_Int\(", ir, re.M)) == 1
+
+
+def test_mono_mir_interprets_identically():
+    # The pass's own correctness contract, checked on the one corpus example
+    # it actually specializes: interpreting monomorphized MIR must give the
+    # same answer as interpreting the unspecialized MIR.
+    src = (REPO_ROOT / "examples" / "linked_list.mx").read_text()
+
+    def run(mono):
+        interp = MirInterpreter()
+        interp.load(mir_from_source(src, monomorphize=mono))
+        out = []
+        interp.register_builtin("print", lambda *a: (out.append(a), UNIT)[1])
+        return interp.call("main", []), tuple(out)
+
+    assert run(False) == run(True)
+
+
+def test_mono_interpreter_path_is_unaffected():
+    # Item 1's contract: only the LLVM entry point monomorphizes.  The
+    # interpreter front door keeps its default of OFF and its MIR is
+    # byte-identical to the unmonomorphized lowering.
+    from metaxu.compiler.mir import dump_mir
+    from metaxu.compiler.pipeline import (emit_llvm_from_source,
+                                          run_pipeline_from_source)
+    _a, _h, mir_txt, _c = run_pipeline_from_source(_MONO_TWO_TYPES_SRC)
+    assert "identity$Int" not in mir_txt
+    assert dump_mir(mir_from_source(_MONO_TWO_TYPES_SRC)) == mir_txt
+    assert "mx_identity_Int" in emit_llvm_from_source(_MONO_TWO_TYPES_SRC)
+
+
+@needs_clang
+def test_native_mono_two_instantiations_differential(tmp_path):
+    assert_native_matches_interp(_MONO_TWO_TYPES_SRC, tmp_path)
+
+
+@needs_clang
+def test_native_mono_let_differential(tmp_path):
+    assert_native_matches_interp(_MONO_LET_SRC, tmp_path)
+
+
+@needs_clang
+def test_native_mono_declared_param_differential(tmp_path):
+    assert_native_matches_interp(_MONO_DECLARED_PARAM_SRC, tmp_path)
+
+
+@needs_clang
+def test_native_mono_recursion_differential(tmp_path):
+    assert_native_matches_interp(_MONO_RECURSION_SRC, tmp_path)
+
+
+@needs_clang
+def test_native_mono_struct_instantiation_differential(tmp_path):
+    assert_native_matches_interp(_MONO_STRUCT_SRC, tmp_path)
+
+
+@needs_clang
+def test_native_mono_linked_list_example_differential(tmp_path):
+    # The one corpus example the pass actually specializes (push_front$Int):
+    # native monomorphized code must still equal the interpreter running the
+    # unspecialized program.
+    assert_native_matches_interp(
+        (REPO_ROOT / "examples" / "linked_list.mx").read_text(), tmp_path)
+
+
+_MONO_ASAN_SRC = """
+struct P { v: int }
+
+fn pick<T>(a: T, b: T) -> T { a }
+
+fn main() -> int {
+    print(pick("asan", "no"))
+    let p = pick(P { v: 5 }, P { v: 6 })
+    print(p.v.to_string())
+    return pick(0, 1)
+}
+"""
+
+
+@needs_asan
+def test_native_mono_struct_instantiation_asan(tmp_path):
+    # Cloned bodies allocate exactly like their originals; ASan over a
+    # struct-carrying instantiation proves cloning introduced no
+    # double-free and no use-after-free (payload boxes leak by design, so
+    # this runs under the documented detect_leaks=0 contract).
+    assert_native_matches_interp_asan_boxes(_MONO_ASAN_SRC, tmp_path)
+
+
+def test_mono_ir_passes_llvm_verifier(tmp_path):
+    if shutil.which("opt") is None:
+        pytest.skip("LLVM opt not installed")
+    for src in (_MONO_TWO_TYPES_SRC, _MONO_LET_SRC, _MONO_DECLARED_PARAM_SRC,
+                _MONO_RECURSION_SRC, _MONO_STRUCT_SRC, _MONO_ASAN_SRC):
+        ll = tmp_path / "mono.ll"
         ll.write_text(llvm_from_source(src))
         proc = subprocess.run(
             ["opt", "-passes=verify", "-disable-output", str(ll)],
