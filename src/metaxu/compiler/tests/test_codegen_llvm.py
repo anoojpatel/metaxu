@@ -2903,12 +2903,28 @@ def test_examples_define_census_does_not_regress():
     # the boxing itself (their remaining demotions are other gaps —
     # std.stream's find, the increment's real win, is census'd in
     # test_std_stream_full_surface_census).
+    #
+    # The HIR-triage round REMOVED 6 defines that only existed because the
+    # front end had silently deleted a handler — the same shape as the FFI
+    # round above, which removed 4 defines once unsafe blocks stopped being
+    # dropped.  examples/06_vector_operations.mx's `with_simd` is written with
+    # the inline `handle SUBJECT { perform Op(p) => body }` form, and that node
+    # had NO HIR lowering: the whole handler vanished, `f` was never called,
+    # and SimdOp's try_vectorize/try_horizontal could only ever be answered by
+    # their declared defaults.  Native codegen lowers that static case, so
+    # reduce/fold/sum/mean/dot/norm/normalize/matmul emitted.  With the handler
+    # real, those ops have a declared default AND a handle scope, so answering
+    # a perform is a runtime choice — "dynamic default routing has no native
+    # lowering" — and every function reached through them demotes explicitly
+    # rather than emitting code for the wrong route.  Net 87 -> 81 (06 loses
+    # 11 and gains the two handler-arm functions plus three main lambdas that
+    # are now reachable).
     total_defines = 0
     for path in _example_files():
         ir = llvm_from_source(path.read_text())
         total_defines += len(re.findall(
             r"^define (?:i64|double|ptr|void) @mx_\w+\(", ir, re.M))
-    assert total_defines >= 87
+    assert total_defines >= 81
 
 
 # ---------------------------------------------------------------------------
@@ -3499,15 +3515,26 @@ def test_vector_operations_example_lifts_transpose_and_static_assert():
     # DIFFERENT lambdas at one call site (closure-kind conflicts), zip's
     # lambda references an undefined name, fold's generic type_of code has
     # free type variables.
+    #
+    # The HIR triage round changed WHICH honest reason dominates. `with_simd`
+    # uses the inline `handle SUBJECT { perform Op(p) => body }` form, which
+    # had no HIR lowering at all: the handler silently vanished, `f` was never
+    # called, and SimdOp performs could only ever be answered by their declared
+    # defaults — which the native backend does lower. With the handler real,
+    # try_vectorize/try_horizontal have BOTH a declared default and a handle
+    # scope, and dynamic default routing has no native lowering, so map/reduce/
+    # fold (and everything reached through them) demote on that instead.
     ir = llvm_from_source(
         (REPO_ROOT / "examples" / "06_vector_operations.mx").read_text())
     assert "define ptr @mx___impl__vector_transpose(ptr" in ir
     assert "define ptr @mx___impl__vector_transpose_lambda8(" in ir
     assert "define ptr @mx_static_assert()" in ir
     assert ir.count("call ptr @mx_fvec_map(ptr") >= 2
-    # the honest residue: higher-order conflicts, not vector builtins
+    # the honest residue: higher-order/effect-routing gaps, not vector builtins
     assert "; function @mx_main: placeholder" in ir
-    assert "irreconcilable value kinds" in ir
+    assert ("has a declared default and also appears in a handle scope" in ir
+            or "irreconcilable value kinds" in ir)
+    assert "call through local 'f' that is not a statically-known closure" in ir
     for lifted_builtin in ("__vec_dim", "__vec_zeros", "__vec_filled",
                            "__vec_comprehension", "__slice_get", "__range",
                            "__cast"):
@@ -5176,3 +5203,85 @@ def test_collections_push_emits_with_both_fields():
 @needs_clang
 def test_native_collections_push_differential(tmp_path):
     assert_native_matches_interp(_COLLECTIONS_PUSH_SRC, tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# HIR triage round: constructs that previously had NO front-end lowering at
+# all (they vanished silently) now reach the native backend. Each is pinned
+# differentially — native stdout/exit must equal the interpreter — so a
+# construct that is newly *present* cannot be newly *wrong*.
+# ---------------------------------------------------------------------------
+
+_TRIAGE_INDIRECT_CALL_SRC = """
+fn main() -> int {
+    let n = (fn(x: int) -> int { x * 2 })(3);
+    print(n);
+    n
+}
+"""
+
+
+@needs_clang
+def test_native_indirect_call_of_lambda_literal_differential(tmp_path):
+    """`(fn(x) -> x*2)(3)` is a CallExpression (computed callee); the whole
+    call used to vanish in HIR and the expression evaluated to unit."""
+    assert_native_matches_interp(_TRIAGE_INDIRECT_CALL_SRC, tmp_path)
+
+
+_TRIAGE_ADDRESS_OF_SRC = """
+struct P { a: int, b: int }
+
+fn main() -> int {
+    let p = P { a: 7, b: 9 };
+    let q = &p.a;
+    print(q);
+    q
+}
+"""
+
+
+@needs_clang
+def test_native_address_of_field_differential(tmp_path):
+    """`&x.f` builds an AddressOf (only the bare-name form builds a Borrow*);
+    it had no lowering, so the expression silently became nothing."""
+    assert_native_matches_interp(_TRIAGE_ADDRESS_OF_SRC, tmp_path)
+
+
+_TRIAGE_BORROW_EXPR_SRC = """
+fn main() -> int {
+    let x = 5;
+    let y = borrow x;
+    print(y);
+    y
+}
+"""
+
+
+@needs_clang
+def test_native_borrow_expression_differential(tmp_path):
+    """`borrow x` had no lowering: the binding was dropped entirely."""
+    assert_native_matches_interp(_TRIAGE_BORROW_EXPR_SRC, tmp_path)
+
+
+_TRIAGE_DOTTED_VARIANT_SRC = """
+enum Color { Red, Green, Blue }
+
+fn main() -> int {
+    let c = Color.Blue;
+    let n = match c {
+        Color.Red => 1,
+        Color.Green => 2,
+        Color.Blue => 3
+    };
+    print(n);
+    n
+}
+"""
+
+
+@needs_clang
+def test_native_dotted_enum_variant_differential(tmp_path):
+    """`Color.Blue` in expression position used to build a field read of an
+    undefined variable; in pattern position it degraded to a wildcard, so the
+    FIRST arm matched every colour."""
+    assert_native_matches_interp(_TRIAGE_DOTTED_VARIANT_SRC, tmp_path)
