@@ -867,3 +867,146 @@ fn main() -> int {
 """
     assert run_main(src, monomorphize=False) == 42
     assert run_main(src, monomorphize=True) == 42
+
+
+# ---------------------------------------------------------------------------
+# Higher-order call-site cloning (monomorphize's second axis)
+# ---------------------------------------------------------------------------
+#
+# A NON-generic function whose polymorphism flows through a closure-typed
+# parameter (fn apply(f) { f() }) is invisible to type-argument
+# specialization, yet each call site's lambda gives it different value
+# kinds and the native backend joins them to `conflict`. Such call sites
+# passing lambda LITERALS are cloned per site: the clone body is identical
+# so behavior cannot change, but the backend's per-function kind cells see
+# one lambda each. A callee with fewer than two call sites is never cloned
+# (nothing joins), and dead originals are erased by a whole-output
+# reference scan.
+
+HO_PROGRAM = """
+fn apply(f) { f() }
+
+fn main() -> int {
+    let a = apply(fn() -> 40);
+    let b = apply(fn() -> 2);
+    return a + b
+}
+"""
+
+
+def test_ho_clone_identical_results():
+    assert run_main(HO_PROGRAM, monomorphize=False) == 42
+    assert run_main(HO_PROGRAM, monomorphize=True) == 42
+
+
+def test_ho_clone_per_site_names_and_erased_original():
+    txt = mir_text(HO_PROGRAM, monomorphize=True)
+    assert "apply$ho1" in txt
+    assert "apply$ho2" in txt
+    # Both sites rewritten and nothing else references apply: erased.
+    assert "func apply suspending" not in txt
+
+
+def test_ho_clone_single_site_callee_is_left_alone():
+    # One call site means no kind join, and cloning would only rename
+    # symbols the backend already pins.
+    txt = mir_text("""
+fn apply(f) { f() }
+
+fn main() -> int {
+    return apply(fn() -> 42)
+}
+""", monomorphize=True)
+    assert "$ho" not in txt
+    assert "func apply suspending" in txt
+
+
+def test_ho_clone_var_routed_lambda_keeps_the_shared_original():
+    # The trigger is a lambda LITERAL at the call site. Routed through a
+    # variable, the site keeps the shared original (this is also what the
+    # backend's shared-site ABI tests rely on).
+    txt = mir_text("""
+fn apply(f) { f() }
+
+fn main() -> int {
+    let g = fn() -> 40;
+    let h = fn() -> 2;
+    return apply(g) + apply(h)
+}
+""", monomorphize=True)
+    assert "$ho" not in txt
+    assert "func apply suspending" in txt
+
+
+def test_ho_clone_mixed_sites_keep_the_original_for_the_var_site():
+    # Two literal sites clone; the var-routed third site still calls the
+    # original by name, so the reference scan must keep it loaded.
+    # (Passing a top-level function itself as a VALUE is not supported by
+    # the language today — the scan's Var branch is defensive — so the
+    # un-rewritten-call-site path is the reachable way to pin retention.)
+    src = """
+fn apply(f) { f() }
+
+fn main() -> int {
+    let a = apply(fn() -> 20);
+    let b = apply(fn() -> 2);
+    let g = fn() -> 20;
+    let c = apply(g);
+    return a + b + c
+}
+"""
+    assert run_main(src, monomorphize=False) == 42
+    assert run_main(src, monomorphize=True) == 42
+    txt = mir_text(src, monomorphize=True)
+    assert "apply$ho1" in txt
+    assert "apply$ho2" in txt
+    assert "func apply suspending" in txt
+
+
+def test_ho_clone_recursive_higher_order_terminates_and_agrees():
+    # A recursive function taking a lambda: the _ho_stack guard leaves the
+    # recursive call pointing at the original (which therefore survives),
+    # and the pass terminates.
+    src = """
+fn repeat(n: int, f) -> int {
+    if n == 0 { 0 } else { f() + repeat(n - 1, f) }
+}
+
+fn main() -> int {
+    let a = repeat(3, fn() -> 10);
+    let b = repeat(4, fn() -> 3);
+    return a + b
+}
+"""
+    assert run_main(src, monomorphize=False) == 42
+    assert run_main(src, monomorphize=True) == 42
+    txt = mir_text(src, monomorphize=True)
+    assert "func repeat suspending" in txt   # recursion keeps the original
+
+
+def test_ho_clone_effectful_stdlib_shape_agrees():
+    # The measured real-world shape: two catch_-style sites whose lambdas
+    # produce different types. Interpreter semantics must be identical
+    # with and without the pass (handler sub-functions are per containing
+    # function, so clones get their own).
+    src = """
+effect Throw {
+    throw(msg: string) -> int
+}
+
+fn catchy(f) {
+    handle Throw with {
+        throw(msg) -> 0 - 1
+    } in {
+        f()
+    }
+}
+
+fn main() -> int {
+    let ok = catchy(fn() -> 40);
+    let boom = catchy(fn() -> { let x = perform Throw.throw("no"); x + 99 });
+    return ok + boom + 3
+}
+"""
+    assert run_main(src, monomorphize=False) == 42
+    assert run_main(src, monomorphize=True) == 42

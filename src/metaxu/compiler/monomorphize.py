@@ -279,6 +279,25 @@ class _Mono:
         # (generic name, concrete type args) -> specialized clone
         self.specialized: Dict[tuple[str, tuple[str, ...]], HFun] = {}
         self.clones_in_order: List[HFun] = []
+        # Higher-order call-site clones: sequence counter, the set of
+        # originals currently being cloned (recursion guard: a recursive
+        # higher-order call inside a clone keeps calling the original
+        # instead of spawning clones forever), and a total-clone cap as
+        # insurance against exponential nesting (f passes a lambda to g
+        # twice, g to h twice, ...). Hitting the cap just stops cloning:
+        # unrewritten call sites keep the original callee, which is the
+        # pass-wide behavior-preservation contract.
+        self._ho_counter = 0
+        self._ho_stack: set[str] = set()
+        self._ho_originals: set[str] = set()
+        self._HO_CLONE_CAP = 1000
+        # Call sites per callee across the whole module (Var references to
+        # a function count double: a function escaping as a value has
+        # unknowable call sites). Cloning only pays when kinds would JOIN
+        # across sites, i.e. when a callee has at least two; a single-site
+        # callee already pins its one lambda through the original name,
+        # and cloning it would only churn symbol names.
+        self._call_site_count: Dict[str, int] = {}
         # Generic functions with at least one call site the pass could not
         # resolve, or referenced by name as a value: must keep the original.
         self.keep_generic: set[str] = set()
@@ -370,6 +389,55 @@ class _Mono:
         self._process_body(clone.body, param_env)
         return mangled
 
+    # -- higher-order call-site cloning -------------------------------------
+
+    def _ho_specialize(self, name: str) -> str | None:
+        """Clone `name` for ONE call site that passes a lambda literal.
+
+        This is the axis the type-argument machinery cannot reach: a
+        function like ``fn catch_(f) { .. f() .. }`` declares no type
+        parameters, so it is invisible to `generic_names`, yet each call
+        site's lambda gives `f` (and the result) a different type. The
+        native backend's value-kind cells are per function, so the four
+        call sites of `std.throw.catch_` join `f`'s kind — and the return
+        kind flowing out of `f()` — into `conflict`, demoting `catch_`
+        and every caller.
+
+        Unlike inferring the lambda's return type (rejected in the module
+        docstring: that is re-running inference, and a wrong answer is a
+        miscompile), a per-call-site clone cannot be wrong: the body is
+        byte-identical and only the NAME is fresh, so runtime behavior is
+        unchanged by construction while the backend's kind fixpoint sees
+        exactly one lambda per clone. The cost is code duplication,
+        bounded by the syntactic count of lambda-passing call sites (and
+        the cap above).
+
+        Returns the clone's name, or None when cloning is capped."""
+        if self._ho_counter >= self._HO_CLONE_CAP:
+            return None
+        original = self.fn_by_name[name]
+        self._ho_originals.add(name)
+        self._ho_counter += 1
+        mangled = f"{name}{MONO_SEP}ho{self._ho_counter}"
+        clone = HFun(
+            sym=mangled,
+            params=list(original.params),
+            dict_params=list(original.dict_params),
+            ret_ty=original.ret_ty,
+            where_cls=list(original.where_cls),
+            body=_clone_expr(original.body),
+            param_modes=dict(original.param_modes) if original.param_modes else None,
+        )
+        self.clones_in_order.append(clone)
+        self._ho_stack.add(name)
+        try:
+            # Process the clone body like any root: its own generic and
+            # higher-order call sites specialize transitively.
+            self._process_body(clone.body, self._declared_param_env(name))
+        finally:
+            self._ho_stack.discard(name)
+        return mangled
+
     # -- body processing ----------------------------------------------------
 
     def _process_body(self, e: HExpr, param_env: Dict[str, str]) -> None:
@@ -423,6 +491,23 @@ class _Mono:
             return
         name = e.callee
         if name not in self.generic_names:
+            # Higher-order call-site cloning (see _ho_specialize): a
+            # NON-generic callee receiving a lambda literal gets its own
+            # clone per call site. Scope deliberately tight — the callee
+            # must be a plain function we hold the body of. `__`-prefixed
+            # synthesized names are excluded because their spelling IS
+            # their dispatch: trait impls (`__impl$Trait$Type$m`) are
+            # found by name pattern at runtime and the backend parses
+            # trait tables out of those names, so a `$hoN` suffix would
+            # change what they mean, not just what they're called.
+            if (name in self.fn_by_name
+                    and not name.startswith("__")
+                    and name not in self._ho_stack
+                    and self._call_site_count.get(name, 0) >= 2
+                    and any(o.op == "Lambda" for o in (e.operands or ()))):
+                ho_name = self._ho_specialize(name)
+                if ho_name is not None:
+                    e.callee = ho_name
             return
         sig = self.sigs[name]
         targs = self._resolve_instantiation(e, sig, param_env)
@@ -455,6 +540,24 @@ class _Mono:
         return env
 
     def run(self, funcs: Sequence[HFun]) -> List[HFun]:
+        # Pre-scan call-site counts over the ORIGINAL bodies (clone bodies
+        # copy an original's sites, so relative counts are stable; a count
+        # depressed by later cloning can only under-clone, never miscount).
+        def count_sites(x: HExpr | None) -> None:
+            if x is None:
+                return
+            if x.op == "Call" and x.callee:
+                self._call_site_count[str(x.callee)] = \
+                    self._call_site_count.get(str(x.callee), 0) + 1
+            if x.op == "Var" and x.var_name in self.fn_by_name:
+                self._call_site_count[str(x.var_name)] = \
+                    self._call_site_count.get(str(x.var_name), 0) + 2
+            for child in _child_exprs(x):
+                count_sites(child)
+
+        for f in funcs:
+            count_sites(f.body)
+
         roots = [f for f in funcs if str(f.sym) not in self.generic_names]
         for f in roots:
             self._process_body(f.body, self._declared_param_env(str(f.sym)))
@@ -495,6 +598,42 @@ class _Mono:
                 continue
             out.append(f)
         out.extend(self.clones_in_order)
+
+        # Erase higher-order originals that nothing references anymore.
+        # Without this the dead original stays loaded and — its closure
+        # parameter now joined over ZERO call sites, its `f()` an indirect
+        # call through nothing — still demotes, inflating the placeholder
+        # count the cloning existed to reduce. Erasure is by a whole-output
+        # reference scan rather than call-site bookkeeping: every way HIR
+        # can reach a function by name is either a Call's `callee` (plain
+        # calls, UFCS method position — _method_callee returns the bare
+        # name) or a `Var` (function as a value, which lowers to
+        # make_closure); `__trait$m` / `__builtin$m` / effect-default
+        # dispatch all go through `__`-prefixed synthesized names, which
+        # are never ho originals by construction. A recursive call left
+        # pointing at the original by the _ho_stack guard is a Call like
+        # any other, so the scan keeps such originals alive. Entry points
+        # are called from OUTSIDE the module by name, so `main` and the
+        # example-gate fallback `example` are never erased.
+        if self._ho_originals:
+            referenced: set[str] = set()
+
+            def scan(x: HExpr | None) -> None:
+                if x is None:
+                    return
+                if x.op == "Call" and x.callee:
+                    referenced.add(str(x.callee))
+                if x.op == "Var" and x.var_name:
+                    referenced.add(str(x.var_name))
+                for child in _child_exprs(x):
+                    scan(child)
+
+            for f in out:
+                scan(f.body)
+            dead = {n for n in self._ho_originals
+                    if n not in referenced and n not in ("main", "example")}
+            if dead:
+                out = [f for f in out if str(f.sym) not in dead]
         return out
 
 
