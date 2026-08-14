@@ -180,6 +180,52 @@ parameters, and a handler case performing its own effect routes to the next
 enclosing handler (handler bodies evaluate outside their own delimitation)
 instead of deadlocking.
 
+## Loudly-unsupported surface constructs (HIR triage)
+
+Update (2026-08-14): HIR lowering used to end in `return None` for any AST
+node class it did not recognize, and every caller skipped a None result — so
+the construct simply VANISHED and the program compiled to something that
+quietly did less than it said. Eight instances of that one bug were found by
+accident, one at a time (if-let, while-let, `unsafe { }`, `@mut e`, list
+literals, `for`, `e as T`, early `return`, struct-field initializers).
+
+The fallback is now loud and every AST node class is triaged into exactly one
+bucket in `AST_NODE_TRIAGE` / `PATTERN_TRIAGE` (`compiler/hir.py`), each with
+a one-line reason; `tests/test_hir_coverage.py` fails if a newly added node
+class is left unclassified. The authoritative list lives in that table — this
+is the summary of what is deliberately NOT supported and errors loudly:
+
+- **GPU**: `to_device(x)`, `from_device(x)`, kernel annotations — no runtime.
+- **Comptime**: `comptime { }` blocks, `comptime fn`, compile-time values,
+  `typeof`-style type reflection, compile-time matching on types — compile-time
+  evaluation is not implemented. (`comptime fn` is rejected explicitly rather
+  than silently compiled as an ordinary run-time function.)
+- **Threads**: `spawn(f())` — the threads runtime is out of scope for v1.
+- **Raw pointers**: pointer dereference has no HIR/MIR representation.
+- **Uncalled generic instantiation**: `let f = ident<int>;` — a type-applied
+  function has no value representation; call it directly (`ident<int>(x)`).
+- **Bare comprehensions**: `f(e for x in it)` — only the vector-literal form
+  `vector[T,N](e for x in it)` has a value representation.
+- **Non-unit tuples**: `(a, b)` — no runtime representation (`()` is unit).
+- **`vector[T,N]` in value position** — it is a TYPE; the value forms are
+  `vector[T,N]()`, `vector[T,N](e, ...)` and `vector[T,N].filled(e)`.
+- **Pattern forms**: list patterns (`[]`, `[x, ...xs]`), tuple patterns,
+  struct patterns, range patterns (`1..5`), guards, arbitrary expressions,
+  matching on the structure of a function, and matching against a field's or
+  an indexed value. Each of these used to degrade to a match-anything
+  wildcard, which silently made the arm win for every value and every later
+  arm dead code. `examples/02_effects_and_handlers.mx`'s `map` was written
+  with list patterns and therefore always returned an empty list; it is now a
+  loop.
+
+`examples/06_vector_operations.mx`'s `with_simd` used the inline
+`handle SUBJECT { perform Op(p) => body }` form, which had no lowering at all
+— the handler vanished, `f` was never called, and the function returned unit.
+That form is now lowered for real; its arms answer `None` (the capability's
+"no vectorized form available" answer, which is what the file's own comments
+promise), because selecting an intrinsic per element function needs the
+comptime type matching and function-structure patterns listed above.
+
 ## Headline findings
 
 - 18 of 19 example programs (`examples/*.mx` + root `test_*.mx`) fail at the
