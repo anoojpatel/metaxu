@@ -159,6 +159,11 @@ Items 3, 4, 5, 6 and 7 are fixed (regression tests:
 `src/metaxu/compiler/tests/test_silent_seams.py`); the remaining gaps
 (8, 9) are parse-time-loud, not silent.
 
+10. Block-bodied lambdas (`fn() -> { stmt; stmt }`) do not parse in
+    expression position — only expression-bodied lambdas work. Found
+    writing `std/state.mx`'s nested-scope test (worked around with named
+    helper functions). Parse-time-loud, not silent.
+
 ## Testing
 
 `src/metaxu/compiler/tests/test_stdlib.py` exercises every module
