@@ -1,0 +1,236 @@
+# std.sort — ordering over Metaxu's builtin Vec.
+#
+# Neither std.vec nor std.stream sorts: std.vec's combinators are all
+# single-pass and streams cannot sort at all (sorting needs the whole
+# sequence). This module is that gap, and it follows std.vec's contract
+# exactly — eager, Vec in, fresh Vec out, the argument never mutated.
+#
+# The algorithm is a top-down MERGE sort, chosen for three reasons and
+# not for speed: it is stable (equal elements keep their input order,
+# which is what makes `sort_by_key` chains compose), it needs no in-place
+# swapping so it fits the fresh-Vec-out contract without copying twice,
+# and its worst case is its average case. A quicksort would be faster in
+# the common case and would give this module an adversarial input that
+# degrades to O(n^2) — a bad trade for a standard library.
+#
+# The comparator convention throughout is a STRICT LESS-THAN predicate:
+#
+#     less(a, b) -> bool      # true when a must come before b
+#
+# not a three-way `cmp` returning -1/0/1. One predicate is enough to
+# order a sequence, it is the cheaper thing for a caller to write
+# (`fn(a: int, b: int) -> a > b` reverses an order), and it removes the
+# question of what a comparator returning 2 means. Stability then falls
+# out of one rule in `merge_into`: take from the LEFT run unless the
+# right element is strictly less. Ties therefore never cross.
+#
+# `sort` itself is ascending ints. Sorting by anything else goes through
+# `sort_by` (own predicate) or `sort_by_key` (project, then compare the
+# projections with <).
+
+export {
+    sort,
+    sort_by,
+    sort_by_key,
+    sort_desc,
+    is_sorted,
+    is_sorted_by,
+    merge,
+    merge_by,
+    binary_search,
+    unique_sorted,
+    min_by_key,
+    max_by_key
+};
+
+# Ascending order for anything `<` accepts. Fresh Vec; `v` is untouched.
+fn sort(v: Vec) -> Vec {
+    sort_by(v, fn(a, b) -> a < b)
+}
+
+# Descending order. Note the argument flip rather than `>`: with `less`
+# defined as strict, `fn(a, b) -> less(b, a)` reverses the order while
+# KEEPING stability (equal elements still hold their input order), which
+# `a > b` would also do here but stops being obvious the moment the
+# caller passes a partial order.
+fn sort_desc(v: Vec) -> Vec {
+    sort_by(v, fn(a, b) -> b < a)
+}
+
+# Stable merge sort under a caller-supplied strict-less-than predicate.
+fn sort_by(v: Vec, less) -> Vec {
+    let n = len(v);
+    if n < 2 {
+        copy_of(v)
+    } else {
+        let mid = n / 2;
+        let left = sort_by(slice_of(v, 0, mid), less);
+        let right = sort_by(slice_of(v, mid, n), less);
+        merge_by(left, right, less)
+    }
+}
+
+# Sort by a projection: `sort_by_key(people, fn(p) -> p.age)`. Because
+# the sort is stable, chaining these sorts by successive keys — sort by
+# the LEAST significant key first — orders by all of them.
+fn sort_by_key(v: Vec, key) -> Vec {
+    sort_by(v, fn(a, b) -> key(a) < key(b))
+}
+
+# Merge two already-sorted vectors into one sorted vector (ascending).
+fn merge(a: Vec, b: Vec) -> Vec {
+    merge_by(a, b, fn(x, y) -> x < y)
+}
+
+# Merge under an explicit predicate. Stable across the two runs: when
+# neither element is less than the other, `a`'s wins.
+#
+# Callers must pass already-sorted vectors; merging unsorted input
+# produces an interleaving, not an ordering. `is_sorted_by` checks it.
+fn merge_by(a: Vec, b: Vec, less) -> Vec {
+    let @mut out = Vec.new();
+    let @mut i = 0;
+    let @mut j = 0;
+    while i < len(a) {
+        if j < len(b) {
+            # Take from b ONLY when it is strictly less: this single
+            # comparison is what makes the whole sort stable.
+            if less(b[j], a[i]) {
+                out.push(b[j]);
+                j = j + 1
+            } else {
+                out.push(a[i]);
+                i = i + 1
+            }
+        } else {
+            out.push(a[i]);
+            i = i + 1
+        }
+    };
+    while j < len(b) {
+        out.push(b[j]);
+        j = j + 1
+    };
+    out
+}
+
+# True when v is in ascending order (empty and single-element are).
+fn is_sorted(v: Vec) -> bool {
+    is_sorted_by(v, fn(a, b) -> a < b)
+}
+
+# True when no element is strictly less than its predecessor. Note this
+# is the negation applied pairwise, not `less(v[i-1], v[i])` — equal
+# neighbours must count as sorted.
+fn is_sorted_by(v: Vec, less) -> bool {
+    let @mut i = 1;
+    let @mut ok = true;
+    while i < len(v) {
+        if less(v[i], v[i - 1]) { ok = false } else { () };
+        i = i + 1
+    };
+    ok
+}
+
+# Some(index of x) in an already-sorted vector, else None. O(log n), and
+# undefined — as in "answers None or an arbitrary match" — if `v` is not
+# sorted ascending.
+#
+# With duplicates this answers SOME index holding x, not the first.
+fn binary_search(v: Vec, x) {
+    let @mut lo = 0;
+    let @mut hi = len(v);
+    let @mut found = None;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if v[mid] == x {
+            found = Some(mid);
+            lo = hi
+        } else {
+            if v[mid] < x { lo = mid + 1 } else { hi = mid }
+        }
+    };
+    found
+}
+
+# Fresh Vec with consecutive duplicates collapsed. On a SORTED vector
+# that is set semantics; on an unsorted one it only collapses runs
+# (which is occasionally what you want, so it is not an error).
+fn unique_sorted(v: Vec) -> Vec {
+    let @mut out = Vec.new();
+    let @mut i = 0;
+    while i < len(v) {
+        if i == 0 {
+            out.push(v[i])
+        } else {
+            if v[i] == v[i - 1] { () } else { out.push(v[i]) }
+        };
+        i = i + 1
+    };
+    out
+}
+
+# Some(element with the smallest key), else None. Ties go to the first,
+# matching the sort's stability.
+fn min_by_key(v: Vec, key) {
+    let @mut best = None;
+    let @mut i = 0;
+    while i < len(v) {
+        if is_none_priv(best) {
+            best = Some(v[i])
+        } else {
+            if key(v[i]) < key(unwrap_priv(best)) { best = Some(v[i]) } else { () }
+        };
+        i = i + 1
+    };
+    best
+}
+
+# Some(element with the largest key), else None. Ties go to the first.
+fn max_by_key(v: Vec, key) {
+    let @mut best = None;
+    let @mut i = 0;
+    while i < len(v) {
+        if is_none_priv(best) {
+            best = Some(v[i])
+        } else {
+            if key(unwrap_priv(best)) < key(v[i]) { best = Some(v[i]) } else { () }
+        };
+        i = i + 1
+    };
+    best
+}
+
+# ---------------------------------------------------------------------
+# Private helpers (not exported).
+# ---------------------------------------------------------------------
+
+# v[lo..hi) as a fresh Vec. The language has no slicing builtin, and the
+# merge sort needs halves that are independent of the input.
+fn slice_of(v: Vec, lo: int, hi: int) -> Vec {
+    let @mut out = Vec.new();
+    let @mut i = lo;
+    while i < hi {
+        out.push(v[i]);
+        i = i + 1
+    };
+    out
+}
+
+fn copy_of(v: Vec) -> Vec {
+    slice_of(v, 0, len(v))
+}
+
+fn is_none_priv(o) -> bool {
+    match o {
+        Some(_) => false,
+        None => true
+    }
+}
+
+fn unwrap_priv(o) {
+    match o {
+        Some(x) => x,
+        None => 0
+    }
+}

@@ -915,3 +915,170 @@ fn main() -> int {
 }
 """)
     assert result == 4           # (0,1) (1,2) (2,3) (3,4)
+
+
+# ----------------------------------------------------------------------
+# std.sort — stable merge sort over Vec
+# ----------------------------------------------------------------------
+
+def test_sort_orders_ascending_and_leaves_the_input_alone():
+    """std.vec's contract is eager, Vec in, FRESH Vec out; sort keeps it,
+    so the caller's vector must still read 5 at index 0 afterwards."""
+    result, prints = run_main("""
+from std.sort import sort, is_sorted;
+
+fn main() -> int {
+    let mut v = Vec.new();
+    v.push(5); v.push(1); v.push(4); v.push(1); v.push(9); v.push(2);
+    let s = sort(v);
+    print(s[0]); print(s[1]); print(s[2]); print(s[3]); print(s[4]); print(s[5]);
+    print(v[0]);
+    if is_sorted(s) { 1 } else { 0 }
+}
+""")
+    assert prints == ["1", "1", "2", "4", "5", "9", "5"]
+    assert result == 1
+
+
+def test_sort_is_stable():
+    """Stability is why this is a merge sort and not a quicksort, and it
+    is what makes sort_by_key chains compose. Sorting (bucket, id) pairs
+    by bucket alone must leave ids in input order within each bucket.
+
+    Only a tie-sensitive assertion can see this: every other sort test
+    here passes under a merge that takes from the right run on ties."""
+    result, prints = run_main("""
+from std.sort import sort_by_key;
+
+fn main() -> int {
+    let mut v = Vec.new();
+    v.push((1, 10));
+    v.push((0, 20));
+    v.push((1, 30));
+    v.push((0, 40));
+    v.push((1, 50));
+    let s = sort_by_key(v, fn(p) -> { let (b, _id) = p; b });
+    let mut i = 0;
+    while i < s.len() {
+        let (b, id) = s[i];
+        print(id);
+        i = i + 1
+    };
+    0
+}
+""")
+    assert prints == ["20", "40", "10", "30", "50"]
+
+
+def test_sort_desc_and_sort_by_key():
+    result, prints = run_main("""
+from std.sort import sort_desc, sort_by_key;
+
+fn abs_of(x: int) -> int {
+    if x < 0 { 0 - x } else { x }
+}
+
+fn main() -> int {
+    let mut v = Vec.new();
+    v.push(3); v.push(7); v.push(5);
+    let d = sort_desc(v);
+    print(d[0]); print(d[2]);
+
+    let mut w = Vec.new();
+    w.push(0 - 5); w.push(2); w.push(0 - 1);
+    let k = sort_by_key(w, fn(x: int) -> abs_of(x));
+    print(k[0]); print(k[1]); print(k[2]);
+    d[0]
+}
+""")
+    assert prints == ["7", "3", "-1", "2", "-5"]
+    assert result == 7
+
+
+def test_sort_binary_search_hits_and_misses():
+    result, prints = run_main("""
+from std.sort import sort, binary_search;
+
+fn main() -> int {
+    let mut v = Vec.new();
+    v.push(9); v.push(3); v.push(7); v.push(1);
+    let s = sort(v);                      # 1, 3, 7, 9
+    let hit = match binary_search(s, 7) { Some(i) => i, None => 0 - 1 };
+    let miss = match binary_search(s, 8) { Some(i) => i, None => 0 - 1 };
+    print(hit); print(miss);
+    hit
+}
+""")
+    assert prints == ["2", "-1"]
+    assert result == 2
+
+
+def test_sort_merge_and_unique_sorted():
+    result, prints = run_main("""
+from std.sort import merge, sort, unique_sorted, is_sorted;
+
+fn main() -> int {
+    let mut a = Vec.new();
+    a.push(1); a.push(4); a.push(6);
+    let mut b = Vec.new();
+    b.push(2); b.push(3); b.push(9);
+    let m = merge(a, b);
+    print(m.len());
+    print(if is_sorted(m) { 1 } else { 0 });
+
+    let mut d = Vec.new();
+    d.push(2); d.push(1); d.push(2); d.push(1); d.push(3);
+    unique_sorted(sort(d)).len()
+}
+""")
+    assert prints == ["6", "1"]
+    assert result == 3           # {1, 2, 3}
+
+
+def test_sort_min_and_max_by_key():
+    result, prints = run_main("""
+from std.sort import min_by_key, max_by_key;
+
+fn abs_of(x: int) -> int {
+    if x < 0 { 0 - x } else { x }
+}
+
+fn main() -> int {
+    let mut v = Vec.new();
+    v.push(0 - 8); v.push(3); v.push(5);
+    let lo = match min_by_key(v, fn(x: int) -> abs_of(x)) { Some(x) => x, None => 0 };
+    let hi = match max_by_key(v, fn(x: int) -> abs_of(x)) { Some(x) => x, None => 0 };
+    print(lo); print(hi);
+    lo + hi
+}
+""")
+    assert prints == ["3", "-8"]     # smallest |x| is 3, largest is -8
+    assert result == -5
+
+
+def test_sort_handles_empty_single_and_deep_recursion():
+    """64 scrambled elements actually exercises the recursive split;
+    (i * 37) % 64 is a permutation of 0..63 because gcd(37, 64) == 1."""
+    result, prints = run_main("""
+from std.sort import sort, is_sorted;
+
+fn main() -> int {
+    let e = Vec.new();
+    let mut one = Vec.new();
+    one.push(42);
+    print(sort(e).len());
+    print(sort(one)[0]);
+
+    let mut v = Vec.new();
+    let mut i = 0;
+    while i < 64 {
+        v.push((i * 37) % 64);
+        i = i + 1
+    };
+    let s = sort(v);
+    print(s[0]); print(s[63]); print(s.len());
+    if is_sorted(s) { 1 } else { 0 }
+}
+""")
+    assert prints == ["0", "42", "0", "63", "64"]
+    assert result == 1
