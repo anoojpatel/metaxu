@@ -296,6 +296,36 @@ def test_multi_line_file_reports_the_right_line(tmp_path, blank_lines):
     assert f"  {expected_line} | " in msg   # the excerpt's gutter
 
 
+def test_fstring_segment_reports_the_fstring_line_not_line_one():
+    """`{expr}` segments are parsed out of a synthetic wrapper source; their
+    raw positions describe that wrapper and would claim line 1."""
+    src = ("fn main() -> int {\n"
+           "    let n = 5\n"
+           "    print(f\"n is {n + 1}\")\n"
+           "    return 0\n"
+           "}\n")
+    module = shared_parser().parse(src, file_path="fstr.mx")
+
+    seen: list = []
+
+    def walk(node):
+        if not isinstance(node, fast.Node) or any(n is node for n in seen):
+            return
+        seen.append(node)
+        for attr, value in vars(node).items():
+            if attr in ("parent", "scope", "location"):
+                continue
+            for item in (value if isinstance(value, (list, tuple)) else [value]):
+                walk(item)
+
+    walk(module)
+    to_string_calls = [n for n in seen
+                       if isinstance(n, fast.FunctionCall) and n.name == "to_string"]
+    assert to_string_calls, "f-string did not desugar to to_string(...)"
+    for call in to_string_calls:
+        assert call.location.line == 3, call.location
+
+
 def test_two_errors_in_one_file_get_distinct_lines(tmp_path):
     source = """\
 enum Shape { Circle(r: int), Square(s: int), Dot }

@@ -43,6 +43,12 @@ have no location; those report the compilation unit's file with no line
 rather than a wrong line. `StructInstantiation` fields are synthesized from
 `(name, value)` tuples and explicitly inherit their value's location.
 
+F-string `{expr}` segments are parsed out of a synthetic wrapper source, so
+their raw positions describe that wrapper (they would claim line 1 of the
+real file). `_parse_fstring_expr` drops them and lets the segment inherit
+the f-string literal's own span instead — a coarse location beats a wrong
+one.
+
 ## Position semantics
 
 `errors.SourceLocation` and `mutaxu_ast.Span` agree, and both are explicit
