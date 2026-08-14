@@ -155,7 +155,8 @@ def run_pipeline_ctx(ctx: PhaseContext, strict: bool = True,
 
 
 def emit_llvm_from_source(source: str, strict: bool = True,
-                          file_path: str = "<mem>") -> str:
+                          file_path: str = "<mem>",
+                          monomorphize: bool = True) -> str:
     """Parse, check, lower to MIR and emit an LLVM IR module (text).
 
     Separate entry point from run_pipeline_from_source (whose CLIF-returning
@@ -163,12 +164,27 @@ def emit_llvm_from_source(source: str, strict: bool = True,
     strict mode exactly like the main pipeline.  Pass `file_path` when the
     source lives on disk so multi-file imports resolve relative to its
     directory (exactly like run_pipeline_from_source).
+
+    `monomorphize` defaults to True on THIS path only.  The native backend's
+    value-kind cells are per-function and monomorphic, so a generic function
+    reached at two different types (``identity(1)`` and ``identity("s")``)
+    joins to `conflict` and demotes the whole function to a placeholder.
+    Cloning per instantiation (compiler/monomorphize.py) gives each
+    instantiation its own kind cells.  The pass is behavior-preserving —
+    unresolvable call sites keep their generic callee and the generic
+    original stays loaded — so this changes which functions the backend can
+    emit, never what the program computes.  The interpreter path
+    (run_pipeline_from_source / run_pipeline_ctx) keeps its default of OFF:
+    it is the semantics reference and stays on the unspecialized MIR.
     """
     from .codegen_llvm import emit_llvm
 
     ctx = build_context_from_source(source, file_path=file_path)
     run_pipeline_ctx(ctx, strict=strict)  # strict type/borrow gate
     hir_funcs = HIRBuilder(ctx.tables, id_map=ctx.id_map).build(ctx.frozen_root)
+    if monomorphize:
+        from .monomorphize import monomorphize_hir, collect_signatures
+        hir_funcs = monomorphize_hir(hir_funcs, collect_signatures(ctx.id_map or {}))
     mir_funcs = lower_hir_to_mir(hir_funcs)
     return emit_llvm(mir_funcs)
 

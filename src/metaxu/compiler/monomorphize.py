@@ -17,9 +17,21 @@ parameters) the pass resolves the instantiation:
   2. call-site-local inference from arguments of statically known type:
      literals, struct instantiations, enum variant constructions, calls to
      non-generic functions with declared primitive returns, resolved nested
-     generic calls whose return type is a bare type parameter, and — inside
+     generic calls whose return type is a bare type parameter, parameters
+     of the enclosing function whose declared type is a primitive, ``let``
+     locals bound to an expression of statically known type, and — inside
      a specialized clone — parameters whose declared type is a substituted
      type parameter.
+
+``let`` locals flow forward through a statement sequence (HIR blocks are
+flat: a ``Let`` node's continuation is its following sibling), each block /
+arm / loop body getting its own scope, so ``let a = 1; identity(a)``
+resolves exactly like ``identity(1)``.  Names that are ever REBOUND — an
+assignment target, a lambda parameter, a match/while-let pattern binder, a
+handler-arm parameter — are excluded from the environment wholesale rather
+than tracked per scope: the pass would otherwise have to prove the shadow
+carries the same type, and a wrong answer here silently picks the wrong
+clone.
 
 A fully resolved call site is rewritten to a specialized clone named
 ``fn$Arg1$Arg2`` (created on demand, memoized, recursion-safe). Clone bodies
@@ -38,10 +50,39 @@ in the signature map, and the HIR call preserves their explicit type args.
 Bracket-form instantiations (``Full[Int](x)``) are rewritten to the angle
 form by desugaring before HIR exists, so they also specialize for free.
 
+Who runs it
+-----------
+``pipeline.emit_llvm_from_source`` runs it by default: the LLVM backend's
+value-kind cells are per-function and monomorphic, so one generic reached
+at two types joins to ``conflict`` and demotes.  The interpreter front door
+(``run_pipeline_from_source`` / ``run_pipeline_ctx``) keeps the flag OFF —
+it is the semantics reference, and every native differential compares
+specialized native code against unspecialized interpreted semantics.
+
 Out of scope (groundwork, documented): substitution inside type
 applications (``Vec[T]``), method/trait-dispatch callees (``__trait$m``),
 and higher-order flow of generic functions as values — such call sites
 simply stay generic.
+
+Measured limit (example corpus, 17 compiling files).  Every one of the 18
+"irreconcilable value kinds" placeholder reasons in that corpus comes from
+ONE call site: the second instantiation of the trait method ``map`` in
+``examples/06_vector_operations.mx`` (``v1.map(x -> x * x)`` at Float and
+``v1.map(x -> x.to_string())`` at String).  This pass cannot reach it for
+two independent reasons, and neither is a small gap:
+
+  * the callee is ``__trait$map``, dispatched on the receiver's runtime
+    type.  Rewriting such a site to a specific impl needs the receiver's
+    TYPE, which HIR does not carry (``HExpr.ty`` is an unresolved variable
+    at this point); guessing would silently pick a different target than
+    the interpreter's dispatch;
+  * even for a plain (non-trait) function of that shape, ``U`` in
+    ``map<U>(self, f: fn(T) -> U) -> vector[U, N]`` occurs in NO bare
+    parameter position — binding it means inferring the lambda argument's
+    return type, i.e. re-running inference inside this pass.
+
+Both are recorded here rather than attempted: a wrong clone choice is a
+miscompile, which is strictly worse than the placeholder it would replace.
 """
 from __future__ import annotations
 
@@ -151,6 +192,53 @@ def _clone_expr(e: HExpr) -> HExpr:
         handle_cases=tuple((op, ps, _clone_expr(b)) for (op, ps, b) in e.handle_cases) if e.handle_cases is not None else None,
         handle_body=ce(e.handle_body),
     )
+
+
+def _pattern_binders(p: Any, out: set) -> None:
+    """Collect every name an HPattern binds (recursively)."""
+    if p is None:
+        return
+    if getattr(p, "kind", None) == "var" and getattr(p, "name", None):
+        out.add(str(p.name))
+    for sub in getattr(p, "subpatterns", None) or ():
+        _pattern_binders(sub, out)
+
+
+def _rebound_names(e: HExpr) -> set:
+    """Names in this function body that are bound somewhere OTHER than a
+    plain ``let`` initializer, or reassigned after binding.
+
+    A ``let``-bound local's type is recorded and reused at call sites below
+    it; that is only sound while the name means one thing. Assignment
+    targets, lambda parameters, pattern binders (match arms, ``while let``)
+    and handler-arm parameters can all give the same spelling a different
+    type, so they are excluded from the environment entirely instead of
+    being tracked per scope. Conservative by construction: an excluded name
+    simply leaves its call sites generic.
+    """
+    out: set = set()
+
+    def walk(x: HExpr | None) -> None:
+        if x is None:
+            return
+        if x.op == "Assign" and x.var_name:
+            out.add(str(x.var_name))
+        for n in x.lambda_params or ():
+            out.add(str(n))
+        for (_op, ps, _b) in x.handle_cases or ():
+            # Arm parameters are a name or a tuple of names depending on
+            # which handler form built the case triple.
+            for n in ((ps,) if isinstance(ps, str) else (ps or ())):
+                if n:
+                    out.add(str(n))
+        for (pat, _body) in x.match_arms or ():
+            _pattern_binders(pat, out)
+        _pattern_binders(x.loop_pattern, out)
+        for child in _child_exprs(x):
+            walk(child)
+
+    walk(e)
+    return out
 
 
 def _child_exprs(e: HExpr) -> List[HExpr]:
@@ -285,10 +373,49 @@ class _Mono:
     # -- body processing ----------------------------------------------------
 
     def _process_body(self, e: HExpr, param_env: Dict[str, str]) -> None:
-        # Post-order: resolve nested calls first so their result types are
-        # available for the enclosing call's inference.
-        for child in _child_exprs(e):
-            self._process_body(child, param_env)
+        """Process one function body. `param_env` maps names already known to
+        have a concrete type on entry (declared primitive parameters of a
+        non-generic root; substituted type parameters inside a clone)."""
+        rebound = _rebound_names(e)
+        self._walk(e, {k: v for k, v in param_env.items() if k not in rebound},
+                   rebound)
+
+    def _walk(self, e: HExpr, env: Dict[str, str], rebound: set) -> None:
+        # Statement sequences share ONE scope: an HIR block is flat, so a
+        # `Let` node's continuation is its following sibling and its binding
+        # must be visible there. Every other child gets a copy, so nothing a
+        # nested block binds escapes it.
+        for seq in (e.operands, e.then_ops, e.else_ops, e.cases,
+                    e.loop_body, e.perform_args):
+            if not seq:
+                continue
+            scope = dict(env)
+            for s in seq:
+                self._walk(s, scope, rebound)
+        for (_n, s) in e.fields or ():
+            self._walk(s, dict(env), rebound)
+        for (_p, b) in e.match_arms or ():
+            self._walk(b, dict(env), rebound)
+        for (_op, _ps, b) in e.handle_cases or ():
+            self._walk(b, dict(env), rebound)
+        for x in (e.left, e.right, e.cond, e.scrutinee, e.assign_value,
+                  e.base, e.field_val, e.lambda_body, e.handle_body):
+            if x is not None:
+                self._walk(x, dict(env), rebound)
+        if e.op == "Let":
+            # Post-order within the binding, then publish the local's type
+            # into the ENCLOSING sequence scope for the following siblings.
+            for (n, src) in e.bindings or ():
+                self._walk(src, env, rebound)
+                known = self._known_type(src, env)
+                if known is not None and str(n) not in rebound:
+                    env[str(n)] = known
+                else:
+                    env.pop(str(n), None)
+            return
+        for (_n, s) in e.bindings or ():
+            self._walk(s, dict(env), rebound)
+        param_env = env
         if e.op == "Var" and e.var_name in self.generic_names:
             # The generic function escapes as a value: keep the original.
             self.keep_generic.add(str(e.var_name))
@@ -309,10 +436,28 @@ class _Mono:
             if ret is not None:
                 self._call_result_type[id(e)] = ret
 
+    def _declared_param_env(self, name: str) -> Dict[str, str]:
+        """Parameters of a NON-GENERIC function whose declared type is a
+        primitive are known concretely inside its body, so `fn wrap(n: int)
+        { identity(n) }` resolves like `identity(1)`. Restricted to
+        primitives on purpose: a declared aggregate ('LinkedList[T]') canonicalizes
+        to its head constructor, which is not the same information as the
+        struct/variant names `_known_type` reports, and guessing there would
+        pick a clone by a name that means something else."""
+        sig = self.sigs.get(name)
+        if sig is None or sig.is_generic:
+            return {}
+        env: Dict[str, str] = {}
+        for pname, ptype in zip(sig.param_names, sig.param_types):
+            canon = _canon(ptype)
+            if canon in _PRIMITIVE_SET and ptype == (ptype or "").split("[", 1)[0]:
+                env[str(pname)] = str(canon)
+        return env
+
     def run(self, funcs: Sequence[HFun]) -> List[HFun]:
         roots = [f for f in funcs if str(f.sym) not in self.generic_names]
         for f in roots:
-            self._process_body(f.body, {})
+            self._process_body(f.body, self._declared_param_env(str(f.sym)))
 
         def survives(name: str) -> bool:
             """A generic original stays loaded unless every visible call
