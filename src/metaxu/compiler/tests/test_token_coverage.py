@@ -643,11 +643,18 @@ def test_handle_with_a_parenthesized_subject_is_loud_not_a_silent_no_op():
     """`handle` is a keyword only when an identifier follows, because a bare
     block is a statement and `handle(x) { }` is otherwise ambiguous with a
     call. The parenthesized-subject spelling therefore does NOT install a
-    handler — and must not do so silently."""
-    from metaxu.compiler.mir_interp import InterpError
+    handler — and must not do so silently.
+
+    It parses as a CALL of a function named `handle`, which no program
+    declares, so name resolution rejects it at compile time
+    (docs/name_resolution.md). It used to survive to run time and die there
+    with `Unknown callee: 'handle'`; the interpreter still raises that if a
+    call ever reaches it unresolved (defence in depth), but the front end no
+    longer lets this one through."""
+    from metaxu.compiler.frozen_borrow_checker import TypeCheckError
 
     assert "HANDLE" not in lex_types("handle (body()) { }")
-    with pytest.raises(InterpError, match="handle"):
+    with pytest.raises(TypeCheckError, match="undefined function 'handle'"):
         run_main('''
             fn body() -> int { 1 }
             fn main() -> int { handle (body()) { } }

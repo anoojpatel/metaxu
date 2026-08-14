@@ -315,6 +315,15 @@ class TraitImplDesugarPass(DesugarPass):
         # function (underscored attrs, frozen into the FunctionDeclaration
         # payload as impl_where/impl_params) so the constraint emitter can
         # enforce decidable impl where clauses at coherence-load time.
+        #
+        # The type parameters are attached UNCONDITIONALLY: they are a
+        # property of the impl block, not of its where clause. An impl's
+        # parameters are also in scope as VALUE names inside its methods —
+        # a const generic is bound to a receiver dimension at method entry
+        # (see `_const_dims` below) and a plain parameter is the argument of
+        # `type_of` — so gating them on `where_clause is not None` made
+        # `implement<T, const N: int> ... { .. type_of(T) .. }` look like a
+        # read of an undefined name (`compiler/name_resolution.py`).
         impl_where = getattr(impl, "where_clause", None)
         impl_tparams = _impl_type_param_names(impl)
         out: list[fast.Node] = []
@@ -322,9 +331,10 @@ class TraitImplDesugarPass(DesugarPass):
             if not isinstance(m, (fast.FunctionDeclaration, fast.MethodImplementation)):
                 continue
             fn = self._method_to_function(m, trait_name, type_name)
+            if fn is not None:
+                fn._impl_type_params = impl_tparams
             if fn is not None and impl_where is not None:
                 fn._impl_where_clause = impl_where
-                fn._impl_type_params = impl_tparams
             if fn is not None and const_dims:
                 # Record which const-generic size parameters of the impl's
                 # receiver type map to which runtime dimension of `self`

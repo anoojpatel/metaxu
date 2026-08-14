@@ -265,8 +265,24 @@ class _FuncLowerer:
             return last_val if last_val is not None else self.unit_value()
         if e.op == "Block" and e.operands is not None:
             last: str | None = None
-            for sube in e.operands:
+            n = len(e.operands)
+            for i, sube in enumerate(e.operands):
                 last = self.lower_expr(sube)
+                # A bare name read emits NO instruction: `lower_expr("Var")`
+                # just answers the slot name. In value position the consumer
+                # names that slot, so the read is real; in STATEMENT position
+                # the name is discarded and the read disappears from MIR
+                # entirely — which is exactly how `undefined_thing; 42`
+                # compiled to `ret 42` with the undefined name nowhere in
+                # sight (docs/name_resolution.md). Name resolution now
+                # rejects that at compile time; force the read anyway so a
+                # slot that is somehow unbound at run time is loud
+                # ("Unbound variable ...") instead of vanishing. Every other
+                # expression form already emits its own instruction, so its
+                # evaluation survives statement position unaided.
+                if i != n - 1 and sube.op == "Var" and sube.var_name and last:
+                    dst = self.state.fresh("r")
+                    self.emit(("let", dst, ("copy",), (last,)))
             return last if last is not None else self.unit_value()
         # Assignment: write through to the variable's runtime slot so loops see
         # the updated value on the next iteration.

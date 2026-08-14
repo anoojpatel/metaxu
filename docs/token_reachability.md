@@ -137,8 +137,12 @@ was written.
 * `handle` is the keyword only when an identifier follows it, because a bare
   block is a statement and `handle(x) { }` is otherwise ambiguous with a call
   followed by a block. The parenthesized-subject spelling
-  (`handle (f()) { .. }`) therefore does not install a handler; it is a loud
-  unknown-callee error, not a silent no-op. Write `handle f() { .. }`.
+  (`handle (f()) { .. }`) therefore does not install a handler; it parses as
+  a call of a function named `handle`, which nothing declares, so it is now
+  a compile-time `undefined function 'handle'`
+  (`docs/name_resolution.md` — it used to reach the interpreter and die
+  there with `Unknown callee`). Either way, never a silent no-op. Write
+  `handle f() { .. }`.
 * `fn f() -> int @once { .. }` (a mode after a return type, as in
   `docs/ownership_and_borrowing.md`) has no grammar production. `@once` in a
   type position (`x: @once int`) and on a binding (`let @once f = ..`) do.
