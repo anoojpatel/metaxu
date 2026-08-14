@@ -20,6 +20,12 @@ class MirFunc:
     # the synthesized __module_init): the interpreter runs it before the
     # entry point and publishes exactly these bindings as globals.
     globals_decl: tuple = ()
+    # Parameter names with pass-by-reference (write-back) semantics: params
+    # declared @mut (uniqueness 'mutable'/'exclusive') plus non-@const
+    # method receivers (`self` of an __impl$... function). Both engines
+    # write a rebound struct param back to the caller ONLY for these names;
+    # plain params keep value semantics (rebinding stays callee-local).
+    mut_params: tuple = ()
 
     def param_names(self) -> tuple:
         """Parameter names from the entry block's params op (empty if none)."""

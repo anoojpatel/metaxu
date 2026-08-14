@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Sequence, List, Dict
 
+from .desugar import IMPL_PREFIX
 from .hir import HFun, HExpr, HPattern
 from .mir import MirFunc, MirBlock
 from .borrow_analysis import plan_drops
@@ -134,7 +135,8 @@ class _FuncLowerer:
     # ------------------------------------------------------------------
 
     def _lower_subfunc(self, name: str, params: Sequence[str], body: HExpr,
-                       ty_sig: Any, suspending: bool) -> None:
+                       ty_sig: Any, suspending: bool,
+                       mut_params: Sequence[str] = ()) -> None:
         """Compile ``body`` into a standalone MirFunc appended to pending lambdas.
 
         Swaps out the block context so nested control flow inside the
@@ -155,7 +157,8 @@ class _FuncLowerer:
         self.state.env = saved_env
         self.ret_bb, self.ret_var = saved_ret_bb, saved_ret_var
         self._pending_lambdas.append(
-            MirFunc(name=name, ty_sig=ty_sig, blocks=sub_blocks, suspending=suspending)
+            MirFunc(name=name, ty_sig=ty_sig, blocks=sub_blocks,
+                    suspending=suspending, mut_params=tuple(mut_params))
         )
 
     # ------------------------------------------------------------------
@@ -450,7 +453,8 @@ class _FuncLowerer:
             # Compile the lambda body as a deferred sub-function
             if e.lambda_body is not None:
                 self._lower_subfunc(lname, e.lambda_params, e.lambda_body,
-                                    ty_sig=e.ty, suspending=bool(e.suspends))
+                                    ty_sig=e.ty, suspending=bool(e.suspends),
+                                    mut_params=e.lambda_mut_params or ())
             return dst
         # Perform: perform Effect.op(args) — a real suspension point. The op
         # ends its block; the continuation is "this function from resume_bb on"
@@ -602,6 +606,34 @@ def _is_matrix_annotation(pty: Any) -> bool:
 
 _NOT_VECTOR = object()
 
+# Uniqueness spellings that grant pass-by-reference (write-back) semantics:
+# `@mut` arrives as 'mutable' (hir._absorb_mode_token), its spec spelling is
+# 'exclusive'.
+_MUT_UNIQUENESS = ("mutable", "exclusive")
+
+
+def _mut_param_names(f: HFun) -> tuple:
+    """Parameter names of ``f`` with write-back (by-reference) semantics.
+
+    Params explicitly declared @mut, plus the `self` receiver of impl
+    methods (`__impl$Trait$Type$m`): method bodies mutate the receiver via
+    `self.field = ...` without an explicit mode, and both engines have
+    always written the receiver back to the caller. A receiver explicitly
+    declared @const/shared opts out. Everything else keeps value semantics.
+    """
+    modes = f.param_modes or {}
+    names = []
+    for (pname, _pty) in f.params:
+        p = str(pname)
+        mi = modes.get(p)
+        uniq = getattr(mi, "uniqueness", None)
+        if uniq in _MUT_UNIQUENESS:
+            names.append(p)
+        elif (p == "self" and str(f.sym).startswith(IMPL_PREFIX)
+                and uniq not in ("shared", "const")):
+            names.append(p)
+    return tuple(names)
+
 
 def lower_hir_to_mir(funcs: Sequence[HFun], borrow_errors: List[Any] | None = None) -> list[MirFunc]:
     """Lower HIR to MIR (ANF direct vs CPS later).
@@ -627,6 +659,12 @@ def lower_hir_to_mir(funcs: Sequence[HFun], borrow_errors: List[Any] | None = No
         # (transpose's self[j][i]) runs strictly instead of indexing
         # scalars. This is the boundary where `mat.matmul(vec)` — the
         # example's "matrix-vector multiplication" — becomes well-shaped.
+        # DOCUMENTED SEMANTICS (kept per adversarial review round 5):
+        # examples/06 explicitly promises matrix-vector multiplication for
+        # a flat vector argument, so the column embedding is intentional,
+        # not a lenient fallback. Both engines implement it identically
+        # (mir_interp promote_matrix / codegen_llvm mx_fvec_promote;
+        # parity pinned in test_round5_regressions).
         matrix_params = tuple(
             str(pname) for (pname, pty) in f.params
             if _is_matrix_annotation(pty)
@@ -641,7 +679,8 @@ def lower_hir_to_mir(funcs: Sequence[HFun], borrow_errors: List[Any] | None = No
         fl.finish_body(res, plan.drop_at_end if plan else ())
         out.append(MirFunc(name=str(f.sym), ty_sig=f.ret_ty, blocks=fl.blocks,
                            suspending=bool(f.body.suspends),
-                           globals_decl=tuple(getattr(f, "globals_decl", ()) or ())))
+                           globals_decl=tuple(getattr(f, "globals_decl", ()) or ()),
+                           mut_params=_mut_param_names(f)))
         # Emit any lambdas that were compiled during lowering
         out.extend(fl._pending_lambdas)
     return out

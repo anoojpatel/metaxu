@@ -455,11 +455,13 @@ Type model (documented conventions):
         (byval-copy).  A later borrow-informed increment can elide that
         copy for @const/read-only params once the borrow checker's results
         are threaded into codegen.  COPY-OUT (interpreter write-back
-        parity): a struct param the callee REBINDS anywhere is copied back
-        through the caller's pointer on every ret path, matching
-        mir_interp._write_back_struct_args (`self.field = ...` methods
-        mutate the caller's binding); lambdas never copy out because the
-        interpreter's closure-call path performs no write-back.
+        parity): a BY-REFERENCE struct param (MirFunc.mut_params: declared
+        @mut, or a method's `self` receiver) the callee REBINDS anywhere is
+        copied back through the caller's pointer on every ret path,
+        matching mir_interp._write_back_struct_args (`self.field = ...`
+        methods mutate the caller's binding); plain params keep value
+        semantics (rebinding stays callee-local); lambdas copy out exactly
+        their @mut-declared params.
       - struct returns are sret-style (the ONE convention used
         everywhere): the caller passes its result variable's storage as a
         leading ``ptr %agg.ret`` argument, the callee copies the returned
@@ -904,8 +906,9 @@ _HEADER = (
     ";   design rather than risking a double-free/use-after-free;\n"
     ";   struct params pass as ptr + callee byval-copy into own storage\n"
     ";   (a borrow-informed increment can elide the copy for @const params);\n"
-    ";   rebound struct params copy OUT through the caller's pointer on ret\n"
-    ";   (interpreter write-back parity; lambdas never copy out);\n"
+    ";   rebound @mut/receiver struct params copy OUT through the caller's\n"
+    ";   pointer on ret (interpreter write-back parity; plain params keep\n"
+    ";   value semantics; lambdas copy out exactly their @mut params);\n"
     ";   struct returns are sret-style: caller passes its result slot as a\n"
     ";   leading ptr %agg.ret arg, callee copies the aggregate in, rets void;\n"
     ";   print/println route by operand type to @metaxu_print_{i64,f64,str};\n"
@@ -1038,9 +1041,39 @@ def _llscalar(kind: str) -> str:
     return _LLTY.get(kind, "i64")
 
 
+# _sanitize's registry: raw name -> sanitized symbol, and the reverse claim
+# map (sanitized -> raw) that makes the mapping INJECTIVE.  Two distinct MIR
+# names that only differ in special characters (`f.g` vs `f$g` vs `f_g`) used
+# to collapse onto one LLVM symbol — a silent collision.  Now the first
+# claimant keeps the plain sanitized form (so historical output is unchanged)
+# and any DIFFERENT raw name mapping onto a claimed symbol gets a short
+# deterministic hash suffix.  emit_llvm resets the registry per module, so
+# the result is deterministic for a given module.
+_SANITIZE_CACHE: Dict[str, str] = {}
+_SANITIZE_CLAIMED: Dict[str, str] = {}
+
+
+def _sanitize_reset() -> None:
+    _SANITIZE_CACHE.clear()
+    _SANITIZE_CLAIMED.clear()
+
+
 def _sanitize(name: str) -> str:
-    """Restrict a symbol to [A-Za-z0-9_]."""
-    return re.sub(r"[^A-Za-z0-9_]", "_", name)
+    """Restrict a symbol to [A-Za-z0-9_], injectively per module."""
+    got = _SANITIZE_CACHE.get(name)
+    if got is not None:
+        return got
+    import hashlib
+    cand = re.sub(r"[^A-Za-z0-9_]", "_", name)
+    salt = name
+    while _SANITIZE_CLAIMED.get(cand, name) != name:
+        # Claimed by a DIFFERENT raw name: disambiguate deterministically.
+        h = hashlib.sha1(salt.encode("utf-8")).hexdigest()[:6]
+        cand = re.sub(r"[^A-Za-z0-9_]", "_", name) + "_x" + h
+        salt = salt + h
+    _SANITIZE_CLAIMED[cand] = name
+    _SANITIZE_CACHE[name] = cand
+    return cand
 
 
 def mangle(name: str) -> str:
@@ -6058,8 +6091,21 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                     continue
                 callee2 = rhs2[1]
                 if callee2 in info.def_count:
-                    # Closure call: lambdas never write back (interpreter
-                    # closure-call parity), whatever lambda it resolves to.
+                    # Closure call: only @mut lambda params write back
+                    # (interpreter closure-call parity). Union the member
+                    # lambdas' write-back positions; unknown members assume
+                    # the worst.
+                    ck2 = kind(callee2)
+                    if not _is_closure(ck2) or _is_dyn_closure(ck2):
+                        return True
+                    for m in _closure_members(ck2):
+                        rb = writeback_map.get(m)
+                        if rb is None:
+                            return True
+                        # closure args map 1:1 onto member param positions
+                        for i, a in enumerate(cargs):
+                            if a == v and i in rb:
+                                return True
                     continue
                 if builtin_of(callee2, tuple(cargs)) is not None:
                     continue  # native runtime builtins never write back
@@ -6143,20 +6189,30 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                         bv_changed = True
 
     # COPY-IN/COPY-OUT struct params: the interpreter WRITES BACK a struct
-    # argument when the callee rebinds the parameter (mir_interp.
-    # _write_back_struct_args — `self.field = ...` methods mutate the
-    # caller's binding).  Natively the caller already passes its storage
-    # pointer, so the callee copies the final param value back through it on
-    # every ret path.  Statically "rebinds anywhere" over-approximates the
-    # interpreter's per-execution identity test, but a not-taken rebind path
-    # writes back the unchanged aggregate — observationally a no-op.
-    # Closure calls get NO write-back in the interpreter, so lambdas never
-    # copy out.  Only struct kinds write back (enums/closures never do).
-    # (Handle-scope subfunctions never copy out either: the interpreter
-    # calls them without its write-back path.)
-    writeback_params = [] if (info.is_lambda or info.is_scope_member) else [
+    # argument when a BY-REFERENCE parameter (MirFunc.mut_params: declared
+    # @mut, or a method's `self` receiver) is rebound by the callee
+    # (mir_interp._write_back_struct_args — `self.field = ...` methods
+    # mutate the caller's binding).  Natively the caller already passes its
+    # storage pointer, so the callee copies the final param value back
+    # through it on every ret path.  Statically "rebinds anywhere"
+    # over-approximates the interpreter's per-execution identity test, but
+    # a not-taken rebind path writes back the unchanged aggregate —
+    # observationally a no-op.  Plain params keep value semantics: rebinding
+    # them stays callee-local in BOTH engines.  Lambdas write back exactly
+    # their @mut-declared params (interpreter closure-call parity).  Only
+    # struct kinds write back (enums/closures never do).  (Handle-scope
+    # subfunctions never copy out: the interpreter calls them without its
+    # write-back path.)
+    # ALL @mut struct params copy out (not just locally-rebound ones): the
+    # interpreter's identity test also fires when a NESTED call wrote back
+    # into this frame's binding (e.g. a lambda passing its @mut param on to
+    # bump) — statically that is "any def could have changed it", and an
+    # untouched param's copy-out writes back the unchanged aggregate, a
+    # no-op.
+    _mut_set = set(getattr(f, "mut_params", ()) or ())
+    writeback_params = [] if info.is_scope_member else [
         p for p in info.params
-        if _is_struct(kinds.get(p, I64)) and info.def_count.get(p, 0) > 1]
+        if p in _mut_set and _is_struct(kinds.get(p, I64))]
 
     def emit_writebacks(lines: List[str]) -> None:
         for p in writeback_params:
@@ -7962,6 +8018,9 @@ def emit_llvm(funcs: Sequence[MirFunc]) -> str:
     Direct functions get full definitions; everything else gets a
     comment-only placeholder carrying its reasons (see module docstring).
     """
+    # Fresh symbol-sanitizer registry per module: deterministic, injective
+    # symbol mangling independent of previously-emitted modules.
+    _sanitize_reset()
     module_names = {f.name for f in funcs}
     structs = _build_struct_table(funcs)
     closures = _build_closure_table(funcs)
@@ -8213,21 +8272,26 @@ def emit_llvm(funcs: Sequence[MirFunc]) -> str:
             info.add_reason(p)
 
     # WRITE-BACK MAP (increment 8, for copy elision): per function, the
-    # argument positions whose struct param is rebound — the callee copies
-    # that param back out through the caller's pointer on ret, so callers
-    # must never alias such a position with elided (copy-free) storage.
-    # Lambdas and handle-scope subfunctions never write back (interpreter
-    # parity), so their positions are all safe.
+    # argument positions whose struct param has by-reference semantics
+    # (MirFunc.mut_params: @mut / method receiver) AND is rebound — the
+    # callee copies that param back out through the caller's pointer on
+    # ret, so callers must never alias such a position with elided
+    # (copy-free) storage.  Plain params never write back (value
+    # semantics, interpreter parity); lambdas write back exactly their
+    # @mut params; handle-scope subfunctions never write back.
     writeback_map: Dict[str, frozenset] = {}
     for info in infos:
         ks = kind_sets.get(info.f.name, {})
-        if info.is_lambda or info.is_scope_member:
+        mut = frozenset(getattr(info.f, "mut_params", ()) or ())
+        if info.is_scope_member:
             writeback_map[info.f.name] = frozenset()
         else:
+            # All @mut struct positions (mirrors _emit_function's
+            # writeback_params: nested calls can mutate an un-rebound @mut
+            # param's storage, so every @mut struct param copies out).
             writeback_map[info.f.name] = frozenset(
                 i for i, p in enumerate(info.params)
-                if _is_struct(ks.get(p, I64))
-                and info.def_count.get(p, 0) > 1)
+                if p in mut and _is_struct(ks.get(p, I64)))
 
     # A function referencing a placeholder cannot link: cascade demotion
     # (direct calls, make_closure fn-pointer targets, closure calls).
