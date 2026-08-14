@@ -14,6 +14,7 @@ from metaxu.extern_ast import (ExternBlock, ExternFunctionDeclaration,
 
 from .desugar import IMPL_SEP, parse_impl_method_name, type_base_name
 from metaxu.errors import SourceLocation, format_location, source_excerpt
+from .recursion import compiler_phase
 
 # Methods that are dispatched as interpreter builtins with the receiver as
 # first argument (`x.to_string()` -> __builtin$to_string(x); see
@@ -577,6 +578,7 @@ class HIRBuilder:
         # lowering diagnostics (most parsed nodes carry no SourceLocation).
         self._root_file: str = "<unknown file>"
 
+    @compiler_phase
     def build(self, root: mast.AstNode) -> list[HFun]:
         funcs: list[HFun] = []
         # The compilation-unit file name for diagnostics: the frozen root

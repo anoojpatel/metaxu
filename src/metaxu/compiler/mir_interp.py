@@ -30,10 +30,65 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from .mir import MirBlock, MirFunc
 from .desugar import IMPL_SEP, parse_impl_method_name
+from .recursion import current_ceiling, grant_slack, recursion_budget
 from .hir import (BUILTIN_CALL_PREFIX, EFFECT_RUNTIME_CALL_PREFIX,
                   STATIC_CALL_PREFIX, TRAIT_CALL_PREFIX,
                   TUPLE_STRUCT_PREFIX as _TUPLE_STRUCT_PREFIX,
                   tuple_field_name as _tuple_field)
+
+
+# ---------------------------------------------------------------------------
+# Recursion budget
+# ---------------------------------------------------------------------------
+#
+# A Metaxu call frame is NOT a Python call frame: the interpreter spends
+# `_call_func` -> `_run_blocks` -> `_run_ops` -> `_eval_rhs` -> the next
+# `_call_func` per Metaxu call, roughly 4 Python frames for a bare
+# recursion and ~24 for a realistic structural one. `recursion.py` carries
+# the measurements, the chosen ceiling and the argument for why raising it
+# does not turn a clean exception into a segfault.
+
+# Stack size for the threads a `handle` body runs on.  Python frames live on
+# the heap, so this is not what bounds Metaxu recursion depth (a 128 KiB
+# thread was measured carrying a 20_000-frame Metaxu recursion); it is
+# headroom for the C-stack side — the C-recursion guard, the runtime's own
+# C frames — so that a handle body is not more fragile than the main thread.
+# 16 MiB is 2x the usual 8 MiB `RLIMIT_STACK` main-thread default; thread
+# stacks are lazily committed, so nested handles cost address space, not RAM.
+HANDLE_THREAD_STACK_BYTES = 16 * 1024 * 1024
+
+# `threading.stack_size()` is a process-global read at thread START, and
+# there is no per-Thread stack-size argument.  Rather than set it once at
+# import (which would silently resize every unrelated thread the host
+# process ever starts), set it, start our thread and put it straight back,
+# with a lock so two handle scopes cannot interleave the swap.
+_STACK_SIZE_LOCK = threading.Lock()
+
+
+def _start_with_stack_size(thread: threading.Thread,
+                           size: int = HANDLE_THREAD_STACK_BYTES) -> None:
+    """Start `thread` with a `size`-byte stack, leaving the global default
+    exactly as it was found.
+
+    Falls back to starting the thread unchanged if the platform rejects the
+    size (`threading.stack_size` raises ValueError below the platform
+    minimum / for a bad multiple, RuntimeError where it is unsupported) —
+    a smaller stack is a smaller ceiling, never a wrong answer.
+    """
+    with _STACK_SIZE_LOCK:
+        try:
+            previous = threading.stack_size()
+            threading.stack_size(size)
+        except (ValueError, RuntimeError):
+            thread.start()
+            return
+        try:
+            thread.start()
+        finally:
+            try:
+                threading.stack_size(previous)
+            except (ValueError, RuntimeError):  # pragma: no cover - defensive
+                pass
 
 
 def _tuple_field_arity(field_name: str) -> "int | None":
@@ -386,6 +441,24 @@ class InterpError(Exception):
         self.note = f" [in function {func_name!r}{where}]"
 
 
+class RecursionLimitExceeded(InterpError):
+    """The interpreter ran out of recursion budget (see recursion.py).
+
+    An `InterpError` so it renders as a Metaxu diagnostic — with the innermost
+    function's name and declaration site attached by the usual `locate` path —
+    instead of leaking a host `RecursionError` traceback across the language
+    boundary.
+
+    NOT catchable by Metaxu `try`/`catch`, on purpose (see docs/try_catch.md):
+    this is interpreter resource exhaustion, not a failure the program
+    produced.  A catch arm would run with the stack still exhausted, so it
+    would either overflow again immediately or "recover" onto a stack that
+    can no longer do useful work.  The native backend uses the real machine
+    stack and has no recoverable equivalent either, so leaving it uncatchable
+    keeps the two backends from diverging on the recovery path.
+    """
+
+
 class _ScopeAbort(BaseException):
     """Raised inside a suspended handle-body thread to tear it down.
 
@@ -526,12 +599,45 @@ class MirInterpreter:
     # ------------------------------------------------------------------
 
     def call(self, func_name: str, args: List[Any]) -> Any:
-        self._ensure_globals()
-        f = self._funcs.get(func_name)
-        if f is None:
-            raise InterpError(f"Unknown function: {func_name!r}")
-        env: Dict[str, Any] = {}
-        return self._call_func(f, args, env)
+        # The budget is process-global, not per-thread, so handle-body
+        # threads started inside this extent inherit the same ceiling.
+        with recursion_budget():
+            self._ensure_globals()
+            f = self._funcs.get(func_name)
+            if f is None:
+                raise InterpError(f"Unknown function: {func_name!r}")
+            env: Dict[str, Any] = {}
+            try:
+                return self._call_func(f, args, env)
+            except RecursionError:
+                # Belt and braces: `_call_func` converts at the innermost
+                # Metaxu frame, but a RecursionError raised OUTSIDE any
+                # `_run_blocks` (scope teardown, a builtin's own recursion)
+                # must not escape as a host exception either.
+                raise self._recursion_exhausted(None) from None
+
+    # ------------------------------------------------------------------
+    # Recursion budget
+    # ------------------------------------------------------------------
+
+    def _recursion_exhausted(self, f: "MirFunc | None") -> "RecursionLimitExceeded":
+        """Turn a host `RecursionError` into a Metaxu diagnostic.
+
+        Grants the slack FIRST: this runs with the stack at the ceiling, and
+        building the message, walking `locate`, tearing down handle scopes
+        and formatting the report all need frames of their own — without the
+        slack the conversion would raise the very error it is converting.
+        `recursion.grant_slack` is idempotent and `recursion_budget` discards
+        the grant when `call` returns.
+        """
+        grant_slack()
+        where = f" while calling {f.name!r}" if f is not None else ""
+        return RecursionLimitExceeded(
+            "recursion limit exceeded" + where + ": the interpreter allows "
+            f"{current_ceiling()} nested Python frames (a few per Metaxu "
+            "call frame). Either the program recursed without a base case, "
+            "or it is deeper than the interpreter supports — the native "
+            "backend uses the machine stack and has no such ceiling.")
 
     def _ensure_globals(self) -> None:
         """Run the synthesized __module_init once (module-level `let`
@@ -574,6 +680,16 @@ class MirInterpreter:
             env[name] = val
         try:
             result = self._run_blocks(f, 0, env)
+        except RecursionError:
+            # The recursion ceiling, converted at the INNERMOST Metaxu frame
+            # that hit it: `RecursionLimitExceeded` is an `InterpError`, so
+            # every enclosing frame takes the branch below instead and
+            # `locate`'s first-wins rule keeps this function's name. `from
+            # None` drops the host chain: a 100_000-frame Python traceback is
+            # not a Metaxu diagnostic (and printing one is its own hazard).
+            err = self._recursion_exhausted(f)
+            err.locate(f.name, getattr(f, "location", None))
+            raise err from None
         except InterpError as exc:
             # Name the function the error happened in (innermost wins).
             exc.locate(f.name, getattr(f, "location", None))
@@ -1009,6 +1125,11 @@ class MirInterpreter:
                     captured[cname] = cval
             try:
                 return self._call_func(body_fn, [], captured)
+            except RecursionLimitExceeded:
+                # Interpreter resource exhaustion, not a program failure:
+                # a catch arm here would run with the stack still at the
+                # ceiling. Propagates past every `try` to the top level.
+                raise
             except InterpError as exc:
                 # `.message`, NOT `str(exc)`: the catch binding is a
                 # LANGUAGE-VISIBLE value, so it gets the plain failure text
@@ -1065,7 +1186,7 @@ class MirInterpreter:
                 name=f"mx-handle-{scope_effect or 'any'}-{frame_id}")
             self._mir_handler_frames.append(frame)
             try:
-                scope.thread.start()
+                _start_with_stack_size(scope.thread)
                 try:
                     return self._pump_scope(scope)
                 except _EffectAbort as abort:

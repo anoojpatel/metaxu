@@ -9,8 +9,10 @@ from .hir import HIRBuilder, dump_hir
 from .lower_hir_to_mir import lower_hir_to_mir
 from .mir import dump_mir
 from .codegen_clif import emit_clif
+from .recursion import compiler_phase
 
 
+@compiler_phase
 def run_pipeline(
     ast_root: AstNode,
     tables: InferSideTables,
@@ -71,6 +73,7 @@ class PhaseContext:
     type_checker: object | None  # Optional since we use frozen AST borrow checker
 
 
+@compiler_phase
 def build_context_from_source(source: str, file_path: str = "<mem>") -> PhaseContext:
     """Build a PhaseContext by running the full front-end phase sequence.
 
@@ -84,6 +87,9 @@ def build_context_from_source(source: str, file_path: str = "<mem>") -> PhaseCon
     The preliminary freeze/tables round exists so desugaring passes that need
     analysis results (e.g. TraitDictionaryDesugarPass needs trait_impls) get a
     populated DesugarContext instead of tables=None.
+
+    Runs under `compiler_phase` (the recursion budget plus a Metaxu
+    diagnostic when it is exceeded).
     """
     import metaxu.metaxu_ast as fast
     from .infer_tables import build_tables_from_frozen_via_simplesub
@@ -140,6 +146,7 @@ def build_context_from_source(source: str, file_path: str = "<mem>") -> PhaseCon
     )
 
 
+@compiler_phase
 def run_pipeline_ctx(ctx: PhaseContext, strict: bool = True,
                      monomorphize: bool = False) -> tuple[str, str, str, str]:
     """Run the pipeline using a prebuilt PhaseContext.
@@ -154,6 +161,7 @@ def run_pipeline_ctx(ctx: PhaseContext, strict: bool = True,
     return ast_json, hir_txt, mir_txt, clif_txt
 
 
+@compiler_phase
 def emit_llvm_from_source(source: str, strict: bool = True,
                           file_path: str = "<mem>",
                           monomorphize: bool = True) -> str:
@@ -189,6 +197,7 @@ def emit_llvm_from_source(source: str, strict: bool = True,
     return emit_llvm(mir_funcs)
 
 
+@compiler_phase
 def run_pipeline_from_source(source: str, strict: bool = True,
                              file_path: str = "<mem>",
                              monomorphize: bool = False) -> tuple[str, str, str, str]:

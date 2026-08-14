@@ -59,6 +59,22 @@ remains the way to give an effect real semantics.
   exceptions pass through untouched) it calls the catch subfunction with
   the message string. `mir_interp.py`.
 
+## The one `InterpError` `catch` does not catch
+
+`mir_interp.RecursionLimitExceeded` — the interpreter running out of
+recursion budget (see docs/v1_gap_analysis.md § "Recursion depth") — is an
+`InterpError` so that it renders as a located Metaxu diagnostic, but
+`try_scope` re-raises it instead of routing it to the catch arm.
+
+It is interpreter resource exhaustion, not a failure the program produced.
+A catch arm would run with the stack still at the ceiling, so it would
+either overflow again immediately or "recover" onto a stack that can no
+longer do useful work. The native backend uses the real machine stack and
+has no recoverable equivalent either, so leaving it uncatchable keeps the
+two backends from diverging on the recovery path — the same reason the
+catch binding is plain text. Pinned by
+`test_recursion_depth.test_try_catch_does_not_swallow_recursion_exhaustion`.
+
 ## What the catch binding is, exactly
 
 The value bound to `e` is `InterpError.message`: the **plain failure text
