@@ -123,9 +123,10 @@ runs natively):
     allocator, so programs the interpreter ACCEPTS behave identically
     while programs it rejects (overrun/UAF/double free) are real UB
     natively — the same strict-error-vs-UB contract as division by zero
-    (ASan differentials pin the accepted side).  Like the interpreter's
-    resolution order, these builtin names win over same-named module
-    functions.
+    (ASan differentials pin the accepted side).  Like the interpreter,
+    a module function of the same name WINS over these (NAME PRECEDENCE,
+    docs/name_precedence.md); `extern` declarations produce no module
+    function, so an FFI program's calls land here.
   * ``as_ptr``: on a string, IDENTITY (native strings already are
     NUL-terminated byte pointers; the interpreter's fresh readonly
     snapshot is observationally identical for every accepted program —
@@ -703,7 +704,7 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 from .mir import MirFunc
 from .cps_frames import is_suspending
 from .desugar import IMPL_SEP, parse_impl_method_name
-from .hir import STATIC_CALL_PREFIX, TRAIT_CALL_PREFIX
+from .hir import BUILTIN_CALL_PREFIX, STATIC_CALL_PREFIX, TRAIT_CALL_PREFIX
 
 # Value kinds -----------------------------------------------------------------
 
@@ -768,10 +769,11 @@ _MATH_EXTERNS = {"sqrt", "sin", "cos"}  # double -> double libc functions
 _INLINE_BUILTINS = {"neg", "not"}
 
 # Vec/string builtins now lowered to the NATIVE runtime (metaxu_rt.c, linked
-# by llvm_run): these mirror the interpreter's builtins exactly.  Like the
-# interpreter's resolution order ("builtins first" for plain calls), these
-# names win over same-named module functions; local closure variables still
-# shadow them.
+# by llvm_run): these mirror the interpreter's builtins exactly.  NAME
+# PRECEDENCE (docs/name_precedence.md): a call reaches these only when
+# _builtin_name says so -- a module function of the same name WINS for plain
+# calls, while a method-position `__builtin$m` call always lands here; local
+# closure variables still shadow both.
 #   Vec.new      -> mx_vec_new          push  -> mx_vec_push
 #   pop          -> mx_vec_pop          len   -> mx_vec_len / mx_str_len
 #   __index_get  -> mx_vec_get          __vec_lit -> mx_vec_new + pushes
@@ -815,7 +817,9 @@ _FFI_CALLS = set(_EXTERN_C_SIGS) | _FFI_SHIMS
 # impl matches the receiver type (mir_interp._dispatch_trait_call step 2).
 # The FFI names are included because they ARE interpreter builtins: a trait
 # call falling through to them must never resolve to a same-named plain
-# module function instead (the interpreter would pick the builtin).
+# module function instead (the interpreter would pick the builtin).  Trait
+# dispatch order is UNCHANGED by the plain-call precedence flip -- see
+# docs/name_precedence.md section 5.
 _TRAIT_BUILTIN_FALLBACK = {"to_string", "int_to_str", "len", "push", "pop",
                            "sqrt", "sin", "cos", "assert"} | _FFI_CALLS
 
@@ -1083,6 +1087,28 @@ def mangle(name: str) -> str:
 
 def _is_runtime_builtin(name: str) -> bool:
     return name in _RUNTIME_NAMES or any(name.startswith(p) for p in _RUNTIME_PREFIXES)
+
+
+def _builtin_name(callee: str, module_names: Set[str]) -> str:
+    """The builtin name a NON-dispatch call op resolves to, or the callee.
+
+    NAME PRECEDENCE (docs/name_precedence.md), mirroring
+    mir_interp._eval_rhs exactly:
+      * ``__builtin$m`` — a method-position call (`x.m()`) that the front
+        end already resolved to the runtime builtin ``m``: always the
+        builtin, never a same-named plain function;
+      * a bare name that a MODULE FUNCTION defines — the user function
+        wins, so return the callee unchanged and let the caller's
+        module-function branch take it (no builtin set contains a name
+        that is also a module function name, because the front end
+        reserves the compiler's ``__`` namespace);
+      * any other bare name — the builtin of that name (if any).
+    """
+    if callee.startswith(BUILTIN_CALL_PREFIX):
+        return callee[len(BUILTIN_CALL_PREFIX):]
+    if callee in module_names:
+        return ""      # shadowed by a user function: matches no builtin set
+    return callee
 
 
 def _is_struct(kind: str) -> bool:
@@ -1916,11 +1942,14 @@ def _analyze_inner(info: _Info, module_names: Set[str],
     # Calls: partition into closure calls (callee is a local variable — the
     # interpreter's shadowing order: locals first), trait-dispatched calls
     # (resolved statically against the receiver kind later), native runtime
-    # builtins (which, like the interpreter's "builtins first" order, win
-    # over same-named module functions), and direct calls, which must hit
-    # module functions or the supported builtins.
+    # builtins (reached only when _builtin_name says the call resolves to a
+    # builtin: a same-named module function wins for plain calls, and a
+    # method-position __builtin$m always resolves here — mirroring
+    # mir_interp), and direct calls, which must hit module functions or the
+    # supported builtins.
     direct_calls: List[Tuple[str, str, Tuple[str, ...]]] = []
     for (dst, callee, cargs) in info.calls:
+        bname = _builtin_name(callee, module_names)
         if callee in info.def_count:
             info.closure_calls.append((dst, callee, cargs))
         elif callee.startswith(TRAIT_CALL_PREFIX):
@@ -1940,11 +1969,12 @@ def _analyze_inner(info: _Info, module_names: Set[str],
                 info.add_reason(target)
             else:
                 direct_calls.append((dst, callee, cargs))
-        elif callee in _NATIVE_RT_CALLS or callee in _FFI_CALLS \
-                or callee == "assert":
-            # Native runtime builtins, the extern-C/FFI names, and assert:
-            # like the interpreter's "builtins first" order these win over
-            # same-named module functions.
+        elif bname in _NATIVE_RT_CALLS or bname in _FFI_CALLS \
+                or bname == "assert":
+            # Native runtime builtins, the extern-C/FFI names, and assert.
+            # _builtin_name has already applied the precedence rule: a name
+            # a module function defines never reaches here (the user
+            # function wins), and __builtin$m always does.
             direct_calls.append((dst, callee, cargs))
         elif callee in closures.targets:
             # Lambdas are only callable through their closure value: a direct
@@ -1959,10 +1989,11 @@ def _analyze_inner(info: _Info, module_names: Set[str],
                 f"direct call to handle-scope subfunction {callee!r}")
         elif callee in module_names:
             direct_calls.append((dst, callee, cargs))
-        elif callee in _PRINT_BUILTINS or callee in _MATH_EXTERNS or callee in _INLINE_BUILTINS:
+        elif bname in _PRINT_BUILTINS or bname in _MATH_EXTERNS or bname in _INLINE_BUILTINS:
             direct_calls.append((dst, callee, cargs))
-        elif _is_runtime_builtin(callee):
-            info.add_reason(f"calls runtime builtin {callee!r} (vec/string/trait)")
+        elif _is_runtime_builtin(bname or callee):
+            info.add_reason(
+                f"calls runtime builtin {bname or callee!r} (vec/string/trait)")
         else:
             info.add_reason(f"unknown external callee {callee!r} (cannot link natively)")
     info.calls = direct_calls
@@ -2987,10 +3018,11 @@ def _infer_kinds(info: _Info, sigs: Dict[str, _Sig], structs: _StructTable,
 
     def apply_builtin(name: str, dst: str, args: Tuple[str, ...],
                       plain_call: bool) -> bool:
-        """Kind constraints of a native runtime builtin call.  For PLAIN
-        calls (interpreter resolution: builtins first) receiver kinds are
-        pinned eagerly; for trait-resolved calls the receiver is already
-        known to be a vec/str (resolution is kind-driven)."""
+        """Kind constraints of a native runtime builtin call.  For calls
+        already resolved to a builtin by NAME (plain and method-position
+        `__builtin$m` sites) receiver kinds are pinned eagerly; for
+        trait-resolved calls the receiver is already known to be a
+        vec/str (resolution is kind-driven)."""
         nonlocal global_changed
         ch = False
         if name == "Vec.new":
@@ -3373,6 +3405,7 @@ def _infer_kinds(info: _Info, sigs: Dict[str, _Sig], structs: _StructTable,
                         changed = unify((dst, args[1], args[2])) or changed
                 elif rk == "call":
                     callee = rhs[1]
+                    bname = _builtin_name(callee, module_names)
                     if callee in info.def_count:
                         # Closure call: types flow through the lambda's sig
                         # once the callee variable's closure kind is known.
@@ -3413,35 +3446,35 @@ def _infer_kinds(info: _Info, sigs: Dict[str, _Sig], structs: _StructTable,
                         elif sres == "builtin":
                             changed = apply_builtin(
                                 starget, dst, args, plain_call=True) or changed
-                    elif callee in _NATIVE_RT_CALLS:
-                        # Interpreter resolution order: builtins first, so
-                        # these win over same-named module functions.
+                    elif bname in _NATIVE_RT_CALLS:
+                        # NAME PRECEDENCE: _builtin_name already decided
+                        # builtin-vs-module-function for this callee.
                         changed = apply_builtin(
-                            callee, dst, args, plain_call=True) or changed
-                    elif callee in _EXTERN_C_SIGS:
-                        pks, rk_ = _EXTERN_C_SIGS[callee]
+                            bname, dst, args, plain_call=True) or changed
+                    elif bname in _EXTERN_C_SIGS:
+                        pks, rk_ = _EXTERN_C_SIGS[bname]
                         if len(args) == len(pks):
                             for a, pk in zip(args, pks):
                                 changed = mark(a, pk) or changed
                             changed = mark(dst, rk_) or changed
-                    elif callee == "as_ptr":
+                    elif bname == "as_ptr":
                         # Receiver stays free (str or vec, like len); the
                         # result is always a raw pointer.
                         changed = mark(dst, PTR) or changed
-                    elif callee in ("ptr_read", "ptr_write"):
+                    elif bname in ("ptr_read", "ptr_write"):
                         if args:
                             changed = mark(args[0], PTR) or changed
                         # offset/value/result are i64 (the default)
-                    elif callee == "assert":
+                    elif bname == "assert":
                         pass  # cond is i64 (checked); dst is unit -> i64
-                    elif callee in _MATH_EXTERNS:
+                    elif bname in _MATH_EXTERNS:
                         for a in args:
                             changed = mark(a, F64) or changed
                         changed = mark(dst, F64) or changed
-                    elif callee == "neg":
+                    elif bname == "neg":
                         if len(args) == 1:
                             changed = unify((dst, args[0])) or changed
-                    elif callee in _PRINT_BUILTINS or callee == "not":
+                    elif bname in _PRINT_BUILTINS or bname == "not":
                         pass  # dst is unit/bool -> i64
                     else:
                         sig = sigs.get(callee)
@@ -4238,6 +4271,7 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                     probs.append("select over aggregate values")
             elif rk == "call":
                 callee = rhs[1]
+                bname = _builtin_name(callee, module_names)
                 if callee in info.def_count:
                     # Closure call: every lambda the callee variable can
                     # name must be known and signature-compatible.  A
@@ -4378,10 +4412,10 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                                     f"{sig.ret}")
                     else:
                         probs.append(starget)
-                elif callee in _NATIVE_RT_CALLS:
-                    check_builtin(callee, dst, args)
-                elif callee in _EXTERN_C_SIGS:
-                    pks, rk_ = _EXTERN_C_SIGS[callee]
+                elif bname in _NATIVE_RT_CALLS:
+                    check_builtin(bname, dst, args)
+                elif bname in _EXTERN_C_SIGS:
+                    pks, rk_ = _EXTERN_C_SIGS[bname]
                     if len(args) != len(pks):
                         probs.append(
                             f"extern call {callee!r} with {len(args)} "
@@ -4396,7 +4430,7 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                             probs.append(
                                 f"extern call {callee!r}: result {dst!r} is "
                                 f"{ty(dst)}, C signature returns {rk_}")
-                elif callee == "as_ptr":
+                elif bname == "as_ptr":
                     if len(args) != 1:
                         probs.append(
                             f"as_ptr with {len(args)} arguments (expects 1)")
@@ -4421,8 +4455,8 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                     if ty(dst) != PTR:
                         probs.append(
                             f"as_ptr result {dst!r} is {ty(dst)}, not rawptr")
-                elif callee in ("ptr_read", "ptr_write"):
-                    want = 2 if callee == "ptr_read" else 3
+                elif bname in ("ptr_read", "ptr_write"):
+                    want = 2 if bname == "ptr_read" else 3
                     if len(args) != want:
                         probs.append(
                             f"{callee} with {len(args)} arguments "
@@ -4441,14 +4475,14 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                             probs.append(
                                 f"{callee} result {dst!r} promoted to "
                                 f"{ty(dst)}")
-                elif callee == "assert":
+                elif bname == "assert":
                     if not args:
                         probs.append("assert with no condition")
                     elif ty(args[0]) != I64:
                         probs.append(
                             f"assert condition {args[0]!r} is {ty(args[0])} "
                             "(native truthiness is i64-only)")
-                elif callee in _PRINT_BUILTINS:
+                elif bname in _PRINT_BUILTINS:
                     for a in args:
                         ak = ty(a)
                         if _is_fvec(ak):
@@ -4461,15 +4495,15 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                                     f"{_fvec_leaf(ak)[0]} leaves")
                         elif ak not in (I64, F64, STR):
                             probs.append(f"print of unsupported kind {ak}")
-                elif callee == "neg":
+                elif bname == "neg":
                     if len(args) == 1 and ty(dst) not in (I64, F64):
                         probs.append(
                             f"neg of kind {ty(dst)} (the interpreter only "
                             "negates numbers)")
-                elif callee == "not":
+                elif bname == "not":
                     if len(args) == 1 and ty(dst) != I64:
                         probs.append(f"not of kind {ty(dst)}")
-                elif callee in _MATH_EXTERNS or callee in _INLINE_BUILTINS:
+                elif bname in _MATH_EXTERNS or bname in _INLINE_BUILTINS:
                     pass  # kinds pinned during inference
                 elif callee in module_names:
                     sig = sigs.get(callee)
@@ -4751,7 +4785,8 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                 ok_positions: Set[int] = set()
                 if rk2 == "copy":
                     ok_positions = {0}
-                elif rk2 == "call" and rhs2[1] in ("len", "__index_get"):
+                elif rk2 == "call" and _builtin_name(
+                        rhs2[1], module_names) in ("len", "__index_get"):
                     ok_positions = {0}
                 elif rk2 == "call" and rhs2[1] == "__vec_comprehension":
                     ok_positions = {2}
@@ -5097,7 +5132,8 @@ _STR_PRODUCER_BUILTINS = ("to_string", "int_to_str")
 
 
 def _owned_strings(f: MirFunc, kinds: Dict[str, str], info: _Info,
-                   builtin_of) -> Tuple[List[str], Set[str], Set[str]]:
+                   builtin_of,
+                   module_names: Set[str]) -> Tuple[List[str], Set[str], Set[str]]:
     """Ownership facts for produced strings this frame provably owns (see
     the section comment above): freed at redefinition and at frame exit.
 
@@ -5180,7 +5216,10 @@ def _owned_strings(f: MirFunc, kinds: Dict[str, str], info: _Info,
                 if callee in info.def_count:
                     for a in args:
                         mark_use(a, ("bad",))  # closure call: env unseen
-                elif callee in _PRINT_BUILTINS:
+                elif _builtin_name(callee, module_names) in _PRINT_BUILTINS:
+                    # NAME PRECEDENCE: a user `fn print` is an ordinary
+                    # module call (it may retain), so only the real builtin
+                    # counts as non-retaining here.
                     for a in args:
                         mark_use(a, ("ok",))  # printf reads, never retains
                 else:
@@ -6023,8 +6062,9 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
         if callee.startswith(STATIC_CALL_PREFIX):
             res, target = _resolve_static_call(callee, traits, module_names)
             return target if res == "builtin" else None
-        if callee in _NATIVE_RT_CALLS or callee == "as_ptr":
-            return callee
+        bname = _builtin_name(callee, module_names)
+        if bname in _NATIVE_RT_CALLS or bname == "as_ptr":
+            return bname
         return None
 
     # Vecs provably dead at frame exit (see _provably_dead_vecs): freed on
@@ -6060,7 +6100,7 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
     # (record null: constants are never freed) from ones carrying fresh
     # produced pointers.
     owned_strs, str_lit_temps, str_prod_temps = _owned_strings(
-        f, kinds, info, builtin_of)
+        f, kinds, info, builtin_of, module_names)
     # Cell-backed and module-constant strings are shared beyond this
     # frame's view: never freeable here (leak by design).
     _str_retained = cellset | init_globals | global_reads
@@ -7120,6 +7160,7 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                 callee = rhs[1]
                 # Locals shadow builtins (the interpreter's resolution
                 # order), so the closure-call check comes first.
+                bname = _builtin_name(callee, module_names)
                 if callee in info.def_count:
                     # Closure call: load {fn, env} from the pair and call
                     # the fn pointer.  A pinned NON-participant lambda is
@@ -7210,11 +7251,11 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                         emit_direct_call(dst, starget, opargs, lines)
                     else:
                         raise _Unsupported(starget)
-                elif callee in _NATIVE_RT_CALLS:
-                    emit_rt_builtin(callee, dst, opargs, lines)
-                elif callee in _EXTERN_C_SIGS:
-                    emit_extern_call(callee, dst, opargs, lines)
-                elif callee == "as_ptr":
+                elif bname in _NATIVE_RT_CALLS:
+                    emit_rt_builtin(bname, dst, opargs, lines)
+                elif bname in _EXTERN_C_SIGS:
+                    emit_extern_call(bname, dst, opargs, lines)
+                elif bname == "as_ptr":
                     a = use(opargs[0], lines)
                     if kind(opargs[0]) == STR:
                         # Native strings already ARE NUL-terminated byte
@@ -7238,7 +7279,7 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                             f"  {v} = call ptr @mx_vec_as_bytes(ptr {a})"
                             "  ; fresh byte snapshot (leaks by design)")
                         setval(dst, v, lines)
-                elif callee == "ptr_read":
+                elif bname == "ptr_read":
                     base = use(opargs[0], lines)
                     off = use(opargs[1], lines)
                     p, b8, v = fresh(), fresh(), fresh()
@@ -7248,7 +7289,7 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                     lines.append(f"  {b8} = load i8, ptr {p}")
                     lines.append(f"  {v} = zext i8 {b8} to i64")
                     setval(dst, v, lines)
-                elif callee == "ptr_write":
+                elif bname == "ptr_write":
                     base = use(opargs[0], lines)
                     off = use(opargs[1], lines)
                     val = use(opargs[2], lines)
@@ -7259,7 +7300,7 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                         f"i64 {off}")
                     lines.append(f"  store i8 {t8}, ptr {p}")
                     setval(dst, "0", lines)  # unit
-                elif callee == "assert":
+                elif bname == "assert":
                     # Inline branch-to-abort on a falsy condition (message
                     # arguments are evaluated by their own MIR ops but not
                     # rendered natively; the interpreter raises instead).
@@ -7275,7 +7316,7 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                     lines.append("  unreachable")
                     lines.append(f"assert.ok.{n}:")
                     setval(dst, "0", lines)  # unit
-                elif callee in _PRINT_BUILTINS:
+                elif bname in _PRINT_BUILTINS:
                     def fvec_repr(a: str) -> str:
                         """Render a fixed vector to its interpreter repr
                         string ("vector[...]"); freed right after the print
@@ -7335,7 +7376,7 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                             f"  call void @mx_str_free(ptr {sv})"
                             "  ; print never retains the repr")
                     setval(dst, "0", lines)  # unit
-                elif callee == "neg":
+                elif bname == "neg":
                     a = use(opargs[0], lines)
                     v = fresh()
                     if kind(dst) == F64:
@@ -7343,17 +7384,17 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                     else:
                         lines.append(f"  {v} = sub i64 0, {a}")
                     setval(dst, v, lines)
-                elif callee == "not":
+                elif bname == "not":
                     a = use(opargs[0], lines)
                     c, v = fresh(), fresh()
                     lines.append(f"  {c} = icmp eq i64 {a}, 0")
                     lines.append(f"  {v} = zext i1 {c} to i64")
                     setval(dst, v, lines)
-                elif callee in _MATH_EXTERNS:
-                    mod.math_used.add(callee)
+                elif bname in _MATH_EXTERNS:
+                    mod.math_used.add(bname)
                     a = use(opargs[0], lines)
                     v = fresh()
-                    lines.append(f"  {v} = call double @{callee}(double {a})")
+                    lines.append(f"  {v} = call double @{bname}(double {a})")
                     setval(dst, v, lines)
                 else:
                     emit_direct_call(dst, callee, opargs, lines)
@@ -8041,12 +8082,13 @@ def emit_llvm(funcs: Sequence[MirFunc]) -> str:
     def dep_names(info: _Info, kinds: Dict[str, str]) -> Set[str]:
         """Module functions this one references and cannot link without:
         direct callees, make_closure targets, resolved closure callees, and
-        statically-resolved trait-call targets.  Native runtime builtin
-        names never count, even when a module function shares the name (the
-        builtin wins, mirroring the interpreter's resolution order)."""
+        statically-resolved trait-call targets.  A callee a module function
+        defines IS a dependency even when a builtin shares the name — the
+        user function wins for plain calls (NAME PRECEDENCE); the builtin
+        forms (__builtin$m and unshadowed names) resolve to no module
+        function and never count."""
         deps = {callee for (_d, callee, _a) in info.calls
-                if callee in module_names and callee not in _NATIVE_RT_CALLS
-                and callee not in _FFI_CALLS}
+                if callee in module_names}
         # Statically-resolved __static$ calls depend on their target fn.
         for (_d, callee, _a) in info.calls:
             if callee.startswith(STATIC_CALL_PREFIX):
@@ -8139,8 +8181,9 @@ def emit_llvm(funcs: Sequence[MirFunc]) -> str:
                         changed = True
                 resolved_calls = []
                 for (dst, callee, args) in info.calls:
-                    if callee in _NATIVE_RT_CALLS or callee in _FFI_CALLS \
-                            or callee == "assert":
+                    bname = _builtin_name(callee, module_names)
+                    if bname in _NATIVE_RT_CALLS or bname in _FFI_CALLS \
+                            or bname == "assert":
                         continue
                     if callee.startswith(STATIC_CALL_PREFIX):
                         sres, starget = _resolve_static_call(

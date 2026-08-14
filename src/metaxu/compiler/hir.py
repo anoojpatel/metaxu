@@ -13,12 +13,14 @@ from metaxu.unsafe_ast import TypeCast, UnsafeBlock
 from .desugar import IMPL_SEP, parse_impl_method_name, type_base_name
 
 # Methods that are dispatched as interpreter builtins with the receiver as
-# first argument (`x.to_string()` -> to_string(x)).
+# first argument (`x.to_string()` -> __builtin$to_string(x); see
+# _method_callee and BUILTIN_CALL_PREFIX below).
 # Note: when a method of the same name is provided by a user trait/impl block,
 # the call lowers to a __trait$ dispatch instead (see the QualifiedFunctionCall
 # and MethodCall paths below), so user impls win over these builtins; the
 # interpreter's trait dispatch falls back to the builtin for receiver types
-# without an impl.
+# without an impl.  A plain top-level function of the same name NEVER wins in
+# method position (docs/name_precedence.md).
 _BUILTIN_METHODS = frozenset({
     "to_string", "len",
     # Vec methods (runtime library)
@@ -49,6 +51,57 @@ STATIC_CALL_PREFIX = f"__static{IMPL_SEP}"
 # interpreter dispatches that callee to its runtime shim table (loudly
 # erroring on symbols it has no shim for).
 EFFECT_RUNTIME_CALL_PREFIX = f"__mx_effect_runtime{IMPL_SEP}"
+
+# Callee-name prefix marking a METHOD-POSITION call to a runtime builtin
+# method: `x.len()` lowers to Call(callee="__builtin$len", operands=(x,)).
+#
+# NAME PRECEDENCE (see docs/name_precedence.md).  Plain calls resolve to a
+# user module function BEFORE the builtin of the same name, so a program
+# that declares `fn push(list, item)` can call it.  Method position must
+# not follow that rule: `x.len()` means "the receiver's length", and a
+# top-level `fn len(...)` is not a method of anything, so it must not
+# hijack every receiver in the program.  Marking the call site keeps the
+# two positions distinguishable in MIR (they were both bare names before,
+# which is exactly why the precedence could not be flipped).  Method
+# position therefore resolves impl -> builtin -> plain function, the same
+# order trait dispatch has always used: a method name declared by any
+# trait/impl goes through TRAIT_CALL_PREFIX instead of this prefix, so a
+# user impl still wins.
+BUILTIN_CALL_PREFIX = f"__builtin{IMPL_SEP}"
+
+# Every BARE (non-dotted, non-reserved) builtin function name the runtime
+# provides — the shadowable surface of the precedence rule.  Pinned equal to
+# mir_interp._register_builtins by test_name_precedence; the module resolver
+# uses it to bind a module's unqualified builtin calls LEXICALLY (a bare
+# `len(v)` inside std/vec.mx means the builtin even when the entry program
+# defines its own `fn len`, because MIR's function namespace is flat).
+BUILTIN_FUNCTION_NAMES = frozenset({
+    "print", "println", "assert", "assert_eq",
+    "to_string", "int_to_str", "len", "push", "pop",
+    "sqrt", "sin", "cos", "neg", "not",
+    # FFI shims over the interpreter's simulated C heap
+    "malloc", "free", "memcpy", "realloc",
+    "ptr_read", "ptr_write", "as_ptr", "fopen", "fclose",
+})
+
+
+def _method_callee(method: str, trait_method_names: set[str]) -> str:
+    """The MIR callee name for a method-position call `recv.method(...)`.
+
+    Three cases, in order:
+      * declared by some trait or impl -> ``__trait$method`` (runtime
+        dispatch on the receiver type; a user impl wins, builtin second,
+        plain function third);
+      * a runtime builtin method       -> ``__builtin$method`` (always the
+        builtin — a plain function never hijacks method position);
+      * anything else                  -> the bare name, i.e. a UFCS-style
+        call of a plain function with the receiver as first argument.
+    """
+    if method in trait_method_names:
+        return TRAIT_CALL_PREFIX + method
+    if method in _BUILTIN_METHODS:
+        return BUILTIN_CALL_PREFIX + method
+    return method
 
 
 @dataclass(slots=True)
@@ -562,8 +615,13 @@ class HIRBuilder:
                 if he is not None:
                     arg_exprs.append(he)
             ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, 'Unit'))
+            # `print(...)` is a GRAMMAR PRODUCTION (print is a lexer
+            # keyword), not an ordinary call, so it always means the
+            # builtin — marked so a module function named `print`
+            # anywhere in the program cannot capture it.
             return self._mk_hexpr(frozen_ctx.node_id, "Expr", ty, frozen_ctx.span,
-                                  op="Call", callee="print", operands=tuple(arg_exprs))
+                                  op="Call", callee=BUILTIN_CALL_PREFIX + "print",
+                                  operands=tuple(arg_exprs))
 
         # Dedicated Resume node: `resume(v)` inside a handle case
         if isinstance(orig, fast.Resume):
@@ -821,7 +879,8 @@ class HIRBuilder:
                                    bindings=((i_name, mk(op="Literal", literal=0)),))
             let_n = self._mk_hexpr(
                 nid, "Stmt", "Unit", span, op="Let",
-                bindings=((n_name, mk(op="Call", callee="len",
+                bindings=((n_name, mk(op="Call",
+                                      callee=BUILTIN_CALL_PREFIX + "len",
                                       operands=(mk(op="Var", var_name=it_name),))),))
             cond = mk(op="BinOp", binop="<",
                       left=mk(op="Var", var_name=i_name),
@@ -1131,8 +1190,7 @@ class HIRBuilder:
                     recv = self._mk_hexpr(frozen_ctx.node_id, 'Expr', ty,
                                           frozen_ctx.span, op='FieldGet',
                                           base=recv, field_name=str(fname))
-                callee = (TRAIT_CALL_PREFIX + last
-                          if last in self._trait_method_names else last)
+                callee = _method_callee(last, self._trait_method_names)
                 return self._mk_hexpr(frozen_ctx.node_id, 'Expr', ty, frozen_ctx.span,
                                       op='Call', callee=callee,
                                       operands=(recv, *arg_exprs))
@@ -1173,8 +1231,7 @@ class HIRBuilder:
                 if he is not None:
                     arg_exprs.append(he)
             ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, 'Unknown'))
-            callee = (TRAIT_CALL_PREFIX + method
-                      if method in self._trait_method_names else method)
+            callee = _method_callee(method, self._trait_method_names)
             if recv_he is not None:
                 return self._mk_hexpr(frozen_ctx.node_id, 'Expr', ty, frozen_ctx.span,
                                       op='Call', callee=callee,
@@ -1324,6 +1381,10 @@ class HIRBuilder:
             callee = {'-': 'neg', '!': 'not', 'not': 'not'}.get(op_sym)
             if callee is None:
                 return None
+            # Unary operators are compiler-synthesized builtin calls:
+            # marked so a module function named `neg`/`not` cannot capture
+            # `-x` / `!x`.
+            callee = BUILTIN_CALL_PREFIX + callee
             ty = self.t.apply_tyenv(self.t.types.get(frozen_ctx.node_id, 'Unknown'))
             return self._mk_hexpr(frozen_ctx.node_id, 'Expr', ty, frozen_ctx.span,
                                   op='Call', callee=callee, operands=(operand_he,))

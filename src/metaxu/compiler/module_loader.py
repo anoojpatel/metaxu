@@ -29,6 +29,9 @@ from dataclasses import dataclass, field
 import metaxu.metaxu_ast as fast
 from metaxu.errors import CompileError
 
+from .desugar import RESERVED_NAME_PREFIX, is_reserved_name
+from .hir import BUILTIN_CALL_PREFIX, BUILTIN_FUNCTION_NAMES
+
 
 # The reserved namespace for the standard library. Imports under `std.*`
 # first resolve to real files under the stdlib root (see _stdlib_dir):
@@ -127,6 +130,10 @@ class ModuleResolver:
         # imports, which populate re-export tables) has been processed:
         # [(target_path, symbol_name, importer_path)]
         self.pending_import_checks: list[tuple[str, str, str]] = []
+        # Effect OPERATION names across the program: like types/traits/
+        # effects they live in one global namespace and are called
+        # unqualified (`emit(x)`), so they are never re-bound to builtins.
+        self.effect_ops: set[str] = set()
 
     # ------------------------------------------------------------------
     # Registration
@@ -191,6 +198,10 @@ class ModuleResolver:
                 info.traits.add(str(getattr(stmt, "name", "") or ""))
             elif isinstance(stmt, fast.EffectDeclaration):
                 info.effects.add(str(getattr(stmt, "name", "") or ""))
+                for op in (getattr(stmt, "operations", None) or []):
+                    op_name = getattr(op, "name", None)
+                    if op_name:
+                        self.effect_ops.add(str(op_name))
         return info
 
     # ------------------------------------------------------------------
@@ -264,6 +275,10 @@ class ModuleResolver:
         # The parser wraps a file's statements in a synthesized module named
         # "main"; the file *is* the module named by its path.
         parsed.name = path
+        # Reserved-name gate on the imported file too (the entry file is
+        # checked by resolve_modules): module renaming happens below, so
+        # this sees the declarations exactly as written.
+        check_reserved_names(parsed, candidate)
         self.loaded_files[candidate] = path
         info = self._register_module_node(parsed, path)
         # merge the loaded file's top-level module into the program so the
@@ -479,6 +494,17 @@ class ModuleResolver:
                     return          # std.* placeholder: leave for builtins
                 if fname in final.functions:
                     node.name = self._final_name(final.path, fname)
+                return
+            # Nothing in THIS module's scope provides the name.  MIR's
+            # function namespace is flat and module functions are renamed
+            # to dotted paths, so a bare builtin name here can only mean
+            # the builtin — bind it now (NAME PRECEDENCE,
+            # docs/name_precedence.md).  Without this, an entry program
+            # declaring `fn len` would capture every `len(v)` inside
+            # std/vec.mx, std/string.mx and std/map.mx, since plain calls
+            # now prefer user functions.
+            if name in BUILTIN_FUNCTION_NAMES and name not in self.effect_ops:
+                node.name = BUILTIN_CALL_PREFIX + name
             return
 
         if isinstance(node, fast.QualifiedFunctionCall):
@@ -648,10 +674,61 @@ def _has_module_constructs(program: fast.Program) -> bool:
     return False
 
 
+def check_reserved_names(program, file_path: str = "<mem>") -> None:
+    """Reject user function declarations in the compiler's reserved namespace.
+
+    Plain calls resolve to a user function BEFORE a same-named builtin (see
+    docs/name_precedence.md), which is only safe because the symbols the
+    compiler generates and calls — ``__trait$m``, ``__static$T$m``,
+    ``__impl$...``, ``__module_init``, ``__builtin$m`` and the ``__vec_*`` /
+    ``__index_*`` / ``__list_*`` intrinsics — are off limits to user code.
+    A declaration that tries to take one of those names is a loud error
+    here, never a silent override downstream.
+
+    Runs on every parsed module (entry file and each loaded import) BEFORE
+    module renaming, so it sees the names as written.
+    """
+    seen: set[int] = set()
+
+    def visit(node) -> None:
+        if isinstance(node, (list, tuple)):
+            for item in node:
+                visit(item)
+            return
+        if not isinstance(node, fast.Node) or id(node) in seen:
+            return
+        seen.add(id(node))
+        name = getattr(node, "name", None)
+        if isinstance(node, fast.FunctionDeclaration) and is_reserved_name(name):
+            raise CompileError(
+                message=(f"function name {name!r} is reserved: names beginning "
+                         f"with '{RESERVED_NAME_PREFIX}' belong to the compiler"),
+                error_type="ReservedNameError",
+                location=getattr(node, "location", None),
+                notes=[f"declared in {file_path}",
+                       "the compiler generates and emits calls to "
+                       "__-prefixed symbols (__trait$/__static$/__impl$/"
+                       "__module_init/__builtin$ and the __vec_*/__index_*/"
+                       "__list_* intrinsics); shadowing one would silently "
+                       "redirect it",
+                       "plain user functions already win over same-named "
+                       "builtins, so a helper called `push` or `len` needs "
+                       "no underscores"])
+        for attr, value in vars(node).items():
+            # "children" mirrors the semantic attributes (walking both
+            # doubles the work); parent/scope/location are back-references.
+            if attr in ModuleResolver._SKIP_FIELDS:
+                continue
+            visit(value)
+
+    visit(program)
+
+
 def resolve_modules(program: fast.Program, file_path: str = "<mem>") -> fast.Program:
     """Resolve modules/imports in `program` in place (loading imported files
     relative to `file_path`'s directory) and return it. Programs that use no
     module constructs are returned untouched."""
+    check_reserved_names(program, file_path)
     if not _has_module_constructs(program):
         return program
     return ModuleResolver(program, file_path).resolve()
