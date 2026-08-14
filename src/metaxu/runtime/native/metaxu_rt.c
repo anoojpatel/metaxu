@@ -5,6 +5,7 @@
  * every observable behavior here, including error message wording.
  */
 #include "metaxu_rt.h"
+#include "metaxu_effects.h"   /* mx_raisef: catchable failures (try/catch) */
 
 #include <math.h>
 #include <stdarg.h>
@@ -13,11 +14,25 @@
 #include <string.h>
 
 /* ------------------------------------------------------------------------
- * Error path: strict, loud, fatal.  Mirrors the interpreter's InterpError
- * philosophy -- a clear message on stderr, then abort().  No fallbacks.
+ * Error paths: strict and loud, in two flavors.
+ *
+ *   mx_rt_fail  -- FATAL.  Message on stderr, then abort().  Used for
+ *                  failures the INTERPRETER does not raise InterpError for
+ *                  (so a `try` must not catch them either) and for
+ *                  allocation / internal-invariant failures, which have no
+ *                  interpreter counterpart at all and must never become a
+ *                  program value.
+ *   mx_rt_raise -- CATCHABLE.  Routed through mx_raise (metaxu_effects.c):
+ *                  an enclosing `try` binds this exact text to its catch
+ *                  parameter, and with no try installed the behavior is
+ *                  identical to mx_rt_fail (same stderr line, abort()).
+ *                  Used ONLY where the wording already reproduces the
+ *                  interpreter's InterpError message byte for byte -- the
+ *                  caught value is language-visible (docs/try_catch.md).
  * ---------------------------------------------------------------------- */
 static void mx_rt_fail(const char *fmt, ...) {
     va_list ap;
+    fflush(stdout);   /* abort() does not: keep the printed prefix visible */
     fputs("metaxu runtime error: ", stderr);
     va_start(ap, fmt);
     vfprintf(stderr, fmt, ap);
@@ -26,6 +41,8 @@ static void mx_rt_fail(const char *fmt, ...) {
     fflush(stderr);
     abort();
 }
+
+#define mx_rt_raise(...) mx_raisef(__VA_ARGS__)
 
 static void *mx_rt_malloc(size_t n) {
     void *p = malloc(n ? n : 1);
@@ -84,7 +101,7 @@ void mx_vec_push(mx_vec *v, int64_t value) {
 int64_t mx_vec_pop(mx_vec *v) {
     mx_vec_check(v, "pop");
     if (v->len == 0) {
-        mx_rt_fail("pop: Vec is empty");
+        mx_rt_raise("pop: Vec is empty");   /* catchable (InterpError) */
     }
     return v->data[--v->len];
 }
@@ -97,8 +114,8 @@ int64_t mx_vec_len(const mx_vec *v) {
 int64_t mx_vec_get(const mx_vec *v, int64_t idx) {
     mx_vec_check(v, "index");
     if (idx < 0 || idx >= v->len) {
-        mx_rt_fail("index out of bounds: %lld (length %lld)",
-                   (long long)idx, (long long)v->len);
+        mx_rt_raise("index out of bounds: %lld (length %lld)",
+                    (long long)idx, (long long)v->len);
     }
     return v->data[idx];
 }
@@ -106,8 +123,8 @@ int64_t mx_vec_get(const mx_vec *v, int64_t idx) {
 void mx_vec_set(mx_vec *v, int64_t idx, int64_t value) {
     mx_vec_check(v, "index");
     if (idx < 0 || idx >= v->len) {
-        mx_rt_fail("index out of bounds: %lld (length %lld)",
-                   (long long)idx, (long long)v->len);
+        mx_rt_raise("index out of bounds: %lld (length %lld)",
+                    (long long)idx, (long long)v->len);
     }
     v->data[idx] = value;
 }
@@ -131,8 +148,8 @@ unsigned char *mx_vec_as_bytes(const mx_vec *v) {
     for (int64_t i = 0; i < v->len; i++) {
         int64_t e = v->data[i];
         if (e < 0 || e > 255) {
-            mx_rt_fail("as_ptr: element %lld is not a byte (0..255): %lld",
-                       (long long)i, (long long)e);
+            mx_rt_raise("as_ptr: element %lld is not a byte (0..255): %lld",
+                        (long long)i, (long long)e);
         }
         out[i] = (unsigned char)e;
     }
@@ -180,8 +197,8 @@ int64_t mx_fvec_len(const mx_fvec *v) {
 int64_t mx_fvec_get(const mx_fvec *v, int64_t idx) {
     mx_fvec_check(v, "index");
     if (idx < 0 || idx >= v->len) {
-        mx_rt_fail("index out of bounds: %lld (length %lld)",
-                   (long long)idx, (long long)v->len);
+        mx_rt_raise("index out of bounds: %lld (length %lld)",
+                    (long long)idx, (long long)v->len);
     }
     return v->elems[idx];
 }
@@ -189,8 +206,8 @@ int64_t mx_fvec_get(const mx_fvec *v, int64_t idx) {
 void mx_fvec_init(mx_fvec *v, int64_t idx, int64_t word) {
     mx_fvec_check(v, "vector init");
     if (idx < 0 || idx >= v->len) {
-        mx_rt_fail("index out of bounds: %lld (length %lld)",
-                   (long long)idx, (long long)v->len);
+        mx_rt_raise("index out of bounds: %lld (length %lld)",
+                    (long long)idx, (long long)v->len);
     }
     v->elems[idx] = word;
 }
@@ -247,7 +264,7 @@ mx_fvec *mx_fvec_slice(const mx_fvec *v, int64_t start, int64_t stop,
         step = 1;
     }
     if (step == 0) {
-        mx_rt_fail("slice: step must be non-zero");
+        mx_rt_raise("slice: step must be non-zero");  /* catchable */
     }
     int64_t lo_clamp = step < 0 ? -1 : 0;
     int64_t hi_clamp = step < 0 ? len - 1 : len;
@@ -330,8 +347,10 @@ static int64_t mx_fvec_scalar_op(int64_t op, int64_t base, int64_t a,
     case 2: return a * b;
     default:
         if (b == 0) {
-            /* The interpreter raises ZeroDivisionError; scalar native sdiv
-             * is UB — the vector runtime aborts loudly instead. */
+            /* FATAL, deliberately: the interpreter raises ZeroDivisionError,
+             * NOT InterpError, so a `try` does not recover from it there
+             * either (scalar native sdiv is plain UB; the vector runtime
+             * aborts loudly instead of guessing). */
             mx_rt_fail("vector binop: integer division by zero");
         }
         /* C truncating semantics, the backend's documented sdiv/srem
@@ -355,9 +374,9 @@ mx_fvec *mx_fvec_binop(int64_t op, int64_t base, int64_t depth, int64_t mode,
         mx_fvec_check(lv, "vector binop");
         mx_fvec_check(rv, "vector binop");
         if (lv->len != rv->len) {
-            mx_rt_fail("vector size mismatch for '%s': %lld vs %lld",
-                       mx_fvec_op_name(op), (long long)lv->len,
-                       (long long)rv->len);
+            mx_rt_raise("vector size mismatch for '%s': %lld vs %lld",
+                        mx_fvec_op_name(op), (long long)lv->len,
+                        (long long)rv->len);
         }
         n = lv->len;
     } else if (mode == 1) {
@@ -406,9 +425,9 @@ mx_fvec *mx_fvec_map(const mx_fvec *v, mx_fvec_map_fn fn, void *env,
         mx_rt_fail("vector comprehension: NULL body function");
     }
     if (expected_n >= 0 && v->len != expected_n) {
-        mx_rt_fail("vector comprehension produced %lld elements for a "
-                   "vector of size %lld",
-                   (long long)v->len, (long long)expected_n);
+        mx_rt_raise("vector comprehension produced %lld elements for a "
+                    "vector of size %lld",
+                    (long long)v->len, (long long)expected_n);
     }
     mx_fvec *out = mx_fvec_new(v->len);
     for (int64_t i = 0; i < v->len; i++) {
@@ -426,8 +445,8 @@ mx_fvec *mx_fvec_map(const mx_fvec *v, mx_fvec_map_fn fn, void *env,
 mx_fvec *mx_fvec_set_copy(const mx_fvec *v, int64_t idx, int64_t word) {
     mx_fvec_check(v, "index assignment");
     if (idx < 0 || idx >= v->len) {
-        mx_rt_fail("index assignment out of bounds: %lld (length %lld)",
-                   (long long)idx, (long long)v->len);
+        mx_rt_raise("index assignment out of bounds: %lld (length %lld)",
+                    (long long)idx, (long long)v->len);
     }
     mx_fvec *out = mx_fvec_new(v->len);
     memcpy(out->elems, v->elems, (size_t)v->len * sizeof(int64_t));
@@ -448,13 +467,13 @@ mx_fvec *mx_fvec_zip_map(const mx_fvec *a, const mx_fvec *b,
     if (a->len != b->len) {
         int64_t lo = a->len < b->len ? a->len : b->len;
         int64_t hi = a->len < b->len ? b->len : a->len;
-        mx_rt_fail("zip: sequences have different lengths [%lld, %lld]",
-                   (long long)lo, (long long)hi);
+        mx_rt_raise("zip: sequences have different lengths [%lld, %lld]",
+                    (long long)lo, (long long)hi);
     }
     if (expected_n >= 0 && a->len != expected_n) {
-        mx_rt_fail("vector comprehension produced %lld elements for a "
-                   "vector of size %lld",
-                   (long long)a->len, (long long)expected_n);
+        mx_rt_raise("vector comprehension produced %lld elements for a "
+                    "vector of size %lld",
+                    (long long)a->len, (long long)expected_n);
     }
     mx_fvec *out = mx_fvec_new(a->len);
     for (int64_t i = 0; i < a->len; i++) {
@@ -519,8 +538,8 @@ unsigned char *mx_fvec_as_bytes(const mx_fvec *v) {
     for (int64_t i = 0; i < v->len; i++) {
         int64_t e = v->elems[i];
         if (e < 0 || e > 255) {
-            mx_rt_fail("as_ptr: element %lld is not a byte (0..255): %lld",
-                       (long long)i, (long long)e);
+            mx_rt_raise("as_ptr: element %lld is not a byte (0..255): %lld",
+                        (long long)i, (long long)e);
         }
         out[i] = (unsigned char)e;
     }
@@ -569,9 +588,9 @@ int64_t mx_str_eq(const char *a, const char *b) {
  * ---------------------------------------------------------------------- */
 int64_t mx_shift_check(int64_t count, int64_t is_left) {
     if (count < 0 || count >= 64) {
-        mx_rt_fail("shift amount %lld out of range for '%s' on a 64-bit int "
-                   "(must be 0..63)",
-                   (long long)count, is_left ? "<<" : ">>");
+        mx_rt_raise("shift amount %lld out of range for '%s' on a 64-bit int "
+                    "(must be 0..63)",
+                    (long long)count, is_left ? "<<" : ">>");
     }
     return count;
 }

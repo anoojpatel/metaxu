@@ -130,9 +130,11 @@ Diagnostics that carry locations:
   it was compiled, and differently again on a backend with no such note.
   `mir_interp`'s `try_scope` therefore passes `exc.message`, while
   tracebacks and the example gate go through `str(exc)` and keep naming the
-  function. `args` is never rewritten. The native backend currently demotes
-  `try_scope` (no native try/catch yet); when it grows one it must bind the
-  same plain `.message` text.
+  function. `args` is never rewritten. The native backend lowers
+  `try_scope` too (mx_try landing pads, metaxu_effects.c) and binds this
+  same plain text: every catchable native failure is raised through
+  `mx_raise` with the interpreter's exact wording, and a differential test
+  pins the caught value byte for byte.
 * **Advisory `-1` diagnostics** from `frozen_constraint_checker`
   ("Unresolved callee ...", "Invalid capture mode ...") are plain strings
   that still say `at node N`. They are advisories, never promoted to a

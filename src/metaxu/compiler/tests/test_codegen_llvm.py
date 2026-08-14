@@ -2958,12 +2958,20 @@ def test_examples_define_census_does_not_regress():
     # lands — test_std_stream_aggregate_element_census, where std.stream's
     # map/filter over a struct/enum element type go from demoted to
     # emitted-and-natively-differential.
+    #
+    # Increment 19 (native try/catch over mx_try landing pads) removes the
+    # last wholesale demotion reason, "uses try/catch (try_scope)".  Only
+    # ONE example writes a try: 04_advanced_types.mx, whose `try_parse`,
+    # its try body and its catch body all emit now — 1 -> 3 defines, and
+    # the census 89 -> 91.  04's `main` still demotes on __list_lit and its
+    # ToString impl on the heterogeneous Result receiver, both unrelated
+    # gaps, so 04 gains defines without becoming natively runnable.
     total_defines = 0
     for path in _example_files():
         ir = llvm_from_source(path.read_text())
         total_defines += len(re.findall(
             r"^define (?:i64|double|ptr|void) @mx_\w+\(", ir, re.M))
-    assert total_defines >= 88
+    assert total_defines >= 91
 
 
 # ---------------------------------------------------------------------------
@@ -6828,3 +6836,473 @@ def test_mono_ir_passes_llvm_verifier(tmp_path):
             ["opt", "-passes=verify", "-disable-output", str(ll)],
             capture_output=True, text=True)
         assert proc.returncode == 0, proc.stderr
+
+
+# ---------------------------------------------------------------------------
+# Increment 19: NATIVE try/catch (mx_try landing pads)
+# ---------------------------------------------------------------------------
+#
+# `try { body } catch e { handler }` was the last construct that demoted
+# wholesale ("uses try/catch (try_scope)").  It now lowers to an env fill
+# plus mx_try over a per-site body thunk and catch thunk (metaxu_effects.c:
+# a setjmp landing pad whose chain is PER-FIBER, so it composes with the
+# ucontext coroutine scheduler instead of fighting it).  Three things can
+# silently go wrong, and each has tests below:
+#
+#   1. the VALUE the catch binding receives must be byte-identical to the
+#      interpreter's `InterpError.message` (docs/try_catch.md);
+#   2. the CONTROL FLOW must match — caught / not caught / nested / across
+#      an effect scope in both directions / uncaught;
+#   3. the SET of catchable failures must match exactly.  Where it cannot
+#      (match_fail: the interpreter's message embeds the MIR function name
+#      and monomorphization renames it) the try DEMOTES with that reason,
+#      rather than catching more or less than the interpreter would.
+
+_TRY_CAUGHT_SRC = """
+effect Fail {
+    boom(x: int) -> int
+}
+
+fn body() performs Fail -> int {
+    perform Fail.boom(1)
+}
+
+fn main() -> int {
+    let r = try {
+        body();
+        1
+    } catch e {
+        print("caught: " + e);
+        7
+    };
+    print(r);
+    0
+}
+"""
+
+_TRY_UNCAUGHT_SRC = """
+effect Fail {
+    boom(x: int) -> int
+}
+
+fn main() -> int {
+    print("before");
+    perform Fail.boom(1);
+    print("after");
+    0
+}
+"""
+
+_TRY_NESTED_SRC = """
+effect Fail {
+    boom(x: int) -> int
+}
+
+fn inner() performs Fail -> int {
+    perform Fail.boom(1)
+}
+
+fn main() -> int {
+    let r = try {
+        let a = try {
+            inner()
+        } catch e1 {
+            print("inner: " + e1);
+            5
+        };
+        a + 1
+    } catch e2 {
+        print("outer: " + e2);
+        99
+    };
+    print(r);
+    0
+}
+"""
+
+_TRY_OVER_EFFECT_SRC = """
+effect Fail {
+    boom(x: int) -> int
+}
+
+fn main() -> int {
+    let r = handle Fail with {
+        boom(x) -> resume(x + 100)
+    } in {
+        try {
+            let v = perform Fail.boom(2);
+            v * 10
+        } catch e {
+            print("must not happen: " + e);
+            0
+        }
+    };
+    print(r);
+    0
+}
+"""
+
+_TRY_NORMAL_SRC = """
+fn main() -> int {
+    let r = try {
+        3 + 4
+    } catch e {
+        print("must not happen: " + e);
+        0
+    };
+    print(r);
+    0
+}
+"""
+
+# A failure raised INSIDE a handle body (on a coroutine stack) caught by a
+# try OUTSIDE the handle: the cross-fiber path (MX_EV_ERROR + re-raise on
+# the owner stack), which the interpreter gets from the ("error", exc)
+# message its body thread sends to _pump_scope.
+_TRY_ACROSS_HANDLE_SRC = """
+effect Fail {
+    boom(x: int) -> int
+}
+
+effect Other {
+    ask() -> int
+}
+
+fn main() -> int {
+    let r = try {
+        handle Fail with {
+            boom(x) -> resume(x + 1)
+        } in {
+            let a = perform Fail.boom(1);
+            let b = perform Other.ask();
+            a + b
+        }
+    } catch e {
+        print("caught: " + e);
+        42
+    };
+    print(r);
+    0
+}
+"""
+
+# The caught value ITSELF, printed verbatim.
+_TRY_VALUE_SRC = """
+effect Parser {
+    parse(input: string) -> int
+}
+
+fn boom() performs Parser -> int {
+    perform Parser.parse("x")
+}
+
+fn main() -> int {
+    let msg = try {
+        boom();
+        "ok"
+    } catch e {
+        e
+    };
+    print(msg);
+    0
+}
+"""
+
+
+# An effect ABORT (handler returns without resuming) unwinding THROUGH a
+# try installed inside the handle body.  That is a scope TEARDOWN, not a
+# failure: the interpreter's _ScopeAbort is a BaseException its try_scope
+# deliberately does not catch, and natively the abort longjmps to the
+# scope's own mx_handle without ever consulting a landing pad.
+_TRY_ABORT_THROUGH_SRC = """
+effect Fail {
+    boom(x: int) -> int
+}
+
+fn main() -> int {
+    let r = handle Fail with {
+        boom(x) -> x + 500
+    } in {
+        try {
+            let v = perform Fail.boom(3);
+            v * 1000
+        } catch e {
+            print("must not happen: " + e);
+            0
+        }
+    };
+    print(r);
+    0
+}
+"""
+
+# A failure raised BY A CATCH BLOCK propagates outward, never to its own
+# try (docs/try_catch.md rule 4): mx_try pops its pad before calling the
+# catch thunk, so the enclosing try's pad is the innermost one.
+_TRY_CATCH_RAISES_SRC = """
+effect A { one() -> int }
+effect B { two() -> int }
+
+fn main() -> int {
+    let r = try {
+        let inner = try {
+            perform A.one()
+        } catch e1 {
+            print("inner: " + e1);
+            perform B.two()
+        };
+        inner + 1
+    } catch e2 {
+        print("outer: " + e2);
+        11
+    };
+    print(r);
+    0
+}
+"""
+
+# A runtime CONTRACT VIOLATION (metaxu_rt.c), not an effect failure: proves
+# the mx_rt_raise conversion reaches the landing pad with the interpreter's
+# exact wording.
+_TRY_VEC_CONTRACT_SRC = """
+fn main() -> int {
+    let r = try {
+        let v = Vec.new();
+        v.push(1);
+        v.pop();
+        v.pop()
+    } catch e {
+        print("caught: " + e);
+        7
+    };
+    print(r);
+    0
+}
+"""
+
+
+def test_try_scope_no_longer_demotes_and_calls_mx_try():
+    ir = llvm_from_source(_TRY_CAUGHT_SRC)
+    assert "uses try/catch (try_scope)" not in ir
+    assert count_placeholders(ir) == 0
+    assert "declare i64 @mx_try(ptr, ptr, ptr, ptr)" in ir
+    assert re.search(r"call i64 @mx_try\(ptr @mxtc\.body\.", ir)
+    # per-site thunks: the body takes only the env; the catch also takes the
+    # failure message pointer (a `str`, never copied or reformatted).
+    assert re.search(r"define internal i64 @mxtc\.body\.\w+\(ptr %env\)", ir)
+    assert re.search(
+        r"define internal i64 @mxtc\.catch\.\w+\(ptr %env, ptr %msg\)", ir)
+
+
+def test_try_catch_parameter_is_a_str_in_the_native_signature():
+    ir = llvm_from_source(_TRY_VALUE_SRC)
+    # the catch subfunction: env pointer + the message pointer (never i64)
+    assert re.search(r"define \w+ @mx___catch_main\w*\(ptr %cl\.env, ptr ", ir)
+
+
+@needs_clang
+def test_try_caught_failure_matches_interpreter(tmp_path):
+    assert_native_matches_interp(_TRY_CAUGHT_SRC, tmp_path)
+
+
+@needs_clang
+def test_try_caught_value_is_byte_identical_to_the_interpreter(tmp_path):
+    # The interpreter binds InterpError.message; so must the native runtime.
+    _result, expected = interp_run(_TRY_VALUE_SRC)
+    assert expected == "No handler for effect 'Parser'\n"
+    ir = llvm_from_source(_TRY_VALUE_SRC)
+    code, stdout = compile_and_run(ir, "main", workdir=str(tmp_path))
+    assert stdout == expected
+    assert code == 0
+
+
+@needs_clang
+def test_try_that_catches_nothing_matches_interpreter(tmp_path):
+    assert_native_matches_interp(_TRY_NORMAL_SRC, tmp_path)
+
+
+@needs_clang
+def test_nested_try_innermost_catches(tmp_path):
+    assert_native_matches_interp(_TRY_NESTED_SRC, tmp_path)
+
+
+@needs_clang
+def test_try_body_performing_an_effect_handled_outside_it(tmp_path):
+    # The pad is installed ON THE HANDLE BODY'S COROUTINE; the perform parks
+    # that fiber, the handler runs on the owner stack, and the resume comes
+    # back to a body whose pad is still exactly where it was.
+    assert_native_matches_interp(_TRY_OVER_EFFECT_SRC, tmp_path)
+
+
+@needs_clang
+def test_try_catches_a_failure_raised_inside_a_handle_body(tmp_path):
+    assert_native_matches_interp(_TRY_ACROSS_HANDLE_SRC, tmp_path)
+
+
+@needs_clang
+def test_failure_in_a_catch_block_escapes_to_the_enclosing_try(tmp_path):
+    _result, expected = interp_run(_TRY_CATCH_RAISES_SRC)
+    assert expected == ("inner: No handler for effect 'A'\n"
+                        "outer: No handler for effect 'B'\n11\n")
+    assert_native_matches_interp(_TRY_CATCH_RAISES_SRC, tmp_path)
+
+
+@needs_clang
+def test_effect_abort_unwinds_through_a_try_without_catching(tmp_path):
+    # Teardown, not failure: the catch block must never run and the handle
+    # value must be the non-resuming case's value (503, not 3000).
+    _result, expected = interp_run(_TRY_ABORT_THROUGH_SRC)
+    assert expected == "503\n"
+    assert_native_matches_interp(_TRY_ABORT_THROUGH_SRC, tmp_path)
+
+
+@needs_clang
+def test_try_catches_a_runtime_contract_violation(tmp_path):
+    # metaxu_rt.c's catchable failures reach the pad with the interpreter's
+    # exact wording ("pop: Vec is empty").
+    _result, expected = interp_run(_TRY_VEC_CONTRACT_SRC)
+    assert expected == "caught: pop: Vec is empty\n7\n"
+    assert_native_matches_interp(_TRY_VEC_CONTRACT_SRC, tmp_path)
+
+
+@needs_clang
+def test_uncaught_failure_matches_the_interpreter(tmp_path):
+    """No try installed: the interpreter raises InterpError and the native
+    binary dies -- same message, same stdout prefix, both non-zero."""
+    from metaxu.compiler.mir_interp import InterpError
+
+    with pytest.raises(InterpError) as ei:
+        interp_run(_TRY_UNCAUGHT_SRC)
+    assert ei.value.message == "No handler for effect 'Fail'"
+
+    ir = llvm_from_source(_TRY_UNCAUGHT_SRC)
+    code, stdout = compile_and_run(ir, "main", workdir=str(tmp_path))
+    assert code != 0                      # abort(), never a silent 0
+    assert stdout == "before\n"           # and nothing after the failure
+    # the message goes to stderr, unchanged by the catchable-raise plumbing
+    proc = subprocess.run([str(tmp_path / "prog.bin")],
+                          capture_output=True, text=True, timeout=60)
+    assert "No handler for effect 'Fail'" in proc.stderr
+
+
+@needs_clang
+def test_try_ir_passes_llvm_verifier(tmp_path):
+    if shutil.which("opt") is None:
+        pytest.skip("LLVM opt not installed")
+    for src in (_TRY_CAUGHT_SRC, _TRY_NESTED_SRC, _TRY_OVER_EFFECT_SRC,
+                _TRY_NORMAL_SRC, _TRY_ACROSS_HANDLE_SRC, _TRY_VALUE_SRC,
+                _TRY_ABORT_THROUGH_SRC, _TRY_VEC_CONTRACT_SRC,
+                _TRY_CATCH_RAISES_SRC):
+        ll = tmp_path / "try.ll"
+        ll.write_text(llvm_from_source(src))
+        proc = subprocess.run(
+            ["opt", "-passes=verify", "-disable-output", str(ll)],
+            capture_output=True, text=True)
+        assert proc.returncode == 0, proc.stderr
+
+
+@needs_asan
+def test_try_that_catches_nothing_is_leak_clean_under_asan(tmp_path):
+    # FULL leak checking: a try whose body completes normally allocates
+    # nothing at all -- no heap pad state, no message copy.
+    assert_native_matches_interp_asan(_TRY_NORMAL_SRC, tmp_path)
+
+
+@needs_asan
+def test_unwinding_try_is_memory_safe_under_asan(tmp_path):
+    # detect_leaks=0, the documented contract for values that leak by
+    # design: the caught message is an ordinary produced `str` the backend
+    # cannot prove dead.  Exit 0 proves what matters here -- the longjmp
+    # corrupted no coroutine stack, the scope teardown at the landing pad
+    # double-freed nothing, and no continuation record was used after free.
+    for i, src in enumerate((_TRY_CAUGHT_SRC, _TRY_NESTED_SRC,
+                             _TRY_ACROSS_HANDLE_SRC, _TRY_OVER_EFFECT_SRC,
+                             _TRY_ABORT_THROUGH_SRC, _TRY_VEC_CONTRACT_SRC,
+                             _TRY_CATCH_RAISES_SRC)):
+        d = tmp_path / f"case{i}"
+        d.mkdir()
+        assert_native_matches_interp_asan_boxes(src, d)
+
+
+@needs_asan
+def test_unwinding_try_frees_the_effect_machinery(tmp_path):
+    """The scheduler itself stays leak-clean across a caught failure.
+
+    ASan with LEAK CHECKING ON over the cross-fiber shape: the only
+    allocation allowed to survive is the caught message copy (mx__dup), so
+    a coroutine stack, a scope record or a continuation record showing up
+    in the leak report is a real regression in the teardown path.
+    """
+    ir = llvm_from_source(_TRY_ACROSS_HANDLE_SRC)
+    workdir = tmp_path / "leakcheck"
+    workdir.mkdir()
+    compile_and_run(ir, "main", workdir=str(workdir),
+                    clang_args=("-fsanitize=address",),
+                    run_env={"ASAN_OPTIONS": "detect_leaks=0"})
+    proc = subprocess.run([str(workdir / "prog.bin")],
+                          capture_output=True, text=True, timeout=60)
+    err = proc.stderr
+    if "LeakSanitizer" not in err:
+        return  # nothing leaked at all: strictly better than the contract
+    m = re.search(r"leaked in (\d+) allocation\(s\)", err)
+    assert m, err
+    n_leaks = int(m.group(1))
+    # EVERY leaked allocation's #1 frame is the failure-message copy.  A
+    # coroutine stack (mx_handle's malloc), a scope record or a continuation
+    # record surviving would push this count apart.
+    assert err.count("in mx__dup") == n_leaks, err
+    assert n_leaks <= 2, err  # one message per raise on this path
+
+
+_TRY_AROUND_MATCH_SRC = """
+enum Color { Red, Green, Blue }
+
+fn classify(c: Color) -> int {
+    match c {
+        Red -> 1,
+        Green -> 2,
+        Blue -> 3
+    }
+}
+
+fn main() -> int {
+    let r = try {
+        classify(Blue)
+    } catch e {
+        print(e);
+        9
+    };
+    print(r);
+    0
+}
+"""
+
+
+def test_try_whose_extent_can_match_fail_demotes_with_the_real_reason():
+    # HONEST DEMOTION, not a wrong answer: the interpreter CATCHES a match
+    # failure ("match failure in 'classify': no pattern matched"), and that
+    # message embeds the MIR function name -- which the native lane's
+    # monomorphization pass renames.  Emitting it would bind a different
+    # string than the interpreter binds; omitting it would fail to catch
+    # what the interpreter catches.  So the try demotes, naming the blocker.
+    ir = llvm_from_source(_TRY_AROUND_MATCH_SRC)
+    assert "try/catch demoted:" in ir
+    assert "match failure in 'classify'" in ir
+    assert "monomorphization renames" in ir
+    # ...and nothing pretends to lower it
+    assert "@mxtc.body." not in ir
+
+
+def test_example_04_gains_its_try_parse_defines():
+    # 04_advanced_types.mx's try_parse is the motivating case: a speculative
+    # `perform Parser.parse` with no handler installed, whose failure the
+    # try turns into `Err(message)`.  Its body/catch subfunctions and
+    # try_parse itself now emit; `main` still demotes on __list_lit and
+    # to_string on its heterogeneous Result receiver (unrelated gaps).
+    ir = llvm_from_source(
+        (REPO_ROOT / "examples" / "04_advanced_types.mx").read_text())
+    assert "uses try/catch (try_scope)" not in ir
+    assert "define void @mx_try_parse(" in ir
+    assert re.search(r"define i64 @mx___try_body_try_parse\w*\(", ir)
+    assert re.search(r"define i64 @mx___catch_try_parse\w*\(", ir)
+    assert re.search(r"call i64 @mx_try\(", ir)
