@@ -4676,21 +4676,28 @@ def test_std_stream_import_emits_cell_counter_handlers():
     assert "unsupported op 'cell_wrap'" not in ir
     assert not re.search(r"reason:.*cell_wrap", ir)
     assert re.search(
-        r"^define i64 @mx___handler_Emit_emit_std_stream_take_hs\d+\(",
+        r"^define i64 @mx___handler_Emit_emit_std_stream_take(?:_ho\d+)?_hs\d+\(",
         ir, re.M)
     assert re.search(
-        r"^define i64 @mx___handler_Emit_emit_std_stream_skip_hs\d+\(",
+        r"^define i64 @mx___handler_Emit_emit_std_stream_skip(?:_ho\d+)?_hs\d+\(",
         ir, re.M)
     assert re.search(
-        r"^define i64 @mx___handler_Loop_break__std_stream_for__hs\d+\(",
+        r"^define i64 @mx___handler_Loop_break__std_stream_for_(?:_ho\d+)?_hs\d+\(",
         ir, re.M)
     # The whole used pipeline emits: main, fold, sum, count, take, iota,
     # the take thunk, and fold's handler case (which calls `f` indirectly).
     # take and iota return closures, so their defines are sret-style.
-    for sym in ("mx_main", "mx_std_stream_fold", "mx_std_stream_sum",
-                "mx_std_stream_count", "mx_std_stream_take",
-                "mx_std_stream_iota", "mx_std_stream_take_lambda1",
-                "mx___handler_Emit_emit_std_stream_fold_hs1"):
+    # A `(?:_ho\d+)?` in the symbol accepts monomorphize's higher-order
+    # per-call-site clones: a stdlib function whose every call site passes
+    # a lambda literal is cloned per site and its dead original erased, so
+    # the define exists under the clone name (same body, fresh symbol).
+    for sym in ("mx_main", r"mx_std_stream_fold(?:_ho\d+)?",
+                r"mx_std_stream_sum(?:_ho\d+)?",
+                r"mx_std_stream_count(?:_ho\d+)?",
+                r"mx_std_stream_take(?:_ho\d+)?",
+                "mx_std_stream_iota",
+                r"mx_std_stream_take(?:_ho\d+)?_lambda1",
+                r"mx___handler_Emit_emit_std_stream_fold(?:_ho\d+)?_hs1"):
         assert re.search(rf"^define (?:i64|void) @{sym}\(", ir, re.M), sym
     # fold's f is a dynamic closure (sum/product/count lambdas): the case
     # calls it indirectly through the word-uniform ABI.
@@ -4861,11 +4868,18 @@ fn total(f: fn(int) -> int) -> int {
     v[0] + v[1] + v[2]
 }
 fn main() -> int {
-    print(total(fn(x: int) -> x + 1));
-    print(total(fn(x: int) -> x * 10));
+    let add = fn(x: int) -> x + 1;
+    let mul = fn(x: int) -> x * 10;
+    print(total(add));
+    print(total(mul));
     0
 }
 """
+# ^ The lambdas are routed through variables ON PURPOSE: monomorphize's
+# per-call-site cloning fires on lambda LITERAL arguments, and this test
+# pins the SHARED-site machinery (one `total`, two callers, word-uniform
+# indirect f). Literal arguments would split the site into two pinned
+# clones and the machinery under test would never engage.
 
 
 def test_comprehension_body_calling_dynamic_closure_emits():
@@ -5079,8 +5093,10 @@ def test_std_stream_full_surface_census():
     for fn in ("iota", "emit_range", "emit_vec", "iter", "for_", "fold",
                "sum", "product", "count", "collect", "all_of", "any_of",
                "find", "map", "filter", "take", "skip", "chain"):
+        # (?:_ho\d+)? accepts monomorphize's per-call-site clones of
+        # higher-order stdlib functions (dead originals are erased).
         assert re.search(
-            rf"^define (?:i64|void|ptr|double) @mx_std_stream_{fn}\(",
+            rf"^define (?:i64|void|ptr|double) @mx_std_stream_{fn}(?:_ho\d+)?\(",
             ir, re.M), fn
     assert count_placeholders(ir) == 0
     # find's handle value is a boxed Option at the boundary.  The producer
@@ -5335,7 +5351,8 @@ def test_native_std_stream_find_both_paths(tmp_path):
     # handle result over a real stream — natively, Some AND None paths,
     # matched against the interpreter.
     ir = assert_native_matches_interp(_FX_STD_FIND_SRC, tmp_path)
-    assert re.search(r"^define \w+ @mx_std_stream_find\(", ir, re.M)
+    assert re.search(r"^define \w+ @mx_std_stream_find(?:_ho\d+)?\(",
+                     ir, re.M)
 
 
 @needs_asan
@@ -5780,14 +5797,17 @@ fn apply(f: fn(Point) -> Point, p: Point) -> Point {
     f(p)
 }
 fn main() -> int {
-    let a = apply(fn(q: Point) -> Point { Point { x: q.y, y: q.x } },
-                  Point { x: 1, y: 2 });
-    let b = apply(fn(q: Point) -> Point { Point { x: q.x + 10, y: q.y + 20 } },
-                  Point { x: 3, y: 4 });
+    let swap = fn(q: Point) -> Point { Point { x: q.y, y: q.x } };
+    let bump = fn(q: Point) -> Point { Point { x: q.x + 10, y: q.y + 20 } };
+    let a = apply(swap, Point { x: 1, y: 2 });
+    let b = apply(bump, Point { x: 3, y: 4 });
     print(a.x, a.y, b.x, b.y);
     0
 }
 """
+# ^ Lambdas via variables on purpose: this pins the SHARED-site word-uniform
+# ABI (two lambdas joined through one apply). Literal arguments would be
+# split into per-site clones by monomorphize and each would pin instead.
 
 
 def test_indirect_aggregate_param_and_return_box_at_the_site():
@@ -5949,11 +5969,17 @@ fn drive(h, k) -> int { h(k, 4) }
 fn main() -> int {
     let twice = fn(g, x) -> g(g(x));
     let thrice = fn(g, x) -> g(g(g(x)));
-    print(drive(twice, fn(v: int) -> v + 1));
-    print(drive(thrice, fn(v: int) -> v * 2));
+    let inc = fn(v: int) -> v + 1;
+    let dbl = fn(v: int) -> v * 2;
+    print(drive(twice, inc));
+    print(drive(thrice, dbl));
     0
 }
 """)
+    # (Every lambda routed through a variable on purpose: a literal at the
+    # call site would trigger monomorphize's per-site cloning, each clone
+    # would pin its pair, and the shared-site demotion under test would
+    # never happen — that improved case is pinned separately below.)
     assert count_placeholders(ir) >= 1
     assert re.search(
         r"reason: indirect closure call through 'h': arg 'k' of kind "
@@ -5969,11 +5995,16 @@ struct P { a: int }
 enum E { X(int), Y }
 fn apply(f, v) { f(v) }
 fn main() -> int {
-    print(apply(fn(p: P) -> p.a + 1, P { a: 4 }));
-    print(apply(fn(e: E) -> match e { E.X(n) => n * 2, E.Y => 0 }, E.X(5)));
+    let fp = fn(p: P) -> p.a + 1;
+    let fe = fn(e: E) -> match e { E.X(n) => n * 2, E.Y => 0 };
+    print(apply(fp, P { a: 4 }));
+    print(apply(fe, E.X(5)));
     0
 }
 """)
+    # (Lambdas via variables on purpose — see the note on the closure-pair
+    # test above; the split-clone version of this program emits cleanly and
+    # is pinned separately below.)
     assert count_placeholders(ir) >= 1
     assert "reason: irreconcilable value kinds for 'v'" in ir
     assert re.search(
@@ -5992,12 +6023,17 @@ fn apply(f: fn(@mut P) -> int, @mut p: P) -> int { f(p) }
 fn main() -> int {
     let mut p = P { a: 1 };
     let mut q = P { a: 2 };
-    print(apply(fn(@mut r: P) -> { r.a = r.a + 10; r.a }, p));
-    print(apply(fn(@mut r: P) -> { r.a = r.a * 10; r.a }, q));
+    let fa = fn(@mut r: P) -> { r.a = r.a + 10; r.a };
+    let fm = fn(@mut r: P) -> { r.a = r.a * 10; r.a };
+    print(apply(fa, p));
+    print(apply(fm, q));
     print(p.a, q.a);
     0
 }
 """)
+    # (Lambdas via variables on purpose: literals would be split into
+    # per-site clones, each of which pins its lambda and CAN write back —
+    # that improved case is pinned separately below.)
     assert count_placeholders(ir) >= 1
     assert re.search(
         r"reason: indirect closure call through 'f': lambda 'main\$lambda\d+' "
@@ -6102,12 +6138,16 @@ fn total_w(s: fn() -> Unit) -> int {
 }
 
 fn main() -> int {
-    let heavy = filter(items(), fn(it: Item) -> bool { it.w > 10 });
-    let bumped = map(heavy,
-                     fn(it: Item) -> Item { Item { id: it.id + 100, w: it.w * 2 } });
+    # Lambdas via variables on purpose: this pins the SHARED-site
+    # word-uniform aggregate ABI through one `map`; literal arguments
+    # would be split into per-site clones by monomorphize.
+    let keep_heavy = fn(it: Item) -> bool { it.w > 10 };
+    let bump = fn(it: Item) -> Item { Item { id: it.id + 100, w: it.w * 2 } };
+    let nudge = fn(it: Item) -> Item { Item { id: it.id, w: it.w + 1 } };
+    let heavy = filter(items(), keep_heavy);
+    let bumped = map(heavy, bump);
     print(total_w(bumped));
-    print(total_w(map(items(),
-                      fn(it: Item) -> Item { Item { id: it.id, w: it.w + 1 } })));
+    print(total_w(map(items(), nudge)));
     0
 }
 """
@@ -6139,14 +6179,18 @@ fn total(s: fn() -> Unit) -> int {
 }
 
 fn main() -> int {
-    let doubled = map(cells(), fn(c: Cell) -> Cell {
+    # Lambdas via variables on purpose (see the struct-element source).
+    let tenfold = fn(c: Cell) -> Cell {
         match c { Cell.Val(n) => Cell.Val(n * 10), Cell.Empty => Cell.Empty }
-    });
-    let nonempty = filter(doubled, fn(c: Cell) -> bool {
+    };
+    let is_val = fn(c: Cell) -> bool {
         match c { Cell.Val(n) => true, Cell.Empty => false }
-    });
+    };
+    let ident = fn(c: Cell) -> Cell { c };
+    let doubled = map(cells(), tenfold);
+    let nonempty = filter(doubled, is_val);
     print(total(nonempty));
-    print(total(map(cells(), fn(c: Cell) -> Cell { c })));
+    print(total(map(cells(), ident)));
     0
 }
 """
@@ -6169,13 +6213,14 @@ def test_std_stream_aggregate_element_census():
     for src, elem in ((_STREAM_STRUCT_ELEM_SRC, r"struct:Item"),
                       (_STREAM_ENUM_ELEM_SRC, r"enum:Cell")):
         ir = llvm_from_source(src)
-        for sym in ("mx_main", "mx_std_stream_map", "mx_std_stream_filter",
-                    "mx_std_stream_map_lambda1",
-                    "mx_std_stream_filter_lambda1",
-                    "mx___handler_Emit_emit_std_stream_map_hs3",
-                    "mx___handler_Emit_emit_std_stream_filter_hs3",
-                    "mx___handle_body_Emit_std_stream_map_hs3",
-                    "mx___handle_body_Emit_std_stream_filter_hs3"):
+        for sym in ("mx_main", r"mx_std_stream_map(?:_ho\d+)?",
+                    r"mx_std_stream_filter(?:_ho\d+)?",
+                    r"mx_std_stream_map(?:_ho\d+)?_lambda1",
+                    r"mx_std_stream_filter(?:_ho\d+)?_lambda1",
+                    r"mx___handler_Emit_emit_std_stream_map(?:_ho\d+)?_hs3",
+                    r"mx___handler_Emit_emit_std_stream_filter(?:_ho\d+)?_hs3",
+                    r"mx___handle_body_Emit_std_stream_map(?:_ho\d+)?_hs3",
+                    r"mx___handle_body_Emit_std_stream_filter(?:_ho\d+)?_hs3"):
             assert re.search(rf"^define (?:i64|void|ptr|double) @{sym}\(",
                              ir, re.M), (sym, elem)
         assert "scalar-only" not in ir
@@ -6387,11 +6432,15 @@ fn bump(s: S) -> int { s.a + s.b }
 fn keep(s: S) -> int { s.a }
 fn apply(f: fn(S) -> int, s: S) -> int { f(s) }
 fn main() -> int {
-    print(apply(fn(s: S) -> bump(s), S { a: 3, b: 4 }));
-    print(apply(fn(s: S) -> keep(s), S { a: 5, b: 6 }));
+    let fb = fn(s: S) -> bump(s);
+    let fk = fn(s: S) -> keep(s);
+    print(apply(fb, S { a: 3, b: 4 }));
+    print(apply(fk, S { a: 5, b: 6 }));
     0
 }
 """
+# ^ Lambdas via variables on purpose: pins the shared-site elision (2)
+# machinery, which monomorphize's per-site cloning would otherwise bypass.
 
 
 def test_readonly_aggregate_indirect_argument_needs_no_box():
@@ -7491,3 +7540,115 @@ def test_vec_element_boxes_are_asan_clean(tmp_path):
     read/write, pop and an escaping vec."""
     assert_native_matches_interp_asan_boxes(_VEC_OF_ENUM_SRC, tmp_path)
     assert_native_matches_interp_asan_boxes(_ESCAPING_PAYLOAD_SRC, tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Higher-order call-site cloning (monomorphize's second axis) — the
+# native payoff. Shapes that DEMOTED when two lambdas joined through one
+# shared site now split into per-site clones, each of which pins its one
+# lambda and takes the typed path. The shared-site machinery (word-uniform
+# ABI, honest demotions) is still pinned above via var-routed lambdas.
+# ---------------------------------------------------------------------------
+
+def test_ho_clones_split_two_return_types_and_erase_the_original(tmp_path):
+    """fn apply(f) { f() } reached at Int and at String: before cloning
+    this joined apply's kinds to conflict and demoted apply plus both
+    callers. Now each site's clone pins, and the dead original is erased
+    (no define, no placeholder, no symbol at all)."""
+    ir = assert_native_matches_interp("""
+fn apply(f) { f() }
+fn main() -> int {
+    let a = apply(fn() -> 1);
+    let b = apply(fn() -> "s");
+    print(a);
+    print(b);
+    0
+}
+""", tmp_path)
+    assert count_placeholders(ir) == 0
+    assert re.search(r"@mx_apply_ho\d+", ir)
+    assert not re.search(r"@mx_apply[^_]", ir)   # original fully gone
+
+
+def test_ho_clone_mut_aggregate_write_back_works_natively(tmp_path):
+    """The @mut-write-back shape that MUST demote through a shared
+    word-uniform site (boundary boxes drop the write) works through
+    per-site clones: each pins its lambda, passes the caller's real
+    pointer, and the write-back lands. p.a and q.a prove it."""
+    ir = assert_native_matches_interp("""
+struct P { a: int }
+fn apply(f: fn(@mut P) -> int, @mut p: P) -> int { f(p) }
+fn main() -> int {
+    let mut p = P { a: 1 };
+    let mut q = P { a: 2 };
+    print(apply(fn(@mut r: P) -> { r.a = r.a + 10; r.a }, p));
+    print(apply(fn(@mut r: P) -> { r.a = r.a * 10; r.a }, q));
+    print(p.a, q.a);
+    0
+}
+""", tmp_path)
+    assert count_placeholders(ir) == 0
+
+
+def test_ho_clone_struct_vs_enum_sites_both_emit(tmp_path):
+    """One site passes a struct, the other an enum — the two-way kind
+    conflict that demoted the shared apply resolves into two clean
+    monomorphic clones."""
+    ir = assert_native_matches_interp("""
+struct P { a: int }
+enum E { X(int), Y }
+fn apply(f, v) { f(v) }
+fn main() -> int {
+    print(apply(fn(p: P) -> p.a + 1, P { a: 4 }));
+    print(apply(fn(e: E) -> match e { E.X(n) => n * 2, E.Y => 0 }, E.X(5)));
+    0
+}
+""", tmp_path)
+    assert count_placeholders(ir) == 0
+
+
+def test_ho_clone_closure_pair_argument_emits(tmp_path):
+    """A closure PAIR through an indirect position has no boundary box and
+    demotes at a shared site; through per-site clones both the h and k
+    positions pin and the whole program emits."""
+    ir = assert_native_matches_interp("""
+fn drive(h, k) -> int { h(k, 4) }
+fn main() -> int {
+    let twice = fn(g, x) -> g(g(x));
+    let thrice = fn(g, x) -> g(g(g(x)));
+    print(drive(twice, fn(v: int) -> v + 1));
+    print(drive(thrice, fn(v: int) -> v * 2));
+    0
+}
+""", tmp_path)
+    assert count_placeholders(ir) == 0
+
+
+def test_ho_clone_stdlib_catch_shape_emits_per_site(tmp_path):
+    """The measured blocker shape: catch_-style effectful wrappers reached
+    with different lambda types. Each clone carries its own handler
+    sub-functions (per-containing-function naming), so the sites cannot
+    collide."""
+    ir = assert_native_matches_interp("""
+effect Throw {
+    throw(msg: string) -> int
+}
+
+fn catchy(f) {
+    handle Throw with {
+        throw(msg) -> 0 - 1
+    } in {
+        f()
+    }
+}
+
+fn main() -> int {
+    let ok = catchy(fn() -> 40);
+    let boom = catchy(fn() -> { let x = perform Throw.throw("no"); x + 99 });
+    print(ok);
+    print(boom);
+    0
+}
+""", tmp_path)
+    assert count_placeholders(ir) == 0
+    assert re.search(r"@mx___handler_Throw_throw_catchy_ho\d+_hs\d+", ir)
