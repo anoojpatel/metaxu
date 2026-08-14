@@ -98,6 +98,12 @@ _BORROW_NODE_MODES = {
     "BorrowExclusive": "exclusive",
 }
 
+#: Binary bitwise operators. They are Int-ONLY on both operands and the
+#: result (the interpreter and both backends work on i64 two's complement),
+#: so the emitter classes all three types `Int` and the constraint graph
+#: rejects a Float/String operand the same way it rejects `1 + "a"`.
+_BITWISE_OPS = frozenset({"&", "|", "^", "<<", ">>"})
+
 
 def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) -> Tuple[None, List[BorrowError]]:
     """Walk the frozen AST and emit constraints through the provided facade.
@@ -1494,6 +1500,25 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
                         simplesub.add_class_constraint("Eq", [left_ty], node.node_id)
                 if kind == "BinaryOperation" and payload_operator(node) in {"+", "-", "*", "/", "%"}:
                     simplesub.add_class_constraint("Number", [node_ty], node.node_id)
+                # Bitwise operators are Int-ONLY. `Int` is a literal class,
+                # so this reaches the constraint-graph conflict detection in
+                # simplesub_adapter: a Float or String operand unifies an
+                # Int-classed var with a Float/String-classed one and the
+                # program fails to compile, exactly like `1 + "a"`.
+                if kind == "BinaryOperation" and payload_operator(node) in _BITWISE_OPS:
+                    simplesub.add_class_constraint("Int", [node_ty], node.node_id)
+                    simplesub.add_class_constraint("Int", [left_ty], node.node_id)
+                    simplesub.add_class_constraint("Int", [right_ty], node.node_id)
+        # `~e` is Int-only, for the same reason the binary bitwise operators
+        # are: it lowers to `xor i64 %e, -1`. (`-e` and `!e` keep their old
+        # permissive typing; only the new operator is constrained here.)
+        if kind == "UnaryOperation" and payload_operator(node) == "~" \
+                and node_ty is not None and children:
+            operand_ty = types.get(children[0].node_id)
+            simplesub.add_class_constraint("Int", [node_ty], node.node_id)
+            if operand_ty is not None:
+                simplesub.add_unify(node_ty, operand_ty)
+                simplesub.add_class_constraint("Int", [operand_ty], node.node_id)
         if kind in {"IfStatement", "IfExpression"} and node_ty is not None and children:
             cond_ty = types.get(children[0].node_id)
             if cond_ty is not None:

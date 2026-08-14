@@ -558,6 +558,24 @@ int64_t mx_str_eq(const char *a, const char *b) {
     return strcmp(a, b) == 0 ? 1 : 0;
 }
 
+/* ------------------------------------------------------------------------
+ * Bitwise shifts: validate the COUNT, then let the caller emit shl/ashr.
+ *
+ * LLVM makes `shl`/`ashr` POISON when the count is negative or >= the bit
+ * width, while mir_interp raises a loud InterpError there -- the same
+ * program with two behaviours and no diagnostic, which is exactly what the
+ * differential tests exist to prevent.  Returning the count (rather than
+ * the shifted value) keeps the shift itself a single native instruction.
+ * ---------------------------------------------------------------------- */
+int64_t mx_shift_check(int64_t count, int64_t is_left) {
+    if (count < 0 || count >= 64) {
+        mx_rt_fail("shift amount %lld out of range for '%s' on a 64-bit int "
+                   "(must be 0..63)",
+                   (long long)count, is_left ? "<<" : ">>");
+    }
+    return count;
+}
+
 void mx_str_free(char *s) {
     if (s != NULL) {
         free(s);

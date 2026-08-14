@@ -430,11 +430,23 @@ fn main() -> int {
 
 
 def test_unsupported_unary_operator_is_loud():
-    """An unrecognized unary operator used to drop the whole expression."""
+    """An unrecognized unary operator used to drop the whole expression.
+
+    `~` is a REAL operator now (bitwise complement, see test_bitwise.py), so
+    the loud path is checked with an operator the language does not have."""
     builder, root = _bare_builder()
-    node = fast.UnaryOperation("~", fast.Literal(1))
+    node = fast.UnaryOperation("#", fast.Literal(1))
     with pytest.raises(UnsupportedConstruct, match="unary operator"):
         builder._from_orig_expr(node, root)
+
+
+def test_the_three_real_unary_operators_lower():
+    """`-`, `!` and `~` all lower to their builtin calls."""
+    builder, root = _bare_builder()
+    for op, callee in (("-", "neg"), ("!", "not"), ("~", "bnot")):
+        he = builder._from_orig_expr(fast.UnaryOperation(op, fast.Literal(1)),
+                                     root)
+        assert he is not None and he.callee.endswith(callee)
 
 
 # ---------------------------------------------------------------------------

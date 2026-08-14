@@ -81,7 +81,7 @@ BUILTIN_CALL_PREFIX = f"__builtin{IMPL_SEP}"
 BUILTIN_FUNCTION_NAMES = frozenset({
     "print", "println", "assert", "assert_eq",
     "to_string", "int_to_str", "len", "push", "pop",
-    "sqrt", "sin", "cos", "neg", "not",
+    "sqrt", "sin", "cos", "neg", "not", "bnot",
     # FFI shims over the interpreter's simulated C heap
     "malloc", "free", "memcpy", "realloc",
     "ptr_read", "ptr_write", "as_ptr", "fopen", "fclose",
@@ -193,7 +193,7 @@ AST_NODE_TRIAGE: dict[str, tuple[str, str]] = {
     "TryCatch": (LOWERED, "`try { } catch e { }`"),
     "TupleLiteral": (LOWERED, "`()` is unit; a non-unit tuple raises (no runtime representation)"),
     "TypeCast": (LOWERED, "`e as T` -> __cast"),
-    "UnaryOperation": (LOWERED, "`-e` / `!e` -> neg / not"),
+    "UnaryOperation": (LOWERED, "`-e` / `!e` / `~e` -> neg / not / bnot"),
     "UnsafeBlock": (LOWERED, "`unsafe { }` — an ordinary block (unsafe is a static permission)"),
     "Variable": (LOWERED, "name read, `null`, or a bare nullary variant"),
     "VariantInstance": (LOWERED, "`Enum::Variant(f: e)`"),
@@ -1800,13 +1800,14 @@ class HIRBuilder:
                 self._from_orig_expr(operand, ctx_for(operand)), orig,
                 frozen_ctx, "the operand of a unary operator")
             op_sym = str(getattr(orig, 'operator', '') or '')
-            callee = {'-': 'neg', '!': 'not', 'not': 'not'}.get(op_sym)
+            callee = {'-': 'neg', '!': 'not', 'not': 'not',
+                      '~': 'bnot'}.get(op_sym)
             if callee is None:
                 # Dropping the whole expression here turned `~x` into nothing.
                 raise UnsupportedConstruct(
                     f"unary operator {op_sym!r} at "
                     f"{self._span_text(frozen_ctx.span)} is not supported "
-                    "(only `-` and `!`/`not` lower)",
+                    "(only `-`, `!`/`not` and `~` lower)",
                     location=self._loc(frozen_ctx.span, orig))
             # Unary operators are compiler-synthesized builtin calls:
             # marked so a module function named `neg`/`not` cannot capture

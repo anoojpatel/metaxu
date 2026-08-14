@@ -30,6 +30,7 @@
  * | mx_f64_to_str    | char* (double)                             | fresh malloc'd string, Python str(float) format |
  * | mx_str_eq        | int64_t (const char*, const char*)         | 1 if contents equal, else 0 |
  * | mx_str_free      | void (char*)                               | frees a produced string; NULL is a no-op |
+ * | mx_shift_check   | int64_t (int64_t count, int64_t is_left)   | returns count; aborts unless 0 <= count < 64 |
  * | mx_vec_as_bytes  | unsigned char* (const mx_vec*)             | fresh malloc'd byte SNAPSHOT of the elements |
  *
  * Vec semantics (mirrors MxVec in mir_interp.py)
@@ -218,6 +219,7 @@ char   *mx_i64_to_str(int64_t value);
 char   *mx_f64_to_str(double value);
 int64_t mx_str_eq(const char *a, const char *b);
 void    mx_str_free(char *s);
+int64_t mx_shift_check(int64_t count, int64_t is_left);
 
 #ifdef __cplusplus
 }
