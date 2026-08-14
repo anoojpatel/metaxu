@@ -20,6 +20,12 @@ the MIR interpreter's reference semantics -- at the C ABI level:
   - unhandled performs abort with the interpreter's message
   - argument padding (fewer args than params = UNIT/0) and the arity
     error for MORE args than params
+  - mx_perform_or_default (increment 15): the declared-default rung —
+    default taken when nothing handles the op, handler beating the
+    default when one is installed, ONE site resolving both ways in one
+    program, the busy-scope skip landing on the default, a default that
+    itself performs (it runs on the performing stack), the env
+    pass-through, and NULL default keeping mx_perform's abort
 
 ASan builds re-run the nested/abort shapes with LEAK CHECKING ENABLED:
 the effect machinery itself (scope records, coroutine stacks, continuation
@@ -569,3 +575,309 @@ int main(void) {
 """, asan=True)
     assert code == 0, f"ASan flagged the deep-recursion run:\n{err}"
     assert out == "200\n"
+
+
+# ---------------------------------------------------------------------------
+# mx_perform_or_default (increment 15): the DYNAMIC default rung
+#
+# Precedence, mirroring mir_interp's `perform`:
+#   innermost non-busy handler frame  >  declared `= expr` default  >  error
+# (the interpreter's `with SYMBOL` runtime-mapping rung between the first
+# two has no native implementation; the compiler demotes ops declaring one).
+#
+# A default RUNS ON THE PERFORMING STACK: no coroutine, no scope record, no
+# continuation.  These drivers prove each claim at the C ABI level.
+# ---------------------------------------------------------------------------
+
+@needs_clang
+def test_default_taken_when_no_scope_handles_the_op(tmp_path):
+    # No mx_handle at all: where mx_perform would abort, the default runs
+    # and its value becomes the perform's value (1 + 100 = 101).
+    code, out, _ = _compile_and_run(tmp_path, _PRELUDE + r"""
+static int64_t dflt(void *env, const int64_t *args) {
+    (void)env;
+    return args[0] + 100;
+}
+int main(void) {
+    int64_t args[1] = {1};
+    printf("%lld\n", (long long)mx_perform_or_default(
+        "Ask", "ask", args, 1, dflt, NULL));
+    return 0;
+}
+""")
+    assert code == 0
+    assert out == "101\n"
+
+
+@needs_clang
+def test_installed_handler_beats_the_default(tmp_path):
+    # Same op, same call: with a scope installed the handler answers and the
+    # default is never entered (it would print if it were).
+    code, out, _ = _compile_and_run(tmp_path, _PRELUDE + r"""
+static int64_t dflt(void *env, const int64_t *args) {
+    (void)env; (void)args;
+    printf("DEFAULT RAN\n");
+    return -1;
+}
+static int64_t body(void *env) {
+    (void)env;
+    int64_t args[1] = {5};
+    return mx_perform_or_default("Ask", "ask", args, 1, dflt, NULL);
+}
+static int64_t handler(void *env, int64_t op, const int64_t *args, mx_k *k) {
+    (void)env; (void)op;
+    return mx_resume(k, args[0] * 2);
+}
+int main(void) {
+    static const char *ops[] = {"ask"};
+    static const int64_t nparams[] = {1};
+    printf("%lld\n", (long long)mx_handle(
+        body, NULL, handler, NULL, "Ask", ops, nparams, 1));
+    return 0;
+}
+""")
+    assert code == 0
+    assert out == "10\n"
+
+
+@needs_clang
+def test_same_site_resolves_both_ways_in_one_program(tmp_path):
+    # THE dynamic case: ONE perform site, called once inside the handle and
+    # once outside it.  Inside -> 10 (handler), outside -> 105 (default).
+    code, out, _ = _compile_and_run(tmp_path, _PRELUDE + r"""
+static int64_t dflt(void *env, const int64_t *args) {
+    (void)env;
+    return args[0] + 100;
+}
+static int64_t site(int64_t x) {
+    int64_t args[1] = {x};
+    return mx_perform_or_default("Ask", "ask", args, 1, dflt, NULL);
+}
+static int64_t body(void *env) { (void)env; return site(5); }
+static int64_t handler(void *env, int64_t op, const int64_t *args, mx_k *k) {
+    (void)env; (void)op;
+    return mx_resume(k, args[0] * 2);
+}
+int main(void) {
+    static const char *ops[] = {"ask"};
+    static const int64_t nparams[] = {1};
+    printf("%lld\n", (long long)mx_handle(
+        body, NULL, handler, NULL, "Ask", ops, nparams, 1));
+    printf("%lld\n", (long long)site(5));
+    return 0;
+}
+""")
+    assert code == 0
+    assert out == "10\n105\n"
+
+
+@needs_clang
+def test_default_skips_a_busy_scope_like_the_interpreter(tmp_path):
+    # A handler case's own perform routes OUTWARD past its busy scope
+    # (mx__find_scope's busy skip == mir_interp._find_mir_frame's).  There
+    # is no other scope, so the default answers: (2+1)*10 = 30, resume(31).
+    code, out, _ = _compile_and_run(tmp_path, _PRELUDE + r"""
+static int64_t dflt(void *env, const int64_t *args) {
+    (void)env;
+    return args[0] * 10;
+}
+static int64_t site(int64_t x) {
+    int64_t args[1] = {x};
+    return mx_perform_or_default("Ask", "ask", args, 1, dflt, NULL);
+}
+static int64_t body(void *env) { (void)env; return site(2); }
+static int64_t handler(void *env, int64_t op, const int64_t *args, mx_k *k) {
+    (void)env; (void)op;
+    int64_t outer = site(args[0] + 1);  /* our own scope is busy */
+    return mx_resume(k, outer + 1);
+}
+int main(void) {
+    static const char *ops[] = {"ask"};
+    static const int64_t nparams[] = {1};
+    printf("%lld\n", (long long)mx_handle(
+        body, NULL, handler, NULL, "Ask", ops, nparams, 1));
+    return 0;
+}
+""")
+    assert code == 0
+    assert out == "31\n"
+
+
+@needs_clang
+def test_default_runs_on_the_performing_stack_and_may_perform(tmp_path):
+    # The default is NOT a suspension: it runs right here.  Proof: it
+    # performs an op that IS handled, so the park/resume happens on the
+    # performing fiber and the scope's deep completion value still flows
+    # out.  `base` is handled (v * 100); `ask` is defaulted (+5) in both.
+    code, out, _ = _compile_and_run(tmp_path, _PRELUDE + r"""
+static int64_t base_dflt(void *env, const int64_t *args) {
+    (void)env; return args[0];
+}
+static int64_t ask_dflt(void *env, const int64_t *args) {
+    (void)env;
+    int64_t a[1] = {args[0]};
+    return mx_perform_or_default("Cap", "base", a, 1, base_dflt, NULL) + 5;
+}
+static int64_t inner(int64_t x) {
+    int64_t a[1] = {x};
+    return mx_perform_or_default("Cap", "ask", a, 1, ask_dflt, NULL) * 2;
+}
+static int64_t body(void *env) { (void)env; return inner(3); }
+static int64_t handler(void *env, int64_t op, const int64_t *args, mx_k *k) {
+    (void)env; (void)op;
+    return mx_resume(k, args[0] * 100);
+}
+int main(void) {
+    static const char *ops[] = {"base"};
+    static const int64_t nparams[] = {1};
+    printf("%lld\n", (long long)inner(3));          /* both defaulted: 16 */
+    printf("%lld\n", (long long)mx_handle(          /* base handled: 610 */
+        body, NULL, handler, NULL, "Cap", ops, nparams, 1));
+    return 0;
+}
+""")
+    assert code == 0
+    assert out == "16\n610\n"
+
+
+@needs_clang
+def test_default_env_pointer_is_passed_through(tmp_path):
+    # The env word reaches the thunk untouched (the ABI slot a capturing
+    # default would use; the compiler passes NULL today).
+    code, out, _ = _compile_and_run(tmp_path, _PRELUDE + r"""
+static int64_t dflt(void *env, const int64_t *args) {
+    (void)args;
+    return *(int64_t *)env;
+}
+int main(void) {
+    int64_t captured = 77;
+    printf("%lld\n", (long long)mx_perform_or_default(
+        "Ask", "ask", NULL, 0, dflt, &captured));
+    return 0;
+}
+""")
+    assert code == 0
+    assert out == "77\n"
+
+
+@needs_clang
+def test_null_default_keeps_the_unhandled_abort(tmp_path):
+    # mx_perform's abort path is untouched: an op with no default still
+    # dies with the interpreter's message, through either entry point.
+    code, _, err = _compile_and_run(tmp_path, _PRELUDE + r"""
+int main(void) {
+    mx_perform_or_default("Ask", "ask", NULL, 0, NULL, NULL);
+    return 0;
+}
+""")
+    assert code != 0
+    assert "Unhandled effect operation: 'ask'" in err
+
+
+@needs_clang
+def test_scope_route_keeps_padding_and_arity_checks(tmp_path):
+    # Routing through a scope is byte-for-byte mx_perform: missing trailing
+    # args still pad with UNIT/0, and MORE args than the case declares is
+    # still the loud arity error.  The default rung softens neither.
+    code, out, _ = _compile_and_run(tmp_path, _PRELUDE + r"""
+static int64_t dflt(void *env, const int64_t *args) {
+    (void)env; (void)args; return -1;
+}
+static int64_t body(void *env) {
+    (void)env;
+    return mx_perform_or_default("Ask", "ask", NULL, 0, dflt, NULL);
+}
+static int64_t handler(void *env, int64_t op, const int64_t *args, mx_k *k) {
+    (void)env; (void)op;
+    return mx_resume(k, args[0] + args[1] + 9);  /* both padded to 0 */
+}
+int main(void) {
+    static const char *ops[] = {"ask"};
+    static const int64_t nparams[] = {2};
+    printf("%lld\n", (long long)mx_handle(
+        body, NULL, handler, NULL, "Ask", ops, nparams, 1));
+    return 0;
+}
+""")
+    assert code == 0
+    assert out == "9\n"
+
+    code, _, err = _compile_and_run(tmp_path, _PRELUDE + r"""
+static int64_t dflt(void *env, const int64_t *args) {
+    (void)env; (void)args; return -1;
+}
+static int64_t body(void *env) {
+    (void)env;
+    int64_t args[2] = {1, 2};
+    return mx_perform_or_default("Ask", "ask", args, 2, dflt, NULL);
+}
+static int64_t handler(void *env, int64_t op, const int64_t *args, mx_k *k) {
+    (void)env; (void)op; (void)args;
+    return mx_resume(k, 0);
+}
+int main(void) {
+    static const char *ops[] = {"ask"};
+    static const int64_t nparams[] = {1};
+    mx_handle(body, NULL, handler, NULL, "Ask", ops, nparams, 1);
+    return 0;
+}
+""")
+    assert code != 0
+    assert "declares only 1 parameter" in err
+
+
+@needs_asan
+def test_asan_default_route_allocates_nothing(tmp_path):
+    # Leak-checked: the default rung installs no scope, allocates no
+    # coroutine stack and no continuation record — 1000 defaulted performs
+    # must be as clean as none.
+    code, out, err = _compile_and_run(tmp_path, _PRELUDE + r"""
+static int64_t dflt(void *env, const int64_t *args) {
+    (void)env; return args[0];
+}
+int main(void) {
+    int64_t total = 0;
+    for (int i = 0; i < 1000; i++) {
+        int64_t a[1] = {1};
+        total += mx_perform_or_default("Ask", "ask", a, 1, dflt, NULL);
+    }
+    printf("%lld\n", (long long)total);
+    return 0;
+}
+""", asan=True)
+    assert code == 0, f"ASan flagged the default-route run:\n{err}"
+    assert out == "1000\n"
+
+
+@needs_asan
+def test_asan_mixed_routes_stay_leak_clean(tmp_path):
+    # Alternating handler / default answers (the handler's own performs skip
+    # its busy scope and default), with the scope torn down at the end.
+    code, out, err = _compile_and_run(tmp_path, _PRELUDE + r"""
+static int64_t dflt(void *env, const int64_t *args) {
+    (void)env; return args[0] * 10;
+}
+static int64_t site(int64_t x) {
+    int64_t a[1] = {x};
+    return mx_perform_or_default("Ask", "ask", a, 1, dflt, NULL);
+}
+static int64_t count(int64_t n) {
+    if (n == 0) return 0;
+    return site(1) + count(n - 1);
+}
+static int64_t body(void *env) { (void)env; return count(50); }
+static int64_t handler(void *env, int64_t op, const int64_t *args, mx_k *k) {
+    (void)env; (void)op;
+    return mx_resume(k, args[0] + site(2)); /* our scope is busy -> default */
+}
+int main(void) {
+    static const char *ops[] = {"ask"};
+    static const int64_t nparams[] = {1};
+    printf("%lld\n", (long long)mx_handle(
+        body, NULL, handler, NULL, "Ask", ops, nparams, 1));
+    printf("%lld\n", (long long)site(3));
+    return 0;
+}
+""", asan=True)
+    assert code == 0, f"ASan flagged the mixed-route run:\n{err}"
+    assert out == "1050\n30\n"

@@ -18,6 +18,14 @@
  *   _ScopeAbort cascade teardown of      mx__teardown_to frees the parked
  *     nested parked bodies                 coroutine stacks outright (C has
  *                                          no destructors to run on them)
+ *   no frame -> __effect_default$E$op    mx_perform_or_default's dflt call
+ *     called in the performing frame       on the performing stack
+ *
+ * Perform precedence (mir_interp's `perform` op, mirrored in
+ * mx__perform_impl): innermost non-busy handler frame, then the declared
+ * `= expr` default, then a loud error.  The interpreter's `with SYMBOL`
+ * runtime mapping sits between the first two and has no native
+ * counterpart; the compiler demotes every op declaring one.
  *
  * Control-transfer invariants (why this is safe):
  *   - all handler-side activity for a scope S (mx_handle's dispatch, every
@@ -319,11 +327,41 @@ int64_t mx_handle(mx_body_fn body, void *body_env,
     return v;
 }
 
-int64_t mx_perform(const char *effect, const char *op,
-                   const int64_t *args, int64_t nargs) {
+/* Shared body of mx_perform / mx_perform_or_default.  `dflt` is the op's
+ * declared `= expr` default (NULL when it has none): the ONLY thing it
+ * changes is what happens when no scope matches -- the abort path of
+ * mx_perform is untouched for ops without a default.
+ *
+ * Precedence mirrored from mir_interp (perform op, in order):
+ *   1. innermost non-busy scope handling (effect, op)   -> park + dispatch
+ *   2. declared `= expr` default                        -> plain call HERE
+ *   3. loud "Unhandled effect operation" error
+ * The interpreter's rung between 1 and 2 -- a `with SYMBOL` runtime
+ * mapping (__effect_runtime$E$op -> the EFFECT_* primitives) -- has no
+ * native implementation; codegen_llvm demotes every op that declares one,
+ * so no emitted call can reach here with a mapping in play.
+ *
+ * The default runs RIGHT HERE, on the performing stack: a default is an
+ * expression, not a suspension.  Nothing is parked, no scope is pushed,
+ * no continuation exists, and the scope stack is bit-for-bit what it was
+ * at the perform -- so a perform inside the default routes (and parks)
+ * exactly as one written at the perform site would, which is what the
+ * interpreter does when it evaluates __effect_default$E$op in the
+ * performing frame's context. */
+static int64_t mx__perform_impl(const char *effect, const char *op,
+                                const int64_t *args, int64_t nargs,
+                                mx_default_fn dflt, void *dflt_env) {
     int64_t op_index = 0;
     mx_scope *s = mx__find_scope(effect, op, &op_index);
     if (s == NULL) {
+        if (dflt != NULL) {
+            if (nargs < 0 || nargs > MX_EFFECT_MAX_ARGS)
+                mx__fatal("effect op performed with more arguments than "
+                          "MX_EFFECT_MAX_ARGS");
+            /* The thunk reads exactly the words its default declares; the
+             * compiler proved the arities agree (it demotes otherwise). */
+            return dflt(dflt_env, args);
+        }
         char buf[256];
         snprintf(buf, sizeof buf, "Unhandled effect operation: '%s'",
                  op ? op : "(null)");
@@ -357,6 +395,17 @@ int64_t mx_perform(const char *effect, const char *op,
      * scope's handler side and stay parked until mx_resume targets us. */
     mx__switch(&k->resume_ctx, &s->handler_ctx, s->owner_stack);
     return k->resume_value;
+}
+
+int64_t mx_perform(const char *effect, const char *op,
+                   const int64_t *args, int64_t nargs) {
+    return mx__perform_impl(effect, op, args, nargs, NULL, NULL);
+}
+
+int64_t mx_perform_or_default(const char *effect, const char *op,
+                              const int64_t *args, int64_t nargs,
+                              mx_default_fn dflt, void *dflt_env) {
+    return mx__perform_impl(effect, op, args, nargs, dflt, dflt_env);
 }
 
 int64_t mx_resume(mx_k *k, int64_t value) {

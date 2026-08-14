@@ -214,8 +214,8 @@ caveat:
     `= expr` default (__effect_default$E$op) and no `with SYMBOL` runtime
     mapping, the perform lowers to a DIRECT CALL of the default function
     (ordinary conventions, aggregates and all, no effect boundary).  An
-    op with a default that also appears in some scope demotes (dynamic
-    default routing has no native lowering).
+    op with a default that ALSO appears in some scope routes dynamically
+    (increment 15, below).
 
 Increment 11 makes vector arithmetic emit REAL LLVM SIMD IR where the
 shape is statically provable, closing the gap between the fixed-vector
@@ -355,6 +355,52 @@ boxes — the same write-once box contract as enum payloads:
     interpreter routes unscoped performs to the EFFECT_* primitives;
     natively mx_perform would abort instead, so effect_mapping.mx's
     threads/mutex ops demote with that exact reason).
+
+Increment 15 lowers DYNAMIC EFFECT-DEFAULT ROUTING — the case where an op
+declares a `= expr` default AND some handle scope lists it, so which one
+answers a perform is decided AT THE PERFORM by the runtime scope stack
+(example 06's SimdOp capability: `try_horizontal(...) = None` answered by
+`with_simd`'s handler inside it and by the default everywhere else):
+  * a new runtime entry point `mx_perform_or_default(effect, op, args,
+    nargs, default_thunk, default_env)` runs the IDENTICAL innermost-
+    non-busy scope lookup as mx_perform (same padding, same arity abort,
+    same parking) and calls the thunk ONLY where mx_perform would have
+    aborted.  mx_perform's abort path is untouched — an op with no default
+    still dies loudly.
+  * the interpreter's precedence at a perform is: in-scope handler frame >
+    `with SYMBOL` runtime mapping > declared `= expr` default > error.
+    Native mirrors rungs 1, 3 and 4 exactly.  Rung 2 (the EFFECT_*
+    primitives) has NO native implementation, so any op declaring a
+    runtime mapping keeps demoting with that reason — the two ends are
+    never blurred, and no lowering can reach the new entry point with a
+    mapping in play.  (The interpreter has a fourth, HOST rung between
+    the frames and the mapping: handlers registered through
+    MirInterpreter.register_effect_handler.  That is a Python embedding
+    API — no compiled Metaxu program and none of the gates install one —
+    so it has no native counterpart and cannot diverge for any program
+    this backend compiles.)
+  * the default RUNS ON THE PERFORMING STACK: it is an expression, not a
+    suspension.  No coroutine, no scope record, no continuation (there is
+    nothing to resume — the perform simply becomes a call).  The scope
+    stack is unchanged across it, so a perform INSIDE the default routes
+    and parks exactly as one written at the perform site would, which is
+    what the interpreter does.
+  * per op, one internal `mxfx.dflt.<default fn>` thunk
+    (`i64 (ptr env, ptr args)`) decodes the boundary words into the
+    default's parameter kinds, calls it, and word-encodes the result —
+    the dispatcher's per-case arm minus the op index and the `__k`.
+    Aggregates use the same boundary boxes as a handler case (param words
+    are the sender's box pointer, an aggregate result is sret-filled into
+    a fresh malloc'd box).  `env` is null today (defaults are top-level
+    module functions with no captures) and exists so a capturing default
+    needs no second entry point.
+  * KIND UNIFICATION: the default's signature joins the SAME module-wide
+    op-name cells as the handler cases (perform args ⊔ case params ⊔
+    default params; perform results ⊔ resume values ⊔ default return), so
+    every route through one op shares one lattice.  A default that cannot
+    agree with its handlers CONFLICTS and demotes, exactly like two
+    irreconcilable same-named ops; an arity disagreement between a perform
+    and its default demotes too (only the SCOPE path pads with UNIT).
 
 Everything else — try_scope, `type_of` (no interpreter builtin exists),
 comprehensions over Vecs, string slicing/indexing — is emitted as a
@@ -885,6 +931,8 @@ _RT_SIGS = {
     "mx_handle": ("i64", ("ptr", "ptr", "ptr", "ptr", "ptr", "ptr", "ptr",
                           "i64")),
     "mx_perform": ("i64", ("ptr", "ptr", "ptr", "i64")),
+    "mx_perform_or_default": ("i64", ("ptr", "ptr", "ptr", "i64", "ptr",
+                                      "ptr")),
     "mx_resume": ("i64", ("ptr", "i64")),
 }
 
@@ -992,7 +1040,10 @@ _HEADER = (
     ";   per-param mx_fvec_promote at entry; print/to_string render the\n"
     ";   interpreter's vector repr via mx_fvec_to_str; performs of ops no\n"
     ";   module scope handles lower to DIRECT CALLS of their declared\n"
-    ";   __effect_default fns;\n"
+    ";   __effect_default fns; an op with a default that a scope MAY also\n"
+    ";   catch lowers to mx_perform_or_default (same scope lookup, the\n"
+    ";   op's mxfx.dflt.* thunk only where mx_perform would abort -- the\n"
+    ";   default runs on the PERFORMING stack, it is not a suspension);\n"
     ";   VECTOR SIMD (increment 11): flat float/int vector binops whose\n"
     ";   operand lengths are statically known emit INLINE <N x double> /\n"
     ";   <N x i64> IR (loads off the word block at byte offset 8, one\n"
@@ -1461,6 +1512,14 @@ class _Info:
     # so no scope can ever intercept it -> a direct call, aggregates and
     # all, exactly the interpreter's fallback).
     default_performs: Dict[Tuple[str, str], str] = field(default_factory=dict)
+    # (effect, op) -> __effect_default fn for performs whose op has a
+    # declared default AND appears in some handle scope: routing is a
+    # RUNTIME choice, lowered to mx_perform_or_default (increment 15).  The
+    # boundary conventions are the ordinary perform ones (op-name kind
+    # cells, word/boundary-box encoding); the default fn's signature joins
+    # those same cells so the per-op thunk's decode is exact.
+    dynamic_default_performs: Dict[Tuple[str, str], str] = field(
+        default_factory=dict)
     # Module-constant names this function READS (used with no local def and
     # declared by __module_init): they load from @mx_g_<name> globals.
     global_reads: Set[str] = field(default_factory=set)
@@ -1711,6 +1770,12 @@ def _analyze_inner(info: _Info, module_names: Set[str],
                 # runtime mapping, which would win), the perform IS a direct
                 # call to __effect_default$E$op — normal call conventions,
                 # aggregates and all, no effect boundary.
+                #
+                # When the op has a default AND some scope lists it, the
+                # choice is DYNAMIC (increment 15): still a real perform
+                # (the scratch alloca, the boundary words, the possible
+                # park), but through mx_perform_or_default, which falls back
+                # to the op's default thunk instead of aborting.
                 if len(op) < 7:
                     info.add_reason("malformed perform op")
                     continue
@@ -1728,14 +1793,18 @@ def _analyze_inner(info: _Info, module_names: Set[str],
                         and default_fn in module_names:
                     info.default_performs[(peffect, pop_name)] = default_fn
                     continue
-                if scoped and default_fn in module_names:
-                    # A scope MAY intercept it dynamically; when none does,
-                    # the interpreter falls back to the default while
-                    # mx_perform would abort — demote, never guess.
-                    info.add_reason(
-                        f"effect op {pop_name!r} has a declared default and "
-                        "also appears in a handle scope (dynamic default "
-                        "routing has no native lowering)")
+                if scoped and runtime_fn not in module_names \
+                        and default_fn in module_names:
+                    # DYNAMIC DEFAULT ROUTING (increment 15): a scope MAY
+                    # intercept this op, and when none does the interpreter
+                    # falls back to the declared default.  The choice is
+                    # made at the perform, by the runtime's scope stack —
+                    # so the perform lowers to mx_perform_or_default, which
+                    # runs the SAME innermost-non-busy lookup and calls the
+                    # op's default thunk (on this stack) only where plain
+                    # mx_perform would have aborted.
+                    info.dynamic_default_performs[(peffect, pop_name)] = \
+                        default_fn
                 if runtime_fn in module_names:
                     # The op declares a `with SYMBOL` C-runtime mapping:
                     # the interpreter routes unscoped performs to the
@@ -3360,12 +3429,34 @@ def _infer_kinds(info: _Info, sigs: Dict[str, _Sig], structs: _StructTable,
                     # Boundary-crossing values unify through the op-name
                     # cells (routing is dynamic; see _ScopeTable).
                     dst, opn, pargs = op[1], op[3], op[4]
+                    # Dynamic default routing: the op's declared default is
+                    # reached through the SAME boundary words as a handler
+                    # case (a per-op thunk decodes them), so its signature
+                    # joins the very same op-name cells — one lattice for
+                    # every route the perform can take.  A default whose
+                    # types cannot agree with the handler cases therefore
+                    # CONFLICTS and demotes, exactly like two irreconcilable
+                    # same-named ops.
+                    ddfn = info.dynamic_default_performs.get((op[2], opn))
+                    ddsig = sigs.get(ddfn) if ddfn is not None else None
+                    if ddsig is not None and len(ddsig.params) != len(pargs):
+                        ddsig = None
                     for i, a in enumerate(pargs):
                         nk = _join(scopes.op_arg_kind(opn, i), get(a))
+                        if ddsig is not None:
+                            nk = _join(nk, ddsig.params[i])
+                            if nk != ddsig.params[i]:
+                                ddsig.params[i] = nk
+                                changed = global_changed = True
                         if scopes.mark_op_arg(opn, i, nk):
                             changed = global_changed = True
                         changed = mark(a, nk) or changed
                     nk = _join(scopes.op_result_kind(opn), get(dst))
+                    if ddsig is not None:
+                        nk = _join(nk, ddsig.ret)
+                        if nk != ddsig.ret:
+                            ddsig.ret = nk
+                            changed = global_changed = True
                     if scopes.mark_op_result(opn, nk):
                         changed = global_changed = True
                     changed = mark(dst, nk) or changed
@@ -4126,6 +4217,40 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                 for a in op[4]:
                     check_boundary(ty(a), f"perform argument {a!r}")
                 check_boundary(ty(op[1]), f"perform result {op[1]!r}")
+                ddfn = info.dynamic_default_performs.get((op[2], op[3]))
+                if ddfn is not None:
+                    # Dynamic default routing: the per-op thunk decodes the
+                    # SAME boundary words the dispatcher would, so the
+                    # default's signature must have converged onto the op
+                    # cells.  Anything that did not converge (an arity
+                    # mismatch stops the join outright) demotes here rather
+                    # than emitting a thunk that decodes words wrongly.
+                    ddsig = sigs.get(ddfn)
+                    if ddsig is None or ddfn not in module_names:
+                        probs.append(
+                            f"effect-op default {ddfn!r} missing from the "
+                            "module")
+                    elif len(ddsig.params) != len(op[4]):
+                        probs.append(
+                            f"perform of {op[3]!r} with {len(op[4])} "
+                            f"arguments; its default declares "
+                            f"{len(ddsig.params)} parameters (dynamic "
+                            "default routing needs an exact arity match: "
+                            "only the SCOPE path pads with UNIT)")
+                    else:
+                        for a, pk_ in zip(op[4], ddsig.params):
+                            if ty(a) != pk_:
+                                probs.append(
+                                    f"dynamic default {ddfn!r}: argument "
+                                    f"{a!r} is {ty(a)} but the default's "
+                                    f"parameter is {pk_} (the default and "
+                                    "the handler cases must agree on the "
+                                    "boundary kinds)")
+                        if ty(op[1]) != ddsig.ret:
+                            probs.append(
+                                f"dynamic default {ddfn!r}: result "
+                                f"{op[1]!r} is {ty(op[1])} but the default "
+                                f"returns {ddsig.ret}")
                 continue
             if op[0] != "let" or len(op) != 4:
                 continue
@@ -5439,6 +5564,12 @@ class _ModuleState:
         self.scope_tables: Dict[str, str] = {}
         # handle site -> body thunk + dispatcher define text
         self.scope_thunks: Dict[str, str] = {}
+        # __effect_default fn -> its mx_default_fn thunk define text, and
+        # the emitted functions whose performs hand that thunk to
+        # mx_perform_or_default (liveness: keep the thunk only when the
+        # default fn AND at least one user survived).
+        self.default_thunks: Dict[str, str] = {}
+        self.default_thunk_users: Dict[str, Set[str]] = {}
         # owner fn -> per-site comprehension thunk defines (kept only when
         # the owner emitted; each thunk calls its body lambda's symbol,
         # which dep_names makes a dependency of the owner).
@@ -5813,6 +5944,82 @@ def _emit_scope_artifacts(site: str, rec: _ScopeSite, sigs: Dict[str, _Sig],
     mod.uses_abort = True
     mod.scope_thunks[site] = "\n".join(bl) + "\n\n" + "\n".join(dl)
     mod.scope_sites[site] = (rec.owner, rec.member_fns())
+
+
+def _default_thunk_sym(dfn: str) -> str:
+    return "mxfx.dflt." + _sanitize(dfn)
+
+
+def _emit_default_thunk(dfn: str, nargs: int, sigs: Dict[str, _Sig],
+                        structs: _StructTable, variants: _VariantTable,
+                        mod: _ModuleState, user: str) -> None:
+    """The per-op `mx_default_fn` thunk for an op with DYNAMIC default
+    routing: `i64 (ptr env, ptr args)` decoding the boundary argument words
+    into the declared default's parameter kinds, calling it, and
+    word-encoding its result.
+
+    This is the dispatcher's per-case arm with the op index and the
+    continuation removed — the default is not a handler case: it receives
+    no `__k` (there is nothing to resume; the perform simply becomes this
+    call) and it runs on the PERFORMING stack, so no boundary is crossed by
+    control, only by values.  Value conventions are therefore identical to
+    a case's: aggregates arrive as the sender's boundary-box pointer (the
+    callee's byval copy IS the copy-out) and an aggregate result is
+    sret-filled into a fresh malloc'd box whose pointer is the word
+    (malloc, never alloca: the word outlives this frame exactly as the
+    dispatcher's does).
+
+    `%env` is unused today — __effect_default$E$op functions are top-level
+    module functions with no captures, so the emitted call sites pass
+    `ptr null`.  The parameter is part of the ABI so a capturing default
+    needs no second entry point.
+    """
+    mod.default_thunk_users.setdefault(dfn, set()).add(user)
+    if dfn in mod.default_thunks:
+        return
+    dsig = sigs[dfn]
+    tl = [f"define internal i64 @{_default_thunk_sym(dfn)}"
+          "(ptr %env, ptr %args) {",
+          f"  ; mx_default_fn thunk for @{mangle(dfn)} (declared `= expr` "
+          "default;",
+          "  ; called by mx_perform_or_default when no scope handles the op,",
+          "  ; ON THE PERFORMING STACK -- a default is not a suspension)",
+          "entry:"]
+    avals = []
+    for j in range(nargs):
+        pk = dsig.params[j] if j < len(dsig.params) else I64
+        wp, wv = f"%a{j}p", f"%a{j}w"
+        tl.append(f"  {wp} = getelementptr inbounds i64, ptr %args, i64 {j}")
+        tl.append(f"  {wv} = load i64, ptr {wp}")
+        if _is_agg(pk):
+            tl.append(f"  %a{j} = inttoptr i64 {wv} to ptr"
+                      f"  ; boundary box: default param {pk}")
+            avals.append(f"ptr %a{j}")
+        else:
+            enc, v = _word_decode(wv, pk, f"%a{j}")
+            tl += enc
+            avals.append(f"{_llscalar(pk)} {v}")
+    if _is_agg(dsig.ret):
+        size = _kind_size(dsig.ret, structs, variants)
+        if size is None:  # unreachable: checks demote infinite layouts
+            raise _Unsupported(
+                f"boundary box of {dsig.ret} has infinite layout")
+        mod.uses_malloc = True
+        tl.append(f"  %rbox = call ptr @malloc(i64 {max(size, 8)})"
+                  f"  ; boundary box: default result {dsig.ret} "
+                  "(write-once, leaks by design)")
+        tl.append(f"  call void @{mangle(dfn)}"
+                  f"({', '.join(['ptr %rbox'] + avals)})")
+        tl.append("  %w = ptrtoint ptr %rbox to i64")
+        tl.append("  ret i64 %w")
+    else:
+        rty = _llscalar(dsig.ret)
+        tl.append(f"  %r = call {rty} @{mangle(dfn)}({', '.join(avals)})")
+        enc, v = _word_encode("%r", dsig.ret, "%w")
+        tl += enc
+        tl.append(f"  ret i64 {v}")
+    tl.append("}")
+    mod.default_thunks[dfn] = "\n".join(tl)
 
 
 def _emit_placeholder(info: _Info, sig: _Sig) -> str:
@@ -6938,6 +7145,30 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                     lines.append(f"  store i64 {w}, ptr {p}")
                 eg = mod.intern_string(peffect)
                 og = mod.intern_string(pop)
+                ddfn = info.dynamic_default_performs.get((peffect, pop))
+                if ddfn is not None:
+                    # DYNAMIC DEFAULT ROUTING: this op declares a default
+                    # AND some scope lists it, so which one answers is
+                    # decided at THIS perform by the runtime's scope stack.
+                    # mx_perform_or_default runs the identical innermost-
+                    # non-busy lookup and, only where mx_perform would have
+                    # aborted, calls the op's default thunk on this stack.
+                    if ddfn not in emitted_names:
+                        raise _Unsupported(
+                            f"dynamic default {ddfn!r} is not emitted")
+                    _emit_default_thunk(ddfn, len(pargs), sigs, structs,
+                                        variants, mod, f.name)
+                    mod.runtime_syms.add("mx_perform_or_default")
+                    w = fresh()
+                    lines.append(
+                        f"  {w} = call i64 @mx_perform_or_default("
+                        f"ptr {eg}, ptr {og}, ptr %perform.args, "
+                        f"i64 {len(pargs)}, ptr @{_default_thunk_sym(ddfn)}, "
+                        f"ptr null)"
+                        f"  ; perform {peffect or '?'}.{pop} -> in-scope "
+                        f"handler, else the declared default @{mangle(ddfn)}")
+                    word_into(pdst, w, lines)
+                    continue
                 mod.runtime_syms.add("mx_perform")
                 w = fresh()
                 lines.append(
@@ -8101,6 +8332,10 @@ def emit_llvm(funcs: Sequence[MirFunc]) -> str:
         # Statically default-resolved performs call the default fn directly.
         deps |= {dfn for dfn in info.default_performs.values()
                  if dfn in module_names}
+        # Dynamically default-routed performs reach it through the per-op
+        # thunk they hand to mx_perform_or_default: same link dependency.
+        deps |= {dfn for dfn in info.dynamic_default_performs.values()
+                 if dfn in module_names}
         # A comprehension site's per-element thunk calls the lambda symbol.
         for (_d, callee, cargs) in info.calls:
             if callee == "__vec_comprehension" and len(cargs) == 3:
@@ -8492,6 +8727,15 @@ def emit_llvm(funcs: Sequence[MirFunc]) -> str:
     for site in sorted(live_scope_shims):
         chunks.append(mod.scope_tables[site])
         chunks.append(mod.scope_thunks[site])
+    # Dynamic-default thunks: kept when the default fn itself emitted AND
+    # at least one performer that hands the thunk to mx_perform_or_default
+    # survived the cascade (dep_names makes the default a dependency of
+    # every such performer, so a demoted default takes them all with it).
+    for dfn in sorted(mod.default_thunks):
+        if dfn in emitted_chunks and any(
+                u in emitted_chunks
+                for u in mod.default_thunk_users.get(dfn, ())):
+            chunks.append(mod.default_thunks[dfn])
     for info in infos:
         chunk = emitted_chunks.get(info.f.name)
         if chunk is not None:

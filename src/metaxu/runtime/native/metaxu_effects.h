@@ -53,11 +53,15 @@
  * |             |          const int64_t *op_nparams, int64_t nops)      |
  * | mx_perform  | int64_t (const char *effect, const char *op,           |
  * |             |          const int64_t *args, int64_t nargs)           |
+ * | mx_perform_ | int64_t (const char *effect, const char *op,           |
+ * | or_default  |          const int64_t *args, int64_t nargs,           |
+ * |             |          mx_default_fn dflt, void *dflt_env)           |
  * | mx_resume   | int64_t (mx_k *k, int64_t value)                       |
  *
  *   mx_body_fn    = int64_t (*)(void *env)
  *   mx_handler_fn = int64_t (*)(void *env, int64_t op_index,
  *                               const int64_t *args, mx_k *k)
+ *   mx_default_fn = int64_t (*)(void *env, const int64_t *args)
  *
  * mx_handle runs `body` on a fresh coroutine under a newly-installed
  * scope and returns the handle expression's value: the body's completion
@@ -76,6 +80,38 @@
  * returns the value passed to mx_resume; when no scope matches it prints
  * "Unhandled effect operation: '<op>'" and aborts (the interpreter's
  * InterpError).
+ *
+ * mx_perform_or_default is mx_perform for an op that ALSO declares a
+ * `= expr` default (the surface `op(x) -> T = expr` form).  Routing is
+ * unchanged whenever a scope matches -- same innermost-non-busy lookup,
+ * same padding/arity rules, same parking -- but where mx_perform aborts,
+ * this entry point calls `dflt(dflt_env, args)` and returns its value.
+ * That mirrors the interpreter's perform precedence exactly:
+ *
+ *     in-scope handler frame  >  declared `= expr` default  >  error
+ *
+ * (the interpreter's third rung, a `with SYMBOL` runtime mapping, sits
+ * between the two and has no native implementation at all -- the compiler
+ * demotes any op that declares one, so no lowering can reach this entry
+ * point with a mapping in play).
+ *
+ * THE DEFAULT RUNS ON THE PERFORMING STACK.  A default is an ordinary
+ * expression, not a suspension: no coroutine is created, no scope is
+ * installed, nothing is parked, and no continuation record exists (there
+ * is nothing to resume -- the perform simply becomes a call).  The scope
+ * stack is untouched across the call, so a perform INSIDE the default
+ * routes exactly as a perform written at the original site would: it sees
+ * the same scopes with the same busy flags, and if it needs to park, it
+ * parks this same fiber.  That is precisely what the interpreter does
+ * (it evaluates the default function in the performing frame's context
+ * with the handler-frame list unchanged), so the two agree by
+ * construction, including for recursive and re-entrant defaults.
+ *
+ * `dflt` receives the caller's `args` pointer UNPADDED: the compiler emits
+ * a per-op thunk that reads exactly the argument words the default
+ * function declares, and demotes any perform whose arity disagrees with
+ * its default (the scope-routed path keeps the runtime's own padding /
+ * arity checks).  Passing dflt == NULL is exactly mx_perform.
  *
  * Limits: at most MX_EFFECT_MAX_ARGS (8) op arguments / case parameters
  * (the compiler demotes anything larger); coroutine stacks are
@@ -109,6 +145,12 @@ typedef struct mx_k mx_k;
 typedef int64_t (*mx_body_fn)(void *env);
 typedef int64_t (*mx_handler_fn)(void *env, int64_t op_index,
                                  const int64_t *args, mx_k *k);
+/* An op's declared `= expr` default, compiled to a per-op thunk that
+ * decodes the argument words and word-encodes the result.  `env` is the
+ * thunk's environment (NULL for the top-level __effect_default$E$op
+ * functions the compiler emits today; the parameter exists so a capturing
+ * default can be added without another ABI change). */
+typedef int64_t (*mx_default_fn)(void *env, const int64_t *args);
 
 int64_t mx_handle(mx_body_fn body, void *body_env,
                   mx_handler_fn handler, void *handler_env,
@@ -118,6 +160,10 @@ int64_t mx_handle(mx_body_fn body, void *body_env,
 
 int64_t mx_perform(const char *effect, const char *op,
                    const int64_t *args, int64_t nargs);
+
+int64_t mx_perform_or_default(const char *effect, const char *op,
+                              const int64_t *args, int64_t nargs,
+                              mx_default_fn dflt, void *dflt_env);
 
 int64_t mx_resume(mx_k *k, int64_t value);
 
