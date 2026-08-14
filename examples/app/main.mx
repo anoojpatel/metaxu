@@ -1,0 +1,190 @@
+# app.main — the driver for the calc language.
+#
+# Everything the other four modules build is wired together here: source
+# text goes through app.lexer, app.parser and app.eval, and this module
+# supplies the *handlers* that decide what the effects those stages
+# perform actually do.
+#
+#   * Throw  -> std.throw's `catch_`, so a lexer, parser or evaluator
+#               error becomes an Err(message) instead of a crash;
+#   * State  -> std.state's `run_state`, which answers both the run's
+#               result and the number of expression nodes it evaluated;
+#   * Trace  -> three handlers over the SAME evaluator: one that discards
+#               every step, one that collects them into a Vec, and one
+#               that counts a budget down and throws when it runs out.
+#
+# Run it with:  uv run python scripts/run_examples.py --stage run examples/app/main.mx
+
+from lexer import tokenize;
+from parser import parse_program;
+from eval import Trace, run_program;
+from syntax import describe_at, render, show_expr;
+from std.state import run_state;
+from std.throw import Throw, catch_;
+from std.parse import split_on;
+
+# The demo programs, as (title, source) pairs. The last four are the
+# error paths: calc reports them, it does not crash on them.
+fn demo_programs() -> Vec {
+    let @mut demos = Vec.new();
+    demos.push(("arithmetic",
+                "let radius = 7; let area = 3 * radius * radius; print area;"));
+    demos.push(("precedence and unary minus",
+                "print 2 + 3 * 4 - -6; print (2 + 3) * 4;"));
+    demos.push(("conditionals and builtins",
+                "let n = 17; print if n % 2 == 1 then max(n, 100) else min(n, 100); print abs(0 - n);"));
+    # `==` / `!=` are the two operators that work on bools as well as
+    # ints, so the last line compares two comparisons.
+    demos.push(("comparison chains",
+                "let a = 3; let b = 4; print a < b; print a * a + b * b == 25; print (a < b) != (b < a);"));
+    # Layout is free: the lexer skips whatever std.parse calls space.
+    demos.push(("multi-line source",
+                "let a = 2;\n\tlet b = a * a;\nprint b + a;"));
+    demos.push(("unbound name", "print 1 + missing;"));
+    demos.push(("type error", "print if 1 then 2 else 3;"));
+    demos.push(("division by zero", "let d = 0; print 10 / d;"));
+    demos.push(("syntax error", "let x = (1 + 2; print x;"));
+    demos
+}
+
+# Run one program with the trace discarded. The Trace handler resumes
+# with unit, so evaluation continues exactly as if nothing listened.
+fn run_quiet(source: string) performs State {
+    catch_(fn() -> {
+        handle Trace with {
+            step(depth, node, value) -> resume(())
+        } in {
+            run_program(parse_program(tokenize(source)))
+        }
+    })
+}
+
+# The same evaluation, with the trace collected instead. `lines` is a
+# capture cell the handler arm writes into, which is how a deep handler
+# accumulates without any global. Rendering happens HERE, in the only
+# handler that wants it.
+fn run_traced(source: string) -> Vec performs State {
+    let @mut lines = Vec.new();
+    catch_(fn() -> {
+        handle Trace with {
+            step(depth, node, value) -> {
+                lines.push(indent(depth) + show_expr(node) + " => " + render(value));
+                resume(())
+            }
+        } in {
+            run_program(parse_program(tokenize(source)))
+        }
+    });
+    lines
+}
+
+# A third Trace handler: one that counts down a budget and cuts the
+# evaluation off when it runs out. A handler arm evaluates OUTSIDE its
+# own delimitation, so the `perform Throw.throw` below routes to the
+# enclosing `catch_` and tears the whole recursion down — a runaway
+# guard that the evaluator itself knows nothing about.
+fn run_with_budget(source: string, budget: int) performs State {
+    let @mut remaining = budget;
+    catch_(fn() -> {
+        handle Trace with {
+            step(depth, node, value) -> {
+                if remaining == 0 {
+                    perform Throw.throw("step budget of " + budget.to_string()
+                                            + " exhausted at " + show_expr(node))
+                } else {
+                    remaining = remaining - 1
+                };
+                resume(())
+            }
+        } in {
+            run_program(parse_program(tokenize(source)))
+        }
+    })
+}
+
+fn main() -> int {
+    let @mut failed = 0;
+    for (title, source) in demo_programs() {
+        print("== " + title + " ==");
+        echo_source(source);
+        # run_state answers both halves: what the run produced, and the
+        # number of expression nodes the evaluator charged to State.
+        let run = run_state(0, fn() -> run_quiet(source));
+        match run.value {
+            Ok(lines) => print_lines(lines),
+            Err(message) => {
+                print("   ! " + message);
+                failed = failed + 1
+            }
+        };
+        print("   (" + run.state.to_string() + " steps)")
+    }
+
+    # The parser's own answer, printed through the Show impl for Stmt:
+    # every statement fully parenthesized, at the offset it started.
+    print("== parse tree ==");
+    print_parse_tree("let t = 1 + 2 * 3; print if t > 6 then abs(0 - t) else t;");
+
+    # One program run again with the collecting Trace handler, to show
+    # the evaluation order the recursion actually takes. The evaluator
+    # performs State whoever is listening, so this needs its own
+    # `run_state` — an unhandled effect is an error here, not a no-op.
+    print("== evaluation trace ==");
+    let traced = run_state(0, fn() -> run_traced("print 2 + 3 * 4;"));
+    print_lines(traced.value);
+
+    # And the same program under a budget too small for it.
+    print("== step budget ==");
+    let capped = run_state(0, fn() -> run_with_budget("print 2 + 3 * 4;", 3));
+    match capped.value {
+        Ok(lines) => print_lines(lines),
+        Err(message) => print("   ! " + message)
+    };
+
+    print("programs that failed: " + failed.to_string());
+    failed
+}
+
+# Lex and parse only. `describe_at` is the same generic renderer the
+# parser uses for tokens — here it is handed spanned STATEMENTS, and the
+# Show impl for Stmt is the one that runs.
+fn print_parse_tree(source: string) {
+    echo_source(source);
+    let parsed = catch_(fn() -> parse_program(tokenize(source)));
+    match parsed {
+        Ok(stmts) => {
+            let @mut i = 0;
+            while i < len(stmts) {
+                print("   " + describe_at(stmts[i]));
+                i = i + 1
+            }
+        },
+        Err(message) => print("   ! " + message)
+    }
+}
+
+# Echo a program one physical line at a time, so a multi-line source
+# stays readable in the report.
+fn echo_source(source: string) {
+    for line in split_on(source, "\n") {
+        print("   | " + line)
+    }
+}
+
+fn print_lines(lines: Vec) {
+    let @mut i = 0;
+    while i < len(lines) {
+        print("   " + lines[i]);
+        i = i + 1
+    }
+}
+
+fn indent(depth: int) -> string {
+    let @mut pad = "";
+    let @mut i = 0;
+    while i < depth {
+        pad = pad + "  ";
+        i = i + 1
+    }
+    pad
+}
