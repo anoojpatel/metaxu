@@ -595,3 +595,323 @@ fn main() -> int {
 }
 """)
     assert result == 1007
+
+
+# ----------------------------------------------------------------------
+# std.state
+# ----------------------------------------------------------------------
+
+def test_state_eval_and_exec_agree_on_the_final_state():
+    """eval_state answers f's result, exec_state the final state; here the
+    computation ends by reading the state, so both are 10+5+7."""
+    result, prints = run_main("""
+from std.state import eval_state, exec_state, increment;
+
+fn bump() -> int {
+    increment(5);
+    increment(7);
+    perform State.get()
+}
+
+fn main() -> int {
+    let v = eval_state(10, fn() -> int { bump() });
+    let s = exec_state(10, fn() -> int { bump() });
+    print(v);
+    print(s);
+    v + s
+}
+""")
+    assert prints == ["22", "22"]
+    assert result == 44
+
+
+def test_state_handler_is_deep_across_called_functions():
+    """get/put performed in a function the handled block CALLS must reach
+    the running handler, not escape it (deep, not shallow, handling)."""
+    result, _ = run_main("""
+from std.state import eval_state, increment;
+
+fn nested() -> int {
+    increment(1);
+    deeper()
+}
+
+fn deeper() -> int {
+    increment(2);
+    perform State.get()
+}
+
+fn main() -> int {
+    eval_state(0, fn() -> int { nested() })
+}
+""")
+    assert result == 3
+
+
+# ----------------------------------------------------------------------
+# std.log
+# ----------------------------------------------------------------------
+
+def test_log_with_collected_logs_captures_every_level():
+    result, _ = run_main("""
+from std.log import log_info, log_warn, with_collected_logs;
+
+fn work() -> int {
+    log_info("starting");
+    log_warn("careful");
+    7
+}
+
+fn main() -> int {
+    with_collected_logs(fn() -> int { work() }).len()
+}
+""")
+    assert result == 2
+
+
+def test_log_quietly_swallows_records_and_keeps_the_value():
+    result, prints = run_main("""
+from std.log import log_error, quietly;
+
+fn main() -> int {
+    quietly(fn() -> int { log_error("suppressed"); 3 })
+}
+""")
+    assert result == 3
+    assert prints == []          # nothing reached the print builtin
+
+
+# ----------------------------------------------------------------------
+# std.random
+# ----------------------------------------------------------------------
+
+def test_random_with_sequence_replays_the_given_draws():
+    """with_sequence is the testing seam: draws come from the Vec, in
+    order, so a random-using function becomes deterministic."""
+    result, _ = run_main("""
+from std.random import with_sequence, next_below;
+
+fn main() -> int {
+    let mut v = Vec::new();
+    v.push(3);
+    v.push(9);
+    with_sequence(v, fn() -> int { next_below(10) + next_below(10) })
+}
+""")
+    assert result == 12
+
+
+def test_random_with_seed_is_reproducible():
+    result, prints = run_main("""
+from std.random import with_seed, next_below;
+
+fn draw() -> int {
+    next_below(100) * 1000 + next_below(100)
+}
+
+fn main() -> int {
+    let a = with_seed(42, fn() -> int { draw() });
+    let b = with_seed(42, fn() -> int { draw() });
+    print(a);
+    print(b);
+    if a == b { 1 } else { 0 }
+}
+""")
+    assert result == 1
+    assert prints[0] == prints[1]
+
+
+# ----------------------------------------------------------------------
+# std.parse
+# ----------------------------------------------------------------------
+
+def test_parse_int_or_handles_valid_negative_and_invalid():
+    result, prints = run_main("""
+from std.parse import parse_int_or;
+
+fn main() -> int {
+    print(parse_int_or("123", 0 - 1));
+    print(parse_int_or("oops", 0 - 1));
+    print(parse_int_or("-45", 0));
+    parse_int_or("123", 0)
+}
+""")
+    assert prints == ["123", "-1", "-45"]
+    assert result == 123
+
+
+def test_parse_split_on_separator():
+    result, _ = run_main("""
+from std.parse import split_on;
+
+fn main() -> int {
+    split_on("a,b,c", ",").len()
+}
+""")
+    assert result == 3
+
+
+# ----------------------------------------------------------------------
+# std.test
+# ----------------------------------------------------------------------
+
+def test_test_run_suite_reports_and_returns_the_failure_count():
+    result, prints = run_main("""
+from std.test import assert_true, assert_eq, run_suite;
+
+fn main() -> int {
+    run_suite("arith", fn() -> () {
+        assert_eq(1 + 1, 2, "one plus one");
+        assert_true(3 > 2, "three beats two");
+    })
+}
+""")
+    assert result == 0
+    assert prints == ["arith : 2 passed, 0 failed"]
+
+
+def test_test_collect_failures_names_only_the_failing_checks():
+    result, _ = run_main("""
+from std.test import assert_true, collect_failures;
+
+fn main() -> int {
+    collect_failures(fn() -> () {
+        assert_true(true, "ok");
+        assert_true(false, "boom");
+    }).len()
+}
+""")
+    assert result == 1
+
+
+# ----------------------------------------------------------------------
+# std.iter — the adapters std.stream defers (they emit tuples)
+# ----------------------------------------------------------------------
+
+def test_iter_take_while_sums_the_leading_run():
+    result, _ = run_main("""
+from std.stream import iota, sum;
+from std.iter import take_while;
+
+fn main() -> int {
+    sum(take_while(iota(100), fn(x: int) -> x < 10))
+}
+""")
+    assert result == 45
+
+
+def test_iter_take_while_aborts_the_producer_rather_than_filtering_it():
+    """The header claims adapters are lazy. take_while achieves that by
+    NOT resuming when the predicate fails — dropping a single-shot
+    delimited continuation unwinds the producer. Observationally: a
+    1000-iteration producer must be pulled 4 times, not 1000, to yield 3
+    elements. A filtering (non-aborting) implementation returns the same
+    sum, so only the pull count distinguishes them."""
+    result, prints = run_main("""
+from std.stream import Emit, count;
+from std.iter import take_while;
+
+fn main() -> int {
+    let @mut pulls = 0;
+    let producer = fn() {
+        let @mut i = 0;
+        while i < 1000 {
+            pulls = pulls + 1;
+            perform Emit.emit(i);
+            i = i + 1;
+        };
+        ()
+    };
+    let taken = count(take_while(producer, fn(x: int) -> x < 3));
+    print(taken);
+    pulls
+}
+""")
+    assert prints == ["3"]       # 0, 1, 2 passed the predicate
+    assert result == 4           # ... and the producer stopped at the 4th
+
+
+def test_iter_drop_while_skips_only_the_leading_run():
+    result, _ = run_main("""
+from std.stream import iota, sum;
+from std.iter import drop_while;
+
+fn main() -> int {
+    sum(drop_while(iota(10), fn(x: int) -> x < 5))
+}
+""")
+    assert result == 35          # 5+6+7+8+9
+
+
+def test_iter_step_by_keeps_every_nth_starting_at_the_first():
+    result, prints = run_main("""
+from std.stream import iota, collect;
+from std.iter import step_by;
+
+fn main() -> int {
+    let v = collect(step_by(iota(10), 3));
+    print(v[0]);
+    print(v[3]);
+    v.len()
+}
+""")
+    assert result == 4           # 0, 3, 6, 9
+    assert prints == ["0", "9"]
+
+
+def test_iter_enumerate_emits_real_tuples():
+    """enumerate emits (index, element) as a TUPLE — destructurable with
+    `let (i, x) = ...`. It used to emit a hand-rolled Pair struct."""
+    result, prints = run_main("""
+from std.stream import emit_vec, collect;
+from std.iter import enumerate;
+
+fn main() -> int {
+    let mut names = Vec::new();
+    names.push(10);
+    names.push(20);
+    let pairs = collect(enumerate(emit_vec(names)));
+    let (i, x) = pairs[1];
+    print(i);
+    print(x);
+    i + x
+}
+""")
+    assert prints == ["1", "20"]
+    assert result == 21
+
+
+def test_iter_zip_with_stops_at_the_shorter_stream():
+    result, _ = run_main("""
+from std.stream import iota, sum;
+from std.iter import zip_with;
+
+fn main() -> int {
+    sum(zip_with(iota(3), iota(10), fn(a: int, b: int) -> a * b))
+}
+""")
+    assert result == 5           # 0*0 + 1*1 + 2*2, bounded by iota(3)
+
+
+def test_iter_chunks_emits_a_short_final_chunk():
+    result, _ = run_main("""
+from std.stream import iota, count;
+from std.iter import chunks;
+
+fn main() -> int {
+    count(chunks(iota(7), 3))
+}
+""")
+    assert result == 3           # [0,1,2] [3,4,5] [6]
+
+
+def test_iter_windows_slides_by_one():
+    result, _ = run_main("""
+from std.stream import iota, count;
+from std.iter import windows;
+
+fn main() -> int {
+    count(windows(iota(5), 2))
+}
+""")
+    assert result == 4           # (0,1) (1,2) (2,3) (3,4)
