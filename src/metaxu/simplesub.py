@@ -156,11 +156,6 @@ class TypeInferencer:
             if args is None:
                 args = getattr(ty, 'type_parameters', None)
             args = args or []
-            try:
-                details = {k: v for k, v in getattr(ty, '__dict__', {}).items() if k not in ('parent',)}
-                print(f"[to_compact_type] TypeApplication base(chosen)={cname}, args={[getattr(a,'name',getattr(a,'base_type',a)) for a in args]} attrs={details}")
-            except Exception:
-                pass
             constructor = TypeConstructor(cname, len(args))
             return CompactType(
                 id=next_id(),
@@ -173,10 +168,6 @@ class TypeInferencer:
         if hasattr(ast, 'GenericType') and isinstance(ty, ast.GenericType):
             base_name = getattr(ty, 'name', None) or getattr(ty, 'base_type', None) or 'Generic'
             targs = getattr(ty, 'type_args', []) or []
-            try:
-                print(f"[to_compact_type] GenericType base={base_name}, args={[getattr(a,'name',getattr(a,'base_type',a)) for a in targs]}")
-            except Exception:
-                pass
             constructor = TypeConstructor(base_name, len(targs))
             return CompactType(
                 id=next_id(),
