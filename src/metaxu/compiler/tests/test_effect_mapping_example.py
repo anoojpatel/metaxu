@@ -6,14 +6,15 @@ them with no handler in scope. Each mapped op compiles to a thunk
 __effect_runtime$Effect$op whose body calls __mx_effect_runtime$SYMBOL;
 the MIR interpreter dispatches that callee to a runtime shim table.
 
-Interpreter execution model (documented on the shims): single logical
-thread — EFFECT_SPAWN runs the child closure to completion at spawn time
-(one legal schedule of real thread semantics) and EFFECT_JOIN returns its
-stored result. Mutexes are therefore exact, not simulated: locking an
-already-locked mutex can never succeed later, so it is a deadlock and a
-loud error; unlocking an unlocked mutex and joining a thread twice are
-loud errors too. Handlers in scope always win over the runtime mapping
-(effects stay virtualizable); a mapped symbol with no shim fails loudly.
+Interpreter execution model (docs/threads_runtime.md): REAL threads —
+EFFECT_SPAWN starts the closure on its own OS thread immediately and
+EFFECT_JOIN blocks for completion and returns the child's result exactly
+once. Mutexes are ERRORCHECK: locking a mutex held by another thread
+blocks; self-relock is a loud deadlock error; unlocking a mutex this
+thread does not hold and joining a thread twice are loud errors too.
+Handlers in scope always win over the runtime mapping (effects stay
+virtualizable); a mapped symbol with no shim fails loudly.
+Deeper thread-semantics coverage lives in test_threads.py.
 
 All tests go through parsed source (parse -> pipeline -> HIR -> MIR ->
 interpreter), never hand-built fixtures.
@@ -104,7 +105,11 @@ fn main() -> () {
     assert result is UNIT
 
 
-def test_locking_locked_mutex_is_deadlock_error():
+def test_locking_held_mutex_on_same_thread_is_deadlock_error():
+    """ERRORCHECK self-relock: this thread already holds the mutex, so a
+    second lock could only ever block on itself — loud EDEADLK-style
+    error (a lock held by ANOTHER thread blocks instead; test_threads.py
+    covers that)."""
     source = MUTEX_EFFECT + """
 fn main() -> () {
     let m = perform Mutex.create();
@@ -112,18 +117,18 @@ fn main() -> () {
     perform Mutex.lock(m);
 }
 """
-    with pytest.raises(InterpError, match="deadlock"):
+    with pytest.raises(InterpError, match="deadlock.*already holds it"):
         run_source(source)
 
 
-def test_unlocking_unlocked_mutex_errors():
+def test_unlocking_unheld_mutex_errors():
     source = MUTEX_EFFECT + """
 fn main() -> () {
     let m = perform Mutex.create();
     perform Mutex.unlock(m);
 }
 """
-    with pytest.raises(InterpError, match="not locked"):
+    with pytest.raises(InterpError, match="does not hold it"):
         run_source(source)
 
 
