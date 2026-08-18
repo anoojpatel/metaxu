@@ -625,12 +625,6 @@ class VariantInstance(Expression):
         self.variant_name = variant_name
         self.field_values = field_values  # Dict of field_name: expression
 
-# Multithreading
-class SpawnExpression(Expression):
-    def __init__(self, function_expression):
-        super().__init__()
-        self.function_expression = function_expression
-
 # SIMD and GPU
 class VectorLiteral(Expression):
     def __init__(self, base_type, size, elements):

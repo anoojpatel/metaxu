@@ -245,9 +245,10 @@ shipped. Current queue, in rough priority order:)
   native coverage").
 - **Cranelift backend decision** (owner): retire codegen_clif.py (26%
   coverage, non-executable) in favor of LLVM (80%+, running binaries)?
-- Thread-boundary polish: aggregate-kinded `EFFECT_JOIN` results, the
-  bare `spawn(e)` expression form, and richer send/sync mode enforcement
-  (v1 capture checks are in; see docs/threads_runtime.md § Modes).
+- Thread-boundary polish: aggregate-kinded `EFFECT_JOIN` results and
+  richer send/sync mode enforcement (v1 capture checks are in; see
+  docs/threads_runtime.md § Modes). The bare `spawn(e)` expression form
+  is resolved by REMOVAL: threads go through the Thread effect only.
 
 ---
 

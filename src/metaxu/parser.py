@@ -933,7 +933,6 @@ class Parser:
                               | resume_expression
                               | try_expression
                               | print_expression
-                              | spawn_expression
                               | exclave_expression
                               | move_expression
                               | borrow_expression
@@ -1362,17 +1361,6 @@ class Parser:
         elif isinstance(pattern, ast.QualifiedFunctionCall):
             op_name = '.'.join(pattern.parts)
             args = pattern.arguments
-        elif isinstance(pattern, ast.SpawnExpression):
-            # `spawn` is a lexer keyword (the `spawn(e)` expression form),
-            # so a handler case labelled `spawn(f)` parses as a
-            # SpawnExpression rather than a FunctionCall.  In case position
-            # it IS the effect op named "spawn" with one parameter — e.g. a
-            # Thread.spawn handler overriding the EFFECT_SPAWN runtime
-            # mapping (docs/threads_runtime.md).  Without this arm the case
-            # silently degraded to a garbage op name ("SpawnExpressionat
-            # 0x...") that could never match a perform.
-            op_name = "spawn"
-            args = [pattern.function_expression]
         elif isinstance(pattern, ast.Variable):
             op_name = pattern.name
             args = []
@@ -1422,10 +1410,6 @@ class Parser:
     def p_print_expression(self, p):
         '''print_expression : PRINT LPAREN argument_list_opt RPAREN'''
         p[0] = ast.PrintStatement(p[3])
-
-    def p_spawn_expression(self, p):
-        '''spawn_expression : SPAWN LPAREN expression RPAREN'''
-        p[0] = ast.SpawnExpression(p[3])
 
     def p_exclave_expression(self, p):
         '''exclave_expression : EXCLAVE expression'''
@@ -2322,8 +2306,6 @@ class Parser:
         """Process variable captures for a node"""
         if isinstance(node, ast.LambdaExpression):
             self._process_lambda_captures(node)
-        elif isinstance(node, ast.SpawnExpression):
-            self._process_spawn_captures(node)
 
     def _process_lambda_captures(self, lambda_expr):
         """Process variable captures for a lambda expression."""
@@ -2340,17 +2322,6 @@ class Parser:
                     lambda_expr.capture_modes[var_name] = "borrow_mut"
                 else:
                     lambda_expr.capture_modes[var_name] = "borrow"
-
-    def _process_spawn_captures(self, spawn):
-        """Process variable captures for a spawn expression."""
-        spawn.captured_vars = set()
-        spawn.capture_modes = {}
-        var_refs = self._find_variables_in_body(spawn.function_expression)
-        scope = getattr(spawn, 'scope', None)
-        for var_name in var_refs:
-            if scope and self._is_variable_defined(var_name, scope.parent):
-                spawn.captured_vars.add(var_name)
-                spawn.capture_modes[var_name] = "move"
 
     def _find_variables_in_body(self, node):
         """Recursively find all variable references in a node"""

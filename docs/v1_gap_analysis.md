@@ -420,7 +420,13 @@ same-arity tuple).
   `typeof`-style type reflection, compile-time matching on types — compile-time
   evaluation is not implemented. (`comptime fn` is rejected explicitly rather
   than silently compiled as an ordinary run-time function.)
-- **Threads**: the `spawn(f())` EXPRESSION form has no HIR/MIR lowering.
+- **Threads**: the bare `spawn(f())` EXPRESSION form is REMOVED from the
+  language (2026-08-18): it duplicated the effect route without being
+  virtualizable, had no semantics behind it, and its keyword caused a
+  real parse bug (a `spawn(f)` handler case could never match). `spawn`
+  is an ordinary identifier now; threads go through
+  `perform Thread.spawn(..)` and calling an undefined `spawn(..)` gets
+  a compile error pointing there.
   Real threads ARE available through the effect-mapped route
   (`perform Thread.spawn(...)` with `with EFFECT_SPAWN`, backed by OS
   threads on both engines — see `docs/threads_runtime.md`); only the

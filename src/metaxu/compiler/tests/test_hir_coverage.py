@@ -348,10 +348,6 @@ fn main() -> int {{
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("label,source,needle", [
-    ("spawn", """
-fn work() -> int { 1 }
-fn main() -> int { spawn(work()); 0 }
-""", "SpawnExpression"),
     ("comptime block", """
 fn main() -> int { comptime { let x = 1; } 0 }
 """, "ComptimeBlock"),
@@ -506,3 +502,40 @@ def test_corpus_lowers_without_dropping_or_wildcarding(path, monkeypatch):
     assert not wildcarded, (
         f"{os.path.basename(path)}: patterns silently degraded to wildcards: "
         f"{sorted(set(wildcarded))}")
+
+
+# ---------------------------------------------------------------------------
+# The removed `spawn(e)` keyword form
+# ---------------------------------------------------------------------------
+# `spawn` was a lexer keyword with an expression production but no semantics
+# behind it (SpawnExpression triaged UNSUPPORTED), and the keyword caused a
+# real bug: a `spawn(f)` handler case parsed as a SpawnExpression and could
+# never match a perform. The keyword is gone: `spawn` is an ordinary
+# identifier, threads go through the Thread effect, and calling an undefined
+# `spawn(..)` gets a compile error pointing at the effect route.
+
+def test_bare_spawn_is_an_undefined_function_with_a_routing_hint():
+    from metaxu.compiler.frozen_borrow_checker import TypeCheckError
+    with pytest.raises(TypeCheckError) as exc:
+        ctx = build_context_from_source("""
+fn work() -> int { 1 }
+fn main() -> int { spawn(work()); 0 }
+""")
+        run_pipeline_ctx(ctx)
+    msg = str(exc.value)
+    assert "undefined function 'spawn'" in msg
+    assert "perform Thread.spawn" in msg
+
+
+def test_spawn_is_an_ordinary_identifier_now():
+    """The keyword is freed: users can define and call their own `spawn`,
+    and a variable may be named spawn."""
+    result, _ = run_main("""
+fn spawn(n: int) -> int { n * 2 }
+
+fn main() -> int {
+    let spawned = spawn(21);
+    spawned
+}
+""")
+    assert result == 42

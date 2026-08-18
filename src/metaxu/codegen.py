@@ -665,10 +665,6 @@ class CodeGenerator:
             self.generate(element)
         self.emit(Opcode.CREATE_VECTOR, node.base_type, node.size)
 
-    def gen_SpawnExpression(self, node):
-        self.generate(node.function_expression)
-        self.emit(Opcode.SPAWN_THREAD)
-
     def gen_EffectHandler(self, effect_name, handler_node):
         handler_label = f"{effect_name}_handler"
         self.enter_scope(handler_label)

@@ -444,6 +444,13 @@ class _Resolver:
         hint = _suggest(name, candidates)
         if hint is not None:
             message += f"; did you mean '{hint}'?"
+        elif name == "spawn" and what == "function":
+            # `spawn(e)` used to be a keyword expression form; it was
+            # removed in favor of the effect route, which handlers can
+            # virtualize. Point old code at it.
+            message += ("; threads are spawned through the Thread effect: "
+                        "`perform Thread.spawn(|| { .. })` "
+                        "(docs/threads_runtime.md)")
         loc = getattr(node, "location", None)
         self.errors.append(BorrowError(
             message=message,
