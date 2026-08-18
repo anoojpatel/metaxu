@@ -26,15 +26,33 @@ Update (2026-08-13): all of those now execute — the run gate is 19/19.
 effect_mapping.mx was the last: its `with EFFECT_*` clauses (effect ops
 mapped onto named runtime primitives) now compile to
 `__effect_runtime$Effect$op` thunks, and the interpreter carries shims for
-EFFECT_MUTEX_CREATE/LOCK/UNLOCK and EFFECT_SPAWN/JOIN under a documented
-single-threaded execution model: spawn runs the child closure to
-completion at spawn time (one legal schedule of real thread semantics),
-join returns its stored result once, and mutexes are exact — locking a
-locked mutex is a deadlock and errors loudly, as do unlock-of-unlocked,
-double join, and any mapped symbol without a shim. In-scope handlers
-still override runtime mappings (effects stay virtualizable). Real OS
-threads remain out of scope for the interpreter; the LLVM backend still
-has no effect-op runtime (see below).
+EFFECT_MUTEX_CREATE/LOCK/UNLOCK and EFFECT_SPAWN/JOIN — originally under
+a single-threaded execution model (spawn ran the child to completion at
+spawn time).
+
+Update (2026-08-18): the single-threaded model is GONE — both engines now
+implement REAL OS threads behind those shims (`docs/threads_runtime.md`
+is the spec). Interpreter: spawn starts the closure on its own
+`threading.Thread` immediately; join blocks and returns the result
+exactly once (double join errors loudly, matching pthread_join); mutexes
+are ERRORCHECK-style owner-tracked wrappers over `threading.Lock` — lock
+held by ANOTHER thread blocks, self-relock is the loud deadlock error,
+unlock-not-held errors; a child's catchable failure surfaces at join,
+catchably. Each spawned thread owns its OWN effect scope stack (children
+do not inherit the spawner's in-scope handlers; handle-body threads adopt
+their creator's context), while in-scope handlers on the performing
+thread still override runtime mappings (effects stay virtualizable — a
+`spawn(f)` handler case now parses correctly too; it used to collide with
+the `spawn` keyword and silently never match). Native: metaxu_threads.c
+(pthreads, PTHREAD_MUTEX_ERRORCHECK, immortal handles, `-pthread` on
+every link) with ALL effects-scheduler globals `_Thread_local`; mapped
+ops no longer demote — unscoped performs call their
+`__effect_runtime$E$op` thunk directly, scoped ones route through
+mx_perform_or_default with the thunk as fallback. effect_mapping.mx went
+from 0 defines / 7 placeholders to 7 / 0; differentials (counter, join
+value, error messages) match the interpreter byte-for-byte and run clean
+under -fsanitize=thread and ASan (detect_leaks=0: handles are immortal
+by design). Error messages are shared byte-for-byte across engines.
 
 Direction update (2026-08-13): the project targets LLVM for AOT native
 compilation (near-C, no GC; modes decide memory). Increment 1 is on this
@@ -394,7 +412,11 @@ same-arity tuple).
   `typeof`-style type reflection, compile-time matching on types — compile-time
   evaluation is not implemented. (`comptime fn` is rejected explicitly rather
   than silently compiled as an ordinary run-time function.)
-- **Threads**: `spawn(f())` — the threads runtime is out of scope for v1.
+- **Threads**: the `spawn(f())` EXPRESSION form has no HIR/MIR lowering.
+  Real threads ARE available through the effect-mapped route
+  (`perform Thread.spawn(...)` with `with EFFECT_SPAWN`, backed by OS
+  threads on both engines — see `docs/threads_runtime.md`); only the
+  bare keyword expression remains unimplemented.
 - **Raw pointers**: pointer dereference has no HIR/MIR representation.
 - **Uncalled generic instantiation**: `let f = ident<int>;` — a type-applied
   function has no value representation; call it directly (`ident<int>(x)`).

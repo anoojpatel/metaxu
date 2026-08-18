@@ -369,12 +369,21 @@ answers a perform is decided AT THE PERFORM by the runtime scope stack
     still dies loudly.
   * the interpreter's precedence at a perform is: in-scope handler frame >
     `with SYMBOL` runtime mapping > declared `= expr` default > error.
-    Native mirrors rungs 1, 3 and 4 exactly.  Rung 2 (the EFFECT_*
-    primitives) has NO native implementation, so any op declaring a
-    runtime mapping keeps demoting with that reason — the two ends are
-    never blurred, and no lowering can reach the new entry point with a
-    mapping in play.  (The interpreter has a fourth, HOST rung between
-    the frames and the mapping: handlers registered through
+    Native mirrors ALL four rungs (docs/threads_runtime.md): rung 2's
+    EFFECT_SPAWN/JOIN and EFFECT_MUTEX_* map to the pthreads-backed
+    primitives in metaxu_threads.c, reached through the op's
+    __effect_runtime$E$op thunk.  The mapping outranks the default, so
+    the thunk passed to mx_perform_or_default is the runtime-mapping
+    thunk when one is declared, else the default thunk; an op no scope
+    lists routes to its fallback thunk by a DIRECT call (no boundary).
+    A `with SYMBOL` outside the implemented set still demotes with a
+    reason.  EFFECT_SPAWN hands the closure's {fn, env} to
+    mx_thread_spawn: member lambdas are forced heap-env (the child
+    dereferences the env after the spawning frame moved on) and must be
+    zero-arg word-uniform (`i64 (ptr env)` is the C child entry's type);
+    Thread/Mutex extern-type values are opaque i64 handle words.  (The
+    interpreter has a fifth, HOST rung between the frames and the
+    mapping: handlers registered through
     MirInterpreter.register_effect_handler.  That is a Python embedding
     API — no compiled Metaxu program and none of the gates install one —
     so it has no native counterpart and cannot diverge for any program
@@ -1028,6 +1037,22 @@ _FVEC_BINOP_CODES = {"+": 0, "-": 1, "*": 2, "/": 3, "%": 4}
 _EFFECT_DEFAULT_PREFIX = "__effect_default$"
 _EFFECT_RUNTIME_PREFIX = "__effect_runtime$"
 
+# The body of an __effect_runtime$E$op thunk calls
+# __mx_effect_runtime$SYMBOL (hir.EFFECT_RUNTIME_CALL_PREFIX); these
+# SYMBOLs lower to the pthreads-backed C primitives in metaxu_threads.c
+# (docs/threads_runtime.md).  value: (C symbol, arity).  Thread[T]/Mutex
+# extern-type values are opaque i64 handle words; lock/unlock "return"
+# the unit word 0.  A `with SYMBOL` outside this table demotes with a
+# reason (the interpreter errors loudly at perform time there too).
+_EFFECT_PRIMITIVE_CALL_PREFIX = "__mx_effect_runtime$"
+_EFFECT_PRIMITIVES = {
+    "EFFECT_SPAWN": ("mx_thread_spawn", 1),         # (closure) -> handle
+    "EFFECT_JOIN": ("mx_thread_join", 1),           # (handle) -> result word
+    "EFFECT_MUTEX_CREATE": ("mx_mutex_create", 0),  # () -> handle
+    "EFFECT_MUTEX_LOCK": ("mx_mutex_lock", 1),      # (handle) -> unit
+    "EFFECT_MUTEX_UNLOCK": ("mx_mutex_unlock", 1),  # (handle) -> unit
+}
+
 # The synthesized module-constant initializer (hir.py): its globals_decl
 # names become module-level LLVM globals `@mx_g_<name>`; the native entry
 # wrapper (llvm_run) calls it before the entry point, exactly the
@@ -1075,6 +1100,14 @@ _RT_SIGS = {
     "mx_fvec_zip_map": ("ptr", ("ptr", "ptr", "ptr", "ptr", "i64")),
     "mx_fvec_to_str": ("ptr", ("ptr", "i64", "i64")),
     "mx_fvec_as_bytes": ("ptr", ("ptr",)),
+    # Threads runtime (metaxu_threads.c, docs/threads_runtime.md): opaque
+    # i64 handle words; spawn takes the closure's {fn, env} split into two
+    # pointer words (the env is compiler-forced heap/immortal).
+    "mx_thread_spawn": ("i64", ("ptr", "ptr")),
+    "mx_thread_join": ("i64", ("i64",)),
+    "mx_mutex_create": ("i64", ()),
+    "mx_mutex_lock": ("i64", ("i64",)),
+    "mx_mutex_unlock": ("i64", ("i64",)),
     # Algebraic effects runtime (metaxu_effects.c).
     "mx_handle": ("i64", ("ptr", "ptr", "ptr", "ptr", "ptr", "ptr", "ptr",
                           "i64")),
@@ -1714,19 +1747,29 @@ class _Info:
     none_def_vars: Set[str] = field(default_factory=set)
     # promote_matrix'd parameters (matmul's vector -> Mx1 embedding).
     promote_params: Tuple[str, ...] = ()
-    # (effect, op) -> __effect_default fn for performs statically resolved
-    # to their declared default (no handle site in the module lists the op,
-    # so no scope can ever intercept it -> a direct call, aggregates and
-    # all, exactly the interpreter's fallback).
+    # (effect, op) -> the op's FALLBACK fn for performs statically resolved
+    # to it (no handle site in the module lists the op, so no scope can
+    # ever intercept it -> a direct call, aggregates and all, exactly the
+    # interpreter's fallback).  The fallback is the op's `with SYMBOL`
+    # runtime-mapping thunk __effect_runtime$E$op when one is declared
+    # (it outranks the default, docs/threads_runtime.md), else the
+    # declared `= expr` default __effect_default$E$op.
     default_performs: Dict[Tuple[str, str], str] = field(default_factory=dict)
-    # (effect, op) -> __effect_default fn for performs whose op has a
-    # declared default AND appears in some handle scope: routing is a
+    # (effect, op) -> the op's fallback fn (same precedence as above) for
+    # performs whose op ALSO appears in some handle scope: routing is a
     # RUNTIME choice, lowered to mx_perform_or_default (increment 15).  The
     # boundary conventions are the ordinary perform ones (op-name kind
-    # cells, word/boundary-box encoding); the default fn's signature joins
+    # cells, word/boundary-box encoding); the fallback fn's signature joins
     # those same cells so the per-op thunk's decode is exact.
     dynamic_default_performs: Dict[Tuple[str, str], str] = field(
         default_factory=dict)
+    # Calls to __mx_effect_runtime$SYMBOL (the bodies of the
+    # __effect_runtime$E$op thunks): (dst, SYMBOL, args), lowered to the
+    # metaxu_threads.c primitives (docs/threads_runtime.md).  Validated in
+    # _check_consistency (SPAWN's closure argument especially) and emitted
+    # as direct mx_* calls.
+    effect_primitive_calls: List[Tuple[str, str, Tuple[str, ...]]] = field(
+        default_factory=list)
     # Module-constant names this function READS (used with no local def and
     # declared by __module_init): they load from @mx_g_<name> globals.
     global_reads: Set[str] = field(default_factory=set)
@@ -1996,33 +2039,31 @@ def _analyze_inner(info: _Info, module_names: Set[str],
                     for (opn, _p, _h) in rec.cases)
                 default_fn = f"{_EFFECT_DEFAULT_PREFIX}{peffect}${pop_name}"
                 runtime_fn = f"{_EFFECT_RUNTIME_PREFIX}{peffect}${pop_name}"
-                if not scoped and runtime_fn not in module_names \
-                        and default_fn in module_names:
-                    info.default_performs[(peffect, pop_name)] = default_fn
-                    continue
-                if scoped and runtime_fn not in module_names \
-                        and default_fn in module_names:
-                    # DYNAMIC DEFAULT ROUTING (increment 15): a scope MAY
-                    # intercept this op, and when none does the interpreter
-                    # falls back to the declared default.  The choice is
-                    # made at the perform, by the runtime's scope stack —
-                    # so the perform lowers to mx_perform_or_default, which
-                    # runs the SAME innermost-non-busy lookup and calls the
-                    # op's default thunk (on this stack) only where plain
-                    # mx_perform would have aborted.
-                    info.dynamic_default_performs[(peffect, pop_name)] = \
-                        default_fn
+                # The op's FALLBACK when no scope intercepts, in the
+                # interpreter's precedence order: the `with SYMBOL` runtime
+                # mapping thunk (docs/threads_runtime.md), else the declared
+                # `= expr` default.  Both share the same routing machinery.
                 if runtime_fn in module_names:
-                    # The op declares a `with SYMBOL` C-runtime mapping:
-                    # the interpreter routes unscoped performs to the
-                    # EFFECT_* primitive thunk (__effect_runtime$E$op),
-                    # while mx_perform would abort — demote, never guess
-                    # (the native threads/mutex runtime is a separate gap).
-                    info.add_reason(
-                        f"effect op {pop_name!r} maps to the C effect "
-                        f"runtime ({runtime_fn!r}); the interpreter routes "
-                        "unhandled performs to its EFFECT_* primitives, "
-                        "which have no native runtime")
+                    fallback_fn = runtime_fn
+                elif default_fn in module_names:
+                    fallback_fn = default_fn
+                else:
+                    fallback_fn = None
+                if not scoped and fallback_fn is not None:
+                    info.default_performs[(peffect, pop_name)] = fallback_fn
+                    continue
+                if scoped and fallback_fn is not None:
+                    # DYNAMIC FALLBACK ROUTING (increment 15): a scope MAY
+                    # intercept this op, and when none does the interpreter
+                    # falls back to the runtime mapping / declared default.
+                    # The choice is made at the perform, by the runtime's
+                    # scope stack — so the perform lowers to
+                    # mx_perform_or_default, which runs the SAME innermost-
+                    # non-busy lookup and calls the op's fallback thunk (on
+                    # this stack) only where plain mx_perform would have
+                    # aborted.
+                    info.dynamic_default_performs[(peffect, pop_name)] = \
+                        fallback_fn
                 if len(pargs) > _MAX_EFFECT_ARGS:
                     info.add_reason(
                         f"perform with {len(pargs)} arguments (native limit "
@@ -2283,6 +2324,24 @@ def _analyze_inner(info: _Info, module_names: Set[str],
                 f"direct call to handle-scope subfunction {callee!r}")
         elif callee in module_names:
             direct_calls.append((dst, callee, cargs))
+        elif callee.startswith(_EFFECT_PRIMITIVE_CALL_PREFIX):
+            # The body of an __effect_runtime$E$op thunk: a `with SYMBOL`
+            # effect-op mapping, lowered to the pthreads-backed primitives
+            # in metaxu_threads.c (docs/threads_runtime.md).
+            symbol = callee[len(_EFFECT_PRIMITIVE_CALL_PREFIX):]
+            prim = _EFFECT_PRIMITIVES.get(symbol)
+            if prim is None:
+                # The interpreter's "no shim for SYMBOL" error, statically.
+                info.add_reason(
+                    f"effect op mapped to runtime primitive {symbol!r}, "
+                    "which has no native implementation (available: "
+                    f"{', '.join(sorted(_EFFECT_PRIMITIVES))})")
+            elif len(cargs) != prim[1]:
+                info.add_reason(
+                    f"runtime primitive {symbol!r} called with "
+                    f"{len(cargs)} argument(s); it takes {prim[1]}")
+            else:
+                info.effect_primitive_calls.append((dst, symbol, cargs))
         elif bname in _PRINT_BUILTINS or bname in _MATH_EXTERNS or bname in _INLINE_BUILTINS:
             direct_calls.append((dst, callee, cargs))
         elif _is_runtime_builtin(bname or callee):
@@ -4646,6 +4705,71 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
     for name in sorted(set(info.def_count) | set(info.use_blocks)):
         if ty(name) == CONFLICT:
             probs.append(f"irreconcilable value kinds for {name!r}")
+
+    # Thread/Mutex runtime primitives (__mx_effect_runtime$SYMBOL inside
+    # the __effect_runtime$E$op thunks — docs/threads_runtime.md).  Handle
+    # words are opaque i64; EFFECT_SPAWN's closure argument must be
+    # invocable from the C child thread: every member lambda known,
+    # zero-argument, heap-env (the env outlives the spawning frame) and on
+    # the word-uniform ABI (`i64 (ptr env)` is exactly the C entry's
+    # `int64_t (*)(void *)`).  EFFECT_JOIN's result is the child's result
+    # word: any word kind decodes exactly; aggregates would need a copy
+    # out of the child's boundary box and demote for now.
+    for (pdst, symbol, pargs) in info.effect_primitive_calls:
+        if symbol == "EFFECT_SPAWN":
+            fk = ty(pargs[0])
+            if not _is_closure(fk):
+                probs.append(
+                    f"EFFECT_SPAWN argument {pargs[0]!r} has kind {fk}, "
+                    "not a statically-known closure")
+            else:
+                for m in _closure_members(fk):
+                    if sigs.get(m) is None or m not in module_names:
+                        probs.append(
+                            f"EFFECT_SPAWN of unknown lambda {m!r}")
+                        continue
+                    if len(sigs[m].params) != 0:
+                        probs.append(
+                            f"EFFECT_SPAWN lambda {m!r} declares "
+                            f"{len(sigs[m].params)} parameter(s); a spawned "
+                            "closure takes none")
+                    if m not in word_uniform:
+                        why = word_blocked.get(m)
+                        probs.append(
+                            f"EFFECT_SPAWN lambda {m!r} cannot take the "
+                            "word-uniform ABI the child thread invokes"
+                            + (f": {why}" if why else
+                               " (aggregate signature or non-participant)"))
+                    elif m not in closures.heap_env:
+                        # Defensive: the driver marks spawn-reaching
+                        # members heap-env before checks run.
+                        probs.append(
+                            f"EFFECT_SPAWN lambda {m!r} not marked heap-env "
+                            "(a stack env would dangle on the child thread)")
+            if ty(pdst) != I64:
+                probs.append(
+                    f"EFFECT_SPAWN result {pdst!r} promoted to {ty(pdst)} "
+                    "(thread handles are opaque i64 words)")
+        elif symbol == "EFFECT_JOIN":
+            if ty(pargs[0]) != I64:
+                probs.append(
+                    f"EFFECT_JOIN argument {pargs[0]!r} has kind "
+                    f"{ty(pargs[0])} (thread handles are opaque i64 words)")
+            if not _is_word_kind(ty(pdst)):
+                probs.append(
+                    f"EFFECT_JOIN result {pdst!r} has kind {ty(pdst)}, "
+                    "which does not decode from the child's result word "
+                    "(word kinds only; aggregates demote)")
+        else:  # EFFECT_MUTEX_CREATE / _LOCK / _UNLOCK
+            for a in pargs:
+                if ty(a) != I64:
+                    probs.append(
+                        f"{symbol} argument {a!r} has kind {ty(a)} "
+                        "(mutex handles are opaque i64 words)")
+            if ty(pdst) != I64:
+                probs.append(
+                    f"{symbol} result {pdst!r} promoted to {ty(pdst)} "
+                    "(opaque i64 handle / unit word)")
 
     # Struct-kinded params and returns are supported: params pass as ptr with
     # a callee byval-copy, returns are sret-style (see module docstring).
@@ -8368,6 +8492,68 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                         emit_direct_call(dst, starget, opargs, lines)
                     else:
                         raise _Unsupported(starget)
+                elif callee.startswith(_EFFECT_PRIMITIVE_CALL_PREFIX):
+                    # `with SYMBOL` thread/mutex primitives inside the
+                    # __effect_runtime$E$op thunks (docs/threads_runtime.md;
+                    # kinds validated by the consistency check).
+                    symbol = callee[len(_EFFECT_PRIMITIVE_CALL_PREFIX):]
+                    prim = _EFFECT_PRIMITIVES.get(symbol)
+                    if prim is None:  # unreachable: prescan demoted
+                        raise _Unsupported(
+                            f"runtime primitive {symbol!r} has no native "
+                            "implementation")
+                    csym = prim[0]
+                    mod.runtime_syms.add(csym)
+                    if symbol == "EFFECT_SPAWN":
+                        # Hand the closure's {fn, env} to the C runtime:
+                        # the child thread invokes fn(env) through the
+                        # word-uniform ABI; the env is a heap (immortal)
+                        # block by the driver's spawn-closure forcing.
+                        base = use(opargs[0], lines)
+                        fpp, envpp = fresh(), fresh()
+                        lines.append(
+                            f"  {fpp} = getelementptr inbounds "
+                            f"{_CLOSURE_PAIR_TY}, ptr {base}, i32 0, i32 0")
+                        fnv = fresh()
+                        lines.append(f"  {fnv} = load ptr, ptr {fpp}")
+                        lines.append(
+                            f"  {envpp} = getelementptr inbounds "
+                            f"{_CLOSURE_PAIR_TY}, ptr {base}, i32 0, i32 1")
+                        envv = fresh()
+                        lines.append(f"  {envv} = load ptr, ptr {envpp}")
+                        v = fresh()
+                        lines.append(
+                            f"  {v} = call i64 @mx_thread_spawn(ptr {fnv}, "
+                            f"ptr {envv})"
+                            "  ; start the closure on a new pthread; opaque "
+                            "immortal handle word")
+                        setval(dst, v, lines)
+                    elif symbol == "EFFECT_JOIN":
+                        a = use(opargs[0], lines)
+                        v = fresh()
+                        lines.append(
+                            f"  {v} = call i64 @mx_thread_join(i64 {a})"
+                            "  ; blocks; the child's result word, exactly "
+                            "once (double join raises)")
+                        # Decode the child's result word per dst's kind
+                        # (word kinds only; the consistency check demotes
+                        # aggregates).
+                        word_into(dst, v, lines)
+                    elif symbol == "EFFECT_MUTEX_CREATE":
+                        v = fresh()
+                        lines.append(
+                            f"  {v} = call i64 @mx_mutex_create()"
+                            "  ; ERRORCHECK mutex; opaque immortal handle "
+                            "word")
+                        setval(dst, v, lines)
+                    else:  # EFFECT_MUTEX_LOCK / EFFECT_MUTEX_UNLOCK
+                        a = use(opargs[0], lines)
+                        v = fresh()
+                        lines.append(
+                            f"  {v} = call i64 @{csym}(i64 {a})"
+                            "  ; blocks if held elsewhere / raises on "
+                            "misuse; unit word")
+                        setval(dst, v, lines)
                 elif bname in _NATIVE_RT_CALLS:
                     emit_rt_builtin(bname, dst, opargs, lines)
                 elif bname in _EXTERN_C_SIGS:
@@ -9456,6 +9642,21 @@ def emit_llvm(funcs: Sequence[MirFunc]) -> str:
         for m in _closure_members(sig.ret):
             if m in module_names:
                 closures.heap_env.add(m)
+
+    # SPAWNED CLOSURES (docs/threads_runtime.md): a closure kind reaching
+    # an __effect_runtime$ thunk's parameter is handed to
+    # mx_thread_spawn, whose child thread dereferences the env AFTER the
+    # spawning frame has moved on — force every member lambda heap-env
+    # (immortal, leak by design; it can never dangle).  Members are
+    # already participants (a thunk parameter IS a function parameter
+    # position), so a word-encodable signature puts them on the
+    # word-uniform ABI the C child entry invokes; the consistency check
+    # demotes anything that cannot take it.
+    for fname, fsig in sigs.items():
+        if fname.startswith(_EFFECT_RUNTIME_PREFIX):
+            for pk in fsig.params:
+                closures.heap_env.update(
+                    m for m in _closure_members(pk) if m in module_names)
 
     # WORD-UNIFORM PARTICIPATION (increment 13).  A lambda participates in
     # the indirect-call ABI — `i64 (ptr env, i64 args...)`, boundary word
