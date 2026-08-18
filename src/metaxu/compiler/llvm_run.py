@@ -8,7 +8,9 @@ The native metaxu runtime (``src/metaxu/runtime/native/metaxu_rt.c``:
 mx_vec_* / mx_str_* / mx_*_to_str, plus ``metaxu_effects.c``: mx_handle /
 mx_perform / mx_resume — the ucontext coroutine scheduler backing
 algebraic effects — and mx_try / mx_raise, the setjmp landing pads backing
-try/catch) is compiled via its cached build recipe
+try/catch, plus ``metaxu_threads.c``: mx_thread_spawn / mx_thread_join /
+mx_mutex_* — the pthreads-backed Thread/Mutex effect primitives, hence
+``-pthread`` on every link) is compiled via its cached build recipe
 and linked into every binary, so modules emitted with native vec/string
 builtin lowerings resolve their ``mx_*`` declares.  When the caller passes
 ``-fsanitize=address`` in ``clang_args`` the runtime object is rebuilt
@@ -56,13 +58,18 @@ __all__ = ["compile_and_run", "LlvmRunError"]
 
 
 def _runtime_object_paths(clang_args: tuple[str, ...]) -> list[str]:
-    """The native runtime objects to link (metaxu_rt.o + metaxu_effects.o),
-    ASan-instrumented when the module itself is being sanitized (separate
-    cache dir per flag set)."""
+    """The native runtime objects to link (metaxu_rt.o + metaxu_effects.o +
+    metaxu_threads.o), sanitizer-instrumented to match the module (separate
+    cache dir per flag set) so sanitized differential tests also check the
+    runtime's own memory/synchronization traffic."""
     if any("-fsanitize=address" in a for a in clang_args):
         objs = runtime_objects(
             build_dir=DEFAULT_BUILD_DIR.parent / "_build_asan",
             extra_cflags=("-fsanitize=address", "-fno-omit-frame-pointer"))
+    elif any("-fsanitize=thread" in a for a in clang_args):
+        objs = runtime_objects(
+            build_dir=DEFAULT_BUILD_DIR.parent / "_build_tsan",
+            extra_cflags=("-fsanitize=thread", "-fno-omit-frame-pointer"))
     else:
         objs = runtime_objects()
     return [str(o) for o in objs]
@@ -180,8 +187,11 @@ def compile_and_run(llvm_ir: str, entry: str = "main", *,
     with open(ll_path, "w") as fh:
         fh.write(full_ir)
 
+    # -pthread: every binary links the threads runtime (metaxu_threads.o's
+    # pthread_* symbols, docs/threads_runtime.md), whether or not the
+    # program spawns.
     compile_proc = subprocess.run(
-        ["clang", "-O2", "-Wno-override-module", ll_path,
+        ["clang", "-O2", "-Wno-override-module", "-pthread", ll_path,
          *_runtime_object_paths(clang_args), "-o", bin_path, "-lm",
          *clang_args],
         capture_output=True, text=True, timeout=timeout)

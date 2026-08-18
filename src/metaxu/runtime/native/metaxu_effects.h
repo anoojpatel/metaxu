@@ -89,12 +89,15 @@
  * this entry point calls `dflt(dflt_env, args)` and returns its value.
  * That mirrors the interpreter's perform precedence exactly:
  *
- *     in-scope handler frame  >  declared `= expr` default  >  error
+ *     in-scope handler frame  >  `with SYMBOL` runtime mapping
+ *                             >  declared `= expr` default  >  error
  *
- * (the interpreter's third rung, a `with SYMBOL` runtime mapping, sits
- * between the two and has no native implementation at all -- the compiler
- * demotes any op that declares one, so no lowering can reach this entry
- * point with a mapping in play).
+ * The two fallback rungs share this one entry point: the compiler passes
+ * the highest-precedence fallback the op declares -- the runtime-mapping
+ * thunk (__effect_runtime$E$op, whose body calls the metaxu_threads.c
+ * primitives) when a `with SYMBOL` clause exists, else the default thunk
+ * -- so the ordering is fixed at compile time and a scope in view still
+ * wins at run time (docs/threads_runtime.md § native lowering).
  *
  * THE DEFAULT RUNS ON THE PERFORMING STACK.  A default is an ordinary
  * expression, not a suspension: no coroutine is created, no scope is
@@ -127,8 +130,14 @@
  * __sanitizer_finish_switch_fiber when compiled with -fsanitize=address,
  * so sanitized differential tests see no false positives.
  *
- * Thread-unsafe by design (single-threaded native programs; the scope
- * stack is a process-wide global), like the rest of the native runtime.
+ * Threads (docs/threads_runtime.md): ALL scheduler state -- the scope
+ * stack, the pad chain, the fiber bookkeeping -- is _Thread_local, so
+ * each OS thread (the main thread and every mx_thread_spawn child from
+ * metaxu_threads.c) runs its own independent instance of this machinery.
+ * That is the effect-scope-isolation contract: scopes, pads and
+ * continuations NEVER cross threads (a spawned child starts with an
+ * empty scope stack), and no lock is needed because no object here is
+ * ever shared.
  *
  * ---------------------------------------------------------------------
  * DELIMITED FAILURE RECOVERY (try/catch) -- mx_try / mx_raise
