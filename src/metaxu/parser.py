@@ -1362,6 +1362,17 @@ class Parser:
         elif isinstance(pattern, ast.QualifiedFunctionCall):
             op_name = '.'.join(pattern.parts)
             args = pattern.arguments
+        elif isinstance(pattern, ast.SpawnExpression):
+            # `spawn` is a lexer keyword (the `spawn(e)` expression form),
+            # so a handler case labelled `spawn(f)` parses as a
+            # SpawnExpression rather than a FunctionCall.  In case position
+            # it IS the effect op named "spawn" with one parameter — e.g. a
+            # Thread.spawn handler overriding the EFFECT_SPAWN runtime
+            # mapping (docs/threads_runtime.md).  Without this arm the case
+            # silently degraded to a garbage op name ("SpawnExpressionat
+            # 0x...") that could never match a perform.
+            op_name = "spawn"
+            args = [pattern.function_expression]
         elif isinstance(pattern, ast.Variable):
             op_name = pattern.name
             args = []

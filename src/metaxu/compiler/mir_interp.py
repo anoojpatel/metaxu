@@ -324,43 +324,71 @@ class MxFile:
 
 
 class MxMutex:
-    """Runtime mutex behind the EFFECT_MUTEX_* primitives (effect_mapping.mx).
+    """Runtime mutex behind the EFFECT_MUTEX_* primitives
+    (docs/threads_runtime.md).
 
-    The interpreter executes on a single logical thread (spawned "threads"
-    run to completion at spawn — see _rt_thread_spawn), so a non-recursive
-    mutex has exact semantics: locking a mutex that is already locked can
-    never succeed later — it IS a deadlock — and unlocking an unlocked mutex
-    is a program error. Both fail loudly rather than no-op.
+    An owner-tracking wrapper over ``threading.Lock`` mirroring
+    PTHREAD_MUTEX_ERRORCHECK under REAL threads (spawned threads run
+    concurrently — see _rt_thread_spawn): locking a mutex held by ANOTHER
+    Metaxu thread BLOCKS until it is released; locking a mutex this thread
+    already holds is a loud deadlock error (EDEADLK); unlocking a mutex
+    this thread does not hold — unlocked, or held by someone else (EPERM
+    covers both) — is a loud error. Never a silent no-op.
+
+    ``owner`` is the holding LOGICAL Metaxu thread's ``_ThreadCtx`` (not a
+    Python thread id): a handle body runs on its own parked Python thread
+    but belongs to the same logical thread as the frame that installed the
+    handler, so lock/unlock pair up across that seam exactly as they do
+    natively, where handle bodies are fibers on the same OS thread.  Only
+    the owning thread ever writes ``owner`` while holding ``_lock``, so
+    the self-relock check (owner is my ctx) is race-free.
     """
-    __slots__ = ("mutex_id", "locked")
+    __slots__ = ("mutex_id", "_lock", "owner")
 
     def __init__(self, mutex_id: int) -> None:
         self.mutex_id = mutex_id
-        self.locked = False
+        self._lock = threading.Lock()
+        self.owner: "object | None" = None
 
     def __repr__(self) -> str:
-        state = "locked" if self.locked else "unlocked"
+        state = "locked" if self.owner is not None else "unlocked"
         return f"<Mutex#{self.mutex_id} {state}>"
 
 
 class MxThread:
-    """Runtime thread handle behind EFFECT_SPAWN / EFFECT_JOIN.
+    """Runtime thread handle behind EFFECT_SPAWN / EFFECT_JOIN
+    (docs/threads_runtime.md).
 
-    The single-threaded interpreter realizes one legal schedule of real
-    thread semantics: the spawned function runs to completion at spawn time
-    (as if the child ran immediately and finished before the parent resumed),
-    and join returns its stored result. Joining twice is an error (the handle
-    is consumed), matching pthread_join.
+    A REAL OS thread: the spawned closure starts on its own
+    ``threading.Thread`` at spawn time and runs concurrently with the
+    spawner; join blocks until it completes and returns its result exactly
+    once. Joining twice is a loud error (the handle is consumed), matching
+    pthread_join. A child that died is re-raised at join with the child's
+    own error. Unjoined handles are detached (daemon threads): program
+    termination does not wait for them. Handles are immortal — double-join
+    is a flag check, never a use-after-free.
     """
-    __slots__ = ("thread_id", "result", "joined")
+    __slots__ = ("thread_id", "thread", "result", "error", "joined",
+                 "_join_lock")
 
-    def __init__(self, thread_id: int, result: Any) -> None:
+    def __init__(self, thread_id: int) -> None:
         self.thread_id = thread_id
-        self.result = result
+        self.thread: "threading.Thread | None" = None
+        self.result: Any = None
+        self.error: "BaseException | None" = None
         self.joined = False
+        self._join_lock = threading.Lock()
+
+    def consume_join(self) -> bool:
+        """Atomically claim the single join; True if this caller got it."""
+        with self._join_lock:
+            if self.joined:
+                return False
+            self.joined = True
+            return True
 
     def __repr__(self) -> str:
-        state = "joined" if self.joined else "done"
+        state = "joined" if self.joined else "running"
         return f"<Thread#{self.thread_id} {state}>"
 
 
@@ -492,8 +520,11 @@ class _EffectScope:
 
     Each perform carries a private reply queue (`k.reply_q`) the body blocks
     on until the handler resumes it (("resume", value)) or aborts it
-    (("abort", _ScopeAbort)). Exactly one side runs at a time, so the
-    interpreter's shared state never sees true concurrency.
+    (("abort", _ScopeAbort)). Exactly one side of a SCOPE runs at a time,
+    so a scope's own state never sees concurrency; true concurrency exists
+    only between LOGICAL threads (EFFECT_SPAWN), whose handler stacks are
+    disjoint per _ThreadCtx and whose shared runtime state is lock-guarded
+    (docs/threads_runtime.md).
     """
     def __init__(self, frame_id: int) -> None:
         self.frame_id = frame_id
@@ -517,6 +548,32 @@ class _ScopeContinuation:
     used: bool = False
 
 
+class _ThreadCtx:
+    """Per-LOGICAL-Metaxu-thread interpreter state (docs/threads_runtime.md
+    § effect-scope isolation).
+
+    Each spawned Metaxu thread owns its OWN handler stacks: a child's
+    perform never routes to a handler installed on the spawning thread (a
+    handler scope is a delimited continuation rooted in the installing
+    thread's stack; crossing threads would suspend a foreign stack).
+
+    A handle-scope BODY thread is NOT a new logical thread: it ADOPTS its
+    creator's ctx (see _body_main), so nested handlers, busy flags and
+    mutex ownership all behave as one thread of control — mirroring the
+    native runtime, where handle bodies are fibers on the same OS thread.
+    Identity of this object doubles as the mutex-ownership token
+    (MxMutex.owner).
+    """
+    __slots__ = ("mir_handler_frames", "handler_stack")
+
+    def __init__(self) -> None:
+        # Delimited MIR-level handler frames installed by handle_scope ops
+        # on THIS logical thread; each is {"id", "effect", "cases", ...}.
+        self.mir_handler_frames: List[Dict[str, Any]] = []
+        # Dynamic (push_handler/pop_handler) stack, same locality.
+        self.handler_stack: List[Dict[str, tuple]] = []
+
+
 class _EffectAbort(Exception):
     """Control exception: a handler case returned WITHOUT calling resume.
 
@@ -534,12 +591,17 @@ class MirInterpreter:
         self._funcs: Dict[str, MirFunc] = {}
         self._effect_handlers: Dict[str, EffectHandler] = {}
         self._builtins: Dict[str, Callable[..., Any]] = {}
-        # Dynamic handler stack: list of {op_name -> (param_name, handler_func_name)}
-        self._handler_stack: List[Dict[str, tuple]] = []
-        # Delimited MIR-level handler frames installed by handle_scope ops:
-        # each is {"id", "effect", "cases": {op: (param, fn_name)}, "captured"}
-        self._mir_handler_frames: List[Dict[str, Any]] = []
+        # Handler stacks are PER LOGICAL METAXU THREAD (_ThreadCtx, reached
+        # through the `_mir_handler_frames` / `_handler_stack` properties):
+        # spawned threads get a fresh ctx (scope isolation), handle-body
+        # threads adopt their creator's. `self._tls` maps each Python
+        # thread to its current ctx.
+        self._tls = threading.local()
         self._next_frame_id: int = 1
+        # Guards the shared id counters (frame/mutex/thread/alloc ids) now
+        # that spawned threads run concurrently. The GIL makes single dict
+        # and list operations atomic, but `x += 1` is not.
+        self._id_lock = threading.Lock()
         # Trait impl index built from mangled function names at load():
         # method -> type_name -> {trait_name: func_name}. Dispatch is on the
         # receiver's RUNTIME type name (MxStruct.name / MxVariant.enum_name /
@@ -575,6 +637,35 @@ class MirInterpreter:
         self._register_builtins()
 
     # ------------------------------------------------------------------
+    # Per-logical-thread state (docs/threads_runtime.md)
+    # ------------------------------------------------------------------
+
+    def _ctx(self) -> _ThreadCtx:
+        """The calling Python thread's logical-thread context.
+
+        Lazily created for threads that never had one installed (the main
+        thread, embedder threads). Spawned Metaxu threads install a FRESH
+        ctx at start (_rt_thread_spawn); handle-body threads install their
+        creator's (handle_scope's _body_main)."""
+        ctx = getattr(self._tls, "ctx", None)
+        if ctx is None:
+            ctx = _ThreadCtx()
+            self._tls.ctx = ctx
+        return ctx
+
+    @property
+    def _mir_handler_frames(self) -> List[Dict[str, Any]]:
+        """MIR handler frames of the CURRENT logical thread (innermost
+        last). A property so the ~10 touch points stay written as before
+        while spawned threads each see their own stack."""
+        return self._ctx().mir_handler_frames
+
+    @property
+    def _handler_stack(self) -> List[Dict[str, tuple]]:
+        """Dynamic push/pop handler stack of the current logical thread."""
+        return self._ctx().handler_stack
+
+    # ------------------------------------------------------------------
     # Loading
     # ------------------------------------------------------------------
 
@@ -600,7 +691,9 @@ class MirInterpreter:
 
     def call(self, func_name: str, args: List[Any]) -> Any:
         # The budget is process-global, not per-thread, so handle-body
-        # threads started inside this extent inherit the same ceiling.
+        # threads AND spawned Metaxu threads started inside this extent
+        # inherit the same ceiling (each Python thread counts its own
+        # depth against it).
         with recursion_budget():
             self._ensure_globals()
             f = self._funcs.get(func_name)
@@ -1151,8 +1244,9 @@ class MirInterpreter:
                         captured[cname] = env[cval]
                 else:
                     captured[cname] = cval
-            frame_id = self._next_frame_id
-            self._next_frame_id += 1
+            with self._id_lock:
+                frame_id = self._next_frame_id
+                self._next_frame_id += 1
             scope = _EffectScope(frame_id)
             frame = {
                 "id": frame_id,
@@ -1166,8 +1260,15 @@ class MirInterpreter:
             if body_func is None:
                 raise InterpError(f"Missing handle body function {body_fn_name!r}")
 
+            creator_ctx = self._ctx()
+
             def _body_main(scope: _EffectScope = scope, body_func: MirFunc = body_func,
                            captured: Dict[str, Any] = captured) -> None:
+                # The body thread is the SAME logical Metaxu thread as its
+                # creator (a parked continuation, not a spawned thread):
+                # adopt the creator's handler stacks and mutex-ownership
+                # identity (docs/threads_runtime.md).
+                self._tls.ctx = creator_ctx
                 try:
                     val = self._call_func(body_func, [], dict(captured))
                 except _ScopeAbort as sa:
@@ -1520,8 +1621,9 @@ class MirInterpreter:
         return buf, start
 
     def _c_alloc(self, data: bytearray, readonly: bool = False) -> MxPtr:
-        aid = self._next_alloc_id
-        self._next_alloc_id += 1
+        with self._id_lock:
+            aid = self._next_alloc_id
+            self._next_alloc_id += 1
         self._c_heap[aid] = data
         return MxPtr(alloc_id=aid, offset=0, readonly=readonly)
 
@@ -1677,19 +1779,23 @@ class MirInterpreter:
     # ------------------------------------------------------------------
     # Runtime shims for `with SYMBOL`-mapped effect ops (effect_mapping.mx)
     # ------------------------------------------------------------------
-    # Single-threaded execution model, stated once: spawn runs the child
-    # function to completion immediately (a legal schedule of real thread
-    # semantics — child finishes before the parent resumes), so mutex
-    # lock/unlock are exact, not simulated: a lock that cannot be acquired
-    # NOW can never be acquired (deadlock -> loud error).
+    # REAL-THREADS execution model (docs/threads_runtime.md), stated once:
+    # spawn starts the closure on its own OS thread immediately and runs
+    # it CONCURRENTLY with the spawner; join blocks for completion and
+    # returns the result exactly once. Mutexes are ERRORCHECK: locking a
+    # mutex held by ANOTHER thread blocks; self-relock is a loud deadlock
+    # error; unlocking a mutex this thread does not hold is a loud error.
+    # Error message wording is shared byte-for-byte with the native
+    # runtime (metaxu_threads.c) — the caught value is language-visible.
 
     def _rt_mutex_create(self, args: List[Any]) -> Any:
         if args:
             raise InterpError(
                 f"EFFECT_MUTEX_CREATE takes no arguments, got {len(args)}")
-        m = MxMutex(self._next_mutex_id)
-        self._next_mutex_id += 1
-        return m
+        with self._id_lock:
+            mutex_id = self._next_mutex_id
+            self._next_mutex_id += 1
+        return MxMutex(mutex_id)
 
     def _rt_mutex_lock(self, args: List[Any]) -> Any:
         if len(args) != 1 or not isinstance(args[0], MxMutex):
@@ -1697,12 +1803,15 @@ class MirInterpreter:
                 f"EFFECT_MUTEX_LOCK expects one Mutex argument, got "
                 f"{[_runtime_type_name(a) for a in args]!r}")
         m = args[0]
-        if m.locked:
+        me = self._ctx()
+        # Only this logical thread can have set owner to `me`, so the
+        # self-relock check cannot race (PTHREAD_MUTEX_ERRORCHECK EDEADLK).
+        if m.owner is me:
             raise InterpError(
-                f"deadlock: EFFECT_MUTEX_LOCK on {m!r}, which is already "
-                f"locked — in the single-threaded interpreter no other "
-                f"thread can ever release it")
-        m.locked = True
+                f"deadlock: EFFECT_MUTEX_LOCK on <Mutex#{m.mutex_id}>: "
+                f"this thread already holds it")
+        m._lock.acquire()  # held by another thread: BLOCK until released
+        m.owner = me
         return UNIT
 
     def _rt_mutex_unlock(self, args: List[Any]) -> Any:
@@ -1711,10 +1820,15 @@ class MirInterpreter:
                 f"EFFECT_MUTEX_UNLOCK expects one Mutex argument, got "
                 f"{[_runtime_type_name(a) for a in args]!r}")
         m = args[0]
-        if not m.locked:
+        # One unified message for "unlocked" and "held by another thread":
+        # ERRORCHECK's EPERM covers both, and the momentary state of a
+        # mutex someone else holds is racy to print (docs/threads_runtime.md).
+        if m.owner is not self._ctx():
             raise InterpError(
-                f"EFFECT_MUTEX_UNLOCK on {m!r}, which is not locked")
-        m.locked = False
+                f"EFFECT_MUTEX_UNLOCK on <Mutex#{m.mutex_id}>: "
+                f"this thread does not hold it")
+        m.owner = None
+        m._lock.release()
         return UNIT
 
     def _rt_thread_spawn(self, args: List[Any]) -> Any:
@@ -1733,10 +1847,38 @@ class MirInterpreter:
             raise InterpError(
                 f"EFFECT_SPAWN: spawned function must take no arguments, "
                 f"but {fn.func_name!r} declares {len(target.param_names())}")
-        # Run the child to completion now (see execution model note above).
-        result = self._call_func(target, [], dict(fn.captured))
-        t = MxThread(self._next_thread_id, result)
-        self._next_thread_id += 1
+        with self._id_lock:
+            thread_id = self._next_thread_id
+            self._next_thread_id += 1
+        t = MxThread(thread_id)
+        captured = dict(fn.captured)
+
+        def _child_main() -> None:
+            # A spawned thread is a NEW logical thread: fresh handler
+            # stacks, so the child never sees the spawner's in-scope
+            # handlers (docs/threads_runtime.md § effect-scope isolation).
+            self._tls.ctx = _ThreadCtx()
+            try:
+                t.result = self._call_func(target, [], captured)
+            except RecursionError:
+                # Same conversion the entry point performs: never let a
+                # host RecursionError cross the language boundary, even
+                # from a child thread (see MirInterpreter.call).
+                t.error = self._recursion_exhausted(target)
+            except BaseException as exc:  # noqa: BLE001 — re-raised at join
+                # Captured, NOT propagated: a child failure must never
+                # unwind into the parent thread; join re-raises it.
+                t.error = exc
+
+        thread = threading.Thread(
+            target=_child_main, daemon=True,
+            name=f"mx-spawn-{thread_id}")
+        t.thread = thread
+        # Same stack-size discipline as handle-body threads (the child
+        # runs arbitrary Metaxu code under the same recursion budget; the
+        # budget itself is process-global, so the child inherits the
+        # ceiling installed around the entry point).
+        _start_with_stack_size(thread)
         return t
 
     def _rt_thread_join(self, args: List[Any]) -> Any:
@@ -1745,9 +1887,17 @@ class MirInterpreter:
                 f"EFFECT_JOIN expects one Thread argument, got "
                 f"{[_runtime_type_name(a) for a in args]!r}")
         t = args[0]
-        if t.joined:
-            raise InterpError(f"EFFECT_JOIN on {t!r}: thread already joined")
-        t.joined = True
+        if not t.consume_join():
+            raise InterpError(
+                f"EFFECT_JOIN on <Thread#{t.thread_id} joined>: "
+                f"thread already joined")
+        if t.thread is not None:
+            t.thread.join()
+        if t.error is not None:
+            # The child's own failure, surfaced on the joining thread —
+            # catchable when it was catchable in the child (InterpError),
+            # uncatchable otherwise, exactly as if raised here.
+            raise t.error
         return t.result
 
     def _builtin_vec_comprehension(self, n: Any, fn: Any, iterable: Any) -> Any:
