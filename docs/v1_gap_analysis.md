@@ -53,6 +53,12 @@ from 0 defines / 7 placeholders to 7 / 0; differentials (counter, join
 value, error messages) match the interpreter byte-for-byte and run clean
 under -fsanitize=thread and ASan (detect_leaks=0: handles are immortal
 by design). Error messages are shared byte-for-byte across engines.
+Spawn-boundary modes are now partially ENFORCED at compile time
+(`compiler/spawn_capture_check.py`): a closure passed to a `with
+EFFECT_SPAWN` op must not capture `@local` values or active `@mut`
+borrows (kinds `locality-spawn-capture`/`borrow-spawn-capture`, hard
+BorrowCheckErrors); see `docs/threads_runtime.md` § Modes for the exact
+enforced subset and what remains declared-only.
 
 Direction update (2026-08-13): the project targets LLVM for AOT native
 compilation (near-C, no GC; modes decide memory). Increment 1 is on this
