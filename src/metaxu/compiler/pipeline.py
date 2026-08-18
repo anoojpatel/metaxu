@@ -131,9 +131,19 @@ def build_context_from_source(source: str, file_path: str = "<mem>") -> PhaseCon
     # promotes them to TypeCheckError like every other `type-*` diagnostic.
     from .name_resolution import check_names
     name_errors = check_names(program, file_path=file_path)
-    if name_errors:
+    # Spawn-capture thread-safety: a closure passed to a `with EFFECT_SPAWN`
+    # operation must not capture @local values or active @mut borrows
+    # (compiler/spawn_capture_check.py, docs/threads_runtime.md § Modes).
+    # Runs over the mutable AST for the same reason name resolution does —
+    # the frozen PerformEffect drops its arguments — and files kinds
+    # "locality-spawn-capture"/"borrow-spawn-capture" on channel -2, which
+    # run_pipeline promotes to BorrowCheckError (no "type-" prefix).
+    from .spawn_capture_check import check_spawn_captures
+    spawn_errors = check_spawn_captures(program, file_path=file_path)
+    if name_errors or spawn_errors:
         merged = dict(tables.constraints)
-        merged[-2] = tuple(merged.get(-2, ())) + tuple(name_errors)
+        merged[-2] = (tuple(merged.get(-2, ())) + tuple(name_errors)
+                      + tuple(spawn_errors))
         tables = replace(tables, constraints=merged)
     return PhaseContext(
         source=source,
