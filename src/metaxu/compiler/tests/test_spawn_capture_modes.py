@@ -381,3 +381,145 @@ fn main() -> int {
 """
     result, _ = run_source(source)
     assert result == 6
+
+
+# ---------------------------------------------------------------------------
+# Rule B: locality follows the data (initializer-driven propagation)
+# ---------------------------------------------------------------------------
+# `let alias = secret` inherits secret's @local (with a provenance chain in
+# the diagnostic); assignment is sticky the same way; and the ONLY way to
+# make local data global is the explicit, CHECKED escape `let @global g =
+# v`, allowed exactly when the checker can verify the value contains no
+# frame references (scalar literals/arithmetic or a scalar type
+# annotation — mode crossing).
+
+def test_alias_of_local_is_tracked_through_let():
+    """The blind spot this closes: an unannotated rebinding used to launder
+    @local away entirely."""
+    with pytest.raises(BorrowCheckError) as exc:
+        compile_source(THREAD_EFFECT + """
+fn main() -> int {
+    let @local secret = make();
+    let alias = secret;
+    let t = perform Thread.spawn(|| { use_it(alias) });
+    0
+}
+fn make() -> int { 41 }
+fn use_it(n: int) -> int { n }
+""")
+    msg = str(exc.value)
+    assert "captures @local variable 'alias'" in msg
+    assert "'alias' was bound from 'secret'" in msg
+    assert "'secret' was declared @local" in msg
+    assert "locality follows the data" in msg
+
+
+def test_alias_chain_is_transitive_with_full_provenance():
+    with pytest.raises(BorrowCheckError) as exc:
+        compile_source(THREAD_EFFECT + """
+fn main() -> int {
+    let @local a = make();
+    let b = a;
+    let c = b;
+    let t = perform Thread.spawn(|| { use_it(c) });
+    0
+}
+fn make() -> int { 1 }
+fn use_it(n: int) -> int { n }
+""")
+    msg = str(exc.value)
+    assert "captures @local variable 'c'" in msg
+    assert "'c' was bound from 'b'" in msg
+    assert "'b' was bound from 'a'" in msg
+    assert "'a' was declared @local" in msg
+
+
+def test_assignment_makes_a_name_local_stickily():
+    """`x = local_thing` after a global binding: x is local from then on
+    (sticky over-approximation, erring toward safety)."""
+    with pytest.raises(BorrowCheckError) as exc:
+        compile_source(THREAD_EFFECT + """
+fn main() -> int {
+    let @local secret = make();
+    let mut x = 0;
+    x = secret;
+    let t = perform Thread.spawn(|| { use_it(x) });
+    0
+}
+fn make() -> int { 1 }
+fn use_it(n: int) -> int { n }
+""")
+    assert "captures @local variable 'x'" in str(exc.value)
+
+
+def test_explicit_global_escape_allowed_with_scalar_evidence():
+    """The checked coercion: the source was initialized from a scalar
+    literal, so its type crosses and `let @global g = v` is certified."""
+    result, _ = run_source(THREAD_EFFECT + """
+fn main() -> int {
+    let @local secret = 41;
+    let @global out = secret;
+    let t = perform Thread.spawn(|| { out + 1 });
+    perform Thread.join(t)
+}
+""")
+    assert result == 42
+
+
+def test_explicit_global_escape_allowed_with_type_annotation():
+    result, _ = run_source(THREAD_EFFECT + """
+fn main() -> int {
+    let @local secret: int = make();
+    let @global out = secret;
+    let t = perform Thread.spawn(|| { out + 1 });
+    perform Thread.join(t)
+}
+fn make() -> int { 41 }
+""")
+    assert result == 42
+
+
+def test_explicit_global_escape_rejected_without_evidence():
+    """No crossing evidence (call-result initializer, no annotation):
+    the escape is refused with guidance, not silently allowed."""
+    with pytest.raises(BorrowCheckError) as exc:
+        compile_source(THREAD_EFFECT + """
+fn main() -> int {
+    let @local v = make();
+    let @global g = v;
+    0
+}
+fn make() -> int { 7 }
+""")
+    msg = str(exc.value)
+    assert "cannot bind @global 'g' from @local 'v'" in msg
+    assert "scalar" in msg
+    assert "'v' was declared @local" in msg
+
+
+def test_unannotated_alias_of_crossing_local_still_propagates():
+    """Crossing evidence does NOT silently launder an unannotated alias:
+    `let a = secret` stays @local even for an int — only the EXPLICIT
+    @global spelling escapes. The visible mark is the point."""
+    with pytest.raises(BorrowCheckError) as exc:
+        compile_source(THREAD_EFFECT + """
+fn main() -> int {
+    let @local secret = 41;
+    let alias = secret;
+    let t = perform Thread.spawn(|| { alias + 1 });
+    0
+}
+""")
+    assert "captures @local variable 'alias'" in str(exc.value)
+
+
+def test_spawn_diagnostic_states_the_boundary_requirement():
+    with pytest.raises(BorrowCheckError) as exc:
+        compile_source(THREAD_EFFECT + """
+fn main() -> int {
+    let @local x = 1;
+    let t = perform Thread.spawn(|| { x });
+    0
+}
+""")
+    assert "spawn requires @global captures" in str(exc.value)

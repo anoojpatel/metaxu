@@ -104,6 +104,63 @@ fn returns_local() -> String {
 }
 ```
 
+### 2.2b Locality follows the data (Rule B)
+
+Metaxu's locality model is committed to **dataflow propagation with
+explicit, checked escape** — the OCaml-modes-shaped answer, chosen over
+"copying launders the mode" (unsound the moment regions are real: a
+copied struct that embeds a borrow still points into the frame) and over
+lifetimes-in-types (a different language). Three commitments define it:
+
+**1. Inference is silent; locality is sticky.** A binding with no
+locality annotation inherits its initializer's locality, and assignment
+propagates the same way. You never re-annotate to *stay* local:
+
+```metaxu
+let @local secret = make();
+let alias = secret;        // @local, inferred — locality follows the data
+x = secret;                // x is @local from here on (sticky)
+```
+
+**2. Escape is spelled, and checked.** The only way to turn local data
+global is the explicit `@global` binding, and it is a *coercion the
+compiler verifies*, not a request it obeys. The certificate is **mode
+crossing**: types that provably contain no reference into any frame
+region (int, bool, float, string) may cross; anything unverifiable is
+refused with guidance:
+
+```metaxu
+let @local n = 41;
+let @global out = n;       // ✓ int crosses — certified escape
+
+let @local v = make_thing();
+let @global g = v;         // ✗ locality-escape: "cannot verify the value
+                           //   contains no reference into the current
+                           //   frame; only scalar-typed values cross"
+```
+
+Crossing evidence never launders an *unannotated* alias — `let a = n`
+stays `@local` even for an int. The visible `@global` mark is the point:
+a reader who sees `@global` knows someone deliberately moved data out of
+the frame and the compiler certified it; no annotation means "whatever
+the data was, it still is."
+
+**3. Errors carry provenance, and boundaries state their requirement.**
+Sticky inference's classic failure is action-at-a-distance, so every
+diagnostic that fires on an inferred-local name walks the chain back to
+the declaration ("'c' was bound from 'b'; 'b' was bound from 'a'; 'a'
+was declared @local — locality follows the data"), and a boundary that
+demands `@global` says *why* (spawn: "the spawning frame may return
+while the thread runs").
+
+Implementation status: enforced today at the **spawn boundary**
+(`compiler/spawn_capture_check.py` — per-function, name-based
+propagation through `let`/assignment, syntactic crossing evidence;
+values flowing through data structures, field reads, or call results
+are documented as untraced). Checker-wide propagation through returns,
+fields and calls is the staged next step; `exclave` (below) remains the
+return-direction escape for region values.
+
 ### 2.3 Exclave Expressions
 
 Exclave expressions provide a way to initialize pre-declared variables in a parent region using values from an inner region. This includes both nested block regions and function returns:
