@@ -84,7 +84,21 @@ This document tracks high-level goals, status, and pointers across the new Pytho
     and frame allocator in the runtime ABI); CLIF-level effect dispatch
   - FFI/threads runtime (unblocks 05_unsafe_and_ffi, effect_mapping)
   - try/catch semantics (undefined in docs; needs a design decision)
-  - Full biunification with principal-type coalescing
+  - Backend consumption of principal types. The biunification engine
+    itself now exists (`simplesub.Biunifier`: subtype-constraint
+    propagation with multi-bound side tables, levels/extrusion for
+    let-polymorphism, principal-type coalescence into
+    union/intersection/mu types with the SimpleSub simplification
+    passes; `SimpleSubFacade.principal_type_of` exposes it lazily over
+    the pipeline's constraint stream, tests in
+    `compiler/tests/test_biunification.py`). Still pending: a
+    CompactType encoding for union/intersection types so coalesced
+    results can feed HIR/codegen, and per-call-site generalization in
+    the frozen-constraint emitter (today every function is one shared
+    monomorphic type, so engine-level let-polymorphism is unused by the
+    pipeline). Hard type-conflict diagnostics deliberately stay with
+    the adapter's constraint-graph detection — the engine's errors are
+    advisory until the two reporters are proven equivalent.
 
 ## Roadmap Details
 
