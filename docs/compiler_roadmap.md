@@ -229,13 +229,25 @@ python -m pytest -q src/metaxu/compiler/tests
 
 ## Immediate Next Actions
 
-- **Implement proper match lowering with pattern compilation and branching (HIGH PRIORITY)** - This will determine how we make progress lowering down and dealing with branching for match expressions
-- Add comprehensive borrow checker tests (UNIQUE vs EXCLUSIVE semantics, locality checking, global-to-local reference prevention, exclave)
-- Connect frozen AST borrow checker to full type checking pipeline
-- Integrate frozen AST borrow checker with HIR-level DropPlan generation
-- Add If-lowering golden test
-- Integrate selective CPS on a small example (read_u32) and extend CLIF for CPS
-- Implement trait dictionary desugaring + assoc types; add Iterator/next_or golden
+(Refreshed 2026-08-18; every item in the previous list — match lowering,
+borrow-checker tests, DropPlan integration, CPS, trait desugaring — has
+shipped. Current queue, in rough priority order:)
+
+- **Incremental module compilation (§9)**: step 1 is per-module codegen
+  units + signature hashing. Gated on the language rule that exported
+  functions require type annotations (owner decision).
+- **Backend consumption of principal types**: the biunification engine
+  produces them (simplesub.py); the constraint emitter needs per-call-site
+  instantiation (it currently shares one type per function) and a
+  CompactType encoding for ∨/∧ before kinds can be seeded from types.
+- **Native coverage chase**: next measured root is `run_program`'s own
+  return kinds in examples/app (see gap analysis § "What actually blocks
+  native coverage").
+- **Cranelift backend decision** (owner): retire codegen_clif.py (26%
+  coverage, non-executable) in favor of LLVM (80%+, running binaries)?
+- Thread-boundary polish: aggregate-kinded `EFFECT_JOIN` results, the
+  bare `spawn(e)` expression form, and richer send/sync mode enforcement
+  (v1 capture checks are in; see docs/threads_runtime.md § Modes).
 
 ---
 
