@@ -156,17 +156,54 @@ native fatal one, which still aborts the process.
   problem; the mutex primitives exist to prevent them, and the native
   test suite proves the mutex path clean under `-fsanitize=thread`.
 
-### Modes: declared vs enforced
+### Modes: what is enforced at the spawn boundary
 
 `spawn`'s declared signature is `fn() -> @global T` and it returns
-`@global Thread[T]`. What today's checkers actually enforce at these call
-sites is only the ordinary borrow/mode discipline of the surrounding
-code; no thread-specific rule (e.g. "captures must be @global", "no
-@local borrows may cross spawn") is enforced beyond it. That is a
-DOCUMENTED GAP, not a guarantee: the runtime keeps itself memory-safe
-(heap envs, immortal boxes/handles) regardless, but cross-thread aliasing
-of mutable state is not statically excluded. Do not claim send/sync-style
-checking anywhere until it exists.
+`@global Thread[T]`. A compile-time check
+(`compiler/spawn_capture_check.py`) now enforces the soundly-checkable
+subset of that promise on the closure argument of every spawn-mapped
+perform. "Spawn-mapped" is decided by the RUNTIME SYMBOL — any operation
+declared `with EFFECT_SPAWN`, whatever the effect or op is named — and
+the check is deliberately syntactic on that op: it applies even when a
+`handle` in scope overrides the runtime mapping, because a virtualized
+spawn that never really threads still promises thread-compatibility by
+its signature. Enforced, as hard `BorrowCheckError`s on the standard
+structured channel:
+
+* **No `@local` captures** (kind `locality-spawn-capture`): the spawned
+  closure must not capture a variable whose DECLARED locality is
+  `@local` (`let @local x` or an `@local` parameter), including through
+  a nested lambda inside the closure and through a named binding
+  (`let work = || ...; perform Thread.spawn(work)`). Rationale, cited in
+  the diagnostic: a `@local` value lives in the spawning frame's stack
+  region, and that frame may return while the child still runs, leaving
+  the capture dangling.
+* **No active `@mut` borrows** (kind `borrow-spawn-capture`): the
+  closure must not capture a binding that holds a live `&mut` reference
+  (`let r = &mut x` then capture `r`), nor capture a variable while such
+  a borrow of it is in scope — an exclusive borrow shared with another
+  thread breaks aliasing-XOR-mutation by construction.
+
+Still allowed, by design (and pinned by
+`tests/test_spawn_capture_modes.py`): capturing Mutex/Thread handles
+(opaque immortal runtime words), Vec and other shared-identity values —
+the mutex-counter pattern is THE intended idiom; races on unprotected
+shared identity remain the program's problem, with the mutex primitives
+and the TSan-verified native path as the answer — and plain copied
+scalars/strings/structs.
+
+What REMAINS unenforced: locality is the binding's declared mode
+(unannotated bindings default to global, exactly as the frozen borrow
+checker treats them), so an `@local` value aliased through an
+unannotated rebinding is not tracked; a closure reaching the spawn
+through a data structure, a call result, or the unqualified-call
+spelling of the op (`spawn(f)` without `perform`) is not traced; and
+there is deliberately no send/sync-style trait machinery — do not claim
+it exists. The check runs over the mutable post-desugar AST (the frozen
+`PerformEffect` drops its arguments — the same lossiness that put name
+resolution there, see `docs/name_resolution.md`) and the runtime keeps
+itself memory-safe (heap envs, immortal boxes/handles) regardless of
+what the checker misses.
 
 ## Native lowering (codegen_llvm)
 
