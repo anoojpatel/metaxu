@@ -5416,27 +5416,26 @@ fn main() -> int {
     assert "effect op 'get' has conflicting result kinds" in ir
 
 
-def test_effect_mapping_runtime_mapped_ops_demote_precisely():
-    # effect_mapping.mx after increment 14: the closure-boundary demotion
-    # is GONE (pairs box now); what remains is the real gap — its ops map
-    # to the C effect runtime (`with EFFECT_*`), which the interpreter
-    # serves through simulated thread/mutex primitives with no native
-    # counterpart.  mx_perform would abort where the interpreter
-    # succeeds, so every performing function demotes with that exact
-    # reason (never wrong code).
+def test_effect_mapping_runtime_mapped_ops_emit_thread_primitives():
+    # effect_mapping.mx is FULLY native now (docs/threads_runtime.md):
+    # its `with EFFECT_*` ops lower through the __effect_runtime$E$op
+    # thunks to the pthreads-backed metaxu_threads.c primitives.  No
+    # handle scope in the module lists the ops, so every perform is a
+    # DIRECT call to its thunk (no boundary, no mx_perform).
     ir = llvm_from_source(
         (REPO_ROOT / "examples" / "effect_mapping.mx").read_text())
-    assert "cannot cross the effect boundary" not in ir
-    assert re.search(
-        r"reason: effect op 'create' maps to the C effect runtime "
-        r"\('__effect_runtime\$Mutex\$create'\)", ir)
-    assert re.search(
-        r"reason: effect op 'lock' maps to the C effect runtime", ir)
-    # main (create/spawn/join) and its thread lambda (lock/unlock) both
-    # demote; the five __effect_runtime$ thunks stay placeholders on
-    # their unlinkable primitive callees.
-    assert re.search(r"@mx_main: placeholder", ir)
-    assert re.search(r"@mx_main_lambda\d+: placeholder", ir)
+    assert count_placeholders(ir) == 0
+    assert "call i64 @mx_thread_spawn(ptr" in ir
+    assert "call i64 @mx_thread_join(i64" in ir
+    assert "call i64 @mx_mutex_create()" in ir
+    assert "call i64 @mx_mutex_lock(i64" in ir
+    assert "call i64 @mx_mutex_unlock(i64" in ir
+    assert "@mx_perform(" not in ir  # all five performs statically routed
+    # The spawned lambda is invoked from the C child thread: it must be
+    # word-uniform (i64 (ptr env)) with a HEAP env (the child runs after
+    # the spawning frame moved on).
+    assert re.search(r"define i64 @mx_main_lambda\d+\(ptr %cl\.env\)", ir)
+    assert re.search(r"heap env for \w+ -> main\$lambda\d+", ir)
 
 
 # ---------------------------------------------------------------------------
@@ -5655,13 +5654,7 @@ fn main() -> int {
     assert "define internal i64 @mxfx.dflt." not in ir
 
 
-def test_runtime_mapped_op_in_a_scope_still_demotes():
-    # The interpreter's precedence puts the `with SYMBOL` runtime mapping
-    # BETWEEN the handler frames and the default.  Native has no EFFECT_*
-    # primitives at all, so an op declaring a mapping must keep demoting
-    # even now that the rung below it (the declared default) is lowerable —
-    # the two ends must never be blurred into one route.
-    ir = llvm_from_source("""
+_SCOPED_MAPPED_OP_SRC = """
 effect Locky = {
     fn create() -> int with EFFECT_MUTEX_CREATE
 }
@@ -5675,13 +5668,28 @@ fn main() -> int {
     print(a);
     0
 }
-""")
-    assert "maps to the C effect runtime" in ir
-    assert "@mx_perform_or_default(" not in ir  # header comment aside
-    ir2 = llvm_from_source(
-        (REPO_ROOT / "examples" / "effect_mapping.mx").read_text())
-    assert "maps to the C effect runtime" in ir2
-    assert "@mx_perform_or_default(" not in ir2
+"""
+
+
+def test_runtime_mapped_op_in_a_scope_routes_dynamically():
+    # The interpreter's precedence puts the `with SYMBOL` runtime mapping
+    # BETWEEN the handler frames and the default.  A scope in this module
+    # lists the op, so routing is a RUNTIME decision: the perform lowers
+    # to mx_perform_or_default with the op's __effect_runtime$E$op thunk
+    # as the fallback — a handler in scope wins, and only otherwise does
+    # the mapping's primitive run (docs/threads_runtime.md).
+    ir = llvm_from_source(_SCOPED_MAPPED_OP_SRC)
+    assert count_placeholders(ir) == 0
+    assert ir.count("call i64 @mx_perform_or_default(") == 1
+    assert "@mxfx.dflt.__effect_runtime_Locky_create" in ir
+
+
+@needs_clang
+def test_native_scoped_mapped_op_handler_wins(tmp_path):
+    """Virtualization preserved natively: the in-scope handler intercepts
+    the mapped op (prints 5, never creates a real mutex) — differential
+    against the interpreter."""
+    assert_native_matches_interp(_SCOPED_MAPPED_OP_SRC, tmp_path)
 
 
 @needs_clang
@@ -7652,3 +7660,182 @@ fn main() -> int {
 """, tmp_path)
     assert count_placeholders(ir) == 0
     assert re.search(r"@mx___handler_Throw_throw_catchy_ho\d+_hs\d+", ir)
+
+
+# ---------------------------------------------------------------------------
+# Real OS threads (docs/threads_runtime.md): EFFECT_SPAWN/JOIN + mutexes
+# ---------------------------------------------------------------------------
+# The interpreter (test_threads.py) is the semantics reference; these
+# differentials run the SCHEDULE-INDEPENDENT programs natively — final
+# counter values, join results, error messages — never interleavings
+# (the spec's determinism policy).  ASan runs use detect_leaks=0: thread
+# and mutex handles (and spawn-crossing closure envs/boxes) are IMMORTAL
+# by design, so ASan proves no-UAF/no-double-free, not leak-freedom.
+
+_TSAN_PROBE: list[bool] = []
+
+
+def tsan_available() -> bool:
+    """True when clang can link -fsanitize=thread (TSan runtime installed)."""
+    if not _TSAN_PROBE:
+        if shutil.which("clang") is None:
+            _TSAN_PROBE.append(False)
+        else:
+            import tempfile, os
+            with tempfile.TemporaryDirectory(prefix="metaxu_tsan_probe_") as d:
+                c = os.path.join(d, "t.c")
+                with open(c, "w") as fh:
+                    fh.write("int main(void){return 0;}\n")
+                proc = subprocess.run(
+                    ["clang", "-fsanitize=thread", c,
+                     "-o", os.path.join(d, "t")],
+                    capture_output=True, text=True)
+                _TSAN_PROBE.append(proc.returncode == 0)
+    return _TSAN_PROBE[0]
+
+
+needs_tsan = pytest.mark.skipif(
+    not tsan_available(),
+    reason="clang TSan runtime not available (compile probe failed)")
+
+_THREAD_EFFECTS_DECL = """
+extern type Thread[T];
+extern type Mutex;
+
+effect Thread = {
+    fn spawn[T](f: fn() -> @global T) -> @global Thread[T] with EFFECT_SPAWN
+    fn join[T](thread: @global Thread[T]) -> @global T with EFFECT_JOIN
+}
+
+effect Mutex = {
+    fn create() -> @global Mutex with EFFECT_MUTEX_CREATE
+    fn lock(mutex: @global Mutex) -> () with EFFECT_MUTEX_LOCK
+    fn unlock(mutex: @global Mutex) -> () with EFFECT_MUTEX_UNLOCK
+}
+"""
+
+# N=4 threads x M=250 mutex-guarded increments of ONE Vec slot (Vec has
+# identity semantics on both engines, so the captured vec IS shared
+# state).  Final value 1000 is schedule-independent.  KEEP THE LOCK/UNLOCK
+# LINES: deleting them was the TSan non-vacuity experiment — TSan then
+# reports a data race on the slot (mx_vec_get/mx_vec_set from two child
+# threads; see the commit message that landed the native thread path) —
+# and the test below asserts the MUTEXED program is TSan-clean.
+_THREAD_COUNTER_SRC = _THREAD_EFFECTS_DECL + """
+fn main() -> int {
+    let m = perform Mutex.create();
+    let @mut counter = Vec.new();
+    counter.push(0);
+    let @mut handles = Vec.new();
+    let @mut i = 0;
+    while i < 4 {
+        let t = perform Thread.spawn(|| {
+            let @mut j = 0;
+            while j < 250 {
+                perform Mutex.lock(m);
+                counter[0] = counter[0] + 1;
+                perform Mutex.unlock(m);
+                j = j + 1
+            };
+            0
+        });
+        handles.push(t);
+        i = i + 1
+    };
+    let @mut k = 0;
+    while k < 4 {
+        perform Thread.join(handles[k]);
+        k = k + 1
+    };
+    print(counter[0].to_string());
+    0
+}
+"""
+
+_THREAD_JOIN_VALUE_SRC = _THREAD_EFFECTS_DECL + """
+fn main() -> int {
+    let x = 40;
+    let t = perform Thread.spawn(|| { x + 2 });
+    let v = perform Thread.join(t);
+    print(v.to_string());
+    0
+}
+"""
+
+# Every catchable thread/mutex error path, in one deterministic program:
+# unlock-not-held, self-relock (EDEADLK), double join, and a child
+# failure surfacing catchably at join.  The caught messages are
+# language-visible values, so native output must be byte-identical to
+# the interpreter's.
+_THREAD_ERRORS_SRC = _THREAD_EFFECTS_DECL + """
+fn main() -> int {
+    let m = perform Mutex.create();
+    let a = try { perform Mutex.unlock(m); "no error" } catch e { e };
+    print(a);
+    perform Mutex.lock(m);
+    let b = try { perform Mutex.lock(m); "no error" } catch e { e };
+    print(b);
+    perform Mutex.unlock(m);
+    let t = perform Thread.spawn(|| { 5 });
+    perform Thread.join(t);
+    let c = try { perform Thread.join(t); "no error" } catch e { e };
+    print(c);
+    let tf = perform Thread.spawn(|| {
+        let @mut v = Vec.new();
+        v.pop()
+    });
+    let d = try { perform Thread.join(tf); "no failure" } catch e {
+        "caught: " + e
+    };
+    print(d);
+    0
+}
+"""
+
+
+@needs_clang
+def test_native_thread_counter_matches_interp(tmp_path):
+    ir = assert_native_matches_interp(_THREAD_COUNTER_SRC, tmp_path)
+    assert count_placeholders(ir) == 0
+    assert "call i64 @mx_thread_spawn(ptr" in ir
+
+
+@needs_clang
+def test_native_join_value_matches_interp(tmp_path):
+    ir = assert_native_matches_interp(_THREAD_JOIN_VALUE_SRC, tmp_path)
+    assert count_placeholders(ir) == 0
+
+
+@needs_clang
+def test_native_thread_error_paths_match_interp(tmp_path):
+    """The caught error messages (unlock-not-held, deadlock self-relock,
+    double join, child failure at join) are byte-identical across
+    engines."""
+    ir = assert_native_matches_interp(_THREAD_ERRORS_SRC, tmp_path)
+    assert count_placeholders(ir) == 0
+
+
+@needs_asan
+def test_native_thread_counter_asan_no_uaf(tmp_path):
+    """ASan (detect_leaks=0: handles/envs are immortal by design): exit 0
+    proves no use-after-free / no double-free across the spawn/join and
+    mutex traffic."""
+    assert_native_matches_interp_asan_boxes(_THREAD_COUNTER_SRC, tmp_path)
+
+
+@needs_tsan
+def test_native_thread_counter_tsan_clean(tmp_path):
+    """-fsanitize=thread (runtime objects TSan-instrumented too, see
+    llvm_run._runtime_object_paths): a TSan report changes the exit code
+    (66) and breaks the stdout/exit differential, so passing == zero
+    reports.  Non-vacuity: with the lock/unlock lines deleted from the
+    counter source, TSan reports a data race on the Vec slot (verified
+    during development; see the landing commit message)."""
+    result, expected_out = interp_run(_THREAD_COUNTER_SRC)
+    assert result in (UNIT, 0)
+    ir = llvm_from_source(_THREAD_COUNTER_SRC)
+    exit_code, stdout = compile_and_run(
+        ir, "main", workdir=str(tmp_path),
+        clang_args=("-fsanitize=thread",))
+    assert stdout == expected_out
+    assert exit_code == 0
