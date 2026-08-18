@@ -26,11 +26,16 @@ RUNTIME_C = NATIVE_DIR / "metaxu_rt.c"
 RUNTIME_H = NATIVE_DIR / "metaxu_rt.h"
 EFFECTS_C = NATIVE_DIR / "metaxu_effects.c"
 EFFECTS_H = NATIVE_DIR / "metaxu_effects.h"
+THREADS_C = NATIVE_DIR / "metaxu_threads.c"
+THREADS_H = NATIVE_DIR / "metaxu_threads.h"
 DEFAULT_BUILD_DIR = NATIVE_DIR / "_build"
 
 # C11, optimized, PIC so the object can also land in shared objects later.
+# -pthread everywhere (not just metaxu_threads.c): it defines _REENTRANT
+# consistently, and the effects runtime's _Thread_local state is part of
+# the threads contract (docs/threads_runtime.md).
 CFLAGS: tuple[str, ...] = (
-    "-std=c11", "-O2", "-g", "-fPIC", "-Wall", "-Wextra",
+    "-std=c11", "-O2", "-g", "-fPIC", "-Wall", "-Wextra", "-pthread",
 )
 
 
@@ -106,17 +111,47 @@ def compile_effects_runtime(
     return obj
 
 
+def _threads_mtime() -> float:
+    # metaxu_threads.c includes metaxu_effects.h (mx_try/mx_raise: the
+    # child's landing pad and the catchable errors).
+    return max(p.stat().st_mtime
+               for p in (THREADS_C, THREADS_H, EFFECTS_H, Path(__file__)))
+
+
+def compile_threads_runtime(
+    build_dir: Optional[Path] = None,
+    clang: str = "clang",
+    extra_cflags: Sequence[str] = (),
+) -> Path:
+    """Compile metaxu_threads.c (the pthreads-backed Thread/Mutex effect
+    primitives, docs/threads_runtime.md) to metaxu_threads.o and return
+    its path.  Same contract as compile_runtime: mtime-cached, extra
+    flags should come with a dedicated ``build_dir``."""
+    build_dir = Path(build_dir) if build_dir is not None else DEFAULT_BUILD_DIR
+    build_dir.mkdir(parents=True, exist_ok=True)
+    obj = build_dir / "metaxu_threads.o"
+    if obj.exists() and obj.stat().st_mtime >= _threads_mtime():
+        return obj
+    _run(
+        [clang, *CFLAGS, *extra_cflags, "-c", str(THREADS_C), "-o", str(obj)],
+        "compiling metaxu_threads.c",
+    )
+    return obj
+
+
 def runtime_objects(
     build_dir: Optional[Path] = None,
     clang: str = "clang",
     extra_cflags: Sequence[str] = (),
-) -> tuple[Path, Path]:
+) -> tuple[Path, Path, Path]:
     """Every native runtime object a metaxu binary links: (metaxu_rt.o,
-    metaxu_effects.o)."""
+    metaxu_effects.o, metaxu_threads.o)."""
     return (
         compile_runtime(build_dir=build_dir, clang=clang,
                         extra_cflags=extra_cflags),
         compile_effects_runtime(build_dir=build_dir, clang=clang,
+                                extra_cflags=extra_cflags),
+        compile_threads_runtime(build_dir=build_dir, clang=clang,
                                 extra_cflags=extra_cflags),
     )
 
@@ -126,15 +161,17 @@ def build_archive(
     clang: str = "clang",
     ar: str = "ar",
 ) -> Path:
-    """Build libmetaxu_rt.a (via ``ar rcs``; both runtime objects) and
+    """Build libmetaxu_rt.a (via ``ar rcs``; all runtime objects) and
     return its path."""
     obj = compile_runtime(build_dir=build_dir, clang=clang)
     fx = compile_effects_runtime(build_dir=build_dir, clang=clang)
+    thr = compile_threads_runtime(build_dir=build_dir, clang=clang)
     lib = obj.parent / "libmetaxu_rt.a"
     if _is_fresh(lib) and lib.stat().st_mtime >= max(
-            obj.stat().st_mtime, fx.stat().st_mtime):
+            obj.stat().st_mtime, fx.stat().st_mtime, thr.stat().st_mtime):
         return lib
-    _run([ar, "rcs", str(lib), str(obj), str(fx)], "archiving libmetaxu_rt.a")
+    _run([ar, "rcs", str(lib), str(obj), str(fx), str(thr)],
+         "archiving libmetaxu_rt.a")
     return lib
 
 

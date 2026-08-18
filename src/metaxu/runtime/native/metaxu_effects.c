@@ -7,7 +7,8 @@
  *   interpreter                          this file
  *   -----------------------------------  --------------------------------
  *   handle body thread (parked)          body coroutine (ucontext + stack)
- *   _mir_handler_frames (global list)    g_top scope stack (innermost first)
+ *   _mir_handler_frames (per logical     g_top scope stack (innermost
+ *     thread; see _ThreadCtx)              first; _Thread_local)
  *   _find_mir_frame (busy skip, effect   mx__find_scope
  *     match, innermost op match)
  *   _pump_scope PERFORM -> case call     dispatcher call in mx_handle /
@@ -27,9 +28,10 @@
  *
  * Perform precedence (mir_interp's `perform` op, mirrored in
  * mx__perform_impl): innermost non-busy handler frame, then the declared
- * `= expr` default, then a loud error.  The interpreter's `with SYMBOL`
- * runtime mapping sits between the first two and has no native
- * counterpart; the compiler demotes every op declaring one.
+ * `with SYMBOL` runtime mapping, then the declared `= expr` default, then
+ * a loud error.  The two fallback rungs share one mechanism here: the
+ * compiler passes the op's fallback thunk (runtime-mapping thunk if one
+ * is declared, else the default thunk) as mx_perform_or_default's dflt.
  *
  * Control-transfer invariants (why this is safe):
  *   - all handler-side activity for a scope S (mx_handle's dispatch, every
@@ -150,30 +152,45 @@ struct mx_scope {
     mx_scope *prev;                 /* global scope stack link */
 };
 
-/* Global scope stack, innermost scope first (single-threaded by design). */
-static mx_scope *g_top = NULL;
+/* ALL scheduler state is _Thread_local (docs/threads_runtime.md): each OS
+ * thread -- the main thread and every mx_thread_spawn child -- owns its
+ * own scope stack, pad chain and fiber bookkeeping, zero-initialized at
+ * thread start.  That is the effect-scope-isolation contract: a spawned
+ * child starts with NO scopes in view (its unhandled performs route to
+ * runtime mappings / defaults, never to a scope rooted in another
+ * thread's stack), and the per-fiber pad-chain semantics are unchanged
+ * WITHIN each thread.  Fibers (ucontext coroutines) never migrate
+ * between threads, so thread-locals read inside a fiber always belong to
+ * the thread that runs it. */
 
-/* The currently running fiber's stack ({NULL, 0} = the main thread before
- * its bounds are learned, or unknown); maintained across every switch so
- * mx_perform can stamp continuations with the stack they park on. */
-static mx_stackinfo g_cur = {NULL, 0};
-/* Main-thread stack bounds, learned from the first coroutine entered
- * directly from the main context (ASan reports them at fiber entry). */
-static mx_stackinfo g_main = {NULL, 0};
+/* Scope stack, innermost scope first (per thread). */
+static _Thread_local mx_scope *g_top = NULL;
+
+/* The currently running fiber's stack ({NULL, 0} = the thread's root
+ * context before its bounds are learned, or unknown); maintained across
+ * every switch so mx_perform can stamp continuations with the stack they
+ * park on. */
+static _Thread_local mx_stackinfo g_cur = {NULL, 0};
+/* Root-stack bounds of THIS thread, learned from the first coroutine
+ * entered directly from the root context (ASan reports them at fiber
+ * entry). */
+static _Thread_local mx_stackinfo g_main = {NULL, 0};
 
 /* Landing-pad chain OF THE RUNNING FIBER (innermost first).  A longjmp may
  * only target a frame on the stack it runs on, so this -- like g_cur -- is
  * saved and restored around every context switch and starts empty on a
  * fresh coroutine.  See "COMPOSITION WITH EFFECT SCOPES" in the header. */
-static mx_pad *g_pad = NULL;
+static _Thread_local mx_pad *g_pad = NULL;
 /* The scope whose BODY COROUTINE is currently running (NULL on an owner
- * stack / the main thread): the target of a failure that finds no pad. */
-static mx_scope *g_fiber = NULL;
-/* The message of the raise currently in flight.  A global, not a pad
- * field: the pad is an automatic object and writing it between setjmp and
- * longjmp would make its value indeterminate.  Only ever read immediately
+ * stack / the thread's root context): the target of a failure that finds
+ * no pad. */
+static _Thread_local mx_scope *g_fiber = NULL;
+/* The message of the raise currently in flight.  Not a pad field: the pad
+ * is an automatic object and writing it between setjmp and longjmp would
+ * make its value indeterminate.  Thread-local because a raise always
+ * resolves on the thread it was raised on.  Only ever read immediately
  * after a longjmp lands, and each raise heap-copies its own text. */
-static char *g_raise_msg = NULL;
+static _Thread_local char *g_raise_msg = NULL;
 
 static void mx__fatal(const char *msg) {
     /* stdout FIRST: abort() does not flush it, and a native program that
@@ -422,12 +439,15 @@ int64_t mx_handle(mx_body_fn body, void *body_env,
  *
  * Precedence mirrored from mir_interp (perform op, in order):
  *   1. innermost non-busy scope handling (effect, op)   -> park + dispatch
- *   2. declared `= expr` default                        -> plain call HERE
- *   3. loud "Unhandled effect operation" error
- * The interpreter's rung between 1 and 2 -- a `with SYMBOL` runtime
- * mapping (__effect_runtime$E$op -> the EFFECT_* primitives) -- has no
- * native implementation; codegen_llvm demotes every op that declares one,
- * so no emitted call can reach here with a mapping in play.
+ *   2. declared `with SYMBOL` runtime mapping           -> plain call HERE
+ *   3. declared `= expr` default                        -> plain call HERE
+ *   4. loud "Unhandled effect operation" error
+ * Rungs 2 and 3 share this one entry point: an op can declare a mapping,
+ * a default, or neither, and the compiler passes the HIGHER-precedence
+ * thunk it has (the __effect_runtime$E$op thunk when a mapping exists --
+ * its body calls the metaxu_threads.c primitives -- else the
+ * __effect_default$E$op thunk) as `dflt`, so the ordering is decided at
+ * compile time and this runtime only ever sees one fallback.
  *
  * The default runs RIGHT HERE, on the performing stack: a default is an
  * expression, not a suspension.  Nothing is parked, no scope is pushed,
