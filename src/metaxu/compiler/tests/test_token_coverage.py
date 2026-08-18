@@ -275,7 +275,11 @@ def test_every_production_is_reachable():
 #: subtraction, never the two statements `a` and `-b`.  Binary `&` (bitwise
 #: and) joined that family; `^`, `|`, `<<` and `>>` cannot conflict at all,
 #: because none of them can START an expression.
-_EXPECTED_SHIFT_REDUCE_CONFLICTS = 164
+#:
+#: 164 -> 162: removing the bare `spawn(e)` expression form (the keyword
+#: and its production are gone; threads go through the Thread effect)
+#: removed the two conflicts its production contributed.
+_EXPECTED_SHIFT_REDUCE_CONFLICTS = 162
 
 
 def _grammar_build_warnings() -> list[str]:

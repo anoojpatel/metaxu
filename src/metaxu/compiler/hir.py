@@ -364,7 +364,6 @@ AST_NODE_TRIAGE: dict[str, tuple[str, str]] = {
     "GetType": (UNSUPPORTED, "compile-time type reflection is not implemented"),
     "KernelAnnotation": (UNSUPPORTED, "GPU kernels have no runtime"),
     "PointerDereference": (UNSUPPORTED, "raw pointer dereference has no HIR/MIR representation"),
-    "SpawnExpression": (UNSUPPORTED, "the threads runtime is out of scope for v1 (docs/v1_gap_analysis.md)"),
     "ToDevice": (UNSUPPORTED, "GPU device transfer has no runtime"),
     "TypeMatchExpression": (UNSUPPORTED, "compile-time matching on types is not implemented"),
 }
