@@ -446,15 +446,32 @@ def test_logic_binop_is_truthiness_not_bitwise():
     assert "and i64" not in ir
 
 
-def test_match_fail_calls_abort():
+def test_match_fail_raises_the_interpreter_message():
+    """match_fail lowers to mx_raise with the interpreter's exact wording
+    (catchable by an enclosing try; fatal with no pad in flight, matching
+    an uncaught InterpError)."""
     f = make_func("m", [
         block([("params", ()), ("match_fail", "no pattern matched")], ("br", 1)),
         block([("let", "u", ("const_ty", "Unit"), ())], ("ret", "u")),
     ])
     ir = emit_llvm([f])
-    assert "declare void @abort() noreturn" in ir
-    assert "call void @abort()" in ir
+    assert "call void @mx_raise(ptr" in ir
+    assert "match failure in 'm': no pattern matched" in ir
     assert "unreachable" in ir
+
+
+def test_match_fail_in_a_mono_clone_names_the_origin():
+    """A monomorphization clone's match_fail names the PRE-specialization
+    function (MirFunc.origin_name), binding the same string the
+    unspecialized interpreter binds."""
+    f = make_func("classify$Int", [
+        block([("params", ()), ("match_fail", "no pattern matched")], ("br", 1)),
+        block([("let", "u", ("const_ty", "Unit"), ())], ("ret", "u")),
+    ])
+    f.origin_name = "classify"
+    ir = emit_llvm([f])
+    assert "match failure in 'classify': no pattern matched" in ir
+    assert "match failure in 'classify$Int'" not in ir
 
 
 # ---------------------------------------------------------------------------
@@ -7335,19 +7352,51 @@ fn main() -> int {
 """
 
 
-def test_try_whose_extent_can_match_fail_demotes_with_the_real_reason():
-    # HONEST DEMOTION, not a wrong answer: the interpreter CATCHES a match
-    # failure ("match failure in 'classify': no pattern matched"), and that
-    # message embeds the MIR function name -- which the native lane's
-    # monomorphization pass renames.  Emitting it would bind a different
-    # string than the interpreter binds; omitting it would fail to catch
-    # what the interpreter catches.  So the try demotes, naming the blocker.
+def test_try_around_match_emits_and_names_the_origin():
+    """The old blanket demotion ("a try whose extent can reach a match_fail
+    demotes") is gone: match_fail raises through mx_raise with the
+    pre-monomorphization origin name, so the message is byte-identical to
+    the interpreter's and the try lowers like any other."""
     ir = llvm_from_source(_TRY_AROUND_MATCH_SRC)
-    assert "try/catch demoted:" in ir
-    assert "match failure in 'classify'" in ir
-    assert "monomorphization renames" in ir
-    # ...and nothing pretends to lower it
-    assert "@mxtc.body." not in ir
+    assert "try/catch demoted:" not in ir
+    assert "call i64 @mx_try(" in ir
+    # the match_fail block is present and raises with the ORIGINAL name
+    assert "match failure in 'classify': no pattern matched" in ir
+
+
+@needs_clang
+def test_native_try_catches_match_failure_like_the_interpreter(tmp_path):
+    """Differential for the formerly-demoted shape: a non-exhaustive match
+    inside a try, in a GENERIC function the native lane monomorphizes.
+    The catch must bind the interpreter's exact message (embedding the
+    pre-specialization name), and the surrounding program continues."""
+    assert_native_matches_interp("""
+enum Color { Red, Green, Blue }
+
+fn pick<T>(c: Color, fallback: T) -> int {
+    match c {
+        Red -> 1,
+        Green -> 2
+    }
+}
+
+fn main() -> int {
+    let caught = try {
+        pick(Blue, 7)
+    } catch e {
+        print(e);
+        9
+    };
+    print(caught);
+    let fine = try {
+        pick(Red, 7)
+    } catch e {
+        0 - 1
+    };
+    print(fine);
+    0
+}
+""", tmp_path)
 
 
 def test_example_04_gains_its_try_parse_defines():

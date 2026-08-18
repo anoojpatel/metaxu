@@ -496,10 +496,10 @@ TRY/CATCH (increment 19) — delimited failure recovery, docs/try_catch.md:
   * WHAT IS CATCHABLE is a contract shared with the runtime
     (metaxu_effects.h): every InterpError the native backend can produce
     inside a delimited extent is raised through mx_raise with the
-    interpreter's own wording.  ONE exception: `match_fail`, whose message
-    embeds the MIR function name that monomorphization renames — a try
-    whose extent can reach one DEMOTES (see _compute_try_extent_blockers)
-    rather than binding a different string than the interpreter binds.
+    interpreter's own wording — match_fail included: its message embeds
+    the function's PRE-monomorphization origin name (MirFunc.origin_name),
+    so classify$Int raises "match failure in 'classify': ..." exactly as
+    the unspecialized reference run does.
     Failures the interpreter does NOT raise InterpError for stay fatal on
     both sides (assert -> AssertionError, division by zero ->
     ZeroDivisionError, double resume -> RuntimeError).
@@ -1066,6 +1066,7 @@ def _mx_global(name: str) -> str:
 
 # Native runtime symbol signatures (metaxu_rt.h ABI): name -> (ret, params).
 _RT_SIGS = {
+    "mx_raise": ("void", ("ptr",)),   # _Noreturn; follows an `unreachable`
     "mx_vec_new": ("ptr", ()),
     "mx_vec_push": ("void", ("ptr", "i64")),
     "mx_vec_pop": ("i64", ("ptr",)),
@@ -1194,9 +1195,8 @@ _HEADER = (
     ";   landing pad whose chain is per-fiber (so it composes with the\n"
     ";   coroutine scheduler), binds the failure's PLAIN message text --\n"
     ";   byte-identical to the interpreter's InterpError.message -- and\n"
-    ";   tears down every effect scope the failure escaped.  A try whose\n"
-    ";   extent can reach a match_fail demotes (that message embeds the\n"
-    ";   MIR function name, which monomorphization renames);\n"
+    ";   tears down every effect scope the failure escaped.  match_fail\n"
+    ";   raises catchably too, naming the pre-monomorphization origin;\n"
     ";   RECLAMATION (increment 8): owned strings (produced, provably\n"
     ";   non-retained) are freed at redefinition + frame exit via shadow\n"
     ";   slots (literals never freed); unique payload boxes (entry-block\n"
@@ -2248,9 +2248,6 @@ def _analyze_inner(info: _Info, module_names: Set[str],
                 elif f.name in scopes.bad:
                     info.add_reason(scopes.bad[f.name])
                 else:
-                    blocker = scopes.try_blocked.get(rhs[1])
-                    if blocker:
-                        info.add_reason(f"try/catch demoted: {blocker}")
                     for n in scopes.env_fields.get(rhs[1], ()):
                         add_use(site_rec.cap_vals.get(n, n), bi)
                 add_def(dst, bi)
@@ -2889,11 +2886,6 @@ class _ScopeTable:
     op_args: Dict[Tuple[str, int], str] = field(default_factory=dict)
     sites_of_owner: Dict[str, List[str]] = field(default_factory=dict)
     bad: Dict[str, str] = field(default_factory=dict)  # fn name -> reason
-    # try site -> why its owner must demote: a failure its DYNAMIC EXTENT
-    # can produce that the interpreter catches but the native runtime keeps
-    # fatal (see _compute_try_extent_blockers).  Empty = the extent's whole
-    # failure surface is catchable with the interpreter's exact messages.
-    try_blocked: Dict[str, str] = field(default_factory=dict)
 
     def _mark(self, store, key, kind: str) -> bool:
         cur = store.get(key, I64)
@@ -3124,147 +3116,7 @@ def _build_scope_table(funcs: Sequence[MirFunc]) -> _ScopeTable:
             what = "try" if rec.kind == "try" else "handle-scope"
             table.mark_bad(rec, f"{what} subfunctions reference names "
                                 f"absent from the site's captures: {missing}")
-    # 5. Try sites: is every failure their extent can raise CATCHABLE
-    # natively, with the interpreter's exact message?
-    table.try_blocked = _compute_try_extent_blockers(funcs, table)
     return table
-
-
-def _compute_try_extent_blockers(funcs: Sequence[MirFunc],
-                                 table: _ScopeTable) -> Dict[str, str]:
-    """Per try site: the reason (if any) its owner must demote.
-
-    A native `try` must catch EXACTLY what the interpreter's `try_scope`
-    catches — never more, never less (docs/try_catch.md).  The runtime side
-    of that is settled in metaxu_effects.h: every InterpError the native
-    backend can actually produce inside a delimited extent is raised through
-    mx_raise with the interpreter's own message text, EXCEPT ONE.
-
-    That one is ``match_fail``.  The interpreter raises
-    ``match failure in 'F': no pattern matched`` — the message embeds the
-    MIR function name, and the native lane runs the MONOMORPHIZATION pass,
-    which renames a specialized generic (``classify`` -> ``classify$Int``).
-    Emitting the message with the name codegen sees would bind a DIFFERENT
-    string than the interpreter binds; emitting nothing would silently fail
-    to catch what the interpreter catches.  Both are divergences, so a try
-    whose extent can reach a match_fail demotes instead, and the fix (when
-    someone wants it) is to carry the pre-monomorphization name into MIR.
-
-    The extent is the transitive callee closure of the try's BODY function
-    (a failure in the CATCH body escapes this try — an enclosing try's own
-    extent covers it, since that walk descends into both subfunctions of a
-    nested try site).  Edges: direct module calls, handle-site bodies and
-    handler cases, nested try bodies and catches, and an op's declared
-    default / runtime-mapping thunk.  Callees outside the module (builtins,
-    extern C) are leaves: none of them can match_fail.  Two shapes make the
-    extent UNKNOWABLE and therefore block as well — an indirect closure call
-    (the target set is not statically fixed here) and a trait/static
-    dispatch with no candidate implementation in the module.
-    """
-    if not any(rec.kind == "try" for rec in table.sites.values()):
-        return {}   # no try in the module: nothing to decide
-    by_name = {f.name: f for f in funcs}
-    impls_by_method: Dict[str, List[str]] = {}
-    impls_by_type_method: Dict[Tuple[str, str], List[str]] = {}
-    for name in by_name:
-        parsed = parse_impl_method_name(name)
-        if parsed is None:
-            continue
-        _trait, tyname, method = parsed
-        impls_by_method.setdefault(method, []).append(name)
-        impls_by_type_method.setdefault((tyname, method), []).append(name)
-
-    local: Dict[str, str] = {}
-    edges: Dict[str, Set[str]] = {}
-    for f in funcs:
-        defined: Set[str] = set()
-        for b in f.blocks:
-            for op in b.ops:
-                if op[0] == "params":
-                    defined.update(op[1])
-                elif op[0] == "let" and len(op) == 4:
-                    defined.add(op[1])
-                elif op[0] == "perform" and len(op) >= 7:
-                    defined.add(op[1])
-        why = ""
-        out: Set[str] = set()
-        for b in f.blocks:
-            for op in b.ops:
-                k = op[0]
-                if k == "match_fail":
-                    why = why or (
-                        f"its extent can reach the match failure in "
-                        f"{f.name!r}, which stays fatal natively (the "
-                        "interpreter's message embeds the MIR function "
-                        "name, which monomorphization renames)")
-                elif k == "perform" and len(op) >= 7:
-                    for pref in ("__effect_default", "__effect_runtime"):
-                        cand = f"{pref}${op[2]}${op[3]}"
-                        if cand in by_name:
-                            out.add(cand)
-                elif k == "let" and len(op) == 4:
-                    rhs = op[2]
-                    rk = rhs[0]
-                    if rk == "call":
-                        callee = rhs[1]
-                        if callee in defined:
-                            why = why or (
-                                f"its extent contains an indirect closure "
-                                f"call in {f.name!r}, whose target set is "
-                                "not statically fixed")
-                        elif callee.startswith("__trait$"):
-                            m = callee[len("__trait$"):]
-                            cands = list(impls_by_method.get(m, ()))
-                            if m in by_name:
-                                cands.append(m)
-                            if not cands:
-                                why = why or (
-                                    f"its extent contains the dynamic trait "
-                                    f"call {callee!r} in {f.name!r} with no "
-                                    "candidate implementation in the module")
-                            out.update(cands)
-                        elif callee.startswith("__static$"):
-                            parts = callee.split("$")
-                            cands: List[str] = []
-                            if len(parts) >= 4:
-                                cands = list(impls_by_type_method.get(
-                                    (parts[2], parts[3]), ()))
-                                dotted = f"{parts[2]}.{parts[3]}"
-                                if dotted in by_name:
-                                    cands.append(dotted)
-                            if not cands:
-                                why = why or (
-                                    f"its extent contains the static call "
-                                    f"{callee!r} in {f.name!r} with no "
-                                    "candidate implementation in the module")
-                            out.update(cands)
-                        elif callee in by_name:
-                            out.add(callee)
-                    elif rk == "handle_scope":
-                        out.add(rhs[1])
-                        out.update(hfn for (_o, _p, hfn) in rhs[3])
-                    elif rk == "try_scope":
-                        out.add(rhs[1])
-                        out.add(rhs[2])
-        local[f.name] = why
-        edges[f.name] = {c for c in out if c in by_name}
-
-    blocked: Dict[str, str] = {n: r for n, r in local.items() if r}
-    changed = True
-    while changed:
-        changed = False
-        for name in by_name:
-            if name in blocked:
-                continue
-            for c in edges.get(name, ()):
-                if c in blocked:
-                    blocked[name] = blocked[c]
-                    changed = True
-                    break
-    return {site: blocked[rec.body_fn]
-            for site, rec in table.sites.items()
-            if rec.kind == "try" and rec.body_fn in blocked}
-
 
 # ---------------------------------------------------------------------------
 # Module-wide trait-impl table and static trait-call resolution
@@ -8053,8 +7905,19 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                              "entry (shared one-word heap cell)")
                 continue
             if opk == "match_fail":
-                mod.uses_abort = True
-                lines.append(f"  call void @abort()  ; match_fail: {op[1]}")
+                # Raise with the interpreter's EXACT wording — the display
+                # name is the pre-monomorphization origin, so classify$Int
+                # raises "match failure in 'classify': ..." just like the
+                # unspecialized reference run, and a catch binds the same
+                # bytes. Catchable via the mx_try pad chain like every
+                # other failure; with no pad in flight mx_raise is fatal,
+                # matching an uncaught InterpError.
+                fname = f.origin_name or f.name
+                msg = f"match failure in {fname!r}: {op[1]}"
+                g = mod.intern_string(msg)
+                mod.runtime_syms.add("mx_raise")
+                lines.append(f"  call void @mx_raise(ptr {g})"
+                             f"  ; match_fail: {op[1]}")
                 lines.append("  unreachable")
                 terminated = True
                 break

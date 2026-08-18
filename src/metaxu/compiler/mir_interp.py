@@ -977,7 +977,13 @@ class MirInterpreter:
                             MxVector(elements=(x,)) for x in val.elements))
             elif tag == "match_fail":
                 detail = op[1] if len(op) > 1 else "no pattern matched"
-                raise InterpError(f"match failure in {f.name!r}: {detail}")
+                # origin_name (pre-monomorphization) so interpreting
+                # monomorphized MIR raises the SAME message the
+                # unspecialized reference run raises — and the native
+                # backend can bind the identical string (codegen_llvm
+                # emits mx_raise with this exact text).
+                fname = f.origin_name or f.name
+                raise InterpError(f"match failure in {fname!r}: {detail}")
             elif tag == "perform":
                 # ("perform", result_dst, effect_name, op_name, arg_names, resume_block, resume_slot)
                 dst = op[1]

@@ -42,6 +42,15 @@ class _FuncLowerer:
 
     def __init__(self, f: HFun) -> None:
         self.f = f
+        # Pre-monomorphization display name for runtime messages ("" when
+        # this is not a monomorphization clone). Subfunction names embed
+        # the containing function's (possibly specialized) sym, so their
+        # origin substitutes the original sym back in — producing exactly
+        # the name the unspecialized interpreter synthesizes. A subfunction
+        # name that does not embed the sym is identical in both lanes and
+        # keeps origin "".
+        origin = getattr(f, "origin_sym", None)
+        self._origin_pair = (str(f.sym), str(origin)) if origin else None
         self.blocks: List[MirBlock] = [MirBlock(ops=[], term=("unreachable",))]
         self.cur: int = 0
         self.state = _ANFState()
@@ -142,6 +151,17 @@ class _FuncLowerer:
             if slot is not None:
                 self.emit(("cell_wrap", slot))
 
+    def _sub_origin(self, sub_name: str) -> str:
+        """The unspecialized interpreter's name for this subfunction ("" =
+        same as sub_name): the containing clone's sym substituted back to
+        its origin (see __init__)."""
+        if self._origin_pair is None:
+            return ""
+        mono, origin = self._origin_pair
+        if mono in sub_name:
+            return sub_name.replace(mono, origin)
+        return ""
+
     # ------------------------------------------------------------------
     # Sub-function compilation (lambdas, effect handler cases)
     # ------------------------------------------------------------------
@@ -170,7 +190,8 @@ class _FuncLowerer:
         self.ret_bb, self.ret_var = saved_ret_bb, saved_ret_var
         self._pending_lambdas.append(
             MirFunc(name=name, ty_sig=ty_sig, blocks=sub_blocks,
-                    suspending=suspending, mut_params=tuple(mut_params))
+                    suspending=suspending, mut_params=tuple(mut_params),
+                    origin_name=self._sub_origin(name))
         )
 
     # ------------------------------------------------------------------
@@ -732,10 +753,12 @@ def lower_hir_to_mir(funcs: Sequence[HFun], borrow_errors: List[Any] | None = No
         # Epilogue: drops + ret (joined with any early returns via ret_bb)
         plan = drops.get(str(f.sym))
         fl.finish_body(res, plan.drop_at_end if plan else ())
+        origin = getattr(f, "origin_sym", None)
         out.append(MirFunc(name=str(f.sym), ty_sig=f.ret_ty, blocks=fl.blocks,
                            suspending=bool(f.body.suspends),
                            globals_decl=tuple(getattr(f, "globals_decl", ()) or ()),
                            mut_params=_mut_param_names(f),
+                           origin_name=str(origin) if origin else "",
                            location=_span_location(f.body.span)))
         # Emit any lambdas that were compiled during lowering
         out.extend(fl._pending_lambdas)

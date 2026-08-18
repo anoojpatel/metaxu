@@ -547,6 +547,12 @@ class HFun:
     where_cls: list[ClassConstraint]
     body: HExpr
     param_modes: dict[str, ModeInfo] | None = None
+    # Pre-monomorphization name, set by monomorphize.py on its clones
+    # (identity$Int, catch_$ho1). Runtime failure messages that embed a
+    # function name (match_fail) use this so the monomorphized native lane
+    # binds the SAME string the unspecialized interpreter binds. None for
+    # every non-clone.
+    origin_sym: Any = None
     # Module-level constants this function initializes (only set on the
     # synthesized __module_init function): the interpreter runs it before
     # the entry point and publishes these names as globals.
