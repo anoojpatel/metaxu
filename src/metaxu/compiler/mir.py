@@ -26,6 +26,12 @@ class MirFunc:
     # write a rebound struct param back to the caller ONLY for these names;
     # plain params keep value semantics (rebinding stays callee-local).
     mut_params: tuple = ()
+    # Pre-monomorphization display name ("" = same as name). Runtime
+    # failure messages that embed a function name (match_fail) use this so
+    # the monomorphized native lane and interp-on-monomorphized-MIR runs
+    # bind the SAME string the unspecialized interpreter binds. Not printed
+    # by dump_mir (golden MIR text is name-keyed and unchanged).
+    origin_name: str = ""
     # errors.SourceLocation of the function's DECLARATION, carried so a
     # runtime error can name the function it happened in. Individual ops
     # have no locations: MIR ops are positional tuples (and are dumped

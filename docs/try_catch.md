@@ -116,16 +116,18 @@ either: `assert` failure (`AssertionError`), integer division by zero
 no interpreter counterpart at all: allocation failure, NULL receivers,
 capacity overflow, internal formatting invariants, `swapcontext` failure.
 
-One asymmetry remains and is handled by **demotion, not by guessing**: a
-match failure IS catchable in the interpreter, but its message embeds the
-MIR function name (`match failure in 'classify': no pattern matched`) and
-the native lane runs monomorphization, which renames a specialized generic
-(`classify` -> `classify$Int`).  Emitting the message with the name codegen
-sees would bind a *different* string; emitting nothing would fail to catch
-what the interpreter catches.  So `codegen_llvm` computes the try body's
-transitive extent and demotes the owner when it can reach a `match_fail`
-(or an indirect call, whose target set is not statically fixed).  Lifting
-this needs the pre-monomorphization name carried into MIR.
+The last asymmetry is gone (2026-08-18): a match failure IS catchable in
+the interpreter, and its message embeds a function name that
+monomorphization used to rename (`classify` -> `classify$Int`).  The
+pre-monomorphization name is now carried through MIR
+(`HFun.origin_sym` -> `MirFunc.origin_name`, with subfunction names
+substituted back so handler/lambda subfunctions match the unspecialized
+lane too), so `match_fail` lowers to `mx_raise` with the interpreter's
+exact wording — `match failure in 'classify': no pattern matched` — from
+the clone as well.  The former extent walk that demoted any try whose
+body could transitively reach a `match_fail` (or an indirect call, which
+made the extent unknowable) is deleted: with every failure now raising
+byte-identical text, extent knowledge is unnecessary.
 
 ### Memory
 

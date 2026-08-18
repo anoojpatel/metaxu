@@ -98,8 +98,10 @@ inside a handle body survives a perform/resume round trip, and a failure on
 a body coroutine escapes to its owner stack as the interpreter's
 `("error", exc)` message does). Catchable native failures are raised with
 the interpreter's exact wording so the catch binding is byte-identical; the
-one asymmetry, `match_fail` (its message embeds the MIR function name that
-monomorphization renames), demotes the try instead of guessing.
+one asymmetry, `match_fail`, was closed on 2026-08-18: the
+pre-monomorphization name rides through MIR (`MirFunc.origin_name`), so a
+specialized clone raises the interpreter's exact message and the former
+try-extent demotion walk is deleted.
 See docs/try_catch.md § "Native lowering".
 
 Native Vec element boxes (2026-08-14): a native Vec slot is one 8-byte

@@ -375,6 +375,7 @@ class _Mono:
             where_cls=list(original.where_cls),
             body=_clone_expr(original.body),
             param_modes=dict(original.param_modes) if original.param_modes else None,
+            origin_sym=getattr(original, "origin_sym", None) or name,
         )
         # Memoize BEFORE processing the body so recursive instantiations
         # (f<Int> calling f with the same T) resolve to this clone.
@@ -427,6 +428,7 @@ class _Mono:
             where_cls=list(original.where_cls),
             body=_clone_expr(original.body),
             param_modes=dict(original.param_modes) if original.param_modes else None,
+            origin_sym=getattr(original, "origin_sym", None) or name,
         )
         self.clones_in_order.append(clone)
         self._ho_stack.add(name)
