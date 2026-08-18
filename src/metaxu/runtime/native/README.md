@@ -17,13 +17,23 @@ current inline lowering of runtime builtins.
 - `metaxu_effects.h` / `metaxu_effects.c` — the algebraic-effects runtime:
   delimited single-shot deep-handler continuations on ucontext coroutines
   (`mx_handle` / `mx_perform` / `mx_resume`), matching the interpreter's
-  parked-thread model; ASan fiber-annotated; leak-clean scheduler
+  parked-thread model; ASan fiber-annotated; leak-clean scheduler.  All
+  scheduler state is `_Thread_local`, so each OS thread runs its own
+  independent instance (docs/threads_runtime.md)
+- `metaxu_threads.h` / `metaxu_threads.c` — pthreads-backed Thread/Mutex
+  effect primitives (`mx_thread_spawn` / `mx_thread_join` /
+  `mx_mutex_*`): real OS threads behind the `with EFFECT_*` mappings,
+  ERRORCHECK mutexes, immortal handles; error wording shared byte for
+  byte with the interpreter (spec: docs/threads_runtime.md)
 - `build.py` — build recipe: `compile_runtime()` /
-  `compile_effects_runtime()` return the cached `.o`s (`runtime_objects()`
-  both), `build_archive()` the `.a`; also runnable as a script
-- Tests: `src/metaxu/compiler/tests/test_native_runtime.py` and
+  `compile_effects_runtime()` / `compile_threads_runtime()` return the
+  cached `.o`s (`runtime_objects()` all three), `build_archive()` the
+  `.a`; also runnable as a script
+- Tests: `src/metaxu/compiler/tests/test_native_runtime.py`,
   `src/metaxu/compiler/tests/test_native_effects_rt.py` (C drivers
-  replaying the interpreter's effect-shape catalogue)
+  replaying the interpreter's effect-shape catalogue), and the native
+  thread differentials in `test_codegen_llvm.py` (semantics reference:
+  `test_threads.py`)
 
 ## ABI
 
