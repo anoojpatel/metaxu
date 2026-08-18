@@ -698,9 +698,13 @@ def _merge_parts(parts: List[PType], positive: bool) -> PType:
             (not positive and isinstance(p, PInter)) else (p,)
         for sp in subparts:
             if positive and isinstance(sp, PBot):
-                continue
+                continue  # identity element of union
             if not positive and isinstance(sp, PTop):
-                continue
+                continue  # identity element of intersection
+            if positive and isinstance(sp, PTop):
+                return PTop()  # absorbing element of union
+            if not positive and isinstance(sp, PBot):
+                return PBot()  # absorbing element of intersection
             if sp not in seen:
                 seen.add(sp)
                 flat.append(sp)
@@ -828,8 +832,10 @@ class Biunifier:
 
     def _error(self, lhs: CompactType, rhs: CompactType, node_id: Optional[int]) -> None:
         a, b = sorted((_short(lhs), _short(rhs)))
-        self.errors.append(BiunifyError(
-            f"type mismatch: one value is required to be {a} and {b}", node_id))
+        message = f"type mismatch: one value is required to be {a} and {b}"
+        if any(e.message == message and e.node_id == node_id for e in self.errors):
+            return  # constraining both directions reports the clash once
+        self.errors.append(BiunifyError(message, node_id))
 
     def constrain(self, lhs: CompactType, rhs: CompactType,
                   node_id: Optional[int] = None) -> None:
@@ -1072,7 +1078,7 @@ class Biunifier:
     # -- principal types ------------------------------------------------------
 
     def principal_ptype(self, ty: CompactType, positive: bool = True) -> PType:
-        return simplify_ptype(self.coalesce(ty, positive))
+        return simplify_ptype(self.coalesce(ty, positive), positive)
 
     def principal_type(self, ty: CompactType, positive: bool = True) -> str:
         """Coalesce, simplify and render the principal type of `ty`,
@@ -1120,11 +1126,12 @@ def _normalize(pt: PType) -> PType:
     return pt
 
 
-def _occurrences(pt: PType):
+def _occurrences(pt: PType, positive: bool = True):
     """Collect, for every inference variable (PVar): the polarities it
     occurs at, the co-occurrence contexts (sibling atoms in its immediately
     enclosing union/intersection), and whether it ever occurs standalone
-    (not directly under a union/intersection)."""
+    (not directly under a union/intersection). `positive` is the polarity
+    of the root (False when simplifying a negative-position query)."""
     pols: Dict[str, Set[bool]] = {}
     contexts: Dict[str, List[Tuple[bool, frozenset]]] = {}
     standalone: Set[str] = set()
@@ -1160,7 +1167,7 @@ def _occurrences(pt: PType):
             go(t.body, pol)
             return
 
-    go(pt, True)
+    go(pt, positive)
     return pols, contexts, standalone
 
 
@@ -1189,7 +1196,7 @@ def _subst_var(pt: PType, name: str, pos_repl: PType, neg_repl: PType,
     return pt
 
 
-def simplify_ptype(pt: PType) -> PType:
+def simplify_ptype(pt: PType, positive: bool = True) -> PType:
     """Simplify a coalesced type per the SimpleSub paper:
 
     1. flatten/dedupe unions and intersections (in `_normalize`);
@@ -1205,7 +1212,7 @@ def simplify_ptype(pt: PType) -> PType:
     """
     pt = _normalize(pt)
     for _ in range(32):
-        pols, contexts, standalone = _occurrences(pt)
+        pols, contexts, standalone = _occurrences(pt, positive)
         changed = False
 
         # (2) polar variable removal
@@ -1245,7 +1252,7 @@ def simplify_ptype(pt: PType) -> PType:
                 break
             if any(not isinstance(a, (PVar, PMuVar)) for a in common):
                 # always accompanied by the same concrete atom on both sides
-                pt = _normalize(_subst_var(pt, name, PBot(), PTop()))
+                pt = _normalize(_subst_var(pt, name, PBot(), PTop(), positive))
                 changed = True
                 break
         if not changed:

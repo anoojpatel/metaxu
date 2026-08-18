@@ -26,6 +26,11 @@ class InferSideTables:
     tyenv: Any
     traits: Mapping[int, Any] = None  # Trait definitions by node_id
     trait_impls: Mapping[str, Any] = None  # Trait implementations by type name
+    # The SimpleSubFacade that produced these tables (or None for tables
+    # built by hand). Kept so downstream consumers/tooling can ask for
+    # principal types (facade.principal_type_of(node_id)) -- a lazy,
+    # advisory query that never affects what compiles.
+    facade: Any = None
 
     def ty_of(self, node_id: int) -> Any:
         return self.types[node_id]
@@ -155,4 +160,5 @@ def build_tables_from_frozen_via_simplesub(frozen_root: Any) -> InferSideTables:
         tyenv=_make_tyenv_from_simplesub(),
         traits=traits,
         trait_impls=trait_impls,
+        facade=ss,
     )
