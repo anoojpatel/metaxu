@@ -78,34 +78,63 @@ LOCAL_CAPTURE_KIND = "locality-spawn-capture"
 #: Diagnostic kind for rule 2 (active @mut borrow crossing a thread boundary).
 MUT_BORROW_CAPTURE_KIND = "borrow-spawn-capture"
 
+#: Diagnostic kind for a rejected explicit escape: `let @global g = v` where
+#: `v` is @local and the checker cannot verify the type crosses modes.
+LOCALITY_ESCAPE_KIND = "locality-escape"
+
 _LOCALITY_NAMES = frozenset({"local", "global"})
 _MUT_BORROW_MODES = frozenset({"mut", "unique", "exclusive"})
+
+#: Declared type names whose values provably contain no reference into any
+#: frame region, so a @local value of such a type may CROSS to @global
+#: (OCaml's "mode crossing" on immediates). Strings are included: string
+#: values are pointers to immutable heap/constant data on both engines,
+#: never into a frame.
+_CROSSING_TYPE_NAMES = frozenset({"int", "bool", "float", "string", "str",
+                                  "Int", "Bool", "Float", "String"})
 
 
 @dataclass
 class _Binding:
     """What the checker knows about one in-scope name."""
-    locality: str = "global"          # declared locality ("local"/"global")
+    locality: str = "global"          # declared OR INFERRED locality
     lambda_node: Any | None = None    # LambdaExpression bound by `let f = fn ...`
     mut_borrow_of: str | None = None  # `let r = &mut x` -> "x"
+    #: Rule B provenance: how this name came to be @local, innermost first
+    #: — a chain of (alias_name, source_name) steps ending at the name that
+    #: was DECLARED @local. Empty for a declared-@local binding itself.
+    provenance: tuple[tuple[str, str], ...] = ()
+    #: Syntactic mode-crossing evidence: True when the value is known (by
+    #: literal shape, scalar arithmetic, or a scalar type annotation) to
+    #: contain no frame references, so it may be explicitly re-bound
+    #: @global even if @local.
+    crosses: bool = False
 
 
-def _declared_locality(mode: Any) -> str:
-    """Explicit locality from a surface mode annotation; default "global".
-
-    Mirrors the frozen emitter's `_split_mode` default: unannotated
-    bindings are permissive-global, so nothing that compiles today changes
-    meaning here.
-    """
+def _declared_locality(mode: Any) -> str | None:
+    """Explicit locality from a surface mode annotation; None when the
+    binding carries no locality annotation (the tri-state matters: an
+    EXPLICIT @global on a @local initializer is a checked escape, while an
+    unannotated binding INHERITS the initializer's locality — Rule B)."""
     tokens = _mode_value(mode)
     if tokens is None:
-        return "global"
+        return None
     if not isinstance(tokens, (list, tuple)):
         tokens = [tokens]
     for token in tokens:
         if isinstance(token, str) and token.lower().lstrip("@") in _LOCALITY_NAMES:
             return token.lower().lstrip("@")
-    return "global"
+    return None
+
+
+def _annotation_crosses(type_annotation: Any) -> bool:
+    """A declared scalar type is crossing evidence."""
+    if type_annotation is None:
+        return False
+    name = getattr(type_annotation, "name", None)
+    if not isinstance(name, str):
+        name = str(type_annotation) if isinstance(type_annotation, str) else None
+    return name in _CROSSING_TYPE_NAMES
 
 
 def _borrow_var_name(value: Any) -> str | None:
@@ -292,9 +321,9 @@ class _SpawnCaptureChecker:
                         f"captures @local variable '{name}': a @local value "
                         f"lives in the spawning frame's stack region, and "
                         f"that frame may return while the spawned thread is "
-                        f"still running, leaving the capture dangling; only "
-                        f"@global (or copied) values may cross a thread "
-                        f"boundary")
+                        f"still running, leaving the capture dangling; "
+                        f"spawn requires @global captures for exactly this "
+                        f"reason{self._provenance_note(name, binding)}")
                 elif binding.mut_borrow_of is not None:
                     self._report(
                         site, lam, MUT_BORROW_CAPTURE_KIND, name,
@@ -314,21 +343,129 @@ class _SpawnCaptureChecker:
                             f"active @mut borrow of it: an exclusive borrow "
                             f"must not be shared across threads")
 
+    # -- Rule B: initializer-driven locality -------------------------------
+    def _expr_crosses(self, expr: Any) -> bool:
+        """Syntactic mode-crossing evidence for an initializer expression:
+        scalar literals, arithmetic/comparison/unary over crossing operands,
+        and names whose bindings carry crossing evidence. Conservative —
+        False means "cannot verify", not "does not cross"."""
+        if isinstance(expr, fast.Literal):
+            return isinstance(getattr(expr, "value", None),
+                              (int, float, bool, str))
+        if isinstance(expr, fast.BinaryOperation):
+            return (self._expr_crosses(getattr(expr, "left", None))
+                    and self._expr_crosses(getattr(expr, "right", None)))
+        if isinstance(expr, fast.ComparisonExpression):
+            return True   # comparisons yield bool
+        if isinstance(expr, fast.UnaryOperation):
+            return self._expr_crosses(getattr(expr, "operand", None))
+        if isinstance(expr, fast.Variable):
+            b = self.lookup(getattr(expr, "name", None))
+            return b is not None and b.crosses
+        return False
+
+    def _init_local_source(self, expr: Any) -> tuple[str, _Binding] | None:
+        """The @local-tracked name an initializer READS AS A WHOLE, if any:
+        a bare variable, or a borrow/move of one. Field reads, calls and
+        literals containing local names copy VALUES out and are not traced
+        (documented limitation)."""
+        name = None
+        if isinstance(expr, fast.Variable):
+            name = getattr(expr, "name", None)
+        elif isinstance(expr, (fast.BorrowShared, fast.BorrowUnique,
+                               fast.Move, fast.BorrowExpression)):
+            name = _borrow_var_name(getattr(expr, "variable", None))
+        if not isinstance(name, str):
+            return None
+        b = self.lookup(name)
+        if b is not None and b.locality == "local":
+            return (name, b)
+        return None
+
     # -- binder helpers ---------------------------------------------------
     def _binding_from_let(self, let_binding: Any) -> _Binding:
         init = getattr(let_binding, "initializer", None)
+        declared = _declared_locality(getattr(let_binding, "mode", None))
+        crosses = (_annotation_crosses(getattr(let_binding, "type_annotation",
+                                               None))
+                   or self._expr_crosses(init))
+        source = self._init_local_source(init)
+        ident = getattr(let_binding, "identifier", None)
+        ident = ident if isinstance(ident, str) else ""
+
+        if declared == "local":
+            # Declared root: provenance chain starts here.
+            locality, provenance = "local", ()
+        elif source is not None:
+            src_name, src_binding = source
+            src_crosses = src_binding.crosses or crosses
+            if declared == "global":
+                # EXPLICIT escape: allowed only with crossing evidence —
+                # the visible, checked laundering point (Rule B).
+                if src_crosses:
+                    locality, provenance = "global", ()
+                    crosses = True
+                else:
+                    self._report_escape(let_binding, ident, src_name,
+                                        src_binding)
+                    # Keep it local so downstream diagnostics stay coherent.
+                    locality = "local"
+                    provenance = ((ident, src_name),) + src_binding.provenance
+            else:
+                # Unannotated: locality FOLLOWS THE DATA.
+                locality = "local"
+                provenance = ((ident, src_name),) + src_binding.provenance
+                crosses = crosses or src_binding.crosses
+        else:
+            locality, provenance = (declared or "global"), ()
+
         return _Binding(
-            locality=_declared_locality(getattr(let_binding, "mode", None)),
+            locality=locality,
             lambda_node=init if isinstance(init, fast.LambdaExpression) else None,
             mut_borrow_of=_mut_borrow_target(init),
+            provenance=provenance,
+            crosses=crosses,
         )
+
+    def _report_escape(self, let_binding: Any, ident: str, src_name: str,
+                       src_binding: _Binding) -> None:
+        chain = self._provenance_note(src_name, src_binding)
+        location = getattr(let_binding, "location", None)
+        self.errors.append(BorrowError(
+            message=(
+                f"cannot bind @global '{ident}' from @local '{src_name}': "
+                f"the checker cannot verify the value contains no reference "
+                f"into the current frame (only scalar-typed values — "
+                f"int/bool/float/string — cross to @global today); keep the "
+                f"binding unannotated to stay @local, or give the source a "
+                f"scalar type annotation{chain}"),
+            node_id=-1,
+            kind=LOCALITY_ESCAPE_KIND,
+            variable=ident,
+            location=location,
+        ))
+
+    def _provenance_note(self, name: str, binding: _Binding) -> str:
+        """Render the Rule B chain: how `name` came to be @local."""
+        if not binding.provenance:
+            return f" (note: '{name}' was declared @local)"
+        steps = "; ".join(
+            f"'{alias}' was bound from '{src}'"
+            for (alias, src) in binding.provenance)
+        root = binding.provenance[-1][1]
+        return (f" (note: {steps}; '{root}' was declared @local — "
+                f"locality follows the data)")
 
     def bind_param(self, param: Any) -> None:
         if isinstance(param, str):
             self.bind(param)
             return
         self.bind(getattr(param, "name", None),
-                  _Binding(locality=_declared_locality(getattr(param, "mode", None))))
+                  _Binding(
+                      locality=_declared_locality(getattr(param, "mode",
+                                                          None)) or "global",
+                      crosses=_annotation_crosses(
+                          getattr(param, "type_annotation", None))))
 
     def bind_pattern(self, p: Any) -> None:
         """Bind every name a pattern introduces (as default-global).
@@ -468,6 +605,20 @@ class _SpawnCaptureChecker:
                     binding = self.lookup(root)
                     if binding is not None:
                         binding.mut_borrow_of = mut_of
+                # Rule B through assignment: `a = local_thing` makes `a`
+                # local from here on (sticky — once a name has held local
+                # data in this scope, it stays tracked; an over-
+                # approximation that errs toward safety).
+                if self.free is None:
+                    src = self._init_local_source(
+                        getattr(node, "expression", None))
+                    if src is not None:
+                        binding = self.lookup(root)
+                        if binding is not None and binding.locality != "local":
+                            src_name, src_binding = src
+                            binding.locality = "local"
+                            binding.provenance = (
+                                ((root, src_name),) + src_binding.provenance)
             else:
                 self.visit(target)
             return

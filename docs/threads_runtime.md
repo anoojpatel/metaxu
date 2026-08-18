@@ -192,14 +192,27 @@ shared identity remain the program's problem, with the mutex primitives
 and the TSan-verified native path as the answer — and plain copied
 scalars/strings/structs.
 
-What REMAINS unenforced: locality is the binding's declared mode
-(unannotated bindings default to global, exactly as the frozen borrow
-checker treats them), so an `@local` value aliased through an
-unannotated rebinding is not tracked; a closure reaching the spawn
-through a data structure, a call result, or the unqualified-call
-spelling of the op (`spawn(f)` without `perform`) is not traced; and
-there is deliberately no send/sync-style trait machinery — do not claim
-it exists. The check runs over the mutable post-desugar AST (the frozen
+Locality now PROPAGATES (Rule B, 2026-08-18 — see
+`docs/ownership_and_borrowing.md` § "Locality follows the data"):
+`let alias = secret` and `x = secret` inherit `@local` from the
+initializer with a provenance chain rendered in the diagnostic
+("'alias' was bound from 'secret'; 'secret' was declared @local —
+locality follows the data"), so the unannotated-rebinding laundering
+hole is closed. The ONLY escape is the explicit spelling
+`let @global g = v`, which is a CHECKED coercion: allowed when the
+checker can verify the value contains no frame references (mode
+crossing — scalar literals, scalar arithmetic/comparisons, or a scalar
+type annotation on the source), rejected with kind `locality-escape`
+and guidance otherwise. Crossing evidence never silently launders an
+unannotated alias — the visible `@global` mark is the point.
+
+What REMAINS unenforced: propagation is per-function and name-based —
+a value flowing through a data structure, a field read, or a call
+result is not traced (copies of AGGREGATES that embed borrows are the
+real future risk there); a closure reaching the spawn through a data
+structure or call result is likewise not traced; crossing evidence is
+syntactic (no type inference is consulted); and there is deliberately
+no send/sync-style trait machinery — do not claim it exists. The check runs over the mutable post-desugar AST (the frozen
 `PerformEffect` drops its arguments — the same lossiness that put name
 resolution there, see `docs/name_resolution.md`) and the runtime keeps
 itself memory-safe (heap envs, immortal boxes/handles) regardless of

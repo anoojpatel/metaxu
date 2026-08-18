@@ -57,8 +57,14 @@ Spawn-boundary modes are now partially ENFORCED at compile time
 (`compiler/spawn_capture_check.py`): a closure passed to a `with
 EFFECT_SPAWN` op must not capture `@local` values or active `@mut`
 borrows (kinds `locality-spawn-capture`/`borrow-spawn-capture`, hard
-BorrowCheckErrors); see `docs/threads_runtime.md` § Modes for the exact
-enforced subset and what remains declared-only.
+BorrowCheckErrors). Locality PROPAGATES per Rule B (2026-08-18,
+`docs/ownership_and_borrowing.md` § "Locality follows the data"):
+unannotated bindings and assignments inherit the initializer's
+locality with provenance-chain diagnostics, and the only escape is the
+explicit `let @global g = v` — a checked coercion allowed exactly when
+mode-crossing evidence (scalar type) certifies it, kind
+`locality-escape` otherwise. See `docs/threads_runtime.md` § Modes for
+the enforced subset and what remains untraced.
 
 Direction update (2026-08-13): the project targets LLVM for AOT native
 compilation (near-C, no GC; modes decide memory). Increment 1 is on this
