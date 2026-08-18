@@ -103,10 +103,13 @@ placeholder, never wrong code. The standard library lives in `std/*.mx`
 ## Current status and remaining work
 
 See `docs/v1_gap_analysis.md` for the authoritative status: what is
-implemented, what is intentionally out of scope (FFI/threads runtime,
-try/catch semantics, CLIF-level effect dispatch, frame chaining across
-suspending calls, full biunification), and why. `docs/compiler_roadmap.md`
-tracks the phase-by-phase plan.
+implemented, what is intentionally out of scope (CLIF-level effect
+dispatch, frame chaining across suspending calls, backend consumption of
+principal types), and why. try/catch is implemented natively
+(docs/try_catch.md); biunification with principal-type coalescing exists
+in `simplesub.py` (advisory via the facade — hard diagnostics still come
+from the conflict detector). `docs/compiler_roadmap.md` tracks the
+phase-by-phase plan.
 
 ## Conventions
 
