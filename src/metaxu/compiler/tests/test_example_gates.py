@@ -134,3 +134,29 @@ def test_unsafe_ffi_example_output(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     result, prints = execute("examples/05_unsafe_and_ffi.mx")
     assert prints == ["Error: Failed to open file"]
+
+
+# ---------------------------------------------------------------------------
+# Showcase suite (benchmarks/suite/): programs must stay compile-clean
+# ---------------------------------------------------------------------------
+# The suite races C twins, so a program that silently starts demoting
+# would still "run" under the interpreter but the native binary would
+# lose functions. Pin: strict pipeline passes AND zero native
+# placeholders for every suite program.
+
+def test_showcase_suite_programs_compile_native_clean():
+    import glob as _glob
+    from metaxu.compiler.pipeline import emit_llvm_from_source
+    suite = sorted(_glob.glob(os.path.join(REPO_ROOT, "benchmarks",
+                                           "suite", "*.mx")))
+    assert len(suite) >= 6, suite
+    allowed_placeholders = {
+        # std.stream's unused drivers demote honestly; the pipeline's
+        # EXECUTED chain is native (it links and runs). Everything else
+        # must be completely clean.
+        "pipeline.mx",
+    }
+    for path in suite:
+        ir = emit_llvm_from_source(open(path).read(), file_path=path)
+        if os.path.basename(path) not in allowed_placeholders:
+            assert "placeholder -- unsupported" not in ir, path

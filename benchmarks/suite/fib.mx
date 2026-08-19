@@ -1,0 +1,5 @@
+// Recursion benchmark: naive fib(35) — call overhead, branch prediction.
+fn fib(n: int) -> int {
+    if n < 2 { n } else { fib(n - 1) + fib(n - 2) }
+}
+fn main() -> int { print(fib(35)); 0 }

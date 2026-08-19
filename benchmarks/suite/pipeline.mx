@@ -1,0 +1,24 @@
+// Effects-as-iterators: one lazy pipeline, no intermediate collections,
+// against the hand-written loop computing the same thing. Both native.
+// This prices the abstraction: handler dispatch per element vs raw loop.
+from std.stream import iota, sum, map, filter;
+
+fn by_hand(n: int) -> int {
+    let mut acc = 0;
+    let mut i = 0;
+    while i < n {
+        if i % 3 == 0 { acc = acc + i * i } else { () };
+        i = i + 1
+    };
+    acc
+}
+
+fn main() -> int {
+    let n = 200000;
+    let piped = sum(map(filter(iota(n), fn(x: int) -> x % 3 == 0),
+                        fn(x: int) -> x * x));
+    let manual = by_hand(n);
+    print(piped);
+    print(manual);
+    if piped == manual { 0 } else { 1 }
+}

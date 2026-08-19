@@ -1,0 +1,24 @@
+// Sieve of Eratosthenes, n = 2M, 3 passes: Vec indexing throughput.
+fn sieve(n: int) -> int {
+    let mut flags = Vec.new();
+    let mut i = 0;
+    while i < n { flags.push(1); i = i + 1 };
+    let mut count = 0;
+    let mut p = 2;
+    while p < n {
+        if flags[p] == 1 {
+            count = count + 1;
+            let mut k = p + p;
+            while k < n { flags[k] = 0; k = k + p }
+        } else { () };
+        p = p + 1
+    };
+    count
+}
+fn main() -> int {
+    let mut total = 0;
+    let mut r = 0;
+    while r < 3 { total = total + sieve(2000000); r = r + 1 };
+    print(total);
+    0
+}
