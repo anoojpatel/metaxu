@@ -10,15 +10,20 @@ before a single timing is taken. Methodology inherited from
 benchmarks/contention/: -falign-functions=64 everywhere, alternating
 run order, medians.
 
-## Measured (2026-08-19, this container, clang -O2, 9 rounds)
+## Measured (2026-08-19, this container, clang -O2, 9 rounds,
+## post tail-resume trampoline)
 
 | benchmark | what it stresses | metaxu | C | ratio |
 | --- | --- | --- | --- | --- |
-| fib(35) | recursion, calls | 30.6 ms | 30.8 ms | **0.99x** |
-| mandelbrot 800² | float ALU, branches | 62.9 ms | 61.7 ms | **1.02x** |
-| orbit 20M steps | struct-per-step rebuild | 166.0 ms | 167.0 ms | **0.99x** |
-| nsieve 3×2M | Vec indexing | 230.9 ms | 159.8 ms | 1.44x |
-| par_sum 40M ×(1+4 threads) | OS threads, join values | 72.4 ms | 53.8 ms | 1.34x |
+| fib(35) | recursion, calls | 30.9 ms | 30.4 ms | **1.02x** |
+| mandelbrot 800² | float ALU, branches | 63.7 ms | 62.2 ms | **1.02x** |
+| orbit 20M steps | struct-per-step rebuild | 165.7 ms | 165.9 ms | **1.00x** |
+| nsieve 3×2M | Vec indexing | 240.7 ms | 188.6 ms | 1.28x |
+| par_sum 40M ×(1+4 threads) | OS threads, join values | 66.6 ms | 56.4 ms | 1.18x |
+| pipeline 200k (metaxu-only) | 3-stage effects pipeline | 278.6 ms | — | ~460 ns/handler crossing |
+
+(Deltas of a few points between runs are normal — see the contention
+benchmarks for how much layout and scheduling luck move microbenchmarks.)
 
 Reading the gaps honestly:
 
@@ -46,11 +51,15 @@ Reading the gaps honestly:
   through `join`), so there are no locks to get wrong and the
   thread-safety checker (docs/separate_send_sync.md) has nothing to
   object to. Compare with the C twin's Job structs and pthread plumbing.
-- `pipeline.mx` — effects-as-iterators: `sum(map(filter(iota(n))))` as
-  one lazy pipeline against the hand-written loop, both native, one
-  binary, self-checked. (Temporarily sized pending the tail-resume
-  trampoline fix this benchmark itself flushed out — writing real
-  programs remains this compiler's best bug detector.)
+- `pipeline.mx` — effects-as-iterators: `sum(map(filter(iota(200000))))`
+  as one lazy pipeline against the hand-written loop, both native, one
+  binary, self-checked. This benchmark flushed out a real runtime bug on
+  arrival: the handler pump dispatched each element RECURSIVELY, capping
+  streams at ~4k elements natively (and ~10-20k in the interpreter). The
+  tail-resume trampoline fixed both engines — pipelines are flat to 10M+
+  elements now — and the ~460 ns/element-crossing figure above is the
+  measured price of a handler dispatch. Writing real programs remains
+  this compiler's best bug detector.
 
 ## Adding a benchmark
 
