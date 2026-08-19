@@ -65,6 +65,7 @@ object, a seeded RNG singleton, an aborting `assert`).
 | Module | Status | Contents |
 | --- | --- | --- |
 | `std.sort` | implemented | stable merge sort: `sort`, `sort_desc`, `sort_by`, `sort_by_key`; `merge`, `merge_by`; `is_sorted`, `is_sorted_by`; `binary_search` (Option), `unique_sorted`, `min_by_key`, `max_by_key` |
+| `std.sync` | implemented | thread-safe sharing (docs/separate_send_sync.md): `Protected`, `protect(v)` (separate by construction — the compiler's spawn checker recognizes it), `with_lock`, `read`, `write`, `update` (atomic read-modify-write; the counter idiom) |
 
 `std.sort` fills a gap neither round covered: `std.vec`'s combinators
 are all single-pass and a stream cannot sort at all (sorting needs the

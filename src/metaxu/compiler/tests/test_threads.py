@@ -73,20 +73,25 @@ fn main() -> int {
     counter.push(0);
     let @mut handles = Vec.new();
     let @mut i = 0;
-    while i < 4 {
-        let t = perform Thread.spawn(|| {
-            let @mut j = 0;
-            while j < 250 {
-                perform Mutex.lock(m);
-                counter[0] = counter[0] + 1;
-                perform Mutex.unlock(m);
-                j = j + 1
-            };
-            0
-        });
-        handles.push(t);
-        i = i + 1
-    };
+    # unsafe: exercises the RAW mutex primitives on purpose (manual
+    # lock/unlock around a bare shared Vec); the blessed non-unsafe
+    # spelling is std.sync.protect (docs/separate_send_sync.md).
+    unsafe {
+        while i < 4 {
+            let t = perform Thread.spawn(|| {
+                let @mut j = 0;
+                while j < 250 {
+                    perform Mutex.lock(m);
+                    counter[0] = counter[0] + 1;
+                    perform Mutex.unlock(m);
+                    j = j + 1
+                };
+                0
+            });
+            handles.push(t);
+            i = i + 1
+        };
+    }
     let @mut k = 0;
     while k < 4 {
         perform Thread.join(handles[k]);

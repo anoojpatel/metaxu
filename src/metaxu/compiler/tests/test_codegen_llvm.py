@@ -194,7 +194,7 @@ from metaxu.compiler.llvm_run import LlvmRunError, compile_and_run
 from metaxu.compiler.lower_hir_to_mir import lower_hir_to_mir
 from metaxu.compiler.mir import MirBlock, MirFunc
 from metaxu.compiler.mir_interp import UNIT, MirInterpreter
-from metaxu.compiler.pipeline import build_context_from_source
+from metaxu.compiler.pipeline import build_context_from_source, run_pipeline_ctx
 
 REPO_ROOT = Path(__file__).parent.parent.parent.parent.parent
 
@@ -216,11 +216,27 @@ def block(ops: list[tuple], term: tuple) -> MirBlock:
 
 def mir_from_source(source: str, monomorphize: bool = False) -> list[MirFunc]:
     ctx = build_context_from_source(source)
+    # Production parity: emit_llvm_from_source runs the STRICT type/borrow
+    # gate before lowering; a helper that skips it would happily compile
+    # sources production rejects (the historical helper-bypass bug class).
+    run_pipeline_ctx(ctx)
     hir = HIRBuilder(ctx.tables, id_map=ctx.id_map).build(ctx.frozen_root)
     if monomorphize:
         from metaxu.compiler.monomorphize import collect_signatures, monomorphize_hir
         hir = monomorphize_hir(hir, collect_signatures(ctx.id_map))
     return lower_hir_to_mir(hir)
+
+
+def llvm_from_source_nonstrict(source: str) -> str:
+    """Emit WITHOUT the strict gate: for pinning the backend's honest-
+    demotion behavior on inputs the type checker rejects (reachable in
+    production only through the documented strict=False API). Every
+    normally-typed test goes through llvm_from_source below."""
+    ctx = build_context_from_source(source)
+    hir = HIRBuilder(ctx.tables, id_map=ctx.id_map).build(ctx.frozen_root)
+    from metaxu.compiler.monomorphize import collect_signatures, monomorphize_hir
+    hir = monomorphize_hir(hir, collect_signatures(ctx.id_map))
+    return emit_llvm(lower_hir_to_mir(hir))
 
 
 def llvm_from_source(source: str, monomorphize: bool = True) -> str:
@@ -1233,8 +1249,10 @@ def test_merged_same_variant_mixed_instantiation_still_demotes():
     # PER-VALUE limits: ONE value (pick's merged result) holding both
     # Some(int) and Some(str) has no single native slot representation, so
     # the writer demotes instead of coercing — the honest boundary of the
-    # per-variant model.
-    ir = llvm_from_source("""
+    # per-variant model. NOTE: this program is a TYPE ERROR under the
+    # strict gate (Some("s") into Some(int)); the test pins the backend's
+    # honest demotion when such MIR arrives via the strict=False API.
+    ir = llvm_from_source_nonstrict("""
 enum Opt { Some(int), None }
 fn pick(n: int) -> Opt { if n > 0 { Some(1) } else { Some("s") } }
 fn main() -> int { let x = pick(1); 0 }
@@ -1252,7 +1270,9 @@ def test_nested_mixed_enum_extraction_demotes():
     # i64 in one use, str in another) loses its per-value refinement when
     # boxed inside ANOTHER enum's payload: extraction would have to guess a
     # representation, so the reader demotes with the boxing-boundary reason.
-    ir = llvm_from_source("""
+    # NOTE: ill-typed under the strict gate (W("s") into W(int)) — pins the
+    # backend's honesty on strict=False inputs.
+    ir = llvm_from_source_nonstrict("""
 enum Inner { W(int), Z }
 enum Outer { O(Inner), E }
 fn use_int() -> Inner { W(1) }
@@ -7370,26 +7390,31 @@ def test_native_try_catches_match_failure_like_the_interpreter(tmp_path):
     inside a try, in a GENERIC function the native lane monomorphizes.
     The catch must bind the interpreter's exact message (embedding the
     pre-specialization name), and the surrounding program continues."""
+    # The nested match is the LEGAL route to a runtime match failure: the
+    # exhaustiveness checker runs on the frozen AST, which drops match-ARM
+    # bodies, so a non-exhaustive match nested in an arm passes the gate
+    # (recorded in docs/v1_gap_analysis.md as a checker blind spot).
     assert_native_matches_interp("""
-enum Color { Red, Green, Blue }
-
-fn pick<T>(c: Color, fallback: T) -> int {
-    match c {
-        Red -> 1,
-        Green -> 2
+fn pick<T>(n: int, fallback: T) -> int {
+    match n {
+        0 -> 0,
+        k -> match k {
+            1 -> 10,
+            2 -> 20
+        }
     }
 }
 
 fn main() -> int {
     let caught = try {
-        pick(Blue, 7)
+        pick(3, 7)
     } catch e {
         print(e);
         9
     };
     print(caught);
     let fine = try {
-        pick(Red, 7)
+        pick(1, 7)
     } catch e {
         0 - 1
     };
@@ -7777,20 +7802,25 @@ fn main() -> int {
     counter.push(0);
     let @mut handles = Vec.new();
     let @mut i = 0;
-    while i < 4 {
-        let t = perform Thread.spawn(|| {
-            let @mut j = 0;
-            while j < 250 {
-                perform Mutex.lock(m);
-                counter[0] = counter[0] + 1;
-                perform Mutex.unlock(m);
-                j = j + 1
-            };
-            0
-        });
-        handles.push(t);
-        i = i + 1
-    };
+    # unsafe: exercises the RAW mutex primitives on purpose (manual
+    # lock/unlock around a bare shared Vec); the blessed non-unsafe
+    # spelling is std.sync.protect (docs/separate_send_sync.md).
+    unsafe {
+        while i < 4 {
+            let t = perform Thread.spawn(|| {
+                let @mut j = 0;
+                while j < 250 {
+                    perform Mutex.lock(m);
+                    counter[0] = counter[0] + 1;
+                    perform Mutex.unlock(m);
+                    j = j + 1
+                };
+                0
+            });
+            handles.push(t);
+            i = i + 1
+        };
+    }
     let @mut k = 0;
     while k < 4 {
         perform Thread.join(handles[k]);
