@@ -440,6 +440,14 @@ same-arity tuple).
 - **Raw pointers**: pointer dereference has no HIR/MIR representation.
 - **Uncalled generic instantiation**: `let f = ident<int>;` — a type-applied
   function has no value representation; call it directly (`ident<int>(x)`).
+- **Exhaustiveness blind spot (frozen-AST lossiness)**: the exhaustiveness
+  checker walks the frozen AST, which drops match-ARM bodies — so a
+  non-exhaustive match NESTED inside another match's arm passes the gate
+  and fails at run time (`match failure in 'f': no pattern matched`,
+  catchable by `try`). Same lossiness family that moved name resolution to
+  the mutable AST (docs/name_resolution.md); the fix is the same shape.
+  Top-level matches are fully checked (enum variants must be exhaustive;
+  int/string literal matches require a wildcard).
 - **Bare comprehensions**: `f(e for x in it)` — only the vector-literal form
   `vector[T,N](e for x in it)` has a value representation.
 - **1-tuples**: `(e)` is parenthesized grouping and `(e,)` is a syntax

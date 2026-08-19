@@ -1,0 +1,92 @@
+# std.sync — thread-safe sharing, the blessed idiom.
+#
+# docs/separate_send_sync.md: Vec and other shared-identity values are NOT
+# separate — capturing one in a spawned closure is a compile error
+# (`separate-spawn-capture`), because two threads mutating through one
+# handle race. This module is the sanctioned answer: `protect(v)` pairs
+# the value with its own mutex into a `Protected` handle that IS separate
+# by construction (every access goes through the lock), and the accessors
+# below make the common patterns one-liners.
+#
+#     let p = protect(0);
+#     let t = perform Thread.spawn(|| {
+#         update(p, fn(n: int) -> n + 1);   # lock; read-modify-write; unlock
+#         0
+#     });
+#
+# The compiler's spawn-capture checker recognizes `protect(..)` results as
+# separate (compiler/spawn_capture_check.py), so this compiles where the
+# bare-Vec capture is rejected.
+#
+# Storage: the value lives in a one-slot Vec (`cell`) so that all copies
+# of the Protected STRUCT alias one storage slot — struct capture copies
+# the struct, but the cell inside is a Vec, and Vec has identity semantics
+# on both engines. The mutex handle rides alongside. Both fields are
+# runtime-heap values, so nothing here is frame-bound.
+
+export {
+    Protected,
+    protect,
+    with_lock,
+    read,
+    write,
+    update
+};
+
+extern type Mutex;
+
+effect Mutex = {
+    fn create() -> @global Mutex with EFFECT_MUTEX_CREATE
+    fn lock(mutex: @global Mutex) -> () with EFFECT_MUTEX_LOCK
+    fn unlock(mutex: @global Mutex) -> () with EFFECT_MUTEX_UNLOCK
+}
+
+# A value paired with the mutex that serializes access to it.
+struct Protected {
+    guard: Mutex,
+    cell: Vec
+}
+
+# Wrap `value` for cross-thread sharing. The Protected handle may be
+# captured by spawned closures freely; the value inside is reachable only
+# through the locked accessors below.
+fn protect(value) -> Protected {
+    let @mut cell = Vec.new();
+    cell.push(value);
+    Protected { guard: perform Mutex.create(), cell: cell }
+}
+
+# General form: run `f` with the lock held, passing the one-slot cell
+# (read with cell[0], write with cell[0] = ..). The lock is released on
+# the value-return path; `f`'s result is answered.
+fn with_lock(p: Protected, f) {
+    perform Mutex.lock(p.guard);
+    let result = f(p.cell);
+    perform Mutex.unlock(p.guard);
+    result
+}
+
+# The current value, read under the lock.
+fn read(p: Protected) {
+    perform Mutex.lock(p.guard);
+    let v = p.cell[0];
+    perform Mutex.unlock(p.guard);
+    v
+}
+
+# Replace the value under the lock.
+fn write(p: Protected, value) -> () {
+    perform Mutex.lock(p.guard);
+    p.cell[0] = value;
+    perform Mutex.unlock(p.guard)
+}
+
+# Atomic read-modify-write: store f(current) and answer the NEW value.
+# This is the counter idiom: `update(p, fn(n: int) -> n + 1)`.
+fn update(p: Protected, f) {
+    perform Mutex.lock(p.guard);
+    let next = f(p.cell[0]);
+    p.cell[0] = next;
+    perform Mutex.unlock(p.guard);
+    next
+}

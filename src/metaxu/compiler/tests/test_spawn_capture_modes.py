@@ -248,23 +248,26 @@ fn main() -> int {
 # ---------------------------------------------------------------------------
 
 def test_mutex_counter_pattern_still_compiles_and_runs():
-    """THE canonical cross-thread pattern (docs/threads_runtime.md): a Vec
-    (shared identity) and a Mutex handle captured by worker closures, the
-    Vec mutated under the lock.  Schedule-independent final value N*M."""
-    source = THREAD_EFFECT + MUTEX_EFFECT + """
+    """THE canonical cross-thread pattern, in its blessed spelling
+    (docs/separate_send_sync.md): the counter lives in std.sync's
+    Protected handle — separate by construction — and the workers use
+    `update` for the atomic read-modify-write.  Schedule-independent
+    final value N*M.  (The RAW Vec+Mutex spelling is now a
+    separate-spawn-capture error unless marked `unsafe`; see the raw
+    variant test below and the runtime-focused tests in
+    test_threads.py.)"""
+    source = THREAD_EFFECT + """
+from std.sync import protect, update, read;
+
 fn main() -> int {
-    let m = perform Mutex.create();
-    let @mut counter = Vec.new();
-    counter.push(0);
+    let p = protect(0);
     let @mut handles = Vec.new();
     let @mut i = 0;
     while i < 2 {
         let t = perform Thread.spawn(|| {
             let @mut j = 0;
             while j < 50 {
-                perform Mutex.lock(m);
-                counter[0] = counter[0] + 1;
-                perform Mutex.unlock(m);
+                update(p, fn(n: int) -> n + 1);
                 j = j + 1
             };
             0
@@ -277,7 +280,7 @@ fn main() -> int {
         perform Thread.join(handles[k]);
         k = k + 1
     };
-    counter[0]
+    read(p)
 }
 """
     result, _ = run_source(source)
@@ -523,3 +526,143 @@ fn main() -> int {
 }
 """)
     assert "spawn requires @global captures" in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# Separateness (docs/separate_send_sync.md): shared mutable identity may
+# not cross a REAL thread boundary un-protected
+# ---------------------------------------------------------------------------
+
+from metaxu.compiler.spawn_capture_check import SEPARATE_CAPTURE_KIND  # noqa: E402
+
+
+def test_bare_vec_capture_into_spawn_is_rejected_with_all_three_fixes():
+    with pytest.raises(BorrowCheckError) as exc:
+        compile_source(THREAD_EFFECT + """
+fn main() -> int {
+    let mut v = Vec.new();
+    v.push(0);
+    let t = perform Thread.spawn(|| { v[0] = v[0] + 1; 0 });
+    0
+}
+""")
+    msg = str(exc.value)
+    assert "shared mutable identity" in msg
+    assert "std.sync.protect" in msg
+    assert "move(v)" in msg
+    assert "unsafe" in msg
+
+
+def test_shared_identity_propagates_through_aliases():
+    """Rule-B-style: `let w = v` inherits v's sharedness, with the chain
+    in the note."""
+    with pytest.raises(BorrowCheckError) as exc:
+        compile_source(THREAD_EFFECT + """
+fn main() -> int {
+    let mut v = Vec.new();
+    let w = v;
+    let t = perform Thread.spawn(|| { w.push(1); 0 });
+    0
+}
+""")
+    msg = str(exc.value)
+    assert "captures 'w'" in msg
+    assert "'w' was bound from 'v'" in msg
+
+
+def test_struct_containing_a_vec_composes_shared():
+    """Structural composition: a struct literal with a Vec field is shared;
+    capturing it is rejected like the Vec itself."""
+    with pytest.raises(BorrowCheckError) as exc:
+        compile_source(THREAD_EFFECT + """
+struct Holder { items: Vec, tag: int }
+
+fn main() -> int {
+    let mut v = Vec.new();
+    let h = Holder { items: v, tag: 1 };
+    let t = perform Thread.spawn(|| { h.items.push(1); 0 });
+    0
+}
+""")
+    assert "captures 'h'" in str(exc.value)
+
+
+def test_protect_result_is_separate_by_construction():
+    """std.sync.protect wraps shared identity behind a lock: capturing the
+    Protected handle compiles (and the full runtime path is exercised by
+    the migrated mutex-counter test above)."""
+    compile_source(THREAD_EFFECT + """
+from std.sync import protect, update;
+
+fn main() -> int {
+    let p = protect(0);
+    let t = perform Thread.spawn(|| { update(p, fn(n: int) -> n + 1); 0 });
+    0
+}
+""")
+
+
+def test_moved_capture_is_the_send_pattern():
+    """Ownership transfer into exactly ONE thread needs no lock: a capture
+    the closure takes by move(..) is exempt."""
+    compile_source(THREAD_EFFECT + """
+fn main() -> int {
+    let mut v = Vec.new();
+    v.push(41);
+    let t = perform Thread.spawn(|| {
+        let mine = move(v);
+        mine[0] + 1
+    });
+    0
+}
+""")
+
+
+def test_unsafe_block_is_the_scoped_escape():
+    """`unsafe { .. }` suspends the separateness rule for spawns inside it
+    — a vouch for THIS crossing, at the call site. Locality/@mut rules
+    are NOT suspended (checked by the second half)."""
+    compile_source(THREAD_EFFECT + """
+fn main() -> int {
+    let mut v = Vec.new();
+    v.push(0);
+    unsafe {
+        let t = perform Thread.spawn(|| { v[0] = v[0] + 1; 0 });
+    }
+    0
+}
+""")
+    # @local still refuses inside unsafe: dangling is not a promise a
+    # programmer can make.
+    with pytest.raises(BorrowCheckError) as exc:
+        compile_source(THREAD_EFFECT + """
+fn main() -> int {
+    let @local x = 1;
+    unsafe {
+        let t = perform Thread.spawn(|| { x });
+    }
+    0
+}
+""")
+    assert "captures @local variable 'x'" in str(exc.value)
+
+
+def test_handler_in_scope_subtracts_the_separateness_demand():
+    """A spawn-mapped perform under a handler for that op is VIRTUALIZED —
+    no real thread — so shared captures are fine there. This is the
+    effects-compose property Rust cannot express: thread-safety
+    obligations relax under test harnesses, statically."""
+    result, _ = run_source(THREAD_EFFECT + """
+fn main() -> int {
+    let mut v = Vec.new();
+    v.push(41);
+    handle Thread with {
+        spawn(f) -> resume(f()),
+        join(t) -> resume(t)
+    } in {
+        let t = perform Thread.spawn(|| { v[0] = v[0] + 1; v[0] });
+        perform Thread.join(t)
+    }
+}
+""")
+    assert result == 42

@@ -62,6 +62,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable
 
 import metaxu.metaxu_ast as fast
+import metaxu.unsafe_ast as uast
 
 from .frozen_borrow_checker import BorrowError
 from .mutaxu_ast import _mode_value
@@ -81,6 +82,19 @@ MUT_BORROW_CAPTURE_KIND = "borrow-spawn-capture"
 #: Diagnostic kind for a rejected explicit escape: `let @global g = v` where
 #: `v` is @local and the checker cannot verify the type crosses modes.
 LOCALITY_ESCAPE_KIND = "locality-escape"
+
+#: Diagnostic kind for rule 3 (shared mutable identity crossing a thread
+#: boundary un-protected) — docs/separate_send_sync.md.
+SEPARATE_CAPTURE_KIND = "separate-spawn-capture"
+
+#: Runtime symbols whose perform results are opaque runtime handles,
+#: separate by construction (the runtime serializes all access).
+_HANDLE_RUNTIME_SYMBOLS = frozenset({
+    "EFFECT_SPAWN", "EFFECT_MUTEX_CREATE",
+})
+
+#: std.sync constructors whose results are separate by construction.
+_PROTECT_CALLEES = frozenset({"protect", "sync.protect", "std.sync.protect"})
 
 _LOCALITY_NAMES = frozenset({"local", "global"})
 _MUT_BORROW_MODES = frozenset({"mut", "unique", "exclusive"})
@@ -109,6 +123,12 @@ class _Binding:
     #: contain no frame references, so it may be explicitly re-bound
     #: @global even if @local.
     crosses: bool = False
+    #: Separateness (docs/separate_send_sync.md): "separate" (safe to share
+    #: across threads), "shared" (known shared mutable identity — Vec),
+    #: or "unknown" (unclassifiable; deliberately NOT rejected).
+    separateness: str = "unknown"
+    #: Rule-B-style chain for HOW the name came to be shared.
+    shared_provenance: tuple[tuple[str, str], ...] = ()
 
 
 def _declared_locality(mode: Any) -> str | None:
@@ -178,9 +198,13 @@ def _op_key(effect_ref: Any) -> tuple[str, str] | None:
     return (parts[-2], parts[-1])
 
 
-def _collect_spawn_ops(root: Any) -> frozenset[tuple[str, str]]:
-    """Every (effect, op) whose declaration carries `with EFFECT_SPAWN`."""
-    ops: set[tuple[str, str]] = set()
+def _collect_spawn_ops(root: Any) -> tuple[frozenset[tuple[str, str]],
+                                            frozenset[tuple[str, str]]]:
+    """(spawn ops, handle-producing ops): every (effect, op) declared
+    `with EFFECT_SPAWN`, and every one whose runtime symbol produces an
+    opaque separate-by-construction handle (spawn, mutex-create)."""
+    spawn: set[tuple[str, str]] = set()
+    handles: set[tuple[str, str]] = set()
     for node in _walk_all(root):
         if not isinstance(node, fast.EffectDeclaration):
             continue
@@ -189,12 +213,15 @@ def _collect_spawn_ops(root: Any) -> frozenset[tuple[str, str]]:
             continue
         effect_key = effect_name.split(".")[-1]
         for op in getattr(node, "operations", None) or []:
-            if getattr(op, "c_effect", None) != SPAWN_RUNTIME_SYMBOL:
-                continue
+            sym = getattr(op, "c_effect", None)
             op_name = getattr(op, "name", None)
-            if isinstance(op_name, str) and op_name:
-                ops.add((effect_key, op_name))
-    return frozenset(ops)
+            if not (isinstance(op_name, str) and op_name):
+                continue
+            if sym == SPAWN_RUNTIME_SYMBOL:
+                spawn.add((effect_key, op_name))
+            if sym in _HANDLE_RUNTIME_SYMBOLS:
+                handles.add((effect_key, op_name))
+    return frozenset(spawn), frozenset(handles)
 
 
 class _SpawnCaptureChecker:
@@ -213,13 +240,22 @@ class _SpawnCaptureChecker:
 
     def __init__(self, spawn_ops: frozenset[tuple[str, str]],
                  file_path: str | None,
-                 collect_free: set[str] | None = None) -> None:
+                 collect_free: set[str] | None = None,
+                 handle_ops: frozenset[tuple[str, str]] = frozenset()) -> None:
         self.spawn_ops = spawn_ops
+        self.handle_ops = handle_ops
         self.file_path = file_path
         self.scopes: list[dict[str, _Binding]] = [{}]
         self.errors: list[BorrowError] = []
         self.free = collect_free
         self._reported: set[tuple[int, str, str]] = set()
+        #: > 0 inside `unsafe { }`: the separateness rule is suspended
+        #: (docs/separate_send_sync.md § 4 — locality/@mut rules are NOT).
+        self._unsafe_depth = 0
+        #: (effect, op) pairs handled by a lexically enclosing `handle`:
+        #: a spawn-mapped perform under one is VIRTUALIZED, so no real
+        #: thread is crossed and separateness is not demanded.
+        self._handled_ops: list[set[tuple[str, str]]] = []
 
     # -- scope helpers ---------------------------------------------------
     def push(self) -> None:
@@ -258,6 +294,26 @@ class _SpawnCaptureChecker:
             self.free.add(name)
 
     # -- the spawn check -------------------------------------------------
+    @staticmethod
+    def _moved_names(lam: Any) -> set[str]:
+        """Names the closure takes by `move(..)` anywhere in its body:
+        ownership transfers into the (single) spawned thread — the Send
+        pattern — so sharedness is not a race for them."""
+        out: set[str] = set()
+        for node in _walk_all(lam):
+            if isinstance(node, fast.Move):
+                name = _borrow_var_name(getattr(node, "variable", None))
+                if name:
+                    out.add(name)
+        return out
+
+    def _shared_note(self, name: str, binding: _Binding) -> str:
+        if not binding.shared_provenance:
+            return ""
+        steps = "; ".join(f"'{a}' was bound from '{b}'"
+                          for (a, b) in binding.shared_provenance)
+        return f" (note: {steps})"
+
     def _resolve_closure(self, arg: Any) -> Any | None:
         """The LambdaExpression an argument denotes, if statically known.
 
@@ -300,14 +356,22 @@ class _SpawnCaptureChecker:
         if key is None or key not in self.spawn_ops:
             return
         op_display = f"{key[0]}.{key[1]}"
+        # Separateness is demanded only when a REAL thread is crossed:
+        # a lexically enclosing handler for this op virtualizes it, and
+        # `unsafe { }` is the scoped escape (docs/separate_send_sync.md).
+        # Locality/@mut rules below apply regardless (signature promise).
+        check_separate = (self._unsafe_depth == 0
+                          and not any(key in hs for hs in self._handled_ops))
         for arg in getattr(node, "arguments", None) or []:
             lam = self._resolve_closure(arg)
             if lam is None:
                 continue
             captures: set[str] = set()
             collector = _SpawnCaptureChecker(
-                self.spawn_ops, self.file_path, collect_free=captures)
+                self.spawn_ops, self.file_path, collect_free=captures,
+                handle_ops=self.handle_ops)
             collector.visit(lam)
+            moved = self._moved_names(lam) if check_separate else set()
             site = arg if _is_node(arg) else node
             for name in sorted(captures):
                 binding = self.lookup(name)
@@ -342,6 +406,19 @@ class _SpawnCaptureChecker:
                             f"captures '{name}' while '{holder}' holds an "
                             f"active @mut borrow of it: an exclusive borrow "
                             f"must not be shared across threads")
+                    elif (check_separate and name not in moved
+                          and binding.separateness == "shared"):
+                        self._report(
+                            site, lam, SEPARATE_CAPTURE_KIND, name,
+                            f"closure passed to spawn-mapped operation "
+                            f"'{op_display}' (with {SPAWN_RUNTIME_SYMBOL}) "
+                            f"captures '{name}', which has shared mutable "
+                            f"identity (Vec): two threads mutating through "
+                            f"one handle race; protect it "
+                            f"(std.sync.protect), move it into exactly one "
+                            f"thread (move({name})), or take responsibility "
+                            f"with `unsafe {{ .. }}`"
+                            f"{self._shared_note(name, binding)}")
 
     # -- Rule B: initializer-driven locality -------------------------------
     def _expr_crosses(self, expr: Any) -> bool:
@@ -382,6 +459,53 @@ class _SpawnCaptureChecker:
             return (name, b)
         return None
 
+    # -- separateness (docs/separate_send_sync.md) -------------------------
+    def _expr_separateness(self, expr: Any) -> tuple[str, tuple]:
+        """(classification, provenance) for an initializer: "separate",
+        "shared" (known shared mutable identity), or "unknown". Structural
+        over struct literals; name-propagating like Rule B locality."""
+        if isinstance(expr, fast.Literal):
+            return "separate", ()
+        if isinstance(expr, (fast.BinaryOperation, fast.ComparisonExpression,
+                             fast.UnaryOperation)):
+            return "separate", ()   # scalar arithmetic results
+        if isinstance(expr, fast.ListLiteral):
+            return "shared", ()     # list literals build Vecs
+        if isinstance(expr, (fast.FunctionCall, fast.QualifiedFunctionCall)):
+            name = getattr(expr, "name", None)
+            if not isinstance(name, str):
+                parts = [str(x) for x in (getattr(expr, "parts", None) or [])]
+                name = ".".join(parts)
+            if name in _PROTECT_CALLEES:
+                return "separate", ()   # Protected: separate by construction
+            base = name.split(".")[0] if isinstance(name, str) else ""
+            if base == "Vec" or name == "Vec.new":
+                return "shared", ()     # Vec constructors: shared identity
+            return "unknown", ()
+        if isinstance(expr, fast.PerformEffect):
+            key = _op_key(getattr(expr, "effect_name", None))
+            if key is not None and key in self.handle_ops:
+                return "separate", ()   # runtime handle (mutex/thread)
+            return "unknown", ()
+        if isinstance(expr, fast.StructInstantiation):
+            # Structural composition: separate iff every field is; shared
+            # if any field is known-shared.
+            worst = "separate"
+            for field in getattr(expr, "field_assignments", None) or []:
+                v = getattr(field, "value", None) or getattr(field, "expression", None)
+                cls, _prov = self._expr_separateness(v)
+                if cls == "shared":
+                    return "shared", ()
+                if cls == "unknown":
+                    worst = "unknown"
+            return worst, ()
+        if isinstance(expr, fast.Variable):
+            b = self.lookup(getattr(expr, "name", None))
+            if b is None:
+                return "unknown", ()
+            return b.separateness, b.shared_provenance
+        return "unknown", ()
+
     # -- binder helpers ---------------------------------------------------
     def _binding_from_let(self, let_binding: Any) -> _Binding:
         init = getattr(let_binding, "initializer", None)
@@ -419,12 +543,18 @@ class _SpawnCaptureChecker:
         else:
             locality, provenance = (declared or "global"), ()
 
+        sep, sep_prov = self._expr_separateness(init)
+        if isinstance(init, fast.Variable) and sep == "shared" and ident:
+            src_name = getattr(init, "name", "")
+            sep_prov = ((ident, src_name),) + sep_prov
         return _Binding(
             locality=locality,
             lambda_node=init if isinstance(init, fast.LambdaExpression) else None,
             mut_borrow_of=_mut_borrow_target(init),
             provenance=provenance,
             crosses=crosses,
+            separateness=sep,
+            shared_provenance=sep_prov,
         )
 
     def _report_escape(self, let_binding: Any, ident: str, src_name: str,
@@ -525,6 +655,37 @@ class _SpawnCaptureChecker:
                 self.bind_pattern(a)
             return
         self.bind_pattern(pattern)
+
+    # -- handled-op extraction (handler subtraction) ----------------------
+    def _handle_effect_ops(self, node: Any) -> set[tuple[str, str]]:
+        """(effect, op) pairs a `handle E with { op(..) -> .. }` covers."""
+        effect = getattr(node, "effect_name", None)
+        effect = str(effect).split(".")[-1] if effect is not None else ""
+        out: set[tuple[str, str]] = set()
+        for c in getattr(node, "handler", None) or []:
+            op = getattr(c, "op_name", None) or getattr(c, "name", None)
+            if isinstance(op, str) and op and effect:
+                out.add((effect, op))
+        return out
+
+    def _handle_block_ops(self, node: Any) -> set[tuple[str, str]]:
+        effect = getattr(node, "effect_name", None) or getattr(node, "effect", None)
+        effect = str(effect).split(".")[-1] if effect is not None else ""
+        out: set[tuple[str, str]] = set()
+        for arm in getattr(node, "arms", None) or []:
+            pattern, _body = _case_parts(arm)
+            op = None
+            if isinstance(pattern, (fast.FunctionCall, fast.QualifiedFunctionCall)):
+                nm = getattr(pattern, "name", None)
+                if not isinstance(nm, str):
+                    parts = [str(x) for x in (getattr(pattern, "parts", None) or [])]
+                    nm = parts[-1] if parts else None
+                op = nm
+            elif isinstance(pattern, fast.Variable):
+                op = getattr(pattern, "name", None)
+            if isinstance(op, str) and op and effect:
+                out.add((effect, op.split(".")[-1]))
+        return out
 
     # -- the walk ---------------------------------------------------------
     def visit_all(self, nodes: Iterable[Any]) -> None:
@@ -707,10 +868,22 @@ class _SpawnCaptureChecker:
             self.visit_body(getattr(node, "catch_body", None))
             self.pop()
             return
+        if isinstance(node, uast.UnsafeBlock):
+            self._unsafe_depth += 1
+            try:
+                self.visit_all(getattr(node, "body", None) or [])
+            finally:
+                self._unsafe_depth -= 1
+            return
         if isinstance(node, fast.HandleEffect):
-            for c in getattr(node, "handler", None) or []:
-                self.visit(c)
-            self.visit_body(getattr(node, "continuation", None))
+            handled = self._handle_effect_ops(node)
+            self._handled_ops.append(handled)
+            try:
+                for c in getattr(node, "handler", None) or []:
+                    self.visit(c)
+                self.visit_body(getattr(node, "continuation", None))
+            finally:
+                self._handled_ops.pop()
             return
         if isinstance(node, fast.HandleCase):
             self.push()
@@ -723,13 +896,21 @@ class _SpawnCaptureChecker:
             self.pop()
             return
         if isinstance(node, fast.HandleBlock):
-            self.visit_body(getattr(node, "subject", None))
-            for arm in getattr(node, "arms", None) or []:
-                pattern, body = _case_parts(arm)
-                self.push()
-                self.bind_handler_arm(pattern)
-                self.visit_body(body)
-                self.pop()
+            handled = self._handle_block_ops(node)
+            self._handled_ops.append(handled)
+            try:
+                self.visit_body(getattr(node, "subject", None))
+            finally:
+                pass  # arms below re-push nothing; popped after the block
+            try:
+                for arm in getattr(node, "arms", None) or []:
+                    pattern, body = _case_parts(arm)
+                    self.push()
+                    self.bind_handler_arm(pattern)
+                    self.visit_body(body)
+                    self.pop()
+            finally:
+                self._handled_ops.pop()
             return
         if isinstance(node, fast.Comprehension):
             self.visit(getattr(node, "iterable", None))
@@ -757,10 +938,10 @@ def check_spawn_captures(root: Any,
     list for programs that declare no `with EFFECT_SPAWN` operation, so the
     pass costs nothing where threads are not in play.
     """
-    spawn_ops = _collect_spawn_ops(root)
+    spawn_ops, handle_ops = _collect_spawn_ops(root)
     if not spawn_ops:
         return []
-    checker = _SpawnCaptureChecker(spawn_ops, file_path)
+    checker = _SpawnCaptureChecker(spawn_ops, file_path, handle_ops=handle_ops)
     statements = _module_statements(root)
     # Module-level `let` bindings are program-wide constants; bind them all
     # before walking so a spawn anywhere can resolve them.
