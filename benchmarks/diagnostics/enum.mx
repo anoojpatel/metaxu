@@ -1,0 +1,15 @@
+enum Op { Add(int), Mul(int), Nop }
+fn eval(op: Op, x: int) -> int {
+    match op { Add(k) => x + k, Mul(k) => x * k, Nop => x }
+}
+fn main() -> int {
+    let mut acc = 1;
+    let mut i = 0;
+    while i < 20000000 {
+        let op = if i % 3 == 0 { Add(2) } else { if i % 3 == 1 { Mul(3) } else { Nop } };
+        acc = (acc + eval(op, i)) % 1000003;
+        i = i + 1
+    };
+    print(acc);
+    0
+}

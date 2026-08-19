@@ -1,0 +1,11 @@
+fn main() -> int {
+    let mut n = 0;
+    let mut i = 0;
+    while i < 200000 {
+        let s = to_string(i);
+        n = n + len(s);
+        i = i + 1
+    };
+    print(n);
+    0
+}

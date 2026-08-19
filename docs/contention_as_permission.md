@@ -213,6 +213,34 @@ and the four-way aligned harness are checked in at
 fails loudly if the shipped guard changes); re-running after runtime
 changes is one command.
 
+### Post-inlining update (2026-08-19, same day)
+
+The inline Vec fast paths (benchmarks/diagnostics/) moved the guard
+INTO generated code: emitted IR now tests the contended flag (relaxed
+atomic header load) and, only when set, the initial-exec TLS permit —
+the runtime's `mx__vec_write_check` still guards the cold/full ops
+(push growth, the `mx__vec_*_fail` terminators re-checking in canonical
+order). Two consequences for the numbers above:
+
+- The +7.5% row described a guard added to ~6-instruction runtime
+  CALLS. With the call gone, the same guard is a larger fraction of a
+  now-tiny inline store loop: measured guard-vs-no-guard on a pure 20M
+  element-store fill (same IR modulo the guard branch, interleaved,
+  aligned) is **~+1.3 ns per write (+80% on that microloop)** — the
+  price is unchanged in absolute terms but the baseline around it got
+  ~3x faster, so the percentage grew. Real access mixes absorb it: the
+  vecwrite diagnostic (fill + setup) races C at ~1.7x total including
+  bounds checks, and nsieve sits at ~1.09x.
+- `run_bench.py`'s runtime-swap variants (noguard/freeze patches) now
+  vary only the RUNTIME's guard, not the inline one in generated code,
+  so their mutation-loop rows no longer represent "guard removed" —
+  they are kept as historical evidence for the B-vs-C decision (which
+  is closed), with a note in benchmarks/contention/README.md.
+
+The guard load stays `monotonic`: an `unordered` variant was measured
+identical (LICM declines to hoist atomic loads either way), so there is
+no performance argument for weakening it.
+
 ## Status (landed 2026-08-19)
 
 Implemented as specced, on both engines, with the wording above shared
