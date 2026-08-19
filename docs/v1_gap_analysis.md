@@ -66,6 +66,29 @@ mode-crossing evidence (scalar type) certifies it, kind
 `locality-escape` otherwise. See `docs/threads_runtime.md` § Modes for
 the enforced subset and what remains untraced.
 
+Update (2026-08-19): contention is now enforced DYNAMICALLY per
+`docs/contention_as_permission.md` (design B — the effects-native
+answer to OxCaml's contention axis). A Vec captured by a closure
+crossing a REAL spawn is marked contended at the crossing (struct
+fields recursed by static layout, STOP at Vec elements — the
+vec-of-vecs hole is test-pinned, identically on both engines);
+mutating a contended Vec with no runtime mutex held raises catchably
+with byte-identical wording, while reads stay free; permission is a
+per-logical-thread held-mutex counter bumped by the mutex runtime
+(`_ThreadCtx.write_permit` / `_Thread_local mx__tls_write_permit`).
+Natively the marking walk is emitted inside the `EFFECT_SPAWN` runtime
+thunk — which executes exactly when the spawn is real, on both the
+direct-call and the mx_perform_or_default fallback routes — so
+handler-virtualized spawns never mark, and unenumerable capture kinds
+demote the thunk with a reason. `unsafe { }` spawn escapes therefore
+land on a loud runtime net instead of nothing (the old locks-deleted
+TSan race experiment now fails deterministically with the
+contended-write error). Costs are measured, not asserted — the
+uncrossed mutator pays +0.38 ns/call (+15.8% on a pure-mutation
+microloop; stated plainly in the spec's Measured section) —
+and `tests/test_contention.py` pins semantics, differentials, TSan
+and non-vacuity.
+
 Direction update (2026-08-13): the project targets LLVM for AOT native
 compilation (near-C, no GC; modes decide memory). Increment 1 is on this
 branch: codegen_llvm.py emits a verifier-clean LLVM module for the direct

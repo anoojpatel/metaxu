@@ -155,6 +155,15 @@ native fatal one, which still aborts the process.
   one vector on both engines). Data races on it are the program's
   problem; the mutex primitives exist to prevent them, and the native
   test suite proves the mutex path clean under `-fsanitize=thread`.
+  Since the contention work (docs/contention_as_permission.md) there is
+  a dynamic net under that problem: a Vec crossing a REAL spawn is
+  marked contended at the crossing, mutating it with no runtime mutex
+  held raises catchably (identical wording on both engines; reads stay
+  free), and lock/unlock grant/revoke the permission via a per-logical-
+  thread counter that follows `_ThreadCtx` adoption / `_Thread_local`
+  fibers exactly like mutex ownership. Enforcement, marking rule (STOP
+  at Vec elements), and measured costs live in that doc;
+  tests/test_contention.py pins both engines.
 
 ### Modes: what is enforced at the spawn boundary
 
