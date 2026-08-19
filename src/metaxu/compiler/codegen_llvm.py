@@ -893,6 +893,7 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from .mir import MirFunc
 from .cps_frames import is_suspending
+from .effect_tail import tail_resume_ids as _tail_resume_ids
 from .desugar import IMPL_SEP, parse_impl_method_name
 from .hir import (BUILTIN_CALL_PREFIX, STATIC_CALL_PREFIX, TRAIT_CALL_PREFIX,
                   is_tuple_struct as _is_tuple_struct)
@@ -1120,6 +1121,7 @@ _RT_SIGS = {
     "mx_perform_or_default": ("i64", ("ptr", "ptr", "ptr", "i64", "ptr",
                                       "ptr")),
     "mx_resume": ("i64", ("ptr", "i64")),
+    "mx_resume_tail": ("i64", ("ptr", "i64")),
     # Delimited failure recovery (try/catch, metaxu_effects.c).
     "mx_try": ("i64", ("ptr", "ptr", "ptr", "ptr")),
 }
@@ -6616,6 +6618,13 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
     cellset = set(cells.backed.get(f.name, ()))
     cap_cellset = set(cells.cap_cells.get(f.name, ()))
 
+    # Tail-position resumes of this handler case (compiler/effect_tail.py,
+    # shared with the interpreter so both engines trampoline the SAME
+    # sites): these emit mx_resume_tail instead of mx_resume.  Only case
+    # subfunctions are analyzed — a resume anywhere else already demoted.
+    tail_resume_set = (_tail_resume_ids(f) if info.scope_role == "case"
+                       else frozenset())
+
     # MODULE CONSTANTS (increment 12): reads of __module_init-declared
     # names with no local binding load from @mx_g_<name>; inside
     # __module_init itself the declared names' defs STORE there (the
@@ -8954,9 +8963,46 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                 # Single-shot resume of this case's own continuation: the
                 # runtime unparks the body and returns its completion value
                 # (deep semantics) — or never returns on abort unwinding.
+                #
+                # TAIL POSITION (effect_tail.py, strict): when the resume's
+                # value IS this case's return value with nothing after it,
+                # emit the trampolined form — mx_resume_tail records (k, v)
+                # and returns immediately, and the case RETURNS RIGHT HERE:
+                # its frame must be gone before the pump switches into the
+                # body from its CONSTANT frame.  That keeps handler-side
+                # stack O(1) per element for stream-shaped handlers instead
+                # of one (case + resume) frame pair per element.  The ops
+                # the analysis proved to be a pure copy chain to the ret
+                # are NOT emitted (the body has not run yet, so there is no
+                # value to copy — mx_resume_tail's result is a dummy the
+                # pump ignores; running word_into on it would copy out of a
+                # null boundary box for aggregate kinds).  Writebacks and
+                # frame frees run exactly as on the normal ret path.
+                # Anything non-tail keeps the general recursive mx_resume.
                 kp = use(opargs[0], lines)
                 w = to_word(kind(opargs[1]), use(opargs[1], lines), lines,
                             src=opargs[1])
+                if id(op) in tail_resume_set:
+                    mod.runtime_syms.add("mx_resume_tail")
+                    v = fresh()
+                    lines.append(
+                        f"  {v} = call i64 @mx_resume_tail(ptr {kp}, "
+                        f"i64 {w})  ; tail resume: record for the pump")
+                    emit_writebacks(lines)
+                    emit_frees(lines)
+                    if is_boundary_ret:
+                        lines.append(
+                            f"  ret i64 {v}  ; tail resume: back to the "
+                            "pump (dummy word, ignored there)")
+                    else:
+                        dec, rv = _word_decode(v, sig.ret, fresh())
+                        lines += dec
+                        lines.append(
+                            f"  ret {_llscalar(sig.ret)} {rv}  ; tail "
+                            "resume: back to the pump (dummy, ignored "
+                            "there)")
+                    terminated = True
+                    break
                 mod.runtime_syms.add("mx_resume")
                 v = fresh()
                 lines.append(f"  {v} = call i64 @mx_resume(ptr {kp}, i64 {w})")

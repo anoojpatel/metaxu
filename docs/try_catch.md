@@ -86,7 +86,9 @@ Three invariants make it compose with in-flight effect scopes:
    with the handler *outside* the try works, and why a failure on the
    handler side can never longjmp into a parked frame.
 2. **A failure on a body fiber with no local pad escapes to its owner.**
-   It becomes an `MX_EV_ERROR` event, which `mx_handle`/`mx_resume` re-raise
+   It becomes an `MX_EV_ERROR` event, which `mx_handle`/`mx_resume` — and
+   the owner-side event pump that trampolines tail resumes
+   (`mx__pump_events`, see metaxu_effects.c "THE PUMP MODEL") — re-raise
    on the owner stack.  That is the interpreter's `("error", exc)` message
    from the body thread to `_pump_scope`, and it is what makes
    `try { handle { ... fail ... } }` — and a `try` inside a handler case

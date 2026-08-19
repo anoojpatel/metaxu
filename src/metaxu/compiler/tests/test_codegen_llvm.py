@@ -2314,7 +2314,9 @@ def test_handle_scope_emits_runtime_call_and_shims():
     # runtime declares
     assert "declare i64 @mx_handle(ptr, ptr, ptr, ptr, ptr, ptr, ptr, i64)" in ir
     assert "declare i64 @mx_perform(ptr, ptr, ptr, i64)" in ir
-    assert "declare i64 @mx_resume(ptr, i64)" in ir
+    # `ask() -> resume(7)` is a TAIL-position resume (effect_tail.py), so
+    # the trampolined form is declared and called instead of mx_resume.
+    assert "declare i64 @mx_resume_tail(ptr, i64)" in ir
     # per-site artifacts: env type, op-name/arity tables, thunk + dispatcher
     assert re.search(r"%henv\.\w+ = type \{", ir)
     assert re.search(r"@mxfx\.ops\.\w+ = private unnamed_addr constant "
@@ -2329,7 +2331,7 @@ def test_handle_scope_emits_runtime_call_and_shims():
     # subfunctions take the leading env param; the case gets __k as a ptr
     assert re.search(r"define i64 @mx___handler_Ask_ask_\w+"
                      r"\(ptr %cl\.env, i64 %a\._, ptr %a\.__k\)", ir)
-    assert "call i64 @mx_resume(ptr %a.__k, i64 7)" in ir
+    assert "call i64 @mx_resume_tail(ptr %a.__k, i64 7)" in ir
 
 
 def test_resume_outside_its_handler_case_demotes():
@@ -4690,8 +4692,10 @@ fn main() -> int {
     let s = take(iota(10), 3);
     let total = sum(s);
     let n = count(iota(5));
+    let folded = fold(iota(4), 0, fn(x: int, acc: int) -> x + acc);
     print(total);
     print(n);
+    print(folded);
     total + n
 }
 """
@@ -4736,8 +4740,9 @@ def test_std_stream_import_emits_cell_counter_handlers():
                 r"mx_std_stream_take(?:_ho\d+)?_lambda1",
                 r"mx___handler_Emit_emit_std_stream_fold(?:_ho\d+)?_hs1"):
         assert re.search(rf"^define (?:i64|void) @{sym}\(", ir, re.M), sym
-    # fold's f is a dynamic closure (sum/product/count lambdas): the case
-    # calls it indirectly through the word-uniform ABI.
+    # sum's accumulator lambda is a dynamic closure flowing through
+    # iter's handler case (and fold's case calls main's lambda the same
+    # way): indirect calls through the word-uniform ABI.
     assert re.search(r"indirect closure call \(.*sum\$lambda", ir)
     # Unused drivers demote honestly on their bottom-kinded parameters.
     assert re.search(
@@ -5101,6 +5106,7 @@ fn main() -> int {
     let s = filter(map(chain(iota(6), take(iota(9), 3)), fn(x: int) -> x * 2),
                    fn(x: int) -> x > 4);
     print(sum(s));
+    print(fold(iota(4), 100, fn(x: int, acc: int) -> acc + x));
     print(product(take(iota(5), 3)));
     print(count(skip(iota(9), 5)));
     iter(iota(3), fn(x) { print(x) });
@@ -6367,9 +6373,13 @@ def test_boundary_results_view_the_producers_box_instead_of_copying_out():
     # boundary box any more in this program.
     ir = llvm_from_source(_FX17_CHAIN_SRC)
     assert count_placeholders(ir) == 0
+    # 4 performs + the handle value.  The 2 resumes are TAIL-position
+    # (effect_tail.py): their cases return to the pump before the body
+    # runs, so no resume result ever materializes in the case — the value
+    # flows through the pump's DONE path into the handle value instead.
     assert len(re.findall(
         r"; elide-copy: \w+ views the producer's write-once boundary box "
-        r"\(struct:St\)", ir)) == 7   # 4 performs + 2 resumes + the handle value
+        r"\(struct:St\)", ir)) == 5
     # the old copy-out shape (inttoptr the word, then load/store the
     # aggregate into our own slot) is gone
     assert "to ptr  ; boundary box: struct:St" not in ir
@@ -6380,9 +6390,14 @@ def test_chained_perform_passes_the_received_box_straight_through():
     # of the previous perform re-uses that box; only the FRESH structs (the
     # initial St and the two resume values) still box.
     ir = llvm_from_source(_FX17_CHAIN_SRC)
+    # 4 pass-throughs: the three chained performs handing the previous
+    # box onward, plus the body's boundary-word return of the last
+    # perform's box.  (The two case RETURNS used to pass their
+    # resume-result box through as the boundary word too; tail resumes
+    # return a dummy to the pump instead, so those two sites are gone.)
     assert len(re.findall(
         r"; elide-box: \w+ already IS an immortal write-once boundary box "
-        r"\(struct:St\); its pointer passes through", ir)) == 6
+        r"\(struct:St\); its pointer passes through", ir)) == 4
     assert len(re.findall(
         r"call ptr @malloc\(i64 16\)"
         r"  ; boundary box: struct:St \(write-once, leaks by design\)",
