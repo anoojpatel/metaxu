@@ -1,0 +1,11 @@
+fn apply3(f, x: int) -> int { f(f(f(x))) }
+fn main() -> int {
+    let mut acc = 0;
+    let mut i = 0;
+    while i < 10000000 {
+        acc = acc + apply3(fn(v: int) -> v + 1, i) % 7;
+        i = i + 1
+    };
+    print(acc);
+    0
+}

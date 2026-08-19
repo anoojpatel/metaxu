@@ -1,0 +1,10 @@
+fn main() -> int {
+    let mut acc = 0;
+    let mut i = 0;
+    while i < 40000000 {
+        acc = acc + (i * i) % 1000;
+        i = i + 1
+    };
+    print(acc);
+    0
+}

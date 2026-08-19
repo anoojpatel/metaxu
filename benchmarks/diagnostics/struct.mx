@@ -1,0 +1,13 @@
+struct P { a: int, b: int, c: int }
+fn mix(p: P) -> P { P { a: p.b + 1, b: p.c * 2, c: p.a + p.b } }
+fn main() -> int {
+    let mut p = P { a: 1, b: 2, c: 3 };
+    let mut i = 0;
+    while i < 40000000 {
+        p = mix(p);
+        p = P { a: p.a % 1000, b: p.b % 1000, c: p.c % 1000 };
+        i = i + 1
+    };
+    print(p.a + p.b + p.c);
+    0
+}

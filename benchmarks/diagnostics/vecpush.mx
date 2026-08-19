@@ -1,0 +1,13 @@
+fn main() -> int {
+    let mut total = 0;
+    let mut r = 0;
+    while r < 4 {
+        let mut v = Vec.new();
+        let mut i = 0;
+        while i < 5000000 { v.push(i); i = i + 1 };
+        total = total + v[4999999];
+        r = r + 1
+    };
+    print(total);
+    0
+}

@@ -160,3 +160,17 @@ def test_showcase_suite_programs_compile_native_clean():
         ir = emit_llvm_from_source(open(path).read(), file_path=path)
         if os.path.basename(path) not in allowed_placeholders:
             assert "placeholder -- unsupported" not in ir, path
+
+
+def test_emission_diagnostics_programs_compile_native_clean():
+    # Same rot-prevention for benchmarks/diagnostics: each pair isolates
+    # one emission pattern, so a demotion would silently turn its row
+    # into a measurement of the placeholder, not the pattern.
+    import glob as _glob
+    from metaxu.compiler.pipeline import emit_llvm_from_source
+    diags = sorted(_glob.glob(os.path.join(REPO_ROOT, "benchmarks",
+                                           "diagnostics", "*.mx")))
+    assert len(diags) >= 8, diags
+    for path in diags:
+        ir = emit_llvm_from_source(open(path).read(), file_path=path)
+        assert "placeholder -- unsupported" not in ir, path

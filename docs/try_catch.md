@@ -100,6 +100,30 @@ Three invariants make it compose with in-flight effect scopes:
    interpreter's `finally: _abort_scope(scope); frames.remove(frame)` plus
    `_pump_scope`'s `finally: frame["busy"] = False`.
 
+### Try-body captures: read-before-rebind names are env fields
+
+The body and catch compile to sub-functions receiving the try site's env
+struct.  Which enclosing names land in that env comes from the codegen
+free-name fixpoint, and it has one non-obvious rule (added 2026-08 after
+the inline-Vec work unmasked a soundness hole): a name that the body
+both USES and DEFINES is still free when it is **upward-exposed** —
+possibly read before its first local def.  The shape that needs it is a
+field or index update on an enclosing struct: `h.data[0] = 9` lowers to
+read `h` → element store → REBIND `h` (the functional store-back), so
+plain `uses - defs` called `h` local and the body read an uninitialized
+slot.  The all-call emission survived that by accident (the garbage
+word reached `mx_vec_set`, whose contended check happened to fire the
+"right" raise); the inline emission dereferenced it and crashed.
+`_upward_exposed` (block-level backward liveness in codegen_llvm.py)
+now keeps such names free — as **by-value** env fields, which is
+interpreter parity: there too the rebind stays local to the body's env
+copy while the Vec mutation travels by identity.  Exposure is
+intersected with the site's captures because liveness also sees the
+impossible br-to-join path after a raising `match_fail`, which would
+otherwise drag match-result temps into the env.  Pinned by
+`test_try_body_field_update_sees_enclosing_struct` (differential, plus
+the env-struct shape).
+
 ### Catchable vs fatal, natively
 
 A failure is catchable **iff** the interpreter raises `InterpError` for it
