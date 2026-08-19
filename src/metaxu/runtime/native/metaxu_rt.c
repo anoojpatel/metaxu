@@ -86,17 +86,26 @@ static void mx_vec_check(const mx_vec *v, const char *op) {
 
 /* The contended-write guard, shared by every Vec mutator.  Order of tests:
  * the uncontended path (the overwhelming common case) pays ONLY the flag
- * test -- the thread-local permit read happens after the unlikely branch.
- * Wording is byte-identical to the interpreter's InterpError
- * (mir_interp._CONTENDED_WRITE_MSG); the caught value is language-visible. */
-static void mx__vec_write_check(mx_vec *v) {
+ * test -- the thread-local permit read (a direct TLS load: the exported
+ * mx__tls_write_permit variable, NOT the accessor call, which measurably
+ * bloated the mutators' fast path) happens after the unlikely branch, and
+ * the raise itself is outlined cold so the mutators carry just a
+ * compare-and-jump.  Wording is byte-identical to the interpreter's
+ * InterpError (mir_interp._CONTENDED_WRITE_MSG); the caught value is
+ * language-visible. */
+__attribute__((cold, noinline))
+static void mx__vec_contended_raise(void) {
+    mx_rt_raise(
+        "write to contended Vec without a held lock: this value crossed "
+        "a thread boundary at spawn; mutate it under a mutex "
+        "(std.sync.with_lock) or keep it thread-local");
+}
+
+static inline void mx__vec_write_check(mx_vec *v) {
     if (__builtin_expect(
-            atomic_load_explicit(&v->contended, memory_order_relaxed), 0)
-        && mx__write_permit() == 0) {
-        mx_rt_raise(
-            "write to contended Vec without a held lock: this value crossed "
-            "a thread boundary at spawn; mutate it under a mutex "
-            "(std.sync.with_lock) or keep it thread-local");
+            atomic_load_explicit(&v->contended, memory_order_relaxed)
+            && mx__tls_write_permit == 0, 0)) {
+        mx__vec_contended_raise();
     }
 }
 
