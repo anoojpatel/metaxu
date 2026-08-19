@@ -6373,9 +6373,13 @@ def test_boundary_results_view_the_producers_box_instead_of_copying_out():
     # boundary box any more in this program.
     ir = llvm_from_source(_FX17_CHAIN_SRC)
     assert count_placeholders(ir) == 0
+    # 4 performs + the handle value.  The 2 resumes are TAIL-position
+    # (effect_tail.py): their cases return to the pump before the body
+    # runs, so no resume result ever materializes in the case — the value
+    # flows through the pump's DONE path into the handle value instead.
     assert len(re.findall(
         r"; elide-copy: \w+ views the producer's write-once boundary box "
-        r"\(struct:St\)", ir)) == 7   # 4 performs + 2 resumes + the handle value
+        r"\(struct:St\)", ir)) == 5
     # the old copy-out shape (inttoptr the word, then load/store the
     # aggregate into our own slot) is gone
     assert "to ptr  ; boundary box: struct:St" not in ir
@@ -6386,9 +6390,14 @@ def test_chained_perform_passes_the_received_box_straight_through():
     # of the previous perform re-uses that box; only the FRESH structs (the
     # initial St and the two resume values) still box.
     ir = llvm_from_source(_FX17_CHAIN_SRC)
+    # 4 pass-throughs: the three chained performs handing the previous
+    # box onward, plus the body's boundary-word return of the last
+    # perform's box.  (The two case RETURNS used to pass their
+    # resume-result box through as the boundary word too; tail resumes
+    # return a dummy to the pump instead, so those two sites are gone.)
     assert len(re.findall(
         r"; elide-box: \w+ already IS an immortal write-once boundary box "
-        r"\(struct:St\); its pointer passes through", ir)) == 6
+        r"\(struct:St\); its pointer passes through", ir)) == 4
     assert len(re.findall(
         r"call ptr @malloc\(i64 16\)"
         r"  ; boundary box: struct:St \(write-once, leaks by design\)",
