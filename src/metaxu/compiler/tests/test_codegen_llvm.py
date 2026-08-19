@@ -7791,10 +7791,13 @@ effect Mutex = {
 # N=4 threads x M=250 mutex-guarded increments of ONE Vec slot (Vec has
 # identity semantics on both engines, so the captured vec IS shared
 # state).  Final value 1000 is schedule-independent.  KEEP THE LOCK/UNLOCK
-# LINES: deleting them was the TSan non-vacuity experiment — TSan then
-# reports a data race on the slot (mx_vec_get/mx_vec_set from two child
-# threads; see the commit message that landed the native thread path) —
-# and the test below asserts the MUTEXED program is TSan-clean.
+# LINES: they are what grants the write permission — since the contention
+# work (docs/contention_as_permission.md) the captured vec is marked
+# contended at spawn, so deleting the lock/unlock no longer races: the
+# first unprotected write raises the contended-write error
+# deterministically (pinned in test_contention.py, which also keeps the
+# historical TSan-data-race experiment's story: the race is now
+# unreachable because the write never happens).
 _THREAD_COUNTER_SRC = _THREAD_EFFECTS_DECL + """
 fn main() -> int {
     let m = perform Mutex.create();
@@ -7804,7 +7807,10 @@ fn main() -> int {
     let @mut i = 0;
     # unsafe: exercises the RAW mutex primitives on purpose (manual
     # lock/unlock around a bare shared Vec); the blessed non-unsafe
-    # spelling is std.sync.protect (docs/separate_send_sync.md).
+    # spelling is std.sync.protect (docs/separate_send_sync.md).  Since
+    # the contention work this manual discipline has a dynamic net: the
+    # vec is marked contended at spawn, and the held lock is what makes
+    # the writes legal (docs/contention_as_permission.md).
     unsafe {
         while i < 4 {
             let t = perform Thread.spawn(|| {
@@ -7907,9 +7913,11 @@ def test_native_thread_counter_tsan_clean(tmp_path):
     """-fsanitize=thread (runtime objects TSan-instrumented too, see
     llvm_run._runtime_object_paths): a TSan report changes the exit code
     (66) and breaks the stdout/exit differential, so passing == zero
-    reports.  Non-vacuity: with the lock/unlock lines deleted from the
-    counter source, TSan reports a data race on the Vec slot (verified
-    during development; see the landing commit message)."""
+    reports.  Non-vacuity history: with the lock/unlock lines deleted the
+    original experiment showed a TSan data race on the Vec slot; since
+    the contention work that variant instead raises the contended-write
+    error before any racing store (pinned in test_contention.py's
+    locks-deleted TSan test)."""
     result, expected_out = interp_run(_THREAD_COUNTER_SRC)
     assert result in (UNIT, 0)
     ir = llvm_from_source(_THREAD_COUNTER_SRC)
