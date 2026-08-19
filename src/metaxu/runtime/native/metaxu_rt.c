@@ -32,7 +32,7 @@
  *                  interpreter's InterpError message byte for byte -- the
  *                  caught value is language-visible (docs/try_catch.md).
  * ---------------------------------------------------------------------- */
-static void mx_rt_fail(const char *fmt, ...) {
+_Noreturn static void mx_rt_fail(const char *fmt, ...) {
     va_list ap;
     fflush(stdout);   /* abort() does not: keep the printed prefix visible */
     fputs("metaxu runtime error: ", stderr);
@@ -177,13 +177,56 @@ int64_t mx_vec_get(const mx_vec *v, int64_t idx) {
 }
 
 void mx_vec_set(mx_vec *v, int64_t idx, int64_t value) {
-    mx_vec_check(v, "index");
+    mx_vec_check(v, "index assignment");
     mx__vec_write_check(v);
+    if (idx < 0 || idx >= v->len) {
+        /* Interpreter parity (mir_interp index assignment): stores say
+         * "index assignment", reads say "index" — mx_fvec_set_copy
+         * already matched and this site lagged until the inline-fast-path
+         * differential caught it. */
+        mx_rt_raise("index assignment out of bounds: %lld (length %lld)",
+                    (long long)idx, (long long)v->len);
+    }
+    v->data[idx] = value;
+}
+
+/* Inline-fast-path cold terminators (metaxu_rt.h): re-run the op's
+ * canonical check order and raise/abort exactly as the full op would.
+ * The trailing mx_rt_fail is defensive — generated code reaches these
+ * only when an inlined check failed, so one of the canonical checks must
+ * fire; if a racing writer changed the header in between (possible only
+ * under a data race the language already forbids), fail loudly. */
+void mx__vec_get_fail(const mx_vec *v, int64_t idx) {
+    mx_vec_check(v, "index");
     if (idx < 0 || idx >= v->len) {
         mx_rt_raise("index out of bounds: %lld (length %lld)",
                     (long long)idx, (long long)v->len);
     }
-    v->data[idx] = value;
+    mx_rt_fail("metaxu internal: Vec get fast-path miss did not fail");
+}
+
+void mx__vec_set_fail(mx_vec *v, int64_t idx) {
+    mx_vec_check(v, "index assignment");
+    mx__vec_write_check(v);
+    if (idx < 0 || idx >= v->len) {
+        mx_rt_raise("index assignment out of bounds: %lld (length %lld)",
+                    (long long)idx, (long long)v->len);
+    }
+    mx_rt_fail("metaxu internal: Vec set fast-path miss did not fail");
+}
+
+void mx__vec_pop_fail(mx_vec *v) {
+    mx_vec_check(v, "pop");
+    mx__vec_write_check(v);
+    if (v->len == 0) {
+        mx_rt_raise("pop: Vec is empty");
+    }
+    mx_rt_fail("metaxu internal: Vec pop fast-path miss did not fail");
+}
+
+void mx__vec_len_fail(const mx_vec *v) {
+    mx_vec_check(v, "len");
+    mx_rt_fail("metaxu internal: Vec len fast-path miss did not fail");
 }
 
 void mx_vec_free(mx_vec *v) {

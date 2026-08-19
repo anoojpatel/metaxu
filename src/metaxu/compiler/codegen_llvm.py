@@ -1074,6 +1074,16 @@ _RT_SIGS = {
     "mx_vec_len": ("i64", ("ptr",)),
     "mx_vec_get": ("i64", ("ptr", "i64")),
     "mx_vec_set": ("void", ("ptr", "i64", "i64")),
+    # Cold-path terminators for the inline Vec fast paths: reached only
+    # when an inlined check failed; re-run the op's canonical checks and
+    # raise/abort with the byte-identical diagnostic.  Their declares
+    # carry the attributes in _RT_ATTRS — noreturn plus a narrow memory
+    # contract — so a never-taken miss branch does not clobber the
+    # surrounding loop's hoisted header loads.
+    "mx__vec_get_fail": ("void", ("ptr", "i64")),
+    "mx__vec_set_fail": ("void", ("ptr", "i64")),
+    "mx__vec_pop_fail": ("void", ("ptr",)),
+    "mx__vec_len_fail": ("void", ("ptr",)),
     "mx_vec_free": ("void", ("ptr",)),
     # Contention marking (docs/contention_as_permission.md): called at the
     # real-spawn path (inside the EFFECT_SPAWN runtime thunk) for every
@@ -1124,6 +1134,24 @@ _RT_SIGS = {
     "mx_resume_tail": ("i64", ("ptr", "i64")),
     # Delimited failure recovery (try/catch, metaxu_effects.c).
     "mx_try": ("i64", ("ptr", "ptr", "ptr", "ptr")),
+}
+
+# Attribute suffixes for _RT_SIGS declares that carry more contract than a
+# bare signature.  The fail terminators never return, and the only memory
+# they WRITE is the raise/abort machinery's own state — memory the module
+# never touches through pointers it holds (LLVM "inaccessiblemem"; every
+# other runtime declare is unmarked and so conservatively clobbers it).
+# That narrow contract is load-bearing: it is what lets LICM keep a hot
+# loop's Vec header loads hoisted across the never-taken miss branch.
+_RT_ATTRS = {
+    "mx__vec_get_fail":
+        " cold noreturn memory(read, inaccessiblemem: readwrite)",
+    "mx__vec_set_fail":
+        " cold noreturn memory(read, inaccessiblemem: readwrite)",
+    "mx__vec_pop_fail":
+        " cold noreturn memory(read, inaccessiblemem: readwrite)",
+    "mx__vec_len_fail":
+        " cold noreturn memory(read, inaccessiblemem: readwrite)",
 }
 
 # Native effect-op argument/parameter limit (metaxu_effects.h
@@ -2932,14 +2960,98 @@ class _ScopeTable:
             self.bad.setdefault(m, reason)
 
 
+def _op_uses_defs(op: tuple) -> Tuple[Set[str], Set[str]]:
+    """Per-op (used names, defined names), mirroring the categorization in
+    ``_fn_defs_uses_sites`` exactly (callee names are NOT uses; capture
+    values of a nested handle/try site ARE uses at the site op — the env
+    fill reads them there, which is what the exposure analysis orders)."""
+    ou: Set[str] = set()
+    od: Set[str] = set()
+    k = op[0]
+    if k == "params":
+        od.update(op[1])
+    elif k == "perform" and len(op) >= 7:
+        ou.update(op[4])
+        od.add(op[1])
+    elif k == "promote_matrix":
+        ou.update(op[1] if len(op) > 1 else ())
+    elif k == "cell_wrap":
+        ou.add(op[1])
+    elif k == "let" and len(op) == 4:
+        _, dst, rhs, args = op
+        od.add(dst)
+        rk = rhs[0]
+        if rk == "alloc_struct" or rk == "make_closure":
+            ou.update(v for (_n, v) in args if isinstance(v, str))
+        elif rk == "handle_scope" or rk == "try_scope":
+            ou.update(v for (_n, v) in args if isinstance(v, str))
+        else:  # call included: args are uses, the callee NAME is not
+            ou.update(a for a in args if isinstance(a, str))
+    return ou, od
+
+
+def _upward_exposed(f: MirFunc) -> Set[str]:
+    """Names possibly READ BEFORE ANY DEF on some entry path (live-in at
+    the entry block): classic backward liveness over gen/kill per block.
+
+    Why this matters: a scope member that REBINDS a captured binding after
+    reading it (the store-back shape field/index updates lower to —
+    `h.data[0] = 9` becomes read h -> mx_vec_set -> rebind h) has the name
+    in both uses and defs, and plain `uses - defs` calls it local.  It is
+    not: the first read must see the ENCLOSING binding, so the name needs
+    an env field like any other capture (by value — interpreter parity:
+    the rebind itself stays local there too, while the vec mutation
+    travels by identity)."""
+    n = len(f.blocks)
+    gen: List[Set[str]] = []
+    kill: List[Set[str]] = []
+    succs: List[Tuple[int, ...]] = []
+    for b in f.blocks:
+        g: Set[str] = set()
+        d: Set[str] = set()
+        for op in b.ops:
+            ou, od = _op_uses_defs(op)
+            g |= (ou - d)
+            d |= od
+        t = b.term
+        if t[0] in ("br_if", "ret") and isinstance(t[1], str) \
+                and t[1] not in d:
+            g.add(t[1])
+        gen.append(g)
+        kill.append(d)
+        if t[0] == "br":
+            succs.append((t[1],))
+        elif t[0] == "br_if":
+            succs.append((t[2], t[3]))
+        else:
+            succs.append(())
+    live_in: List[Set[str]] = [set() for _ in range(n)]
+    changed = True
+    while changed:
+        changed = False
+        for i in range(n - 1, -1, -1):
+            out: Set[str] = set()
+            for s in succs[i]:
+                if 0 <= s < n:
+                    out |= live_in[s]
+            ni = gen[i] | (out - kill[i])
+            if ni != live_in[i]:
+                live_in[i] = ni
+                changed = True
+    return live_in[0] if n else set()
+
+
 def _fn_defs_uses_sites(
-        f: MirFunc) -> Tuple[Set[str], Set[str], Set[str], List[str]]:
+        f: MirFunc) -> Tuple[Set[str], Set[str], Set[str], List[str],
+                             Set[str]]:
     """(defined names, directly used names, call CALLEE names, handle sites
-    contained) of a function — the base facts for the free-name fixpoint.
-    Callee names are kept separate: a callee is a free name only when the
-    handle site actually captured a binding of that name (interpreter
-    resolution order: the env shadows module functions and builtins), so
-    plain calls to module functions must not force phantom captures."""
+    contained, upward-exposed names) of a function — the base facts for the
+    free-name fixpoint.  Callee names are kept separate: a callee is a free
+    name only when the handle site actually captured a binding of that name
+    (interpreter resolution order: the env shadows module functions and
+    builtins), so plain calls to module functions must not force phantom
+    captures.  Upward-exposed names (read before any def on some path) are
+    free even when locally rebound — see ``_upward_exposed``."""
     defs: Set[str] = set()
     uses: Set[str] = set()
     callees: Set[str] = set()
@@ -2947,37 +3059,25 @@ def _fn_defs_uses_sites(
     for b in f.blocks:
         for op in b.ops:
             k = op[0]
-            if k == "params":
-                defs.update(op[1])
-            elif k == "perform" and len(op) >= 7:
-                uses.update(op[4])
+            if k == "let" and len(op) == 4 and op[2][0] in ("handle_scope",
+                                                            "try_scope"):
+                sites.append(op[2][1])
                 defs.add(op[1])
-            elif k == "promote_matrix":
-                uses.update(op[1] if len(op) > 1 else ())
-            elif k == "cell_wrap":
-                uses.add(op[1])
-            elif k == "let" and len(op) == 4:
-                _, dst, rhs, args = op
-                defs.add(dst)
-                rk = rhs[0]
-                if rk == "alloc_struct" or rk == "make_closure":
-                    uses.update(v for (_n, v) in args if isinstance(v, str))
-                elif rk == "handle_scope" or rk == "try_scope":
-                    sites.append(rhs[1])
-                    # capture VALUES are used only as far as the site's
-                    # members need them (the lowering captures every env
-                    # name conservatively; the interpreter is non-strict
-                    # about unbound ones) — added during the fixpoint.
-                elif rk == "call":
-                    uses.update(a for a in args if isinstance(a, str))
-                    if len(rhs) > 1 and isinstance(rhs[1], str):
-                        callees.add(rhs[1])
-                else:
-                    uses.update(a for a in args if isinstance(a, str))
+                # capture VALUES are used only as far as the site's
+                # members need them (the lowering captures every env
+                # name conservatively; the interpreter is non-strict
+                # about unbound ones) — added during the fixpoint.
+                continue
+            ou, od = _op_uses_defs(op)
+            uses |= ou
+            defs |= od
+            if k == "let" and len(op) == 4 and op[2][0] == "call" \
+                    and len(op[2]) > 1 and isinstance(op[2][1], str):
+                callees.add(op[2][1])
         t = b.term
         if t[0] in ("br_if", "ret") and isinstance(t[1], str):
             uses.add(t[1])
-    return defs, uses, callees, sites
+    return defs, uses, callees, sites, _upward_exposed(f)
 
 
 def _build_scope_table(funcs: Sequence[MirFunc]) -> _ScopeTable:
@@ -3091,7 +3191,7 @@ def _build_scope_table(funcs: Sequence[MirFunc]) -> _ScopeTable:
         for m in table.member_site:
             if m not in by_name:
                 continue
-            defs, uses, callees, inner_sites = base[m]
+            defs, uses, callees, inner_sites, exposed = base[m]
             site_caps = table.sites[table.member_site[m]].cap_vals
             need = set(uses)
             # A call whose callee name the site captured resolves to the
@@ -3103,7 +3203,18 @@ def _build_scope_table(funcs: Sequence[MirFunc]) -> _ScopeTable:
             need |= {c for c in callees if c in site_caps}
             for s2 in inner_sites:
                 need |= site_needs(s2)
-            nf = (need - defs) | (need & defs & wrapped_names)
+            # A name both used and defined stays free when it is
+            # cell-wrapped (writes go through the shared cell) OR
+            # upward-exposed (read before the local rebind: the first read
+            # must see the enclosing binding — the store-back shape field
+            # and index updates lower to).  Exposure alone is intersected
+            # with the site's captures: liveness sees the impossible
+            # br-to-join path after a raising match_fail, which makes
+            # match-result TEMPS look read-before-def, and a temp is never
+            # a site capture while a real enclosing binding always is.
+            nf = (need - defs) | (need & defs
+                                  & (wrapped_names
+                                     | (exposed & set(site_caps))))
             nf -= {n for n in nf
                    if n in global_names and n not in site_caps}
             if nf != free[m]:
@@ -6042,6 +6153,14 @@ class _ModuleState:
         self.uses_malloc = False   # @global structs: malloc/free declares
         self.uses_printf = False   # direct variadic printf (multi-arg print)
         self.runtime_syms: Set[str] = set()  # mx_* native runtime declares
+        # Inlined Vec-mutator fast paths read the per-thread write permit
+        # directly (contended-write guard, docs/contention_as_permission.md).
+        self.uses_tls_permit = False
+        # Inline Vec accesses carry TBAA tags separating header words from
+        # element words (always distinct allocations by the runtime's
+        # contract), so an element store cannot pin the loop-hoisted
+        # len/data loads.  Untagged accesses stay compatible with both.
+        self.uses_vec_tbaa = False
         # extern C FFI declares beyond malloc/free (memcpy/realloc/fopen/
         # fclose), emitted with their real C signatures.
         self.extern_c_syms: Set[str] = set()
@@ -7409,11 +7528,106 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                 f"  {v} = call {rty} @{mangle(callee)}({', '.join(avals)})")
             setval(dst, v, lines)
 
+    # TBAA access tags for the inline Vec fast paths (metadata nodes !0-!4
+    # emitted by _emit_runtime when used): header words and element words
+    # live in DISTINCT allocations by the runtime's contract (the header is
+    # its own malloc block; data is a separately (re)allocated buffer), so
+    # tagging them apart lets clang keep the hoisted len/data loads live
+    # across element stores.  Untagged accesses alias both — partial
+    # tagging stays sound.
+    TBAA_HDR = ", !tbaa !3"
+    TBAA_ELEM = ", !tbaa !4"
+
+    # ---- Inline Vec fast paths -------------------------------------------
+    # Growable-Vec accessors are the hottest runtime calls the backend
+    # emits, and an opaque call per element access blocks every loop
+    # optimization clang could otherwise do (register caching, LICM,
+    # strength reduction) — measured at 2.6-2.9x vs C on unit-stride loops
+    # (benchmarks/diagnostics).  So the COMMON case is emitted inline
+    # against the mx_vec header layout (metaxu_rt.c: len @0, cap @8,
+    # data @16, contended @24 — 32 bytes) and ANY miss branches to the
+    # runtime, which re-runs the full checks in the runtime's canonical
+    # order so every diagnostic (NULL receiver, bounds, contended-write,
+    # growth/OOM) stays byte-identical to the all-call emission and the
+    # interpreter.  get/set/pop/len misses are ALWAYS failures, so their
+    # cold blocks call the noreturn mx__vec_*_fail terminators whose
+    # narrow memory contract (_RT_ATTRS) keeps hot-loop header loads
+    # hoistable across the never-taken branch; push's miss includes the
+    # normal growth path and calls the full op.
+
+    def _vec_data_ep(recv: str, idx: str, lines: List[str]) -> str:
+        """Address of element idx: data pointer lives at header offset 16."""
+        mod.uses_vec_tbaa = True
+        dpp, data, ep = fresh(), fresh(), fresh()
+        lines.append(
+            f"  {dpp} = getelementptr inbounds i8, ptr {recv}, i64 16")
+        lines.append(f"  {data} = load ptr, ptr {dpp}, align 8{TBAA_HDR}")
+        lines.append(
+            f"  {ep} = getelementptr inbounds i64, ptr {data}, i64 {idx}")
+        return ep
+
+    def _vec_permit_guard(recv: str, uid: str, tag: str, hot: str, cold: str,
+                          lines: List[str]) -> None:
+        """Contended-write guard (docs/contention_as_permission.md): hot iff
+        the vec never crossed a spawn (relaxed atomic flag at offset 24 is
+        0) OR this thread holds a lock permit (direct initial-exec TLS
+        load, mirroring mx__vec_write_check's field-not-accessor choice)."""
+        mod.uses_tls_permit = True
+        cp, cont, contz = fresh(), fresh(), fresh()
+        perm_lbl = f"{tag}.perm.{uid}"
+        lines.append(
+            f"  {cp} = getelementptr inbounds i8, ptr {recv}, i64 24")
+        lines.append(
+            f"  {cont} = load atomic i64, ptr {cp} monotonic, "
+            f"align 8{TBAA_HDR}")
+        lines.append(f"  {contz} = icmp eq i64 {cont}, 0")
+        lines.append(f"  br i1 {contz}, label %{hot}, label %{perm_lbl}")
+        lines.append(f"{perm_lbl}:")
+        perm, pok = fresh(), fresh()
+        lines.append(
+            f"  {perm} = load i64, ptr @mx__tls_write_permit, align 8")
+        lines.append(f"  {pok} = icmp ne i64 {perm}, 0")
+        lines.append(f"  br i1 {pok}, label %{hot}, label %{cold}")
+
+    def _emit_vec_set_inline(recv: str, idx: str, w: str,
+                             lines: List[str]) -> None:
+        """In-place Vec element store: inline null + bounds (one unsigned
+        compare covers negatives) + contended guard, then a direct store.
+        Every miss is a FAILURE (null / out-of-bounds / contended write
+        without a permit), so the cold block calls the noreturn
+        mx__vec_set_fail terminator — canonical check order, byte-identical
+        diagnostic — whose narrow memory contract (writes only
+        inaccessible raise state) keeps the surrounding loop's header
+        loads hoistable where a call to the full op would clobber them."""
+        mod.runtime_syms.add("mx__vec_set_fail")
+        uid = fresh()[1:]
+        hot, cold = f"vset.hot.{uid}", f"vset.fail.{uid}"
+        nn = fresh()
+        lines.append(f"  {nn} = icmp eq ptr {recv}, null")
+        lines.append(f"  br i1 {nn}, label %{cold}, label %vset.len.{uid}")
+        lines.append(f"vset.len.{uid}:")
+        ln, inb = fresh(), fresh()
+        lines.append(f"  {ln} = load i64, ptr {recv}, align 8{TBAA_HDR}")
+        lines.append(f"  {inb} = icmp ult i64 {idx}, {ln}")
+        lines.append(f"  br i1 {inb}, label %vset.grd.{uid}, label %{cold}")
+        lines.append(f"vset.grd.{uid}:")
+        _vec_permit_guard(recv, uid, "vset", hot, cold, lines)
+        lines.append(f"{cold}:")
+        lines.append(
+            f"  call void @mx__vec_set_fail(ptr {recv}, i64 {idx})"
+            "  ; miss: canonical checks + diagnostic, never returns")
+        lines.append("  unreachable")
+        lines.append(f"{hot}:")
+        ep = _vec_data_ep(recv, idx, lines)
+        lines.append(f"  store i64 {w}, ptr {ep}, align 8{TBAA_ELEM}")
+
     def emit_rt_builtin(name: str, dst: str, opargs: Tuple[str, ...],
                         lines: List[str]) -> None:
         """Lower an interpreter builtin to its native runtime call
         (metaxu_rt.c, linked by llvm_run).  The consistency check already
-        validated arities and kinds; anything off here is a hard error."""
+        validated arities and kinds; anything off here is a hard error.
+        Growable-Vec accessors additionally get inline fast paths (header
+        comment above) with the runtime call demoted to the miss branch."""
         if name == "Vec.new":
             mod.runtime_syms.add("mx_vec_new")
             v = fresh()
@@ -7430,30 +7644,117 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
             # every alias exactly as in the interpreter.
             w = to_word(elem, use(opargs[1], lines), lines)
             mod.runtime_syms.add("mx_vec_push")
-            lines.append(f"  call void @mx_vec_push(ptr {recv}, i64 {w})")
+            # Fast path: in-capacity push is a store plus a len bump; the
+            # growth path (len == cap) and every failure go to mx_vec_push.
+            uid = fresh()[1:]
+            hot, cold = f"vpush.hot.{uid}", f"vpush.cold.{uid}"
+            done = f"vpush.done.{uid}"
+            nn = fresh()
+            lines.append(f"  {nn} = icmp eq ptr {recv}, null")
+            lines.append(
+                f"  br i1 {nn}, label %{cold}, label %vpush.cap.{uid}")
+            lines.append(f"vpush.cap.{uid}:")
+            ln, cp, cap, full = fresh(), fresh(), fresh(), fresh()
+            lines.append(f"  {ln} = load i64, ptr {recv}, align 8{TBAA_HDR}")
+            lines.append(
+                f"  {cp} = getelementptr inbounds i8, ptr {recv}, i64 8")
+            lines.append(f"  {cap} = load i64, ptr {cp}, align 8{TBAA_HDR}")
+            lines.append(f"  {full} = icmp eq i64 {ln}, {cap}")
+            lines.append(
+                f"  br i1 {full}, label %{cold}, label %vpush.grd.{uid}")
+            lines.append(f"vpush.grd.{uid}:")
+            _vec_permit_guard(recv, uid, "vpush", hot, cold, lines)
+            lines.append(f"{hot}:")
+            ep = _vec_data_ep(recv, ln, lines)
+            lines.append(f"  store i64 {w}, ptr {ep}, align 8{TBAA_ELEM}")
+            l1 = fresh()
+            lines.append(f"  {l1} = add i64 {ln}, 1")
+            lines.append(f"  store i64 {l1}, ptr {recv}, align 8{TBAA_HDR}")
+            lines.append(f"  br label %{done}")
+            lines.append(f"{cold}:")
+            lines.append(f"  call void @mx_vec_push(ptr {recv}, i64 {w})"
+                         "  ; miss: growth or canonical diagnostic")
+            lines.append(f"  br label %{done}")
+            lines.append(f"{done}:")
             setval(dst, "0", lines)  # unit
         elif name == "pop":
             recv = use(opargs[0], lines)
             elem = _vec_elem(kind(opargs[0]))
-            mod.runtime_syms.add("mx_vec_pop")
+            # Fast path: non-empty pop is a load plus a len decrement.
+            # Every miss is a failure (NULL / empty / contended write
+            # without a permit), so the cold block is the noreturn
+            # mx__vec_pop_fail terminator (canonical order, byte-identical
+            # diagnostic, loop-hoisting-friendly memory contract).
+            mod.runtime_syms.add("mx__vec_pop_fail")
+            uid = fresh()[1:]
+            hot, cold = f"vpop.hot.{uid}", f"vpop.fail.{uid}"
+            nn = fresh()
+            lines.append(f"  {nn} = icmp eq ptr {recv}, null")
+            lines.append(
+                f"  br i1 {nn}, label %{cold}, label %vpop.len.{uid}")
+            lines.append(f"vpop.len.{uid}:")
+            ln, nz = fresh(), fresh()
+            lines.append(f"  {ln} = load i64, ptr {recv}, align 8{TBAA_HDR}")
+            lines.append(f"  {nz} = icmp ne i64 {ln}, 0")
+            lines.append(
+                f"  br i1 {nz}, label %vpop.grd.{uid}, label %{cold}")
+            lines.append(f"vpop.grd.{uid}:")
+            _vec_permit_guard(recv, uid, "vpop", hot, cold, lines)
+            lines.append(f"{cold}:")
+            lines.append(f"  call void @mx__vec_pop_fail(ptr {recv})"
+                         "  ; miss: canonical checks + diagnostic, "
+                         "never returns")
+            lines.append("  unreachable")
+            lines.append(f"{hot}:")
+            l1 = fresh()
+            lines.append(f"  {l1} = add i64 {ln}, -1")
+            ep = _vec_data_ep(recv, l1, lines)
             w = fresh()
-            lines.append(f"  {w} = call i64 @mx_vec_pop(ptr {recv})")
+            lines.append(f"  {w} = load i64, ptr {ep}, align 8{TBAA_ELEM}")
+            lines.append(f"  store i64 {l1}, ptr {recv}, align 8{TBAA_HDR}")
             vec_elem_into(dst, elem, w, lines)
         elif name == "__index_get":
             recv = use(opargs[0], lines)
             rk0 = kind(opargs[0])
             idx = use(opargs[1], lines)
-            w = fresh()
             if _is_fvec(rk0):
                 elem = _fvec_elem(rk0)
                 mod.runtime_syms.add("mx_fvec_get")
+                w = fresh()
                 lines.append(
                     f"  {w} = call i64 @mx_fvec_get(ptr {recv}, i64 {idx})")
             else:
                 elem = _vec_elem(rk0)
-                mod.runtime_syms.add("mx_vec_get")
+                # Fast path: null + bounds (one unsigned compare covers
+                # negatives) then a direct load; reads never take the
+                # contended guard (reads are free by design).  Every miss
+                # is a failure, so the cold block is the noreturn
+                # mx__vec_get_fail terminator (canonical order,
+                # byte-identical diagnostic, loop-hoisting-friendly
+                # memory contract).
+                mod.runtime_syms.add("mx__vec_get_fail")
+                uid = fresh()[1:]
+                hot, cold = f"vget.hot.{uid}", f"vget.fail.{uid}"
+                nn = fresh()
+                lines.append(f"  {nn} = icmp eq ptr {recv}, null")
                 lines.append(
-                    f"  {w} = call i64 @mx_vec_get(ptr {recv}, i64 {idx})")
+                    f"  br i1 {nn}, label %{cold}, label %vget.len.{uid}")
+                lines.append(f"vget.len.{uid}:")
+                ln, inb = fresh(), fresh()
+                lines.append(
+                    f"  {ln} = load i64, ptr {recv}, align 8{TBAA_HDR}")
+                lines.append(f"  {inb} = icmp ult i64 {idx}, {ln}")
+                lines.append(
+                    f"  br i1 {inb}, label %{hot}, label %{cold}")
+                lines.append(f"{cold}:")
+                lines.append(
+                    f"  call void @mx__vec_get_fail(ptr {recv}, i64 {idx})"
+                    "  ; miss: canonical checks + diagnostic, never returns")
+                lines.append("  unreachable")
+                lines.append(f"{hot}:")
+                ep = _vec_data_ep(recv, idx, lines)
+                w = fresh()
+                lines.append(f"  {w} = load i64, ptr {ep}, align 8{TBAA_ELEM}")
             vec_elem_into(dst, elem, w, lines)
         elif name == "__index_store":
             # Store-back index assignment `place = __index_store(place, i,
@@ -7480,11 +7781,9 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                 setval(dst, v, lines)
             else:
                 w = to_word(_vec_elem(rk0), use(opargs[2], lines), lines)
-                mod.runtime_syms.add("mx_vec_set")
-                lines.append(
-                    f"  call void @mx_vec_set(ptr {recv}, i64 {idx}, "
-                    f"i64 {w})  ; in-place element store (identity "
-                    "semantics)")
+                lines.append("  ; in-place element store (identity "
+                             "semantics), inline fast path")
+                _emit_vec_set_inline(recv, idx, w, lines)
                 setval(dst, recv, lines)
         elif name == "__index_set":
             # In-place element store (Vec receivers only; immutable
@@ -7493,9 +7792,7 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
             idx = use(opargs[1], lines)
             w = to_word(_vec_elem(kind(opargs[0])), use(opargs[2], lines),
                         lines)
-            mod.runtime_syms.add("mx_vec_set")
-            lines.append(
-                f"  call void @mx_vec_set(ptr {recv}, i64 {idx}, i64 {w})")
+            _emit_vec_set_inline(recv, idx, w, lines)
             setval(dst, "0", lines)  # unit
         elif name == "__zip":
             # Virtual value: the comprehension site reads the zipped
@@ -7773,11 +8070,34 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
         elif name == "len":
             recv = use(opargs[0], lines)
             rk0 = kind(opargs[0])
-            sym = ("mx_vec_len" if _is_vec(rk0)
-                   else "mx_fvec_len" if _is_fvec(rk0) else "mx_str_len")
-            mod.runtime_syms.add(sym)
-            v = fresh()
-            lines.append(f"  {v} = call i64 @{sym}(ptr {recv})")
+            if _is_vec(rk0):
+                # Fast path: len is the first header word; the only miss
+                # is a NULL receiver, so the cold block is the noreturn
+                # mx__vec_len_fail terminator.  Inlining this matters as
+                # much as get/set — `i < v.len()` sits in every loop
+                # header, and as a visible load clang can hoist or fold
+                # it where a call was a full barrier.
+                mod.runtime_syms.add("mx__vec_len_fail")
+                mod.uses_vec_tbaa = True
+                uid = fresh()[1:]
+                hot, cold = f"vlen.hot.{uid}", f"vlen.fail.{uid}"
+                nn = fresh()
+                lines.append(f"  {nn} = icmp eq ptr {recv}, null")
+                lines.append(f"  br i1 {nn}, label %{cold}, label %{hot}")
+                lines.append(f"{cold}:")
+                lines.append(f"  call void @mx__vec_len_fail(ptr {recv})"
+                             "  ; miss: NULL-receiver diagnostic, "
+                             "never returns")
+                lines.append("  unreachable")
+                lines.append(f"{hot}:")
+                v = fresh()
+                lines.append(
+                    f"  {v} = load i64, ptr {recv}, align 8{TBAA_HDR}")
+            else:
+                sym = "mx_fvec_len" if _is_fvec(rk0) else "mx_str_len"
+                mod.runtime_syms.add(sym)
+                v = fresh()
+                lines.append(f"  {v} = call i64 @{sym}(ptr {recv})")
             setval(dst, v, lines)
         elif name in ("to_string", "int_to_str"):
             k = kind(opargs[0])
@@ -9422,7 +9742,27 @@ def _emit_runtime(mod: _ModuleState) -> List[str]:
     # Native metaxu runtime symbols (metaxu_rt.c, linked by llvm_run).
     for name in sorted(mod.runtime_syms):
         rt, params = _RT_SIGS[name]
-        decls.append(f"declare {rt} @{name}({', '.join(params)})")
+        decls.append(f"declare {rt} @{name}({', '.join(params)})"
+                     f"{_RT_ATTRS.get(name, '')}")
+    if mod.uses_tls_permit:
+        # Per-thread write permit (metaxu_threads.c), read directly by the
+        # inlined Vec-mutator guards.  initialexec mirrors the C side's
+        # tls_model("initial-exec") — always valid: the runtime links into
+        # executables, never dlopen'd libraries.
+        decls.append("@mx__tls_write_permit = external thread_local"
+                     "(initialexec) global i64, align 8")
+    if mod.uses_vec_tbaa:
+        # TBAA domain for the inline Vec fast paths: header words (len/
+        # cap/data/contended) and element words are DISTINCT allocations
+        # by the runtime's contract, so their access tags never alias —
+        # which keeps hoisted header loads live across element stores.
+        # Untagged accesses (everything else the backend emits) stay
+        # compatible with both.
+        decls.append('!0 = !{!"metaxu TBAA root"}')
+        decls.append('!1 = !{!"mx.vec.header", !0, i64 0}')
+        decls.append('!2 = !{!"mx.vec.elem", !0, i64 0}')
+        decls.append("!3 = !{!1, !1, i64 0}")
+        decls.append("!4 = !{!2, !2, i64 0}")
     if decls:
         chunks.append("\n".join(decls))
     if mod.print_helpers:

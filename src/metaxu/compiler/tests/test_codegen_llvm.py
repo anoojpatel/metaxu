@@ -2036,11 +2036,14 @@ def test_vec_builtins_declare_runtime_symbols():
     # as frame-confined (freed), and main is a real define.
     ir = llvm_from_source(_VEC_SUM_SRC)
     assert "define i64 @mx_main()" in ir
+    # get/pop/len emit inline fast paths whose miss branches call the
+    # noreturn fail terminators, so those are the declared symbols now;
+    # push keeps the full-op declare for its growth path.
     for decl in ("declare ptr @mx_vec_new()",
                  "declare void @mx_vec_push(ptr, i64)",
-                 "declare i64 @mx_vec_pop(ptr)",
-                 "declare i64 @mx_vec_len(ptr)",
-                 "declare i64 @mx_vec_get(ptr, i64)",
+                 "declare void @mx__vec_pop_fail(ptr)",
+                 "declare void @mx__vec_len_fail(ptr)",
+                 "declare void @mx__vec_get_fail(ptr, i64)",
                  "declare void @mx_vec_free(ptr)"):
         assert decl in ir, f"missing runtime declare: {decl}"
     assert "call void @mx_vec_free" in ir
@@ -4291,7 +4294,10 @@ fn main() -> int {
 def test_index_store_on_vec_lowers_to_mx_vec_set_and_stays_freeable():
     ir = llvm_from_source(_VEC_INDEX_STORE_SRC)
     assert count_placeholders(ir) == 0
-    assert re.search(r"call void @mx_vec_set\(ptr %t\d+, i64 %?\w+, "
+    # Inline fast path: a direct store through the header's data pointer,
+    # with the noreturn fail terminator on the miss branch.
+    assert "vset.hot." in ir
+    assert re.search(r"call void @mx__vec_set_fail\(ptr %t\d+, "
                      r"i64 %?\w+\)", ir)
     # The __index_store result aliases the receiver (same pointer), so the
     # dead-vec analysis still proves the vec frame-local and frees it.
@@ -7941,3 +7947,114 @@ def test_native_thread_counter_tsan_clean(tmp_path):
         clang_args=("-fsanitize=thread",))
     assert stdout == expected_out
     assert exit_code == 0
+
+
+# ---------------------------------------------------------------------------
+# Inline Vec fast paths: the growable-Vec accessors emit their common case
+# inline against the mx_vec header (len @0, cap @8, data @16, contended
+# @24) and demote every miss to the original runtime call, so diagnostics
+# stay byte-identical while unit-stride loops stop paying a call per access.
+# ---------------------------------------------------------------------------
+
+_VEC_FAST_PATH_SRC = """
+fn main() -> int {
+    let @mut v = Vec.new();
+    v.push(1);
+    v[0] = 2;
+    let x = v[0];
+    let n = v.len();
+    let p = v.pop();
+    x + n + p
+}
+"""
+
+
+def test_vec_accessors_emit_inline_fast_paths():
+    ir = llvm_from_source(_VEC_FAST_PATH_SRC)
+    assert count_placeholders(ir) == 0
+    # Hot paths are inline...
+    for tag in ("vpush.hot.", "vset.hot.", "vget.hot.", "vlen.hot.",
+                "vpop.hot."):
+        assert tag in ir, tag
+    # ...and every miss branch reaches the runtime for the canonical
+    # diagnostic: push's growth path calls the full op (growth is a
+    # normal outcome), while get/set/pop/len misses are always failures
+    # and call the noreturn fail terminators (narrow memory contract so
+    # hot-loop header loads stay hoisted across the never-taken branch).
+    for cold in ("call void @mx_vec_push", "call void @mx__vec_set_fail",
+                 "call void @mx__vec_get_fail",
+                 "call void @mx__vec_len_fail",
+                 "call void @mx__vec_pop_fail"):
+        assert cold in ir, cold
+    for attr in ("declare void @mx__vec_get_fail(ptr, i64) cold noreturn "
+                 "memory(read, inaccessiblemem: readwrite)",):
+        assert attr in ir, attr
+    # Mutator guards read the contended flag (relaxed atomic) and the
+    # per-thread write permit (direct initial-exec TLS load) inline,
+    # mirroring mx__vec_write_check exactly.
+    assert "load atomic i64" in ir
+    assert ("@mx__tls_write_permit = external thread_local(initialexec) "
+            "global i64" in ir)
+
+
+def test_vec_reads_skip_the_contended_guard():
+    # Reads are free by design (docs/contention_as_permission.md): the
+    # get/len fast paths must not touch the contended flag or the permit.
+    ir = llvm_from_source(
+        "fn main() -> int { let v = Vec.new(); v.push(7); v[0] + v.len() }")
+    assert count_placeholders(ir) == 0
+    get_block = ir[ir.index("vget.len."):ir.index("vlen.")]
+    assert "load atomic" not in get_block
+    assert "mx__tls_write_permit" not in get_block
+
+
+@needs_clang
+def test_native_vec_misses_raise_identically(tmp_path):
+    """The inline fast paths cover hits; every MISS must fall back to the
+    runtime call and raise the interpreter's message byte for byte."""
+    src = """
+fn main() -> int {
+    let @mut v = Vec.new();
+    v.push(10);
+    let neg = 0 - 1;
+    let a = try { v[3] } catch e { print(e); 0 - 1 };
+    let b = try { v[neg] } catch e { print(e); 0 - 2 };
+    let c = try { v[1] = 5; 0 } catch e { print(e); 0 - 3 };
+    let @mut empty = Vec.new();
+    let d = try { empty.pop() } catch e { print(e); 0 - 4 };
+    print(a); print(b); print(c); print(d);
+    0
+}
+"""
+    ir = assert_native_matches_interp(src, tmp_path)
+    assert count_placeholders(ir) == 0
+
+
+@needs_clang
+def test_try_body_field_update_sees_enclosing_struct(tmp_path):
+    """Regression (unmasked by the fast-path inlining): a try body that
+    updates a field of an enclosing struct READS the binding before its
+    local store-back rebind, so the name must be a try-site env field.
+    The old `uses - defs` free-name arithmetic called it local — the body
+    read an uninitialized alloca, UB that happened to survive the all-call
+    emission (the garbage word reached mx_vec_set, whose contended check
+    misfired 'correctly') and segfaulted under the inline one.  Now
+    `_upward_exposed` liveness keeps read-before-rebind captures free."""
+    src = """
+struct Holder { tag: int, data: Vec }
+
+fn main() -> int {
+    let @mut inner = Vec.new();
+    inner.push(3);
+    let h = Holder { tag: 1, data: inner };
+    let r = try { h.data[0] = 9; h.data[0] } catch e { print(e); 0 - 1 };
+    print(r);
+    print(inner[0]);
+    0
+}
+"""
+    ir = assert_native_matches_interp(src, tmp_path)
+    assert count_placeholders(ir) == 0
+    # The site env actually carries the struct now (it was `type {}`).
+    assert re.search(
+        r"%henv\.__try_body_main_tc\d+ = type \{ [^}]*Holder", ir)

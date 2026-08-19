@@ -201,6 +201,20 @@ int64_t mx_vec_pop(mx_vec *v);
 int64_t mx_vec_len(const mx_vec *v);
 int64_t mx_vec_get(const mx_vec *v, int64_t idx);
 void    mx_vec_set(mx_vec *v, int64_t idx, int64_t value);
+
+/* Cold-path terminators for the inline Vec fast paths (codegen_llvm).
+ * Generated code branches here only after the inlined checks already
+ * failed; each re-runs its op's canonical check order so the diagnostic
+ * stays byte-identical to calling the full op, then aborts if somehow
+ * nothing fired.  They never return — which is what lets the emitted
+ * declares carry `noreturn` plus a narrow memory contract, keeping the
+ * hot loop's header loads hoistable around the never-taken branch. */
+__attribute__((cold, noreturn)) void mx__vec_get_fail(const mx_vec *v,
+                                                      int64_t idx);
+__attribute__((cold, noreturn)) void mx__vec_set_fail(mx_vec *v,
+                                                      int64_t idx);
+__attribute__((cold, noreturn)) void mx__vec_pop_fail(mx_vec *v);
+__attribute__((cold, noreturn)) void mx__vec_len_fail(const mx_vec *v);
 void    mx_vec_free(mx_vec *v);
 unsigned char *mx_vec_as_bytes(const mx_vec *v);
 /* Contention (docs/contention_as_permission.md): mark a vector as having
