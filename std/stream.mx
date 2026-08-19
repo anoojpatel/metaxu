@@ -144,6 +144,16 @@ fn for_(producer, f) {
 # f(x1, f(x2, .. f(xN, init))). Each handler case chains through
 # resume(()), whose value is the fold of the REST of the stream —
 # Ante's foldr, and the way to accumulate without mutable state.
+#
+# COST NOTE: foldr's pending f-applications are the semantics, so this
+# arm is NOT tail-shaped (`f(x, resume(()))` does work after the resume)
+# and each element holds a handler-side stack frame until the stream
+# ends — O(n) stack depth on both engines (the native owner stack, the
+# interpreter's recursion budget). Use `iter` with a mutable accumulator
+# (the `sum`/`product`/`count` shape below) when the combining function
+# is associative-enough that a left fold serves: that arm IS tail-shaped
+# and runs in O(1) handler stack per element (docs/v1_gap_analysis.md
+# § "Effects pump: tail-resume trampoline").
 fn fold(producer, init, f) {
     handle Emit with {
         emit(x) -> f(x, resume(()))
@@ -153,19 +163,29 @@ fn fold(producer, init, f) {
     }
 }
 
-# Sum of all emitted elements (0 when empty).
+# Sum of all emitted elements (0 when empty). Accumulator-based (a left
+# fold via `iter`, whose handler arm is tail-shaped — O(1) stack per
+# element, so million-element streams run flat); for int sums this is
+# value-identical to the foldr form it replaced.
 fn sum(producer) {
-    fold(producer, 0, fn(x, acc) -> x + acc)
+    let @mut acc = 0;
+    iter(producer, fn(x) { acc = acc + x });
+    acc
 }
 
-# Product of all emitted elements (1 when empty).
+# Product of all emitted elements (1 when empty). Accumulator-based,
+# like sum.
 fn product(producer) {
-    fold(producer, 1, fn(x, acc) -> x * acc)
+    let @mut acc = 1;
+    iter(producer, fn(x) { acc = acc * x });
+    acc
 }
 
-# Number of emitted elements.
+# Number of emitted elements. Accumulator-based, like sum.
 fn count(producer) -> int {
-    fold(producer, 0, fn(x, acc) -> acc + 1)
+    let @mut acc = 0;
+    iter(producer, fn(x) { acc = acc + 1 });
+    acc
 }
 
 # Collect all emitted elements into a fresh Vec. (Vec captures are
