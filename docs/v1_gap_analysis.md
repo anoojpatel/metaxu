@@ -442,10 +442,13 @@ the pipeline runs 1,000,000 elements natively at flat stack/heap and
 200,000+ in the interpreter, with identical outputs. What remains O(n)
 by SEMANTICS, not implementation: genuine foldr (`fold`'s
 `f(x, resume(()))` does work after the resume — its pending
-applications are per-element frames on the owner stack; native ceiling
-measured between 50,000 and 100,000 elements on an 8 MiB main stack,
-interpreter ceiling ~15,000 under the recursion budget), and any other
-arm that computes after resuming. Tests:
+applications are per-element frames on the owner stack; a bare
+`fold(iota(n), ...)` measured native 10k ok / 30k segfault on the 8 MiB
+main stack and interpreter 12k ok / 20k RecursionLimitExceeded under
+the 100k-frame budget, i.e. a ceiling of 1-3 x 10^4 foldr DISPATCHES —
+elements that reach the fold, so a filter in front buys
+proportionally more), and any other arm that computes after resuming.
+Tests:
 `test_effect_tail_resume.py` (analysis, 1M native stack stability,
 interpreter 20k, non-tail differentials, single-shot on a consumed-then-
 tail-resumed continuation, ASan).
