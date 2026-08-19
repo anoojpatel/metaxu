@@ -49,10 +49,10 @@ static _Atomic int64_t g_next_mutex_id = 1;
  * threads start at 0 and handle-body fibers (same OS thread) share the
  * logical thread's grant, exactly like pthread mutex ownership.  Bumped
  * only on SUCCESSFUL lock/unlock -- see the error paths below. */
-static _Thread_local int64_t g_write_permit = 0;
+_Thread_local int64_t mx__tls_write_permit = 0;
 
 int64_t mx__write_permit(void) {
-    return g_write_permit;
+    return mx__tls_write_permit;
 }
 
 /* ------------------------------------------------------------------------
@@ -189,7 +189,7 @@ int64_t mx_mutex_lock(int64_t handle) {
         mx_thr_fatal("EFFECT_MUTEX_LOCK: pthread_mutex_lock failed", rc);
     /* Lock HELD from here: grant write permission.  Strictly after the
      * error paths -- a failed ERRORCHECK lock must not bump. */
-    g_write_permit += 1;
+    mx__tls_write_permit += 1;
     return 0; /* unit */
 }
 
@@ -202,10 +202,10 @@ int64_t mx_mutex_unlock(int64_t handle) {
      * the two statements to observe an inconsistent counter.  The EPERM
      * error path (unlock of a mutex this thread does not hold) restores
      * the counter before raising -- a failed unlock changes nothing. */
-    g_write_permit -= 1;
+    mx__tls_write_permit -= 1;
     int rc = pthread_mutex_unlock(&m->mu);
     if (rc == EPERM) {
-        g_write_permit += 1;
+        mx__tls_write_permit += 1;
         /* One unified message for "unlocked" and "held by another
          * thread" (EPERM covers both, and the momentary state is racy to
          * print) -- interpreter wording (mir_interp._rt_mutex_unlock). */
