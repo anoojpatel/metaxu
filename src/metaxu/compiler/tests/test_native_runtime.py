@@ -77,17 +77,25 @@ def compile_and_run(tmp_path: Path, driver_src: str, *,
     With no `try` installed -- as in every driver here -- a raise prints the
     same line and abort()s, so these tests observe exactly what they did
     before the split.
+
+    metaxu_threads.c comes along too since the contention work
+    (docs/contention_as_permission.md): the Vec mutators' contended-write
+    guard reads the per-thread permit counter (mx__write_permit), which
+    lives with the mutex primitives.  The three objects always link as one
+    unit in production (build.runtime_objects / llvm_run).
     """
     driver = tmp_path / "driver.c"
     driver.write_text(driver_src)
     exe = tmp_path / "driver"
-    cmd = ["clang", "-std=c11", "-Wall", f"-I{NATIVE_DIR}"]
+    cmd = ["clang", "-std=c11", "-Wall", "-pthread", f"-I{NATIVE_DIR}"]
     if sanitize:
         cmd += ["-g", "-fsanitize=address",
-                str(driver), str(build.RUNTIME_C), str(build.EFFECTS_C)]
+                str(driver), str(build.RUNTIME_C), str(build.EFFECTS_C),
+                str(build.THREADS_C)]
     else:
         obj = build.compile_runtime()
-        cmd += [str(driver), str(obj), str(build.compile_effects_runtime())]
+        cmd += [str(driver), str(obj), str(build.compile_effects_runtime()),
+                str(build.compile_threads_runtime())]
     cmd += ["-o", str(exe), "-lm"]
     cc = subprocess.run(cmd, capture_output=True, text=True)
     assert cc.returncode == 0, f"driver compile failed:\n{cc.stderr}"
