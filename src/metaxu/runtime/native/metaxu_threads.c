@@ -44,6 +44,17 @@ static void mx_thr_fatal(const char *msg, int err) {
 static _Atomic int64_t g_next_thread_id = 1;
 static _Atomic int64_t g_next_mutex_id = 1;
 
+/* Contention permission (docs/contention_as_permission.md): a per-thread
+ * count of mutexes held through this runtime.  _Thread_local, so spawned
+ * threads start at 0 and handle-body fibers (same OS thread) share the
+ * logical thread's grant, exactly like pthread mutex ownership.  Bumped
+ * only on SUCCESSFUL lock/unlock -- see the error paths below. */
+_Thread_local int64_t mx__tls_write_permit = 0;
+
+int64_t mx__write_permit(void) {
+    return mx__tls_write_permit;
+}
+
 /* ------------------------------------------------------------------------
  * Threads
  * ---------------------------------------------------------------------- */
@@ -176,6 +187,9 @@ int64_t mx_mutex_lock(int64_t handle) {
     }
     if (rc != 0)
         mx_thr_fatal("EFFECT_MUTEX_LOCK: pthread_mutex_lock failed", rc);
+    /* Lock HELD from here: grant write permission.  Strictly after the
+     * error paths -- a failed ERRORCHECK lock must not bump. */
+    mx__tls_write_permit += 1;
     return 0; /* unit */
 }
 
@@ -183,8 +197,15 @@ int64_t mx_mutex_unlock(int64_t handle) {
     mx_mutex *m = (mx_mutex *)(intptr_t)handle;
     if (m == NULL)
         mx_thr_fatal("EFFECT_MUTEX_UNLOCK: NULL mutex handle", 0);
+    /* Revoke write permission BEFORE the pthread call: once the unlock
+     * succeeds the lock is gone, and no code on this thread runs between
+     * the two statements to observe an inconsistent counter.  The EPERM
+     * error path (unlock of a mutex this thread does not hold) restores
+     * the counter before raising -- a failed unlock changes nothing. */
+    mx__tls_write_permit -= 1;
     int rc = pthread_mutex_unlock(&m->mu);
     if (rc == EPERM) {
+        mx__tls_write_permit += 1;
         /* One unified message for "unlocked" and "held by another
          * thread" (EPERM covers both, and the momentary state is racy to
          * print) -- interpreter wording (mir_interp._rt_mutex_unlock). */

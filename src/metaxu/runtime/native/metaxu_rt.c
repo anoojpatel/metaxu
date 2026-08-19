@@ -6,9 +6,11 @@
  */
 #include "metaxu_rt.h"
 #include "metaxu_effects.h"   /* mx_raisef: catchable failures (try/catch) */
+#include "metaxu_threads.h"   /* mx__write_permit: contention permission */
 
 #include <math.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -59,6 +61,19 @@ struct mx_vec {
     int64_t  len;   /* current element count */
     int64_t  cap;   /* allocated slots */
     int64_t *data;  /* element buffer (NULL iff cap == 0) */
+    /* Contention flag (docs/contention_as_permission.md): set once when
+     * this vector crosses a real spawn boundary; checked by every MUTATOR
+     * (push/pop/set) against the per-thread write permit.  Atomic with
+     * relaxed ordering so a re-mark at a second spawn cannot race a
+     * concurrent flag read in another thread's mutator (the initial mark
+     * happens-before the child via pthread_create); relaxed loads/stores
+     * compile to plain moves on x86-64, so the uncrossed fast path pays
+     * exactly one flag test on the header cache line.
+     *
+     * Layout note: this grows the header from 24 to 32 bytes, which moves
+     * it from glibc malloc's 32-byte chunk into the 48-byte one.  Measured
+     * cost: see the spec's "Measured" section (per-vector, one-time). */
+    _Atomic int64_t contended;
 };
 
 #define MX_VEC_INITIAL_CAP 8
@@ -69,16 +84,56 @@ static void mx_vec_check(const mx_vec *v, const char *op) {
     }
 }
 
+/* The contended-write guard, shared by every Vec mutator.  Order of tests:
+ * the uncontended path (the overwhelming common case) pays ONLY the flag
+ * test -- the thread-local permit read (a direct TLS load: the exported
+ * mx__tls_write_permit variable, NOT the accessor call, which measurably
+ * bloated the mutators' fast path) happens after the unlikely branch, and
+ * the raise itself is outlined cold so the mutators carry just a
+ * compare-and-jump.  Wording is byte-identical to the interpreter's
+ * InterpError (mir_interp._CONTENDED_WRITE_MSG); the caught value is
+ * language-visible. */
+__attribute__((cold, noinline))
+static void mx__vec_contended_raise(void) {
+    mx_rt_raise(
+        "write to contended Vec without a held lock: this value crossed "
+        "a thread boundary at spawn; mutate it under a mutex "
+        "(std.sync.with_lock) or keep it thread-local");
+}
+
+static inline void mx__vec_write_check(mx_vec *v) {
+    if (__builtin_expect(
+            atomic_load_explicit(&v->contended, memory_order_relaxed)
+            && mx__tls_write_permit == 0, 0)) {
+        mx__vec_contended_raise();
+    }
+}
+
+/* Mark one vector contended (spawn-boundary crossing).  Called from
+ * generated code at the real-spawn path (codegen_llvm emits the marking
+ * walk over the spawned closure's captures inside the EFFECT_SPAWN
+ * runtime thunk, which executes iff the spawn is real); NULL is a no-op
+ * so struct fields holding a never-initialized vec slot stay safe. */
+void mx_vec_mark_contended(void *vp) {
+    mx_vec *v = (mx_vec *)vp;
+    if (v == NULL) {
+        return;
+    }
+    atomic_store_explicit(&v->contended, 1, memory_order_relaxed);
+}
+
 mx_vec *mx_vec_new(void) {
     mx_vec *v = (mx_vec *)mx_rt_malloc(sizeof(mx_vec));
     v->len = 0;
     v->cap = 0;
     v->data = NULL;
+    atomic_store_explicit(&v->contended, 0, memory_order_relaxed);
     return v;
 }
 
 void mx_vec_push(mx_vec *v, int64_t value) {
     mx_vec_check(v, "push");
+    mx__vec_write_check(v);
     if (v->len == v->cap) {
         int64_t new_cap = v->cap == 0 ? MX_VEC_INITIAL_CAP : v->cap * 2;
         if (new_cap <= v->cap ||
@@ -100,6 +155,7 @@ void mx_vec_push(mx_vec *v, int64_t value) {
 
 int64_t mx_vec_pop(mx_vec *v) {
     mx_vec_check(v, "pop");
+    mx__vec_write_check(v);
     if (v->len == 0) {
         mx_rt_raise("pop: Vec is empty");   /* catchable (InterpError) */
     }
@@ -122,6 +178,7 @@ int64_t mx_vec_get(const mx_vec *v, int64_t idx) {
 
 void mx_vec_set(mx_vec *v, int64_t idx, int64_t value) {
     mx_vec_check(v, "index");
+    mx__vec_write_check(v);
     if (idx < 0 || idx >= v->len) {
         mx_rt_raise("index out of bounds: %lld (length %lld)",
                     (long long)idx, (long long)v->len);
