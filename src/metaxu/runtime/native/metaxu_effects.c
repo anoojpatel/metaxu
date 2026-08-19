@@ -11,10 +11,12 @@
  *     thread; see _ThreadCtx)              first; _Thread_local)
  *   _find_mir_frame (busy skip, effect   mx__find_scope
  *     match, innermost op match)
- *   _pump_scope PERFORM -> case call     dispatcher call in mx_handle /
- *     with busy=True                       mx_resume with s->busy = 1
+ *   _pump_scope PERFORM -> case call     dispatcher call in mx__pump_events
+ *     with busy=True                       with s->busy = 1
  *   resume() -> unpark body, wait for    mx_resume: swap to the perform
  *     next event (busy off meanwhile)      site, dispatch next event
+ *   _pump_scope tail-resume loop         mx_resume_tail records (k, v);
+ *     (_TailResume unwound to the pump)    mx__pump_events does the switch
  *   _EffectAbort unwind to handle_scope  longjmp(s->abort_jmp)
  *   _ScopeAbort cascade teardown of      mx__teardown_to frees the parked
  *     nested parked bodies                 coroutine stacks outright (C has
@@ -25,6 +27,58 @@
  *   InterpError raised in the extent     mx_raise -> longjmp to the pad
  *   ("error", exc) body thread message   MX_EV_ERROR + re-raise on the
  *     re-raised by _pump_scope             scope's owner stack
+ *
+ * THE PUMP MODEL.  All handler-case dispatch for a scope runs in ONE
+ * owner-side event loop, mx__pump_events, entered from mx_handle (the
+ * body's first perform) or from mx_resume (a general resume waiting for
+ * the resumed body's next event).  Each iteration dispatches one event's
+ * case and then looks at how the case ended:
+ *
+ *   - TAIL RESUME (the compiler proved the resume's value IS the case's
+ *     return value, nothing after it -- compiler/effect_tail.py): the
+ *     case called mx_resume_tail, which only RECORDS (k, v) on the scope
+ *     and returns; the case returns to the pump, and the pump performs
+ *     the switch into the body from its own CONSTANT frame, then loops
+ *     for the scope's next event.  Handler-side stack usage is O(1) in
+ *     the number of events -- the fix for the stream-pipeline stack
+ *     cliff (a recursive pump grew (case + resume frame) per element).
+ *     The consumed continuation record is freed right after the switch
+ *     comes back (single-shot, provably unreachable: a tail resume is
+ *     the case's last action and the compiler demotes any k that
+ *     escapes into an env or closure).
+ *   - GENERAL RESUME (mx_resume, anywhere but tail position): keeps its
+ *     recursive semantics -- the resumed body's next perform is pumped
+ *     from inside mx_resume, so the C stack tracks handler-code nesting
+ *     (e.g. fold's f(x, resume(())) pending applications, which ARE the
+ *     foldr semantics).  hres is then already the whole body's
+ *     completion value (deep), and the pump returns it.
+ *   - NO RESUME: abort -- the case's value is the handle expression's
+ *     value; the pump reports it (mx_handle returns it; mx_resume
+ *     longjmps the intervening handler frames away, as before).
+ *
+ * EQUIVALENCE WITH THE RECURSIVE PUMP (the interpreter's _pump_scope is
+ * the model; induction on the number of events the body still produces):
+ * under deep handling, a TAIL case's value is resume's value, which is
+ * the WHOLE body's eventual completion value.  In the recursive scheme
+ * that value is produced at the innermost recursion (the DONE event),
+ * and every tail case on the way out returns it UNCHANGED (that is what
+ * tail position means: no op after the resume, the ret returns its
+ * value).  So collapsing the chain -- the pump switches into the body
+ * itself and, at MX_EV_DONE, takes done_value directly as the scope's
+ * value -- yields the identical result.  A non-tail case in the chain
+ * re-enters via mx_resume exactly as before, so mixed chains compose:
+ * the pump's constant frame stands in for the deleted tail frames only.
+ * Abort: a case declining to resume makes its value the handle value in
+ * both schemes (recursive: propagated/longjmp'd through the tail frames,
+ * which would have returned it unchanged; pump: returned directly).
+ * Errors: MX_EV_ERROR raises on the owner stack in both schemes, and the
+ * pad chain is identical -- a tail case cannot have a live pad at its
+ * resume (a pad around the resume would make it non-tail; pads it
+ * installed earlier were popped on its normal path), so the deleted
+ * frames held no pads.  busy flags: the pump holds busy=1 exactly while
+ * a case runs and 0 while the body runs, which is what the recursive
+ * chain maintained at every level (mx_resume cleared it before switching
+ * and re-set it around the nested dispatch).
  *
  * Perform precedence (mir_interp's `perform` op, mirrored in
  * mx__perform_impl): innermost non-busy handler frame, then the declared
@@ -147,6 +201,13 @@ struct mx_scope {
      * a nested mx_resume pump): longjmp back to this scope's mx_handle */
     jmp_buf abort_jmp;
     int64_t abort_value;
+    /* Pending tail resume: mx_resume_tail RECORDS (k, value) here and
+     * returns; the pump that dispatched the case consumes it and performs
+     * the switch from its own constant frame.  Only ever set between a
+     * case's mx_resume_tail call and its return to the pump (one side of
+     * a scope runs at a time, so no other dispatch can intervene). */
+    mx_k *tail_k;
+    int64_t tail_value;
     /* bookkeeping */
     mx_k *k_list;
     mx_scope *prev;                 /* global scope stack link */
@@ -267,6 +328,26 @@ static void mx__teardown_to(mx_scope *s) {
     }
 }
 
+/* Unlink one continuation record from its scope's list and free it.
+ * Only for a record the caller proved consumed AND unreachable: the pump
+ * calls this for tail-resumed continuations after the switch back (the
+ * body has read resume_value by then, the ucontext was consumed by the
+ * switch, and a tail resume is its case's last action so no later
+ * single-shot check can touch the record -- the compiler demotes any k
+ * that escapes into an env/closure).  GENERAL (non-tail) resumes never
+ * free: the record must stay allocated so a later double resume hits the
+ * `used` flag (the clean single-shot fatal), not freed memory; those
+ * records are reclaimed at scope teardown as before. */
+static void mx__free_k(mx_scope *s, mx_k *k) {
+    mx_k **pp = &s->k_list;
+    while (*pp != NULL && *pp != k)
+        pp = &(*pp)->next;
+    if (*pp == NULL)
+        mx__fatal("continuation record missing from its scope's list");
+    *pp = k->next;
+    free(k);
+}
+
 /* Free every scope ABOVE `top` (exclusive), leaving `top` itself installed.
  * The try landing pad's unwind: every scope pushed inside the delimited
  * extent is gone -- coroutine stacks, continuation records and scope
@@ -348,6 +429,76 @@ static mx_scope *mx__find_scope(const char *effect, const char *op,
     return NULL;
 }
 
+typedef struct {
+    int64_t value;
+    int aborted;   /* the last case declined to resume */
+} mx_pump_result;
+
+/* The owner-side event pump (see THE PUMP MODEL in the file header).
+ * Precondition: s->ev_kind == MX_EV_PERFORM and the caller runs on s's
+ * owner stack.  Dispatches the pending event's case, then:
+ *
+ *   - the case TAIL-RESUMED (mx_resume_tail recorded s->tail_k): switch
+ *     into the body from THIS frame, free the consumed record, and loop
+ *     on the scope's next event -- MX_EV_DONE returns done_value as the
+ *     scope's final value (exactly what the deleted chain of tail frames
+ *     would have propagated, see the equivalence note in the header),
+ *     MX_EV_ERROR re-raises on this owner stack, MX_EV_PERFORM iterates;
+ *   - the case GENERAL-resumed (k->used, no tail record): its return
+ *     value is already the whole body's completion value (deep) --
+ *     return it, aborted = 0;
+ *   - the case did NOT resume: return its value with aborted = 1 (the
+ *     caller decides between returning it as the handle value and
+ *     longjmp-unwinding nested handler frames). */
+static mx_pump_result mx__pump_events(mx_scope *s) {
+    for (;;) {
+        mx_k *k = s->ev_k;
+        s->tail_k = NULL;
+        s->busy = 1;
+        int64_t hres = s->handler(s->handler_env, s->ev_op_index,
+                                  s->ev_args, k);
+        s->busy = 0;
+        if (s->tail_k == NULL) {
+            mx_pump_result r = { hres, !k->used };
+            return r;
+        }
+        /* Tail resume recorded.  It must be THIS dispatch's continuation:
+         * the compiler only emits mx_resume_tail on a case's own trailing
+         * __k parameter. */
+        mx_k *tk = s->tail_k;
+        s->tail_k = NULL;
+        if (tk != k)
+            mx__fatal("tail resume of a foreign continuation "
+                      "(pump invariant violated)");
+        tk->resume_value = s->tail_value;
+        /* Unpark the body at its perform site; the handler side now waits
+         * HERE -- every later body->handler transfer re-enters this loop
+         * at constant depth. */
+        mx__switch(&s->handler_ctx, &tk->resume_ctx, tk->stack);
+        if (g_cur.bottom == NULL)
+            g_cur = s->owner_stack;
+        /* The body has moved past the perform site (it read resume_value
+         * strictly before switching back).  The record is consumed and
+         * unreachable: reclaim it now -- this is what keeps a stream's
+         * heap flat instead of one leaked mx_k (with its ~1 KB ucontext)
+         * per element. */
+        mx__free_k(s, tk);
+        if (s->ev_kind == MX_EV_DONE) {
+            mx_pump_result r = { s->done_value, 0 };
+            return r;
+        }
+        if (s->ev_kind == MX_EV_ERROR) {
+            /* Same re-raise point as mx_handle/mx_resume: the failure
+             * escaped the body fiber and must surface on the owner
+             * stack.  The deleted tail frames held no pads (see the
+             * equivalence note), so the pad chain here is exactly what
+             * the recursive unwind would have seen. */
+            mx__raise_owned(s->ev_error);
+        }
+        /* MX_EV_PERFORM: next element's event -- loop, constant frame. */
+    }
+}
+
 int64_t mx_handle(mx_body_fn body, void *body_env,
                   mx_handler_fn handler, void *handler_env,
                   const char *effect,
@@ -414,20 +565,17 @@ int64_t mx_handle(mx_body_fn body, void *body_env,
          * (the interpreter keeps the frame until handle_scope's finally). */
         mx__raise_owned(s->ev_error);
     }
-    /* MX_EV_PERFORM: dispatch the first perform.  Deep semantics make one
-     * dispatch enough -- every later perform against this scope is pumped
-     * recursively inside mx_resume (the interpreter calls _pump_scope
-     * exactly once per handle_scope, too). */
-    mx_k *k = s->ev_k;
-    s->busy = 1;
-    int64_t hres = s->handler(s->handler_env, s->ev_op_index, s->ev_args, k);
-    s->busy = 0;
-    /* k->used: the case resumed, so hres is already the WHOLE delimited
-     * body's completion value (deep).  !k->used: the case declined to
-     * resume -- abort semantics make its value the handle's value.  Either
-     * way hres is the result; teardown frees the (completed or parked)
+    /* MX_EV_PERFORM: enter the event pump.  Tail-resuming cases loop
+     * inside it at constant depth; a general resume recurses inside
+     * mx_resume (the interpreter calls _pump_scope exactly once per
+     * handle_scope, too).  Whatever the pump reports is the handle
+     * value: the DONE value reached through tail resumes, a
+     * general-resuming case's return value (already the WHOLE delimited
+     * body's completion value, deep), or a non-resuming case's return
+     * value (abort semantics).  Teardown frees the (completed or parked)
      * body coroutine and anything nested inside it. */
-    int64_t v = hres;
+    mx_pump_result r = mx__pump_events(s);
+    int64_t v = r.value;
     mx__teardown_to(s);
     return v;
 }
@@ -531,7 +679,12 @@ int64_t mx_resume(mx_k *k, int64_t value) {
     s->busy = 0;
     k->resume_value = value;
     /* Unpark the body at its perform site; the handler side now waits
-     * here (handler_ctx re-saved) for the scope's next event. */
+     * here (handler_ctx re-saved) for the scope's next event.  NOTE: k is
+     * NOT freed on this (general) path -- it must stay allocated so a
+     * later resume of the same continuation hits the `used` flag above
+     * (the clean single-shot fatal) instead of freed memory.  It is
+     * reclaimed at scope teardown, so the cost is transient, one record
+     * per still-live general resume of the scope. */
     mx__switch(&s->handler_ctx, &k->resume_ctx, k->stack);
     if (g_cur.bottom == NULL)
         g_cur = s->owner_stack;
@@ -548,21 +701,44 @@ int64_t mx_resume(mx_k *k, int64_t value) {
          * the interpreter's resume() `finally: frame["busy"] = was_busy`. */
         mx__raise_owned(s->ev_error);
     }
-    /* The body performed against this scope again: pump recursively (the
-     * interpreter's _pump_scope recursion, as plain C recursion on the
-     * owner stack). */
-    mx_k *k2 = s->ev_k;
-    s->busy = 1;
-    int64_t hres = s->handler(s->handler_env, s->ev_op_index, s->ev_args, k2);
+    /* The body performed against this scope again: pump from here (the
+     * interpreter's _pump_scope recursion -- one C recursion per GENERAL
+     * resume on the owner stack; the pump's own tail loop handles any
+     * chain of tail-resuming dispatches at constant depth). */
+    mx_pump_result r = mx__pump_events(s);
     s->busy = was_busy;
-    if (k2->used)
-        return hres; /* that case resumed: hres is the body's final value */
-    /* The nested case declined to resume: unwind every handler-side frame
+    if (!r.aborted)
+        return r.value; /* the body's final value (deep) */
+    /* A nested case declined to resume: unwind every handler-side frame
      * between here and the scope's mx_handle (the interpreter's
      * _EffectAbort propagating through resume() calls). */
-    s->abort_value = hres;
+    s->abort_value = r.value;
     g_pad = s->owner_pad;  /* pads inside the abandoned frames die with them */
     longjmp(s->abort_jmp, 1);
+}
+
+int64_t mx_resume_tail(mx_k *k, int64_t value) {
+    /* The TAIL form of resume, emitted by the compiler ONLY where the
+     * resume's value is returned as the case's value with nothing after
+     * it (compiler/effect_tail.py -- strict; anything doubtful keeps
+     * mx_resume).  Records the resume on the scope and returns
+     * immediately: the case then returns to the pump that dispatched it,
+     * and THE PUMP performs the switch into the body from its constant
+     * frame.  The return value is a placeholder for the case's dataflow
+     * (its ret still needs a word); the pump ignores the case's return
+     * value whenever a tail resume is recorded. */
+    if (k == NULL)
+        mx__fatal("resume: NULL continuation");
+    if (k->used)
+        mx__fatal("Continuation already consumed (single-shot violation)");
+    k->used = 1;
+    mx_scope *s = k->scope;
+    if (s->tail_k != NULL)
+        mx__fatal("tail resume recorded twice in one dispatch "
+                  "(pump invariant violated)");
+    s->tail_k = k;
+    s->tail_value = value;
+    return 0;
 }
 
 /* ------------------------------------------------------------------------
