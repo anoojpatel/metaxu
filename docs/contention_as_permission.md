@@ -91,11 +91,12 @@ runtime net. (The TSan non-vacuity experiment from the threads work
 changes accordingly: deleting the locks from the counter now aborts
 deterministically with the contended-write error instead of racing.)
 
-Follow-up enabled by this backstop (recorded, not implemented): the
-static rule can be RELAXED to writes-only — read-only captures of
-shared values are safe to admit statically once unprotected writes are
-dynamically caught. That is option A of the design discussion, and it
-becomes strictly safe to adopt after this lands.
+Design A (the writes-only static layer) is LANDED alongside this spec:
+the static rule rejects only captures the closure WRITES (assignments
+and mutator methods, traced through struct-field receivers); read-only
+captures of shared values compile and run. A mutation hidden behind a
+helper call is deliberately left to this dynamic layer — rejecting
+every capture that flows into a call would outlaw reads like sum(v).
 
 ## Runtime cost (measured, not asserted)
 
