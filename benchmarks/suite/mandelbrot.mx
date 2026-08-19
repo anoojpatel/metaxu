@@ -1,0 +1,27 @@
+// Mandelbrot 800x800, 50 iterations: float ALU + branches.
+fn main() -> int {
+    let mut total = 0;
+    let mut fy = 0.0;
+    while fy < 800.0 {
+        let mut fx = 0.0;
+        while fx < 800.0 {
+            let x0 = fx / 400.0 - 1.5;
+            let y0 = fy / 400.0 - 1.0;
+            let mut x = 0.0; let mut y = 0.0;
+            let mut i = 0;
+            while i < 50 {
+                if x * x + y * y > 4.0 { i = 99 } else {
+                    let xt = x * x - y * y + x0;
+                    y = 2.0 * x * y + y0;
+                    x = xt;
+                    i = i + 1
+                }
+            };
+            if i < 99 { total = total + 1 } else { () };
+            fx = fx + 1.0
+        };
+        fy = fy + 1.0
+    };
+    print(total);
+    0
+}

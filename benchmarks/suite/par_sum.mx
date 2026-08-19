@@ -1,0 +1,36 @@
+// Parallel scaling: the same 40M-element reduction on 1 vs 4 OS threads.
+// Ergonomics on display: no shared state AT ALL — each worker owns its
+// range and the results come back through join, so the thread-safety
+// checker has nothing to object to and no locks exist to get wrong.
+extern type Thread[T];
+effect Thread = {
+    fn spawn[T](f: fn() -> @global T) -> @global Thread[T] with EFFECT_SPAWN
+    fn join[T](thread: @global Thread[T]) -> @global T with EFFECT_JOIN
+}
+
+fn work(lo: int, hi: int) -> int {
+    let mut acc = 0;
+    let mut i = lo;
+    while i < hi {
+        acc = acc + (i * i) % 1000;
+        i = i + 1
+    };
+    acc
+}
+
+fn main() -> int {
+    let n = 40000000;
+    // one thread
+    let serial = work(0, n);
+    // four threads
+    let q = n / 4;
+    let t1 = perform Thread.spawn(|| { work(0, q) });
+    let t2 = perform Thread.spawn(|| { work(q, 2 * q) });
+    let t3 = perform Thread.spawn(|| { work(2 * q, 3 * q) });
+    let t4 = perform Thread.spawn(|| { work(3 * q, n) });
+    let parallel = perform Thread.join(t1) + perform Thread.join(t2)
+                 + perform Thread.join(t3) + perform Thread.join(t4);
+    print(serial);
+    print(parallel);
+    if serial == parallel { 0 } else { 1 }
+}

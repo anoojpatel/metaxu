@@ -1,0 +1,25 @@
+// Struct-heavy float integrator: 20M steps of a damped orbit.
+// Every step rebuilds the struct — MIR value semantics; SROA/mem2reg
+// scalarize it, so this prices the abstraction at zero.
+struct Body { x: float, y: float, vx: float, vy: float }
+
+fn step(b: Body) -> Body {
+    let r2 = b.x * b.x + b.y * b.y + 0.5;
+    let ax = 0.0 - b.x / r2;
+    let ay = 0.0 - b.y / r2;
+    Body { x: b.x + b.vx * 0.001, y: b.y + b.vy * 0.001,
+           vx: (b.vx + ax * 0.001) * 0.9999995,
+           vy: (b.vy + ay * 0.001) * 0.9999995 }
+}
+
+fn main() -> int {
+    let mut b = Body { x: 1.0, y: 0.0, vx: 0.0, vy: 1.0 };
+    let mut i = 0;
+    while i < 20000000 {
+        b = step(b);
+        i = i + 1
+    };
+    print(to_string(b.x));
+    print(to_string(b.y));
+    0
+}
