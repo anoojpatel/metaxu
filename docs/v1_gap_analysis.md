@@ -417,6 +417,39 @@ depth this budget already provides at ~1/100th of the cost. Revisit if a
 program needs more than ~20_000 frames, or if the effect scheduler is
 rebuilt for other reasons.
 
+## Effects pump: tail-resume trampoline (2026-08-19)
+
+The handler pump used to be RECURSIVE per event on both engines: a case's
+`resume(v)` parked the handler side inside the resume frame inside the
+case frame, so each stream element left a (case frame + resume frame)
+pair on the scope's owner stack for the whole stream. Natively that was
+~250 B/element against the 1 MiB coroutine stacks — a
+`sum(map(filter(iota(n), ...), ...))` pipeline segfaulted between 2,000
+and 5,000 elements — plus one never-freed `mx_k` (~1 KB of ucontext) per
+element; the interpreter hit its 100k-frame recursion budget between
+10,000 and 20,000 elements. Fixed by a codegen-assisted trampoline:
+`compiler/effect_tail.py` marks resumes in TAIL position (the case's
+value IS resume's value — the shape of every std.stream/std.state/
+std.log arm except `fold`'s), the native runtime's owner-side event loop
+(`mx__pump_events` in metaxu_effects.c, where the equivalence argument
+against the recursive scheme is written down) performs those switches
+from a constant frame and frees each consumed continuation record, and
+the interpreter's `_pump_scope` loops on a `_TailResume` unwind the same
+way — BOTH engines consult the same analysis, so they trampoline the
+same sites. `std.stream`'s `sum`/`product`/`count` moved from foldr to
+tail-shaped accumulator arms as part of this. Measured after the fix:
+the pipeline runs 1,000,000 elements natively at flat stack/heap and
+200,000+ in the interpreter, with identical outputs. What remains O(n)
+by SEMANTICS, not implementation: genuine foldr (`fold`'s
+`f(x, resume(()))` does work after the resume — its pending
+applications are per-element frames on the owner stack; native ceiling
+measured between 50,000 and 100,000 elements on an 8 MiB main stack,
+interpreter ceiling ~15,000 under the recursion budget), and any other
+arm that computes after resuming. Tests:
+`test_effect_tail_resume.py` (analysis, 1M native stack stability,
+interpreter 20k, non-tail differentials, single-shot on a consumed-then-
+tail-resumed continuation, ASan).
+
 ## Loudly-unsupported surface constructs (HIR triage)
 
 Update (2026-08-14): HIR lowering used to end in `return None` for any AST
