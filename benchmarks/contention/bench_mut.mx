@@ -1,0 +1,11 @@
+fn main() -> int {
+    let mut v = Vec.new();
+    v.push(0);
+    let mut i = 0;
+    while i < 30000000 {
+        v[0] = v[0] + 1;
+        i = i + 1
+    };
+    print(v[0]);
+    0
+}
