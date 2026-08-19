@@ -307,6 +307,39 @@ class _SpawnCaptureChecker:
                     out.add(name)
         return out
 
+    #: Vec methods that mutate their receiver (reads like len/get stay free).
+    _MUTATOR_METHODS = frozenset({"push", "pop"})
+
+    @classmethod
+    def _written_names(cls, lam: Any) -> set[str]:
+        """Root names the closure WRITES: assignment targets (x = .., x[i] =
+        .., x.f = ..) and receivers of mutating method calls (x.push(..),
+        x.items.pop()). Contention weakens access, it does not revoke it
+        (docs/contention_as_permission.md): only these writes are demanded
+        of the static layer — a mutation hidden behind a helper call is the
+        DYNAMIC layer's job, not grounds to reject every read."""
+        out: set[str] = set()
+
+        def root_of(target: Any) -> str | None:
+            if isinstance(target, str):
+                return target.split(".")[0].split("[")[0].strip() or None
+            base = getattr(target, "base", None)
+            if base is not None:
+                return root_of(base)
+            name = getattr(target, "name", None)
+            return name if isinstance(name, str) else None
+
+        for node in _walk_all(lam):
+            if isinstance(node, fast.Assignment):
+                root = root_of(getattr(node, "name", None))
+                if root:
+                    out.add(root)
+            elif isinstance(node, fast.QualifiedFunctionCall):
+                parts = [str(x) for x in (getattr(node, "parts", None) or [])]
+                if len(parts) >= 2 and parts[-1] in cls._MUTATOR_METHODS:
+                    out.add(parts[0])
+        return out
+
     def _shared_note(self, name: str, binding: _Binding) -> str:
         if not binding.shared_provenance:
             return ""
@@ -372,6 +405,7 @@ class _SpawnCaptureChecker:
                 handle_ops=self.handle_ops)
             collector.visit(lam)
             moved = self._moved_names(lam) if check_separate else set()
+            written = self._written_names(lam) if check_separate else set()
             site = arg if _is_node(arg) else node
             for name in sorted(captures):
                 binding = self.lookup(name)
@@ -407,14 +441,17 @@ class _SpawnCaptureChecker:
                             f"active @mut borrow of it: an exclusive borrow "
                             f"must not be shared across threads")
                     elif (check_separate and name not in moved
+                          and name in written
                           and binding.separateness == "shared"):
                         self._report(
                             site, lam, SEPARATE_CAPTURE_KIND, name,
                             f"closure passed to spawn-mapped operation "
                             f"'{op_display}' (with {SPAWN_RUNTIME_SYMBOL}) "
-                            f"captures '{name}', which has shared mutable "
-                            f"identity (Vec): two threads mutating through "
-                            f"one handle race; protect it "
+                            f"captures AND WRITES '{name}', which has "
+                            f"shared mutable identity (Vec): two threads "
+                            f"mutating through one handle race (reads are "
+                            f"free — contention weakens access, it does not "
+                            f"revoke it); protect it "
                             f"(std.sync.protect), move it into exactly one "
                             f"thread (move({name})), or take responsibility "
                             f"with `unsafe {{ .. }}`"

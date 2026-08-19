@@ -566,7 +566,7 @@ fn main() -> int {
 }
 """)
     msg = str(exc.value)
-    assert "captures 'w'" in msg
+    assert "captures AND WRITES 'w'" in msg
     assert "'w' was bound from 'v'" in msg
 
 
@@ -584,7 +584,7 @@ fn main() -> int {
     0
 }
 """)
-    assert "captures 'h'" in str(exc.value)
+    assert "captures AND WRITES 'h'" in str(exc.value)
 
 
 def test_protect_result_is_separate_by_construction():
@@ -666,3 +666,37 @@ fn main() -> int {
 }
 """)
     assert result == 42
+
+
+def test_read_only_capture_of_shared_value_compiles_and_runs():
+    """Design A (docs/contention_as_permission.md § follow-up, landed):
+    contention weakens access rather than revoking it — a spawned closure
+    may CAPTURE shared identity freely and READ it; only WRITES demand
+    protect/move/unsafe. Before the writes-only relaxation this program
+    was rejected outright."""
+    result, _ = run_source(THREAD_EFFECT + """
+fn main() -> int {
+    let mut v = Vec.new();
+    v.push(40);
+    v.push(2);
+    let t = perform Thread.spawn(|| { v[0] + v[1] });
+    perform Thread.join(t)
+}
+""")
+    assert result == 42
+
+
+def test_write_through_helper_call_is_the_dynamic_layers_job():
+    """A mutation hidden behind a helper call is statically untraced BY
+    DESIGN (rejecting every capture passed to a call would outlaw reads
+    like sum(v)); the dynamic contention layer owns it. This test pins
+    the static behavior: it compiles."""
+    compile_source(THREAD_EFFECT + """
+fn bump(w: Vec) -> () { w.push(1) }
+
+fn main() -> int {
+    let mut v = Vec.new();
+    let t = perform Thread.spawn(|| { bump(v); 0 });
+    0
+}
+""")
