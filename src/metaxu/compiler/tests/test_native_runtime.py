@@ -222,7 +222,7 @@ int main(void) {
 }
 """)
     assert proc.returncode != 0
-    assert "index out of bounds: 0 (length 0)" in proc.stderr
+    assert "index assignment out of bounds: 0 (length 0)" in proc.stderr
 
 
 @needs_clang

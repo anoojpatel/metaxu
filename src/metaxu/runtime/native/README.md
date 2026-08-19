@@ -69,7 +69,8 @@ error: `, and calls `abort()`. No error codes, no silent fallbacks.
 Message wording reuses the interpreter's where one exists:
 
 - pop on empty Vec: `pop: Vec is empty`
-- out-of-bounds get/set: `index out of bounds: <idx> (length <len>)`
+- out-of-bounds get: `index out of bounds: <idx> (length <len>)`
+- out-of-bounds set: `index assignment out of bounds: <idx> (length <len>)`
 - `NULL` receivers/arguments and allocation failures also abort.
 
 ## Memory ownership
