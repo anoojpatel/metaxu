@@ -23,7 +23,15 @@
  *     WHOLE delimited body.  Any further perform the resumed body makes
  *     against this scope is dispatched recursively inside mx_resume (a C
  *     recursion on the handler side, mirroring the interpreter's
- *     _pump_scope recursion);
+ *     _pump_scope recursion).  A resume in TAIL position -- the case's
+ *     value IS the resume's value, nothing after it -- is emitted as
+ *     mx_resume_tail instead (compiler/effect_tail.py decides,
+ *     strictly): it RECORDS (k, v) and returns to the case, which
+ *     returns to the scope's owner-side event pump, and the pump
+ *     switches into the body from its own CONSTANT frame.  Handler-side
+ *     stack is therefore O(1) per event for tail-shaped handlers (the
+ *     std.stream/std.state/std.log shapes) instead of one (case + resume)
+ *     frame pair per element; see THE PUMP MODEL in metaxu_effects.c;
  *   - ABORT: a handler case that returns without resuming makes its
  *     return value the handle expression's value and tears down the
  *     parked body.  When the non-resuming case ran inside a nested
@@ -36,9 +44,15 @@
  *     observationally equivalent to the interpreter's cascade;
  *   - SINGLE-SHOT: resuming a consumed continuation prints the
  *     interpreter's message ("Continuation already consumed (single-shot
- *     violation)") and aborts the process.  Continuation records are
- *     freed at scope teardown; `used` is checked before anything else is
- *     touched.
+ *     violation)") and aborts the process; `used` is checked before
+ *     anything else is touched.  Continuation records consumed by a TAIL
+ *     resume are freed by the pump as soon as the switch into the body
+ *     comes back (they are provably unreachable: the tail resume is the
+ *     case's last action and the compiler demotes any continuation that
+ *     escapes into an env or closure), so streams run at flat heap.
+ *     Records consumed by a GENERAL resume stay allocated until scope
+ *     teardown -- deliberately, so a double resume hits the `used` flag,
+ *     never freed memory.
  *
  * ABI conventions (all effect-boundary values are opaque 8-byte words:
  * i64 as-is, double bit-cast, pointers ptrtoint -- the compiler knows the
@@ -57,6 +71,9 @@
  * | or_default  |          const int64_t *args, int64_t nargs,           |
  * |             |          mx_default_fn dflt, void *dflt_env)           |
  * | mx_resume   | int64_t (mx_k *k, int64_t value)                       |
+ * | mx_resume_  | int64_t (mx_k *k, int64_t value)                       |
+ * | tail        |   (tail-position resume: records and returns; the      |
+ * |             |    pump does the switch -- see DEEP semantics above)   |
  *
  *   mx_body_fn    = int64_t (*)(void *env)
  *   mx_handler_fn = int64_t (*)(void *env, int64_t op_index,
@@ -123,8 +140,12 @@
  *
  * Memory: coroutine stacks, scope records and continuation records are
  * freed at scope completion/abort -- effect machinery itself is
- * leak-clean under ASan/LSan.  Values flowing through performs follow the
- * backend's usual contracts (boxes/strings may leak by design).
+ * leak-clean under ASan/LSan.  Tail-resumed continuation records are
+ * additionally freed PER EVENT by the pump (flat heap for streams);
+ * general-resumed records are kept until scope teardown so the
+ * single-shot `used` check never reads freed memory (transient, not a
+ * leak).  Values flowing through performs follow the backend's usual
+ * contracts (boxes/strings may leak by design).
  *
  * ASan: switches are annotated with __sanitizer_start_switch_fiber /
  * __sanitizer_finish_switch_fiber when compiled with -fsanitize=address,
@@ -267,6 +288,14 @@ int64_t mx_perform_or_default(const char *effect, const char *op,
                               mx_default_fn dflt, void *dflt_env);
 
 int64_t mx_resume(mx_k *k, int64_t value);
+
+/* Tail-position resume (see the DEEP semantics note above): records the
+ * resume on the continuation's scope and returns 0 immediately; the
+ * owner-side pump performs the actual switch into the body from its
+ * constant frame.  Emitted by the compiler ONLY where effect_tail.py
+ * proved the resume's value is the case's return value with nothing
+ * after it; everything else uses mx_resume. */
+int64_t mx_resume_tail(mx_k *k, int64_t value);
 
 /* --- Delimited failure recovery (try/catch) ----------------------------- */
 
