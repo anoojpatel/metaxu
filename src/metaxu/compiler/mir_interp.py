@@ -249,11 +249,19 @@ class MxVec:
     `&mut self` method mutates the one shared list, so the caller observes the
     push even though the enclosing struct was passed by value. This matches
     what programs like examples/10_traits_and_structs.mx expect from Vec.
+
+    ``contended`` (docs/contention_as_permission.md): set once when this
+    vector crosses a REAL spawn boundary (_rt_thread_spawn's marking walk
+    over the closure's captures). A mutation (push/pop/index-set) of a
+    contended vec on a thread whose logical-thread write permit is 0 (no
+    mutex held through the runtime — _ThreadCtx.write_permit) raises
+    catchably with the spec's exact wording; reads stay free.
     """
-    __slots__ = ("items",)
+    __slots__ = ("items", "contended")
 
     def __init__(self, items: Optional[List[Any]] = None) -> None:
         self.items = items if items is not None else []
+        self.contended = False
 
     def __len__(self) -> int:
         return len(self.items)
@@ -564,7 +572,7 @@ class _ThreadCtx:
     Identity of this object doubles as the mutex-ownership token
     (MxMutex.owner).
     """
-    __slots__ = ("mir_handler_frames", "handler_stack")
+    __slots__ = ("mir_handler_frames", "handler_stack", "write_permit")
 
     def __init__(self) -> None:
         # Delimited MIR-level handler frames installed by handle_scope ops
@@ -572,6 +580,13 @@ class _ThreadCtx:
         self.mir_handler_frames: List[Dict[str, Any]] = []
         # Dynamic (push_handler/pop_handler) stack, same locality.
         self.handler_stack: List[Dict[str, tuple]] = []
+        # Contention permission (docs/contention_as_permission.md): count
+        # of mutexes this LOGICAL thread holds through the runtime
+        # (_rt_mutex_lock +1 / _rt_mutex_unlock -1). Handle-body threads
+        # adopt their creator's ctx, so the permission follows the logical
+        # thread exactly like mutex ownership; spawned threads get a fresh
+        # ctx and start at 0. Read by the contended-Vec write checks.
+        self.write_permit: int = 0
 
 
 class _EffectAbort(Exception):
@@ -1560,16 +1575,44 @@ class MirInterpreter:
         # identical to Vec.new() followed by pushes.
         self._builtins["__list_lit"] = lambda *xs: MxVec(list(xs))
         self._builtins["__list_concat"] = _builtin_list_concat
-        self._builtins["push"] = _builtin_push
-        self._builtins["pop"] = _builtin_pop
+
+        # Contended-write permission check (docs/contention_as_permission.md):
+        # EVERY Vec-mutating builtin (push, pop, index-set, index-store)
+        # goes through this guard; reads (len/get/iteration/slicing) stay
+        # free. Bound wrappers, because the permission lives on the calling
+        # LOGICAL thread's ctx (handle bodies adopt their creator's — the
+        # grant follows the logical thread exactly like mutex ownership).
+        def _contended_write_check(recv: Any) -> None:
+            if (isinstance(recv, MxVec) and recv.contended
+                    and self._ctx().write_permit == 0):
+                raise InterpError(_CONTENDED_WRITE_MSG)
+
+        def _checked_push(recv: Any, *vals: Any) -> Any:
+            _contended_write_check(recv)
+            return _builtin_push(recv, *vals)
+
+        def _checked_pop(recv: Any) -> Any:
+            _contended_write_check(recv)
+            return _builtin_pop(recv)
+
+        def _checked_index_set(base: Any, idx: Any, value: Any) -> Any:
+            _contended_write_check(base)
+            return _builtin_index_set(base, idx, value)
+
+        def _checked_index_store(base: Any, idx: Any, value: Any) -> Any:
+            _contended_write_check(base)
+            return _builtin_index_store(base, idx, value)
+
+        self._builtins["push"] = _checked_push
+        self._builtins["pop"] = _checked_pop
         # --- Runtime library: math methods on numbers -----------------------
         self._builtins["sqrt"] = _make_math_method("sqrt", math.sqrt)
         self._builtins["sin"] = _make_math_method("sin", math.sin)
         self._builtins["cos"] = _make_math_method("cos", math.cos)
         # --- Runtime library: indexing / slicing / fixed-size vectors -------
         self._builtins["__index_get"] = _builtin_index_get
-        self._builtins["__index_set"] = _builtin_index_set
-        self._builtins["__index_store"] = _builtin_index_store
+        self._builtins["__index_set"] = _checked_index_set
+        self._builtins["__index_store"] = _checked_index_store
         self._builtins["__zip"] = _builtin_zip
         self._builtins["__slice_get"] = _builtin_slice_get
         self._builtins["__range"] = _builtin_range
@@ -1818,6 +1861,10 @@ class MirInterpreter:
                 f"this thread already holds it")
         m._lock.acquire()  # held by another thread: BLOCK until released
         m.owner = me
+        # Lock HELD from here: grant write permission on this LOGICAL
+        # thread (docs/contention_as_permission.md). Strictly after the
+        # error paths — a failed ERRORCHECK lock must not bump.
+        me.write_permit += 1
         return UNIT
 
     def _rt_mutex_unlock(self, args: List[Any]) -> Any:
@@ -1829,10 +1876,15 @@ class MirInterpreter:
         # One unified message for "unlocked" and "held by another thread":
         # ERRORCHECK's EPERM covers both, and the momentary state of a
         # mutex someone else holds is racy to print (docs/threads_runtime.md).
-        if m.owner is not self._ctx():
+        me = self._ctx()
+        if m.owner is not me:
             raise InterpError(
                 f"EFFECT_MUTEX_UNLOCK on <Mutex#{m.mutex_id}>: "
                 f"this thread does not hold it")
+        # Revoke write permission before releasing: strictly after the
+        # ownership check, so a failed unlock changes nothing (mirrors
+        # metaxu_threads.c mx_mutex_unlock).
+        me.write_permit -= 1
         m.owner = None
         m._lock.release()
         return UNIT
@@ -1858,6 +1910,15 @@ class MirInterpreter:
             self._next_thread_id += 1
         t = MxThread(thread_id)
         captured = dict(fn.captured)
+        # Contention marking (docs/contention_as_permission.md § marking
+        # rule): a REAL spawn marks every captured Vec contended, recursing
+        # through struct fields, STOPPING at Vec elements. This runs only
+        # here — a handler-virtualized spawn never reaches this shim — and
+        # BEFORE the thread starts, so the marks happen-before the child.
+        # The native engine emits the identical walk inside the
+        # EFFECT_SPAWN runtime thunk (codegen_llvm); asymmetry is a bug.
+        for cap_value in captured.values():
+            _mark_contended(cap_value)
 
         def _child_main() -> None:
             # A spawned thread is a NEW logical thread: fresh handler
@@ -2180,6 +2241,34 @@ def _builtin_len(x: Any) -> int:
     if isinstance(x, (MxVec, MxVector, str, list, tuple)):
         return len(x)
     raise InterpError(f"len: unsupported receiver type {_runtime_type_name(x)!r}")
+
+
+# Contention as permission (docs/contention_as_permission.md). Wording is
+# language-visible (a `try` binds it) and shared byte-for-byte with the
+# native runtime (metaxu_rt.c mx__vec_write_check).
+_CONTENDED_WRITE_MSG = (
+    "write to contended Vec without a held lock: this value crossed "
+    "a thread boundary at spawn; mutate it under a mutex "
+    "(std.sync.with_lock) or keep it thread-local")
+
+
+def _mark_contended(value: Any) -> None:
+    """The spec's marking rule, applied to one spawned-closure capture:
+    Vec identity -> mark contended (do NOT descend into elements — the
+    vec-of-vecs hole is documented and pinned by test, because native code
+    cannot enumerate runtime elements and the engines must agree); struct
+    values -> recurse fields by layout; mutable-capture cells -> the cell
+    aliases the binding, so walk the boxed value (native envs capture the
+    cell POINTER and the emitted walk loads through it). Everything else
+    (scalars, strings, fixed vectors, enum variants, closures, handles)
+    stops, identically on both engines."""
+    if isinstance(value, MxVec):
+        value.contended = True
+    elif isinstance(value, MxStruct):
+        for field_value in value.fields.values():
+            _mark_contended(field_value)
+    elif isinstance(value, MxCell):
+        _mark_contended(value.value)
 
 
 def _builtin_push(recv: Any, *vals: Any) -> Any:

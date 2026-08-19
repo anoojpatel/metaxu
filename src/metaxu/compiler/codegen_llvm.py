@@ -1074,6 +1074,10 @@ _RT_SIGS = {
     "mx_vec_get": ("i64", ("ptr", "i64")),
     "mx_vec_set": ("void", ("ptr", "i64", "i64")),
     "mx_vec_free": ("void", ("ptr",)),
+    # Contention marking (docs/contention_as_permission.md): called at the
+    # real-spawn path (inside the EFFECT_SPAWN runtime thunk) for every
+    # vec the spawned closure captures, directly or through struct fields.
+    "mx_vec_mark_contended": ("void", ("ptr",)),
     "mx_str_concat": ("ptr", ("ptr", "ptr")),
     "mx_str_len": ("i64", ("ptr",)),
     "mx_i64_to_str": ("ptr", ("i64",)),
@@ -8384,6 +8388,142 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                             f"{_CLOSURE_PAIR_TY}, ptr {base}, i32 0, i32 1")
                         envv = fresh()
                         lines.append(f"  {envv} = load ptr, ptr {envpp}")
+
+                        # CONTENTION MARKING (docs/contention_as_permission
+                        # .md § marking rule): this thunk body executes iff
+                        # the spawn is REAL — a direct-mapped perform calls
+                        # it, and a scoped perform reaches it only as
+                        # mx_perform_or_default's fallback after no handler
+                        # claimed the op — so marking HERE covers both
+                        # routes and never marks a virtualized spawn,
+                        # mirroring the interpreter's _rt_thread_spawn
+                        # exactly. Walk the captures of each member lambda
+                        # the closure kind admits (branching on the fn
+                        # pointer when there are several): vec captures are
+                        # marked, struct captures recurse by static field
+                        # layout, cell captures (mutable) load through the
+                        # cell pointer, and the walk STOPS at vec elements
+                        # (the documented, test-pinned hole). A capture
+                        # whose kind cannot be enumerated demotes the thunk
+                        # — an honest placeholder, never engine asymmetry.
+                        _NO_MARKS_REASON = (
+                            "cannot emit contention marks for spawn "
+                            "captures (kinds unavailable)")
+
+                        def _vec_mark_at(slotp: str) -> None:
+                            mod.runtime_syms.add("mx_vec_mark_contended")
+                            vv = fresh()
+                            lines.append(f"  {vv} = load ptr, ptr {slotp}")
+                            lines.append(
+                                f"  call void @mx_vec_mark_contended"
+                                f"(ptr {vv})  ; spawn capture crossed")
+
+                        def _mark_struct(sname: str, basep: str,
+                                         on_path: frozenset) -> None:
+                            if (sname in structs.bad
+                                    or sname not in structs.fields
+                                    or sname in on_path):
+                                raise _Unsupported(_NO_MARKS_REASON)
+                            sty = f"%struct.{_sanitize(sname)}"
+                            for fi, fnm in enumerate(structs.fields[sname]):
+                                fk2 = structs.field_kind(sname, fnm)
+                                if _is_vec(fk2):
+                                    p2 = fresh()
+                                    lines.append(
+                                        f"  {p2} = getelementptr inbounds "
+                                        f"{sty}, ptr {basep}, i32 0, i32 {fi}")
+                                    _vec_mark_at(p2)
+                                elif _is_struct(fk2):
+                                    p2 = fresh()
+                                    lines.append(
+                                        f"  {p2} = getelementptr inbounds "
+                                        f"{sty}, ptr {basep}, i32 0, i32 {fi}")
+                                    _mark_struct(_struct_name(fk2), p2,
+                                                 on_path | {sname})
+                                elif fk2 == CONFLICT:
+                                    raise _Unsupported(_NO_MARKS_REASON)
+                                # else: scalars/str/fvec/enum/closure stop
+                                # (the spec recurses struct fields ONLY;
+                                # the interpreter's _mark_contended agrees).
+
+                        def _member_needs_marks(m: str) -> bool:
+                            def kind_touches(k: str,
+                                             seen: frozenset) -> bool:
+                                if _is_cell_marker(k):
+                                    k = _cell_elem(k)
+                                if _is_vec(k) or k == CONFLICT:
+                                    return True
+                                if _is_struct(k):
+                                    sn = _struct_name(k)
+                                    if sn in seen:
+                                        return True  # forces the demote path
+                                    if (sn in structs.bad
+                                            or sn not in structs.fields):
+                                        return True
+                                    return any(
+                                        kind_touches(
+                                            structs.field_kind(sn, f2),
+                                            seen | {sn})
+                                        for f2 in structs.fields[sn])
+                                return False
+                            return any(kind_touches(k, frozenset())
+                                       for (_c, k) in env_fields(m))
+
+                        def _mark_member_env(m: str, envp: str) -> None:
+                            ety2 = f"%env.{_sanitize(m)}"
+                            for fi, (cn2, ck2) in enumerate(env_fields(m)):
+                                is_cell = _is_cell_marker(ck2)
+                                ek = _cell_elem(ck2) if is_cell else ck2
+                                if not (_is_vec(ek) or _is_struct(ek)
+                                        or ek == CONFLICT):
+                                    continue
+                                if ek == CONFLICT:
+                                    raise _Unsupported(_NO_MARKS_REASON)
+                                p2 = fresh()
+                                lines.append(
+                                    f"  {p2} = getelementptr inbounds "
+                                    f"{ety2}, ptr {envp}, i32 0, i32 {fi}")
+                                if is_cell:
+                                    # Mutable capture: the env holds the
+                                    # one-word cell POINTER; only a vec can
+                                    # live in a cell word.
+                                    if not _is_vec(ek):
+                                        raise _Unsupported(_NO_MARKS_REASON)
+                                    cp2 = fresh()
+                                    lines.append(
+                                        f"  {cp2} = load ptr, ptr {p2}"
+                                        f"  ; cell pointer for {cn2}")
+                                    _vec_mark_at(cp2)
+                                elif _is_vec(ek):
+                                    _vec_mark_at(p2)
+                                else:  # inline struct capture
+                                    _mark_struct(_struct_name(ek), p2,
+                                                 frozenset())
+
+                        spawn_members = _closure_members(kind(opargs[0]))
+                        marked = [m for m in spawn_members
+                                  if _member_needs_marks(m)]
+                        if len(spawn_members) == 1 and marked:
+                            # The kind pins the one lambda: no branch.
+                            _mark_member_env(spawn_members[0], envv)
+                        elif marked:
+                            uid = fresh()[1:]
+                            done_lbl = f"spawn.marked.{uid}"
+                            for j, m in enumerate(marked):
+                                cnd, nxt = fresh(), f"spawn.next.{uid}.{j}"
+                                lines.append(
+                                    f"  {cnd} = icmp eq ptr {fnv}, "
+                                    f"@{mangle(m)}")
+                                lines.append(
+                                    f"  br i1 {cnd}, label "
+                                    f"%spawn.mark.{uid}.{j}, label %{nxt}")
+                                lines.append(f"spawn.mark.{uid}.{j}:")
+                                _mark_member_env(m, envv)
+                                lines.append(f"  br label %{done_lbl}")
+                                lines.append(f"{nxt}:")
+                            lines.append(f"  br label %{done_lbl}")
+                            lines.append(f"{done_lbl}:")
+
                         v = fresh()
                         lines.append(
                             f"  {v} = call i64 @mx_thread_spawn(ptr {fnv}, "
@@ -9390,6 +9530,13 @@ def emit_llvm(funcs: Sequence[MirFunc]) -> str:
             ck = kinds.get(cvar, I64)
             deps.update(m for m in _closure_members(ck)
                         if m in module_names)
+        # The EFFECT_SPAWN thunk's contention-marking walk branches on the
+        # spawned closure's member lambda SYMBOLS (@mx_<lambda>), so the
+        # thunk cannot link if any member demoted.
+        for (_pd, symbol, pargs) in info.effect_primitive_calls:
+            if symbol == "EFFECT_SPAWN" and pargs:
+                deps.update(m for m in _closure_members(kinds.get(pargs[0], I64))
+                            if m in module_names)
         # Reading a module constant is meaningless unless its initializer
         # emitted (the entry wrapper must be able to run it first): a
         # demoted __module_init cascades onto every global reader.

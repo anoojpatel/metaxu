@@ -73,6 +73,16 @@ int64_t mx_mutex_create(void);
 int64_t mx_mutex_lock(int64_t handle);
 int64_t mx_mutex_unlock(int64_t handle);
 
+/* Contention permission (docs/contention_as_permission.md): the calling
+ * thread's held-mutex count.  _Thread_local, bumped by mx_mutex_lock
+ * (+1, only after a SUCCESSFUL lock -- a failed ERRORCHECK lock never
+ * bumps) and mx_mutex_unlock (-1, restored on the EPERM error path).
+ * Spawned threads start at 0 (fresh TLS); handle bodies are ucontext
+ * fibers on the SAME OS thread, so the permission follows the logical
+ * thread exactly like mutex ownership does.  Read by the Vec mutators'
+ * contended-write guard (metaxu_rt.c mx__vec_write_check). */
+int64_t mx__write_permit(void);
+
 #ifdef __cplusplus
 }
 #endif

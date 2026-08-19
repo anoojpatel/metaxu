@@ -40,10 +40,12 @@ CFLAGS: tuple[str, ...] = (
 
 
 def _sources_mtime() -> float:
-    # metaxu_rt.c includes metaxu_effects.h (mx_raisef: catchable failures),
-    # so the effects header is one of its sources too.
+    # metaxu_rt.c includes metaxu_effects.h (mx_raisef: catchable failures)
+    # and metaxu_threads.h (mx__write_permit: the contended-write guard's
+    # permission read), so both headers are among its sources too.
     return max(p.stat().st_mtime
-               for p in (RUNTIME_C, RUNTIME_H, EFFECTS_H, Path(__file__)))
+               for p in (RUNTIME_C, RUNTIME_H, EFFECTS_H, THREADS_H,
+                         Path(__file__)))
 
 
 def _is_fresh(artifact: Path) -> bool:
