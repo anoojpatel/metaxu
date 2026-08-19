@@ -167,6 +167,50 @@ same link, only the .o files differ.
   from glibc malloc's 32-byte chunk to the 48-byte one — +16 bytes of
   real memory per vector, once.
 
+### Independent re-measurement (2026-08-19): alignment dominates
+
+The numbers above were verified independently at merge — and the
+verification found that the headline uncrossed-path number was a
+CODE-LAYOUT artifact, in both directions. Re-measuring old-vs-new with a
+separately built old runtime gave **-17%** (the new runtime apparently
+faster) for the same comparison the agent measured at **+15.8%**; forcing
+`-falign-functions=64` on every build revealed the baseline binary alone
+swings ±30% (133 ms vs 91 ms, identical source) on linker placement
+luck. **Unaligned contention-cost measurements measure layout, not the
+guard.** The alignment-controlled numbers (four runtimes — old, a
+no-guard layout control, permit/B, freeze/C — one shared IR per
+benchmark, 24 rotated-order interleaved rounds, medians):
+
+| Variant | 30M-iter mutation loop | 1M lock/unlock pairs |
+| --- | --- | --- |
+| old (no contention) | 90.8 ms | 16.8 ms |
+| no-guard control | 88.4 ms (−2.7%, ≈noise) | 17.9 ms (+6.9%)* |
+| **permit (B, shipped)** | **97.7 ms (+7.5%, ≈+0.23 ns/guarded call)** | **17.9 ms (+6.6%, ≈+1.1 ns/pair)** |
+| freeze (C variant) | 90.3 ms (−0.6%, ≈0) | 17.3 ms (+3.0%, ≈noise) |
+
+\* the control keeps permit's lock bookkeeping (only the vec guard is
+compiled out), so its lock column matching permit's is the expected
+cross-check.
+
+So the honest uncrossed-path cost is **~+7.5% on a worst-case
+pure-mutation microloop** (smaller than the agent's unaligned reading),
+and smaller than the layout variance ordinary builds exhibit anyway.
+
+### The B-vs-C performance verdict
+
+Freeze (design C: contended → writes always refused, no TLS anywhere)
+wins the microbenchmarks — its guard is a lone flag test that vanishes
+into the pipeline (≈0% mutation, ≈noise locking). But the entire win
+comes from refusing functionality: under freeze a contended vec cannot
+be written even under a correctly held lock, so manual-discipline code
+(including the raw-primitive test surface) becomes impossible rather
+than checked, and `Protected` would need per-access exemption machinery
+that claws back roughly the TLS read it saves. Permit (B) pays
+~+7.5% on a loop real programs do not resemble, and preserves manual
+locking and the usefulness of `unsafe`. **B stays.** The freeze sources
+and the four-way aligned harness are in the session records; re-running
+after runtime changes is cheap.
+
 ## Status (landed 2026-08-19)
 
 Implemented as specced, on both engines, with the wording above shared
