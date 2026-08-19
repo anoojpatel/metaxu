@@ -207,9 +207,11 @@ be written even under a correctly held lock, so manual-discipline code
 than checked, and `Protected` would need per-access exemption machinery
 that claws back roughly the TLS read it saves. Permit (B) pays
 ~+7.5% on a loop real programs do not resemble, and preserves manual
-locking and the usefulness of `unsafe`. **B stays.** The freeze sources
-and the four-way aligned harness are in the session records; re-running
-after runtime changes is cheap.
+locking and the usefulness of `unsafe`. **B stays.** The freeze variant
+and the four-way aligned harness are checked in at
+`benchmarks/contention/` (run_bench.py; the freeze guard as a patch that
+fails loudly if the shipped guard changes); re-running after runtime
+changes is one command.
 
 ## Status (landed 2026-08-19)
 

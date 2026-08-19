@@ -1,0 +1,17 @@
+extern type Mutex;
+effect Mutex = {
+    fn create() -> @global Mutex with EFFECT_MUTEX_CREATE
+    fn lock(mutex: @global Mutex) -> () with EFFECT_MUTEX_LOCK
+    fn unlock(mutex: @global Mutex) -> () with EFFECT_MUTEX_UNLOCK
+}
+fn main() -> int {
+    let m = perform Mutex.create();
+    let mut i = 0;
+    while i < 1000000 {
+        perform Mutex.lock(m);
+        perform Mutex.unlock(m);
+        i = i + 1
+    };
+    print(i);
+    0
+}

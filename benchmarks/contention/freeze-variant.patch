@@ -1,0 +1,35 @@
+--- a/metaxu_rt.c	2026-08-19 06:59:06.269878518 +0000
++++ b/metaxu_rt.c	2026-08-19 06:59:06.272346163 +0000
+@@ -103,8 +103,7 @@
+ 
+ static inline void mx__vec_write_check(mx_vec *v) {
+     if (__builtin_expect(
+-            atomic_load_explicit(&v->contended, memory_order_relaxed)
+-            && mx__tls_write_permit == 0, 0)) {
++            atomic_load_explicit(&v->contended, memory_order_relaxed), 0)) {
+         mx__vec_contended_raise();
+     }
+ }
+--- a/metaxu_threads.c	2026-08-19 06:59:06.269938167 +0000
++++ b/metaxu_threads.c	2026-08-19 06:59:06.272401118 +0000
+@@ -189,7 +189,6 @@
+         mx_thr_fatal("EFFECT_MUTEX_LOCK: pthread_mutex_lock failed", rc);
+     /* Lock HELD from here: grant write permission.  Strictly after the
+      * error paths -- a failed ERRORCHECK lock must not bump. */
+-    mx__tls_write_permit += 1;
+     return 0; /* unit */
+ }
+ 
+@@ -202,11 +201,9 @@
+      * the two statements to observe an inconsistent counter.  The EPERM
+      * error path (unlock of a mutex this thread does not hold) restores
+      * the counter before raising -- a failed unlock changes nothing. */
+-    mx__tls_write_permit -= 1;
+     int rc = pthread_mutex_unlock(&m->mu);
+     if (rc == EPERM) {
+-        mx__tls_write_permit += 1;
+-        /* One unified message for "unlocked" and "held by another
++            /* One unified message for "unlocked" and "held by another
+          * thread" (EPERM covers both, and the momentary state is racy to
+          * print) -- interpreter wording (mir_interp._rt_mutex_unlock). */
+         mx_raisef("EFFECT_MUTEX_UNLOCK on <Mutex#%lld>: "
