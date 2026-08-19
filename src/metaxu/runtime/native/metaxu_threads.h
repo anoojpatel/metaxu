@@ -73,6 +73,30 @@ int64_t mx_mutex_create(void);
 int64_t mx_mutex_lock(int64_t handle);
 int64_t mx_mutex_unlock(int64_t handle);
 
+/* Contention permission (docs/contention_as_permission.md): the calling
+ * thread's held-mutex count.  _Thread_local, bumped by mx_mutex_lock
+ * (+1, only after a SUCCESSFUL lock -- a failed ERRORCHECK lock never
+ * bumps) and mx_mutex_unlock (-1, restored on the EPERM error path).
+ * Spawned threads start at 0 (fresh TLS); handle bodies are ucontext
+ * fibers on the SAME OS thread, so the permission follows the logical
+ * thread exactly like mutex ownership does.  Read by the Vec mutators'
+ * contended-write guard (metaxu_rt.c mx__vec_write_check).
+ *
+ * The counter is exported as a variable, not only through the accessor:
+ * the guard sits on the mutator fast path, and an opaque cross-TU CALL
+ * in that path (even behind a never-taken branch) measurably bloats the
+ * uncrossed case -- the direct TLS load keeps it to a compare.  The
+ * accessor exists for tests/tools; runtime-internal readers use the
+ * variable.  tls_model("initial-exec"): under the default -fPIC these
+ * objects would use the general-dynamic __tls_get_addr CALL sequence,
+ * whose clobbers force register spills in the mutators even on the
+ * not-taken path (measured; see the spec's numbers); IE is a plain
+ * %fs-relative load and is always valid here because the runtime links
+ * into executables, never into dlopen'd libraries. */
+extern _Thread_local int64_t mx__tls_write_permit
+    __attribute__((tls_model("initial-exec")));
+int64_t mx__write_permit(void);
+
 #ifdef __cplusplus
 }
 #endif

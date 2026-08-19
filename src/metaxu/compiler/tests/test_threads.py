@@ -75,7 +75,10 @@ fn main() -> int {
     let @mut i = 0;
     # unsafe: exercises the RAW mutex primitives on purpose (manual
     # lock/unlock around a bare shared Vec); the blessed non-unsafe
-    # spelling is std.sync.protect (docs/separate_send_sync.md).
+    # spelling is std.sync.protect (docs/separate_send_sync.md).  Since
+    # the contention work this manual discipline has a dynamic net: the
+    # vec is marked contended at spawn, and the held lock is what makes
+    # the writes legal (docs/contention_as_permission.md).
     unsafe {
         while i < 4 {
             let t = perform Thread.spawn(|| {

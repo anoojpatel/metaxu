@@ -203,6 +203,13 @@ int64_t mx_vec_get(const mx_vec *v, int64_t idx);
 void    mx_vec_set(mx_vec *v, int64_t idx, int64_t value);
 void    mx_vec_free(mx_vec *v);
 unsigned char *mx_vec_as_bytes(const mx_vec *v);
+/* Contention (docs/contention_as_permission.md): mark a vector as having
+ * crossed a real spawn boundary.  After this, mutating it (push/pop/set)
+ * from a thread whose write permit is 0 (no mutex held through the
+ * runtime, see metaxu_threads.h mx__write_permit) raises catchably with
+ * the spec's exact wording; reads stay free.  void* so generated code can
+ * pass the raw env/field word; NULL is a no-op. */
+void    mx_vec_mark_contended(void *v);
 
 /* --- Fixed-size vectors (immutable, write-once fill) --------------------- */
 mx_fvec *mx_fvec_new(int64_t len);
