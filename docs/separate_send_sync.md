@@ -49,7 +49,7 @@ struct fields) are rejected; read-only captures of shared values are
 admitted, because contention weakens access rather than revoking it
 (design A, docs/contention_as_permission.md). A mutation hidden behind
 a helper call is statically untraced by design — the dynamic contention
-layer owns it. And A call result the checker cannot classify passes — a
+layer owns it. A call result the checker cannot classify passes — a
 deliberate false-negative bias, because rejecting every unclassifiable
 capture would make the check unusable and push everyone straight to
 `unsafe`. The trace is syntactic and name-based, like Rule B locality
