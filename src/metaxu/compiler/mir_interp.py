@@ -601,9 +601,36 @@ class _EffectAbort(Exception):
         self.value = value
 
 
+class _TailResume(Exception):
+    """Control exception: a handler case reached a TAIL-position resume.
+
+    compiler/effect_tail.py proved (strictly, and identically for the
+    native backend) that the resume's value IS the case's return value
+    with nothing after it, so instead of recursing (_pump_scope -> case ->
+    resume -> _pump_scope ..., one Python frame chain per element for
+    stream-shaped handlers), the resume site marks the continuation
+    consumed and unwinds the case's frames back to the _pump_scope that
+    dispatched it; the pump sends the resume value and LOOPS for the
+    scope's next event at constant depth.  Equivalent to the recursion
+    because a tail case returns resume's value unchanged: the body's
+    eventual DONE value (deep semantics) reaches the pump identically
+    whether propagated back through the deleted frames or read directly
+    at the loop — see THE PUMP MODEL in runtime/native/metaxu_effects.c
+    for the full argument (this class is the interpreter half of that
+    same design).  Not an InterpError: `try` must never catch it (it is
+    control flow, not a failure), exactly like _EffectAbort.
+    """
+    def __init__(self, k: "_ScopeContinuation", value: Any) -> None:
+        super().__init__("tail resume")
+        self.k = k
+        self.value = value
+
+
 class MirInterpreter:
     def __init__(self) -> None:
         self._funcs: Dict[str, MirFunc] = {}
+        # ids of tail-position resume ops (filled by load(); see there).
+        self._tail_resume_ids: frozenset = frozenset()
         self._effect_handlers: Dict[str, EffectHandler] = {}
         self._builtins: Dict[str, Callable[..., Any]] = {}
         # Handler stacks are PER LOGICAL METAXU THREAD (_ThreadCtx, reached
@@ -692,6 +719,15 @@ class MirInterpreter:
                 trait_name, type_name, method = parsed
                 by_type = self._impl_index.setdefault(method, {})
                 by_type.setdefault(type_name, {})[trait_name] = f.name
+        # Tail-position resumes in handler-case functions (shared analysis
+        # with the native backend — compiler/effect_tail.py — so both
+        # engines trampoline the SAME sites): identities of the `let` op
+        # tuples whose resume short-circuits back to _pump_scope's loop
+        # via _TailResume instead of recursing.  Recomputed over ALL
+        # loaded functions on each load() (a later load can add the
+        # handle_scope that makes an earlier function a case).
+        from .effect_tail import program_tail_resume_ids
+        self._tail_resume_ids = program_tail_resume_ids(self._funcs.values())
 
     def register_effect_handler(self, effect_name: str, effect_class: str,
                                   fn: Callable[[str, list[Any], MxContinuation], Any]) -> None:
@@ -867,48 +903,78 @@ class MirInterpreter:
         Called from handle_scope (initial wait) and from resume() (waiting for
         the body to finish or perform again). Returns the handle result;
         raises _EffectAbort(frame_id) when a handler case declines to resume.
+
+        THE LOOP: a case that ends in a TAIL-position resume (_TailResume,
+        see effect_tail.py) hands (k, value) back here instead of recursing;
+        this pump sends the value and waits for the scope's next event at
+        CONSTANT depth — the interpreter half of the native runtime's
+        tail-resume trampoline (metaxu_effects.c, THE PUMP MODEL, where the
+        equivalence argument lives).  General (non-tail) resumes keep the
+        recursion: the case's resume() re-enters this method in a fresh
+        frame, so depth tracks handler-code nesting (fold's pending
+        f-applications), not element count.
         """
         frame = scope.frame
-        msg = scope.to_handler.get()
-        kind = msg[0]
-        if kind == "done":
-            return msg[1]
-        if kind == "error":
-            raise msg[1]
-        if kind == "cascade":
-            raise msg[1]  # _ScopeAbort for an outer scope: keep unwinding
-        # ("perform", op_name, arg_vals, k)
-        _, op_name, arg_vals, sk = msg
-        case_params, handler_fn_name = frame["cases"][op_name]
-        if isinstance(case_params, str):
-            case_params = (case_params,)
-        target = self._funcs.get(handler_fn_name)
-        if target is None:
-            raise InterpError(f"Missing handler function {handler_fn_name!r}")
-        handler_env = dict(frame["captured"])
-        # Bind the op's arguments positionally to the case parameters.
-        # Zero-arg ops carry a synthesized case parameter, so FEWER args than
-        # params is legitimate (pad with UNIT) — but MORE args than params is
-        # a program bug that must error, not silently truncate.
-        if len(arg_vals) > len(case_params):
-            raise InterpError(
-                f"Effect op {op_name!r} performed with {len(arg_vals)} "
-                f"argument(s) but its handler case declares only "
-                f"{len(case_params)} parameter(s)")
-        handler_args = list(arg_vals)
-        handler_args += [UNIT] * (len(case_params) - len(handler_args))
-        frame["busy"] = True
-        try:
-            handler_result = self._call_func(target, [*handler_args, sk], handler_env)
-        finally:
-            frame["busy"] = False
-        if sk.used:
-            # The handler resumed: resume() pumped the body to completion, so
-            # handler_result already reflects the whole delimited body's value.
-            return handler_result
-        # The handler returned without resuming: abort the handle scope with
-        # the handler's value.
-        raise _EffectAbort(frame["id"], handler_result)
+        while True:
+            msg = scope.to_handler.get()
+            kind = msg[0]
+            if kind == "done":
+                return msg[1]
+            if kind == "error":
+                raise msg[1]
+            if kind == "cascade":
+                raise msg[1]  # _ScopeAbort for an outer scope: keep unwinding
+            # ("perform", op_name, arg_vals, k)
+            _, op_name, arg_vals, sk = msg
+            case_params, handler_fn_name = frame["cases"][op_name]
+            if isinstance(case_params, str):
+                case_params = (case_params,)
+            target = self._funcs.get(handler_fn_name)
+            if target is None:
+                raise InterpError(f"Missing handler function {handler_fn_name!r}")
+            handler_env = dict(frame["captured"])
+            # Bind the op's arguments positionally to the case parameters.
+            # Zero-arg ops carry a synthesized case parameter, so FEWER args
+            # than params is legitimate (pad with UNIT) — but MORE args than
+            # params is a program bug that must error, not silently truncate.
+            if len(arg_vals) > len(case_params):
+                raise InterpError(
+                    f"Effect op {op_name!r} performed with {len(arg_vals)} "
+                    f"argument(s) but its handler case declares only "
+                    f"{len(case_params)} parameter(s)")
+            handler_args = list(arg_vals)
+            handler_args += [UNIT] * (len(case_params) - len(handler_args))
+            frame["busy"] = True
+            tail: Optional[_TailResume] = None
+            try:
+                handler_result = self._call_func(
+                    target, [*handler_args, sk], handler_env)
+            except _TailResume as tr:
+                tail = tr
+            finally:
+                frame["busy"] = False
+            if tail is not None:
+                # The tail resume must consume THIS dispatch's continuation
+                # (effect_tail.py only marks resumes of the case's own __k).
+                if tail.k is not sk:
+                    raise InterpError(
+                        "tail resume of a foreign continuation "
+                        "(pump invariant violated)")
+                # Unblock the body at its perform site and loop for the
+                # scope's next event.  The case's value is resume's value
+                # (tail position), which is the body's eventual DONE value
+                # (deep semantics) — exactly what the next loop iteration
+                # returns when the body completes.
+                tail.k.reply_q.put(("resume", tail.value))
+                continue
+            if sk.used:
+                # The handler resumed (general form): resume() pumped the
+                # body to completion, so handler_result already reflects the
+                # whole delimited body's value.
+                return handler_result
+            # The handler returned without resuming: abort the handle scope
+            # with the handler's value.
+            raise _EffectAbort(frame["id"], handler_result)
 
     def _abort_scope(self, scope: _EffectScope) -> None:
         """Tear down a scope's body thread if it is still suspended.
@@ -955,6 +1021,22 @@ class MirInterpreter:
                 continue
             elif tag == "let":
                 dst, rhs, args = op[1], op[2], op[3]
+                if rhs and rhs[0] == "resume" and id(op) in self._tail_resume_ids:
+                    # TAIL-position resume of the case's own continuation
+                    # (effect_tail.py): consume it and unwind to the
+                    # dispatching _pump_scope, which sends the value and
+                    # loops — no per-element recursion.  Only scope
+                    # continuations trampoline; a stack-effect
+                    # MxContinuation keeps the general path below.
+                    k = self._lookup(args[0], env, f)
+                    if isinstance(k, _ScopeContinuation):
+                        if k.used:
+                            raise RuntimeError(
+                                "Continuation already consumed "
+                                "(single-shot violation)")
+                        k.used = True
+                        k.scope.pending_k = None
+                        raise _TailResume(k, self._lookup(args[1], env, f))
                 val = self._eval_rhs(rhs, args, env, f)
                 cur = env.get(dst)
                 if isinstance(cur, MxCell) and not isinstance(val, MxCell):
