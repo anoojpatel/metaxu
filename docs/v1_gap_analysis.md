@@ -83,9 +83,11 @@ handler-virtualized spawns never mark, and unenumerable capture kinds
 demote the thunk with a reason. `unsafe { }` spawn escapes therefore
 land on a loud runtime net instead of nothing (the old locks-deleted
 TSan race experiment now fails deterministically with the
-contended-write error). Costs are measured, not asserted — the
-uncrossed mutator pays +0.38 ns/call (+15.8% on a pure-mutation
-microloop; stated plainly in the spec's Measured section) —
+contended-write error). Costs are measured, not asserted — alignment-controlled: the
+uncrossed mutator pays ~+7.5% on a worst-case pure-mutation microloop
+(~+0.23 ns/guarded call; earlier unaligned readings of +15.8% and even
+-17% were shown to be code-layout artifacts — see the spec's Measured
+section) —
 and `tests/test_contention.py` pins semantics, differentials, TSan
 and non-vacuity.
 
