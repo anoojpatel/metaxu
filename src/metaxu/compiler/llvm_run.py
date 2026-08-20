@@ -124,6 +124,33 @@ def _placeholder_reasons(llvm_ir: str, sym: str) -> list[str]:
     return reasons
 
 
+# The inline Vec fast paths declare their cold-path fail terminators with
+# `memory(read, inaccessiblemem: readwrite)` — LLVM 16+ syntax that older
+# clangs (Apple clang before Xcode 15, Ubuntu clang-14/15) reject as a
+# PARSE error, killing every native compile on such a toolchain.  Probe
+# the actual clang once per process by compiling a one-line .ll carrying
+# the attribute; when unsupported, strip the memory clause from the
+# declares before compiling (`cold noreturn` — ancient syntax — stays).
+# The only cost of the fallback is a lost loop-hoisting hint, never
+# correctness: the attribute is an optimization contract, not semantics.
+_MEMORY_ATTR = " memory(read, inaccessiblemem: readwrite)"
+_MEMORY_ATTR_PROBE: list[bool] = []
+
+
+def _clang_supports_memory_attr() -> bool:
+    if not _MEMORY_ATTR_PROBE:
+        with tempfile.TemporaryDirectory(prefix="metaxu_attr_probe_") as d:
+            ll = os.path.join(d, "probe.ll")
+            with open(ll, "w") as fh:
+                fh.write(f"declare void @p(ptr) cold noreturn{_MEMORY_ATTR}\n")
+            proc = subprocess.run(
+                ["clang", "-c", "-Wno-override-module", ll,
+                 "-o", os.path.join(d, "probe.o")],
+                capture_output=True, text=True)
+            _MEMORY_ATTR_PROBE.append(proc.returncode == 0)
+    return _MEMORY_ATTR_PROBE[0]
+
+
 def compile_and_run(llvm_ir: str, entry: str = "main", *,
                     workdir: str | None = None,
                     timeout: float = 60.0,
@@ -176,6 +203,9 @@ def compile_and_run(llvm_ir: str, entry: str = "main", *,
                 "module constants initializer @"
                 f"{init_sym} is a placeholder, so no entry point can run "
                 f"natively: {detail}")
+
+    if _MEMORY_ATTR in llvm_ir and not _clang_supports_memory_attr():
+        llvm_ir = llvm_ir.replace(_MEMORY_ATTR, "")
 
     full_ir = (llvm_ir + "\n\n; native entry wrapper (llvm_run)\n"
                + _WRAPPERS[rty].format(sym=sym, init=init_call) + "\n")
