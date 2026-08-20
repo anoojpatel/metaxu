@@ -8058,3 +8058,22 @@ fn main() -> int {
     # The site env actually carries the struct now (it was `type {}`).
     assert re.search(
         r"%henv\.__try_body_main_tc\d+ = type \{ [^}]*Holder", ir)
+
+
+@needs_clang
+def test_memory_attr_fallback_for_older_clangs(tmp_path, monkeypatch):
+    """The fail-terminator declares use `memory(...)` — LLVM 16+ syntax
+    that older clangs reject as a PARSE error, killing every native
+    compile.  llvm_run probes the actual clang and strips the clause
+    when unsupported; forcing the no-support path must still compile and
+    run the program identically (the attribute is an optimization hint,
+    never semantics)."""
+    from metaxu.compiler import llvm_run as lr
+    monkeypatch.setattr(lr, "_MEMORY_ATTR_PROBE", [False])
+    ir = llvm_from_source(_VEC_FAST_PATH_SRC)
+    assert lr._MEMORY_ATTR in ir
+    code, out = lr.compile_and_run(ir, "main", workdir=str(tmp_path))
+    assert (code, out) == (5, "")  # x + n + p = 2 + 1 + 2
+    written = (tmp_path / "prog.ll").read_text()
+    assert lr._MEMORY_ATTR not in written
+    assert "cold noreturn" in written  # ancient syntax, kept everywhere
