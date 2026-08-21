@@ -893,6 +893,7 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from .mir import MirFunc
 from .cps_frames import is_suspending
+from .tile_shape_check import TILE_ARITY
 from .effect_tail import tail_resume_ids as _tail_resume_ids
 from .desugar import IMPL_SEP, parse_impl_method_name
 from .hir import (BUILTIN_CALL_PREFIX, STATIC_CALL_PREFIX, TRAIT_CALL_PREFIX,
@@ -993,7 +994,13 @@ _NATIVE_RT_CALLS = {"Vec.new", "push", "pop", "len", "to_string",
                     # the interpreter's error made static), and __zip the
                     # lockstep pair iterable of zip comprehensions
                     # (mx_fvec_zip_map).
-                    "__index_store", "__index_set", "__zip"}
+                    "__index_store", "__index_set", "__zip",
+                    # Tiles (docs/gpu_tiles.md Stage 0): dotted statics ->
+                    # mx_tile_* (metaxu_rt.c); shapes ride `tile:` kinds.
+                    "Tile.zeros", "Tile.filled", "Tile.arange",
+                    "Tile.from_vec", "Tile.to_vec", "Tile.add", "Tile.mul",
+                    "Tile.scale", "Tile.dot", "Tile.sum", "Tile.transpose",
+                    "Tile.get", "Tile.rows", "Tile.cols"}
 
 # Extern C symbols the interpreter shims over its simulated heap
 # (mir_interp._ffi_*): natively these are DIRECT calls to the real libc
@@ -1132,6 +1139,23 @@ _RT_SIGS = {
                                       "ptr")),
     "mx_resume": ("i64", ("ptr", "i64")),
     "mx_resume_tail": ("i64", ("ptr", "i64")),
+    # Tiles (docs/gpu_tiles.md Stage 0, metaxu_rt.c): shapes are static in
+    # `tile:` kinds; is_f64 selects element arithmetic.
+    "mx_tile_zeros": ("ptr", ("i64", "i64")),
+    "mx_tile_filled": ("ptr", ("i64", "i64", "i64")),
+    "mx_tile_arange": ("ptr", ("i64", "i64")),
+    "mx_tile_from_vec": ("ptr", ("ptr", "i64", "i64")),
+    "mx_tile_to_vec": ("ptr", ("ptr",)),
+    "mx_tile_add": ("ptr", ("ptr", "ptr", "i64")),
+    "mx_tile_mul": ("ptr", ("ptr", "ptr", "i64")),
+    "mx_tile_scale": ("ptr", ("ptr", "i64", "i64")),
+    "mx_tile_dot": ("ptr", ("ptr", "ptr", "i64")),
+    "mx_tile_sum": ("i64", ("ptr", "i64")),
+    "mx_tile_transpose": ("ptr", ("ptr",)),
+    "mx_tile_get": ("i64", ("ptr", "i64", "i64")),
+    "mx_tile_rows": ("i64", ("ptr",)),
+    "mx_tile_cols": ("i64", ("ptr",)),
+    "mx_tile_to_str": ("ptr", ("ptr", "i64")),
     # Delimited failure recovery (try/catch, metaxu_effects.c).
     "mx_try": ("i64", ("ptr", "ptr", "ptr", "ptr")),
 }
@@ -1333,7 +1357,8 @@ _HEADER = (
 
 def _llparam(kind: str) -> str:
     """The LLVM parameter/return-slot type for a value kind (aggregates -> ptr)."""
-    if _is_agg(kind) or _is_vec(kind) or _is_fvec(kind) or kind in (KONT, PTR):
+    if _is_agg(kind) or _is_vec(kind) or _is_fvec(kind) or _is_tile(kind) \
+            or kind in (KONT, PTR):
         return "ptr"
     return _LLTY.get(kind, "i64")
 
@@ -1341,9 +1366,9 @@ def _llparam(kind: str) -> str:
 def _llscalar(kind: str) -> str:
     """The LLVM type of a non-aggregate (register-sized) value kind.
     Vec values are opaque `mx_vec*` pointers; fixed vectors are opaque
-    `mx_fvec*` pointers; kont is an opaque `mx_k*`; rawptr is a raw C
-    `ptr`."""
-    if _is_vec(kind) or _is_fvec(kind) or kind in (KONT, PTR):
+    `mx_fvec*` pointers; tiles are opaque `mx_tile*` pointers; kont is an
+    opaque `mx_k*`; rawptr is a raw C `ptr`."""
+    if _is_vec(kind) or _is_fvec(kind) or _is_tile(kind) or kind in (KONT, PTR):
         return "ptr"
     return _LLTY.get(kind, "i64")
 
@@ -1579,9 +1604,31 @@ def _fvec_with_leaf(kind: str, leaf: str) -> str:
     return leaf
 
 
+# Tiles (docs/gpu_tiles.md Stage 0): `tile:<elem>:<R>x<C>` — the STATIC
+# shape rides the kind string, which is the whole point (shape agreement
+# is checked at compile time and every emission site knows R and C).
+_TILE_PREFIX = "tile:"
+
+
+def _is_tile(kind: str) -> bool:
+    return kind.startswith(_TILE_PREFIX)
+
+
+def _tile_parts(kind: str) -> Tuple[str, int, int]:
+    """('tile:f64:2x3') -> ('f64', 2, 3)."""
+    elem, shape = kind[len(_TILE_PREFIX):].rsplit(":", 1)
+    r, c = shape.split("x")
+    return elem, int(r), int(c)
+
+
+def _tile_of(elem: str, rows: int, cols: int) -> str:
+    return f"{_TILE_PREFIX}{elem}:{rows}x{cols}"
+
+
 def _is_word_kind(kind: str) -> bool:
     """Kinds storable as an opaque 8-byte word in a Vec element slot."""
-    return kind in (I64, F64, STR) or _is_vec(kind) or _is_fvec(kind)
+    return (kind in (I64, F64, STR) or _is_vec(kind) or _is_fvec(kind)
+            or _is_tile(kind))
 
 
 def _vec_slot_boxable(kind: str) -> bool:
@@ -1673,6 +1720,16 @@ def _join(a: str, b: str) -> str:
     if _is_fvec(a) and _is_fvec(b):
         e = _join(_fvec_elem(a), _fvec_elem(b))
         return CONFLICT if e == CONFLICT else _fvec_of(e)
+    if _is_tile(a) and _is_tile(b):
+        # Shapes are part of the kind: different shapes never join (the
+        # tile shape checker rejects the static cases up front; a joined
+        # CONFLICT here demotes whatever slipped past it).
+        ea, ra, ca = _tile_parts(a)
+        eb, rb, cb = _tile_parts(b)
+        if (ra, ca) != (rb, cb):
+            return CONFLICT
+        e = _join(ea, eb)
+        return CONFLICT if e == CONFLICT else _tile_of(e, ra, ca)
     if _is_enum(a) and _is_enum(b):
         ename = _enum_name(a)
         if ename != _enum_name(b):
@@ -3491,6 +3548,19 @@ def _infer_kinds(info: _Info, sigs: Dict[str, _Sig], structs: _StructTable,
     kinds: Dict[str, str] = {}
     global_changed = False
 
+    # Integer-constant temps (MIR const ops): tile ctor shapes must be
+    # statically known to become part of a `tile:` kind.  ANF makes ctor
+    # shape arguments freshly-consted temps, so direct consts suffice; a
+    # non-const shape simply never produces a tile kind and the
+    # consistency check demotes the site with a clear reason.
+    int_consts: Dict[str, int] = {}
+    for _b in info.f.blocks:
+        for _op in _b.ops:
+            if _op[0] == "let" and len(_op) == 4 and _op[2][0] == "const":
+                _v = _op[2][1]
+                if isinstance(_v, int) and not isinstance(_v, bool):
+                    int_consts[_op[1]] = _v
+
     def get(n: str) -> str:
         return kinds.get(n, I64)
 
@@ -3732,6 +3802,88 @@ def _infer_kinds(info: _Info, sigs: Dict[str, _Sig], structs: _StructTable,
             for a in args:
                 ch = mark(a, F64) or ch
             ch = mark(dst, F64) or ch
+        elif name.startswith("Tile."):
+            ch = tile_builtin(name[len("Tile."):], dst, args) or ch
+        return ch
+
+    def tile_builtin(op: str, dst: str, args: Tuple[str, ...]) -> bool:
+        """Kind rules of the Tile dotted statics (docs/gpu_tiles.md).
+
+        Shapes come from int-constant ctor arguments and then FLOW through
+        the ops as part of the `tile:` kind.  Element-kind promotion is
+        kept monotone: an operand still at the i64 bottom that might yet
+        become f64 (filled's fill value, from_vec's Vec) only pins an
+        int-element tile once ``assume_final`` says nothing can promote
+        it further — the same discipline the trait-receiver resolution
+        uses.  Bad arities/shapes mark nothing; the consistency check
+        turns them into demotion reasons."""
+        ch = False
+
+        def ctor_shape(r: str, c: str) -> Optional[Tuple[int, int]]:
+            rv, cv = int_consts.get(r), int_consts.get(c)
+            if rv is None or cv is None or rv <= 0 or cv <= 0:
+                return None
+            return rv, cv
+
+        if op in ("zeros", "arange") and len(args) == 2:
+            shape = ctor_shape(args[0], args[1])
+            if shape is not None:
+                elem = F64 if op == "zeros" else I64
+                ch = mark(dst, _tile_of(elem, *shape)) or ch
+        elif op == "filled" and len(args) == 3:
+            shape = ctor_shape(args[0], args[1])
+            if shape is not None:
+                fk = get(args[2])
+                if fk == F64:
+                    ch = mark(dst, _tile_of(F64, *shape)) or ch
+                elif fk == I64 and assume_final:
+                    ch = mark(dst, _tile_of(I64, *shape)) or ch
+        elif op == "from_vec" and len(args) == 3:
+            ch = mark(args[0], _vec_of(I64)) or ch
+            shape = ctor_shape(args[1], args[2])
+            if shape is not None and _is_vec(get(args[0])):
+                elem = _vec_elem(get(args[0]))
+                if elem == F64:
+                    ch = mark(dst, _tile_of(F64, *shape)) or ch
+                elif elem == I64 and assume_final:
+                    ch = mark(dst, _tile_of(I64, *shape)) or ch
+        elif op == "to_vec" and len(args) == 1:
+            if _is_tile(get(args[0])):
+                elem, _r, _c = _tile_parts(get(args[0]))
+                ch = mark(dst, _vec_of(elem)) or ch
+        elif op in ("add", "mul") and len(args) == 2:
+            ch = unify((dst, args[0], args[1])) or ch
+        elif op == "scale" and len(args) == 2:
+            ch = unify((dst, args[0])) or ch
+            if _is_tile(get(args[0])):
+                elem, _r, _c = _tile_parts(get(args[0]))
+                ch = mark(args[1], elem) or ch
+        elif op == "dot" and len(args) == 2:
+            ka, kb = get(args[0]), get(args[1])
+            if _is_tile(ka) and _is_tile(kb):
+                ea, ra, ca = _tile_parts(ka)
+                eb, rb, cb = _tile_parts(kb)
+                e = _join(ea, eb)
+                if ca != rb or e == CONFLICT:
+                    ch = mark(dst, CONFLICT) or ch
+                else:
+                    ch = mark(dst, _tile_of(e, ra, cb)) or ch
+                    ch = mark(args[0], _tile_of(e, ra, ca)) or ch
+                    ch = mark(args[1], _tile_of(e, rb, cb)) or ch
+        elif op == "sum" and len(args) == 1:
+            if _is_tile(get(args[0])):
+                elem, _r, _c = _tile_parts(get(args[0]))
+                ch = mark(dst, elem) or ch
+        elif op == "transpose" and len(args) == 1:
+            if _is_tile(get(args[0])):
+                elem, r, c = _tile_parts(get(args[0]))
+                ch = mark(dst, _tile_of(elem, c, r)) or ch
+        elif op == "get" and len(args) == 3:
+            if _is_tile(get(args[0])):
+                elem, _r, _c = _tile_parts(get(args[0]))
+                ch = mark(dst, elem) or ch
+        # rows/cols: i64 dst and i64-bottom receiver need no marks here;
+        # the consistency check requires the receiver to be a tile.
         return ch
 
     def fvec_binop_unify(dst: str, a0: str, a1: str) -> bool:
@@ -4661,13 +4813,120 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                 elif ty(dst) != STR:
                     probs.append(
                         f"{name} result {dst!r} is {ty(dst)}, not str")
+            elif _is_tile(ak):
+                if _tile_parts(ak)[0] not in (I64, F64):
+                    probs.append(
+                        f"{name} of a tile of {_tile_parts(ak)[0]} elements")
+                elif ty(dst) != STR:
+                    probs.append(
+                        f"{name} result {dst!r} is {ty(dst)}, not str")
             elif ak not in (I64, F64, STR):
                 probs.append(
-                    f"{name} of kind {ak} (only i64/f64/str/fixed-vector "
-                    "lower to mx_i64_to_str/mx_f64_to_str/identity/"
-                    "mx_fvec_to_str)")
+                    f"{name} of kind {ak} (only i64/f64/str/fixed-vector/"
+                    "tile lower to mx_i64_to_str/mx_f64_to_str/identity/"
+                    "mx_fvec_to_str/mx_tile_to_str)")
             elif ty(dst) != STR:
                 probs.append(f"{name} result {dst!r} is {ty(dst)}, not str")
+        elif name.startswith("Tile."):
+            # Consistency of a Tile dotted-static call's FINAL kinds
+            # (docs/gpu_tiles.md).  Anything off is a demotion reason,
+            # not a user error: the tile shape checker already rejected
+            # the statically visible misuse at compile time, so what
+            # reaches here is a shape or element kind the module could
+            # not resolve to constants.
+            top = name[len("Tile."):]
+            want = TILE_ARITY.get(top)
+            if want is None:
+                probs.append(f"unknown Tile builtin {name!r}")
+                return
+            if len(args) != want:
+                probs.append(f"{name} with {len(args)} arguments "
+                             f"(expects {want})")
+                return
+            if top in ("zeros", "filled", "arange", "from_vec"):
+                if not _is_tile(ty(dst)):
+                    probs.append(
+                        f"{name} result {dst!r} has kind {ty(dst)}: the "
+                        "tile shape or element kind is not statically "
+                        "resolvable (rows/cols must be positive integer "
+                        "literals; elements int or float)")
+                    return
+                elem, _r, _c = _tile_parts(ty(dst))
+                if elem not in (I64, F64):
+                    probs.append(f"{name} of {elem} elements "
+                                 "(tiles hold int or float)")
+                elif top == "from_vec":
+                    vk = ty(args[0])
+                    if not _is_vec(vk):
+                        probs.append(f"{name} source {args[0]!r} has kind "
+                                     f"{vk}, not a Vec")
+                    elif _vec_elem(vk) != elem:
+                        probs.append(f"{name} of a Vec of {_vec_elem(vk)} "
+                                     f"into a tile of {elem}")
+                elif top == "filled" and ty(args[2]) != elem:
+                    probs.append(f"{name} fill value {args[2]!r} is "
+                                 f"{ty(args[2])}, elements are {elem}")
+            elif top in ("add", "mul", "scale", "dot", "sum", "transpose",
+                         "get", "to_vec", "rows", "cols"):
+                ka = ty(args[0])
+                if not _is_tile(ka):
+                    probs.append(f"{name} receiver {args[0]!r} has kind "
+                                 f"{ka}, not a Tile (its shape must be "
+                                 "statically known)")
+                    return
+                elem, r, c = _tile_parts(ka)
+                if elem not in (I64, F64):
+                    probs.append(f"{name} of {elem} elements "
+                                 "(tiles hold int or float)")
+                    return
+                if top in ("add", "mul"):
+                    if ty(args[1]) != ka or ty(dst) != ka:
+                        probs.append(
+                            f"{name} operand/result kinds disagree "
+                            f"({ka}, {ty(args[1])} -> {ty(dst)})")
+                elif top == "scale":
+                    if ty(args[1]) != elem:
+                        probs.append(f"{name} scalar {args[1]!r} is "
+                                     f"{ty(args[1])}, elements are {elem}")
+                    elif ty(dst) != ka:
+                        probs.append(f"{name} result {dst!r} is {ty(dst)}, "
+                                     f"receiver is {ka}")
+                elif top == "dot":
+                    kb = ty(args[1])
+                    if not _is_tile(kb):
+                        probs.append(f"{name} operand {args[1]!r} has kind "
+                                     f"{kb}, not a Tile")
+                        return
+                    eb, rb, cb = _tile_parts(kb)
+                    if eb != elem or c != rb:
+                        probs.append(f"{name} operands disagree "
+                                     f"({ka} · {kb})")
+                    elif ty(dst) != _tile_of(elem, r, cb):
+                        probs.append(f"{name} result {dst!r} is {ty(dst)}, "
+                                     f"expected {_tile_of(elem, r, cb)}")
+                elif top == "sum":
+                    if ty(dst) != elem:
+                        probs.append(f"{name} result {dst!r} is {ty(dst)}, "
+                                     f"elements are {elem}")
+                elif top == "transpose":
+                    if ty(dst) != _tile_of(elem, c, r):
+                        probs.append(f"{name} result {dst!r} is {ty(dst)}, "
+                                     f"expected {_tile_of(elem, c, r)}")
+                elif top == "get":
+                    if ty(args[1]) != I64 or ty(args[2]) != I64:
+                        probs.append(f"{name} indices must be ints "
+                                     f"({ty(args[1])}, {ty(args[2])})")
+                    elif ty(dst) != elem:
+                        probs.append(f"{name} result {dst!r} is {ty(dst)}, "
+                                     f"elements are {elem}")
+                elif top == "to_vec":
+                    if ty(dst) != _vec_of(elem):
+                        probs.append(f"{name} result {dst!r} is {ty(dst)}, "
+                                     f"expected {_vec_of(elem)}")
+                else:  # rows / cols
+                    if ty(dst) != I64:
+                        probs.append(f"{name} result {dst!r} promoted to "
+                                     f"{ty(dst)}")
         elif name in _MATH_EXTERNS:
             pass  # kinds pinned to f64 during inference
 
@@ -5201,6 +5460,12 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                                 probs.append(
                                     f"print of a vector of "
                                     f"{_fvec_leaf(ak)[0]} leaves")
+                        elif _is_tile(ak):
+                            # tiles render via mx_tile_to_str (repr parity)
+                            if _tile_parts(ak)[0] not in (I64, F64):
+                                probs.append(
+                                    f"print of a tile of "
+                                    f"{_tile_parts(ak)[0]} elements")
                         elif ak not in (I64, F64, STR):
                             probs.append(f"print of unsupported kind {ak}")
                 elif bname == "neg":
@@ -7794,6 +8059,109 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                         lines)
             _emit_vec_set_inline(recv, idx, w, lines)
             setval(dst, "0", lines)  # unit
+        elif name.startswith("Tile."):
+            # Tiles (docs/gpu_tiles.md Stage 0): every op is one mx_tile_*
+            # call; the `tile:` kind supplies the element type (is_f64
+            # flag) and the shapes are already burned into the kinds the
+            # consistency check validated.  Blocks are write-once and leak
+            # by design, like fvec.
+            top = name[len("Tile."):]
+
+            def tflag(k: str) -> str:
+                return "1" if _tile_parts(k)[0] == F64 else "0"
+
+            if top in ("zeros", "arange"):
+                sym = f"mx_tile_{top}"
+                mod.runtime_syms.add(sym)
+                r = use(opargs[0], lines)
+                c = use(opargs[1], lines)
+                v = fresh()
+                lines.append(f"  {v} = call ptr @{sym}(i64 {r}, i64 {c})"
+                             "  ; tile ctor (write-once, leaks by design)")
+                setval(dst, v, lines)
+            elif top == "filled":
+                elem, _r, _c = _tile_parts(kind(dst))
+                r = use(opargs[0], lines)
+                c = use(opargs[1], lines)
+                w = to_word(elem, use(opargs[2], lines), lines)
+                mod.runtime_syms.add("mx_tile_filled")
+                v = fresh()
+                lines.append(
+                    f"  {v} = call ptr @mx_tile_filled(i64 {r}, i64 {c}, "
+                    f"i64 {w})  ; tile ctor (write-once, leaks by design)")
+                setval(dst, v, lines)
+            elif top == "from_vec":
+                src = use(opargs[0], lines)
+                r = use(opargs[1], lines)
+                c = use(opargs[2], lines)
+                mod.runtime_syms.add("mx_tile_from_vec")
+                v = fresh()
+                lines.append(
+                    f"  {v} = call ptr @mx_tile_from_vec(ptr {src}, "
+                    f"i64 {r}, i64 {c})  ; length-checked copy-in")
+                setval(dst, v, lines)
+            elif top == "to_vec":
+                a = use(opargs[0], lines)
+                mod.runtime_syms.add("mx_tile_to_vec")
+                v = fresh()
+                lines.append(f"  {v} = call ptr @mx_tile_to_vec(ptr {a})"
+                             "  ; fresh Vec (escape analysis never frees "
+                             "tile-born vecs: leaks by design)")
+                setval(dst, v, lines)
+            elif top in ("add", "mul", "dot"):
+                a = use(opargs[0], lines)
+                b = use(opargs[1], lines)
+                sym = f"mx_tile_{top}"
+                mod.runtime_syms.add(sym)
+                v = fresh()
+                lines.append(
+                    f"  {v} = call ptr @{sym}(ptr {a}, ptr {b}, "
+                    f"i64 {tflag(kind(opargs[0]))})")
+                setval(dst, v, lines)
+            elif top == "scale":
+                elem, _r, _c = _tile_parts(kind(opargs[0]))
+                a = use(opargs[0], lines)
+                w = to_word(elem, use(opargs[1], lines), lines)
+                mod.runtime_syms.add("mx_tile_scale")
+                v = fresh()
+                lines.append(
+                    f"  {v} = call ptr @mx_tile_scale(ptr {a}, i64 {w}, "
+                    f"i64 {tflag(kind(opargs[0]))})")
+                setval(dst, v, lines)
+            elif top == "sum":
+                elem, _r, _c = _tile_parts(kind(opargs[0]))
+                a = use(opargs[0], lines)
+                mod.runtime_syms.add("mx_tile_sum")
+                w = fresh()
+                lines.append(
+                    f"  {w} = call i64 @mx_tile_sum(ptr {a}, "
+                    f"i64 {tflag(kind(opargs[0]))})"
+                    "  ; pinned row-major accumulation (interp parity)")
+                vec_elem_into(dst, elem, w, lines)
+            elif top == "transpose":
+                a = use(opargs[0], lines)
+                mod.runtime_syms.add("mx_tile_transpose")
+                v = fresh()
+                lines.append(f"  {v} = call ptr @mx_tile_transpose(ptr {a})")
+                setval(dst, v, lines)
+            elif top == "get":
+                elem, _r, _c = _tile_parts(kind(opargs[0]))
+                a = use(opargs[0], lines)
+                i = use(opargs[1], lines)
+                j = use(opargs[2], lines)
+                mod.runtime_syms.add("mx_tile_get")
+                w = fresh()
+                lines.append(
+                    f"  {w} = call i64 @mx_tile_get(ptr {a}, i64 {i}, "
+                    f"i64 {j})  ; bounds raise catchably (interp wording)")
+                vec_elem_into(dst, elem, w, lines)
+            else:  # rows / cols
+                a = use(opargs[0], lines)
+                sym = f"mx_tile_{top}"
+                mod.runtime_syms.add(sym)
+                v = fresh()
+                lines.append(f"  {v} = call i64 @{sym}(ptr {a})")
+                setval(dst, v, lines)
         elif name == "__zip":
             # Virtual value: the comprehension site reads the zipped
             # SOURCES directly and drives mx_fvec_zip_map (the consistency
@@ -8104,6 +8472,15 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
             a = use(opargs[0], lines)
             if k == STR:
                 setval(dst, a, lines)  # to_string of a string is identity
+            elif _is_tile(k):
+                elem, _r, _c = _tile_parts(k)
+                mod.runtime_syms.add("mx_tile_to_str")
+                v = fresh()
+                lines.append(
+                    f"  {v} = call ptr @mx_tile_to_str(ptr {a}, "
+                    f"i64 {1 if elem == F64 else 0})"
+                    "  ; tile repr (fresh string, leaks by design)")
+                setval(dst, v, lines)
             elif _is_fvec(k):
                 leaf, depth = _fvec_leaf(k)
                 mod.runtime_syms.add("mx_fvec_to_str")
@@ -8965,11 +9342,29 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                             f"i64 {1 if leaf == F64 else 0}, i64 {depth})"
                             "  ; vector repr for print")
                         return sv
+                    def tile_repr(a: str) -> str:
+                        """Render a tile to its interpreter repr string
+                        ("tile[RxC](...)"); freed right after the print."""
+                        elem, _r, _c = _tile_parts(kind(a))
+                        mod.runtime_syms.add("mx_tile_to_str")
+                        sv = fresh()
+                        lines.append(
+                            f"  {sv} = call ptr @mx_tile_to_str("
+                            f"ptr {use(a, lines)}, "
+                            f"i64 {1 if elem == F64 else 0})"
+                            "  ; tile repr for print")
+                        return sv
                     fvec_temps: List[str] = []
                     if len(opargs) == 1:
                         k = kind(opargs[0])
                         if _is_fvec(k):
                             sv = fvec_repr(opargs[0])
+                            fvec_temps.append(sv)
+                            mod.print_helpers.add(STR)
+                            lines.append(
+                                f"  call void @metaxu_print_str(ptr {sv})")
+                        elif _is_tile(k):
+                            sv = tile_repr(opargs[0])
                             fvec_temps.append(sv)
                             mod.print_helpers.add(STR)
                             lines.append(
@@ -8994,9 +9389,25 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                                 fvec_temps.append(sv)
                                 parts.append("%s")
                                 avals.append(f"ptr {sv}")
+                            elif _is_tile(k2):
+                                sv = tile_repr(a)
+                                fvec_temps.append(sv)
+                                parts.append("%s")
+                                avals.append(f"ptr {sv}")
+                            elif k2 == F64:
+                                # Interpreter parity (see _PRINT_FMTS):
+                                # floats render via mx_f64_to_str, not %g.
+                                mod.runtime_syms.add("mx_f64_to_str")
+                                sv = fresh()
+                                lines.append(
+                                    f"  {sv} = call ptr @mx_f64_to_str("
+                                    f"double {use(a, lines)})")
+                                fvec_temps.append(sv)
+                                parts.append("%s")
+                                avals.append(f"ptr {sv}")
                             else:
                                 parts.append(
-                                    {I64: "%lld", F64: "%g", STR: "%s"}[k2])
+                                    {I64: "%lld", STR: "%s"}[k2])
                                 avals.append(f"{_LLTY[k2]} {use(a, lines)}")
                         fmt = " ".join(parts) + "\n"
                         g = mod.intern_string(fmt)
@@ -9702,7 +10113,9 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
 
 _PRINT_FMTS = {
     "i64": ("@.fmt.i64", "%lld\n"),
-    "f64": ("@.fmt.f64", "%g\n"),
+    # f64 prints through mx_f64_to_str (Python-repr parity; %g diverged
+    # from the interpreter on integral floats), so its directive is %s.
+    "f64": ("@.fmt.f64", "%s\n"),
     "str": ("@.fmt.str", "%s\n"),
 }
 _PRINT_ARG = {"i64": "i64", "f64": "double", "str": "ptr"}
@@ -9721,6 +10134,10 @@ def _emit_runtime(mod: _ModuleState) -> List[str]:
             _string_global(gname, content)
             for content, gname in sorted(mod.strings.items(), key=lambda kv: kv[1])))
     decls: List[str] = []
+    if F64 in mod.print_helpers:
+        # The f64 print helper renders through mx_f64_to_str (parity).
+        mod.runtime_syms.add("mx_f64_to_str")
+        mod.runtime_syms.add("mx_str_free")
     if mod.print_helpers or mod.uses_printf:
         decls.append("declare i32 @printf(ptr, ...)")
     if mod.uses_abort:
@@ -9772,6 +10189,22 @@ def _emit_runtime(mod: _ModuleState) -> List[str]:
         for k in sorted(mod.print_helpers):
             g, _ = _PRINT_FMTS[k]
             aty = _PRINT_ARG[k]
+            if k == F64:
+                # Interpreter parity: print(1.0) is "1.0", not %g's "1".
+                # Route through mx_f64_to_str (Python-repr float text,
+                # already the to_string contract) instead of a %g printf —
+                # the tile differentials caught %g diverging on integral
+                # floats.  The fresh string is freed right after.
+                chunks.append("\n".join([
+                    f"define internal void @metaxu_print_{k}({aty} %x) {{",
+                    "entry:",
+                    "  %s = call ptr @mx_f64_to_str(double %x)",
+                    f"  %r = call i32 (ptr, ...) @printf(ptr {g}, ptr %s)",
+                    "  call void @mx_str_free(ptr %s)",
+                    "  ret void",
+                    "}",
+                ]))
+                continue
             chunks.append("\n".join([
                 f"define internal void @metaxu_print_{k}({aty} %x) {{",
                 "entry:",

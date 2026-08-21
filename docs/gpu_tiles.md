@@ -1,8 +1,17 @@
 # GPU tiles: the portable core and the Apple-first backend
 
-Status: **Stage 0 in progress** (portable core, no GPU dependency).
-This document is the design of record for writing Triton/Gluon-class
-GPU kernels in Metaxu, targeting MLX/Metal first.
+Status: **Stage 0 landed** (portable core, no GPU dependency) —
+`Tile.*` dotted statics on both engines, `tile:<elem>:<R>x<C>` kinds,
+the compile-time shape checker (`tile_shape_check.py`,
+`type-tile-shape`), mx_tile_* native runtime, and the differential
+gate (`tests/test_tiles.py`: 19 tests — interpreter reference,
+compile-time rejections, byte-identical native output including tile
+reprs and catchable bounds raises).  Landing it also forced a real
+parity fix: native `print(f64)` used `%g` ("12" for 12.0) where the
+interpreter prints Python repr ("12.0") — print now routes through
+`mx_f64_to_str` everywhere.  This document is the design of record for
+writing Triton/Gluon-class GPU kernels in Metaxu, targeting MLX/Metal
+first.
 
 ## The strategy in one paragraph
 

@@ -647,6 +647,262 @@ unsigned char *mx_fvec_as_bytes(const mx_fvec *v) {
 }
 
 /* ------------------------------------------------------------------------
+ * Tiles (docs/gpu_tiles.md, Stage 0): immutable 2D row-major blocks.
+ *
+ * Same word-block model as mx_fvec: elements are int64 words (f64 via
+ * bitcast; the emitter's `tile:` kind carries the element type and passes
+ * is_f64 to the ops whose arithmetic differs).  Blocks are write-once and
+ * leak by design, exactly like fvec (immutability makes sharing sound and
+ * ownership never unique).  Shape/kind agreement is STATIC natively (the
+ * tile shape checker rejects it at compile time and the kind system
+ * demotes anything unresolvable), so mismatches reaching these functions
+ * are internal errors (mx_rt_fail), not language-visible raises; the two
+ * checks that are dynamic even natively — from_vec length and get bounds
+ * — raise catchably with wording byte-identical to mir_interp's _tile_*.
+ * Accumulation order is pinned to match the interpreter bit-for-bit:
+ * row-major for sum, k ascending for dot.
+ * ---------------------------------------------------------------------- */
+
+struct mx_tile {
+    int64_t rows;
+    int64_t cols;
+    int64_t elems[];  /* rows*cols element words, row-major */
+};
+
+static mx_tile *mx_tile_new(int64_t rows, int64_t cols) {
+    if (rows <= 0 || cols <= 0) {
+        mx_rt_fail("metaxu internal: non-positive tile shape %lldx%lld "
+                   "reached the runtime", (long long)rows, (long long)cols);
+    }
+    mx_tile *t = (mx_tile *)mx_rt_malloc(
+        sizeof(mx_tile) + (size_t)(rows * cols) * sizeof(int64_t));
+    t->rows = rows;
+    t->cols = cols;
+    return t;
+}
+
+static void mx_tile_check(const mx_tile *t, const char *op) {
+    if (t == NULL) {
+        mx_rt_fail("%s: expected a Tile receiver, got NULL", op);
+    }
+}
+
+mx_tile *mx_tile_zeros(int64_t rows, int64_t cols) {
+    mx_tile *t = mx_tile_new(rows, cols);
+    /* +0.0's bit pattern is all-zeros, so float and int zero coincide. */
+    memset(t->elems, 0, (size_t)(rows * cols) * sizeof(int64_t));
+    return t;
+}
+
+mx_tile *mx_tile_filled(int64_t rows, int64_t cols, int64_t word) {
+    mx_tile *t = mx_tile_new(rows, cols);
+    for (int64_t i = 0; i < rows * cols; i++) t->elems[i] = word;
+    return t;
+}
+
+mx_tile *mx_tile_arange(int64_t rows, int64_t cols) {
+    mx_tile *t = mx_tile_new(rows, cols);
+    for (int64_t i = 0; i < rows * cols; i++) t->elems[i] = i;
+    return t;
+}
+
+mx_tile *mx_tile_from_vec(const mx_vec *v, int64_t rows, int64_t cols) {
+    if (v == NULL) {
+        mx_rt_raise("Tile.from_vec: expected a Vec, got NULL");
+    }
+    mx_tile *t = mx_tile_new(rows, cols);
+    if (v->len != rows * cols) {
+        mx_rt_raise("Tile.from_vec: Vec length %lld does not fill "
+                    "%lldx%lld (= %lld elements)", (long long)v->len,
+                    (long long)rows, (long long)cols,
+                    (long long)(rows * cols));
+    }
+    memcpy(t->elems, v->data, (size_t)v->len * sizeof(int64_t));
+    return t;
+}
+
+mx_vec *mx_tile_to_vec(const mx_tile *t) {
+    mx_tile_check(t, "Tile.to_vec");
+    mx_vec *v = mx_vec_new();
+    for (int64_t i = 0; i < t->rows * t->cols; i++) {
+        mx_vec_push(v, t->elems[i]);
+    }
+    return v;
+}
+
+static void mx_tile_same(const mx_tile *a, const mx_tile *b,
+                         const char *op) {
+    mx_tile_check(a, op);
+    mx_tile_check(b, op);
+    if (a->rows != b->rows || a->cols != b->cols) {
+        mx_rt_fail("metaxu internal: %s shape mismatch reached the runtime "
+                   "(%lldx%lld vs %lldx%lld)", op, (long long)a->rows,
+                   (long long)a->cols, (long long)b->rows,
+                   (long long)b->cols);
+    }
+}
+
+/* Elementwise add/mul: is_f64 selects the arithmetic; words in, words out. */
+#define MX_TILE_EW(name, fop, iop)                                          \
+    mx_tile *name(const mx_tile *a, const mx_tile *b, int64_t is_f64) {     \
+        mx_tile_same(a, b, #name);                                          \
+        mx_tile *out = mx_tile_new(a->rows, a->cols);                       \
+        int64_t n = a->rows * a->cols;                                      \
+        for (int64_t i = 0; i < n; i++) {                                   \
+            if (is_f64) {                                                   \
+                double x, y, r;                                             \
+                memcpy(&x, &a->elems[i], sizeof x);                         \
+                memcpy(&y, &b->elems[i], sizeof y);                         \
+                r = fop;                                                    \
+                memcpy(&out->elems[i], &r, sizeof r);                       \
+            } else {                                                        \
+                int64_t x = a->elems[i], y = b->elems[i];                   \
+                out->elems[i] = (iop);                                      \
+            }                                                               \
+        }                                                                   \
+        return out;                                                         \
+    }
+
+MX_TILE_EW(mx_tile_add, x + y, x + y)
+MX_TILE_EW(mx_tile_mul, x * y, x * y)
+
+mx_tile *mx_tile_scale(const mx_tile *t, int64_t sword, int64_t is_f64) {
+    mx_tile_check(t, "Tile.scale");
+    mx_tile *out = mx_tile_new(t->rows, t->cols);
+    int64_t n = t->rows * t->cols;
+    for (int64_t i = 0; i < n; i++) {
+        if (is_f64) {
+            double x, s, r;
+            memcpy(&x, &t->elems[i], sizeof x);
+            memcpy(&s, &sword, sizeof s);
+            r = x * s;
+            memcpy(&out->elems[i], &r, sizeof r);
+        } else {
+            out->elems[i] = t->elems[i] * sword;
+        }
+    }
+    return out;
+}
+
+mx_tile *mx_tile_dot(const mx_tile *a, const mx_tile *b, int64_t is_f64) {
+    mx_tile_check(a, "Tile.dot");
+    mx_tile_check(b, "Tile.dot");
+    if (a->cols != b->rows) {
+        mx_rt_fail("metaxu internal: Tile.dot shape mismatch reached the "
+                   "runtime (%lldx%lld · %lldx%lld)", (long long)a->rows,
+                   (long long)a->cols, (long long)b->rows,
+                   (long long)b->cols);
+    }
+    int64_t R = a->rows, K = a->cols, C = b->cols;
+    mx_tile *out = mx_tile_new(R, C);
+    for (int64_t i = 0; i < R; i++) {
+        for (int64_t j = 0; j < C; j++) {
+            if (is_f64) {
+                double acc = 0.0;
+                for (int64_t k = 0; k < K; k++) {  /* pinned: k ascending */
+                    double x, y;
+                    memcpy(&x, &a->elems[i * K + k], sizeof x);
+                    memcpy(&y, &b->elems[k * C + j], sizeof y);
+                    acc = acc + x * y;
+                }
+                memcpy(&out->elems[i * C + j], &acc, sizeof acc);
+            } else {
+                int64_t acc = 0;
+                for (int64_t k = 0; k < K; k++) {
+                    acc = acc + a->elems[i * K + k] * b->elems[k * C + j];
+                }
+                out->elems[i * C + j] = acc;
+            }
+        }
+    }
+    return out;
+}
+
+int64_t mx_tile_sum(const mx_tile *t, int64_t is_f64) {
+    mx_tile_check(t, "Tile.sum");
+    int64_t n = t->rows * t->cols;
+    if (is_f64) {
+        double acc = 0.0;
+        for (int64_t i = 0; i < n; i++) {  /* pinned: row-major */
+            double x;
+            memcpy(&x, &t->elems[i], sizeof x);
+            acc = acc + x;
+        }
+        int64_t w;
+        memcpy(&w, &acc, sizeof w);
+        return w;
+    }
+    int64_t acc = 0;
+    for (int64_t i = 0; i < n; i++) acc = acc + t->elems[i];
+    return acc;
+}
+
+mx_tile *mx_tile_transpose(const mx_tile *t) {
+    mx_tile_check(t, "Tile.transpose");
+    mx_tile *out = mx_tile_new(t->cols, t->rows);
+    for (int64_t r = 0; r < t->rows; r++) {
+        for (int64_t c = 0; c < t->cols; c++) {
+            out->elems[c * t->rows + r] = t->elems[r * t->cols + c];
+        }
+    }
+    return out;
+}
+
+int64_t mx_tile_get(const mx_tile *t, int64_t i, int64_t j) {
+    mx_tile_check(t, "Tile.get");
+    if (i < 0 || i >= t->rows || j < 0 || j >= t->cols) {
+        mx_rt_raise("Tile.get: index out of bounds: (%lld, %lld) "
+                    "(shape %lldx%lld)", (long long)i, (long long)j,
+                    (long long)t->rows, (long long)t->cols);
+    }
+    return t->elems[i * t->cols + j];
+}
+
+int64_t mx_tile_rows(const mx_tile *t) {
+    mx_tile_check(t, "Tile.rows");
+    return t->rows;
+}
+
+int64_t mx_tile_cols(const mx_tile *t) {
+    mx_tile_check(t, "Tile.cols");
+    return t->cols;
+}
+
+/* repr(MxTile): "tile[RxC](e, e, ...; e, ...)" — rows joined by "; ",
+ * byte-identical to the interpreter's MxTile.__repr__. */
+char *mx_tile_to_str(const mx_tile *t, int64_t is_f64) {
+    mx_tile_check(t, "to_string");
+    char *buf = NULL;
+    size_t len = 0, cap = 0;
+    char head[64];
+    snprintf(head, sizeof head, "tile[%lldx%lld](",
+             (long long)t->rows, (long long)t->cols);
+    mx_buf_append(&buf, &len, &cap, head);
+    for (int64_t r = 0; r < t->rows; r++) {
+        if (r > 0) {
+            mx_buf_append(&buf, &len, &cap, "; ");
+        }
+        for (int64_t c = 0; c < t->cols; c++) {
+            if (c > 0) {
+                mx_buf_append(&buf, &len, &cap, ", ");
+            }
+            char *piece;
+            if (is_f64) {
+                double x;
+                memcpy(&x, &t->elems[r * t->cols + c], sizeof x);
+                piece = mx_f64_to_str(x);
+            } else {
+                piece = mx_i64_to_str(t->elems[r * t->cols + c]);
+            }
+            mx_buf_append(&buf, &len, &cap, piece);
+            free(piece);
+        }
+    }
+    mx_buf_append(&buf, &len, &cap, ")");
+    return buf;
+}
+
+/* ------------------------------------------------------------------------
  * Strings: NUL-terminated byte strings; results are fresh malloc'd buffers.
  * ---------------------------------------------------------------------- */
 static void mx_str_check(const char *s, const char *op, const char *which) {

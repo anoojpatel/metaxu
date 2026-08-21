@@ -187,6 +187,7 @@ extern "C" {
 
 typedef struct mx_vec mx_vec;
 typedef struct mx_fvec mx_fvec;
+typedef struct mx_tile mx_tile;
 
 /* Comprehension body: compiled closure thunk (env, element word) -> word. */
 typedef int64_t (*mx_fvec_map_fn)(void *env, int64_t word);
@@ -244,6 +245,27 @@ mx_fvec *mx_fvec_set_copy(const mx_fvec *v, int64_t idx, int64_t word);
 mx_fvec *mx_fvec_zip_map(const mx_fvec *a, const mx_fvec *b,
                          mx_fvec_zip_fn fn, void *env, int64_t expected_n);
 char    *mx_fvec_to_str(const mx_fvec *v, int64_t base, int64_t depth);
+
+/* Tiles (docs/gpu_tiles.md Stage 0): immutable 2D row-major word blocks,
+ * write-once, leak by design (like mx_fvec).  is_f64 selects the element
+ * arithmetic; the emitter passes it from the static `tile:` kind.  Shape
+ * and element-kind agreement is static natively; from_vec length and get
+ * bounds raise catchably, wording byte-identical to the interpreter. */
+mx_tile *mx_tile_zeros(int64_t rows, int64_t cols);
+mx_tile *mx_tile_filled(int64_t rows, int64_t cols, int64_t word);
+mx_tile *mx_tile_arange(int64_t rows, int64_t cols);
+mx_tile *mx_tile_from_vec(const mx_vec *v, int64_t rows, int64_t cols);
+mx_vec  *mx_tile_to_vec(const mx_tile *t);
+mx_tile *mx_tile_add(const mx_tile *a, const mx_tile *b, int64_t is_f64);
+mx_tile *mx_tile_mul(const mx_tile *a, const mx_tile *b, int64_t is_f64);
+mx_tile *mx_tile_scale(const mx_tile *t, int64_t sword, int64_t is_f64);
+mx_tile *mx_tile_dot(const mx_tile *a, const mx_tile *b, int64_t is_f64);
+int64_t  mx_tile_sum(const mx_tile *t, int64_t is_f64);
+mx_tile *mx_tile_transpose(const mx_tile *t);
+int64_t  mx_tile_get(const mx_tile *t, int64_t i, int64_t j);
+int64_t  mx_tile_rows(const mx_tile *t);
+int64_t  mx_tile_cols(const mx_tile *t);
+char    *mx_tile_to_str(const mx_tile *t, int64_t is_f64);
 unsigned char *mx_fvec_as_bytes(const mx_fvec *v);
 
 /* --- Strings ------------------------------------------------------------ */
