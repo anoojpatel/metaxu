@@ -212,6 +212,24 @@ This document tracks high-level goals, status, and pointers across the new Pytho
 - Interpreter path stays whole-program (it is the semantics reference and
   compilation speed there is not a bottleneck).
 
+### 10) GPU tiles: portable core, Apple/MLX-first backend (in progress)
+- Design of record: `docs/gpu_tiles.md` (strategy, mode-axis decisions,
+  layout algebra, staging). Summary: Triton/Gluon-class tile kernels;
+  the tile types, ops, interpreter semantics, shape checking and (later)
+  layout inference are target-neutral in this compiler; backends are
+  thin text emitters — Metal Shading Language via `mx.fast.metal_kernel`
+  first, textual TritonGPU MLIR for NVIDIA/AMD later. Not built ON
+  MLIR (no Metal path, wrong build shape, interpreter needed anyway).
+- Stage 0 (portable core, no GPU): `Tile[T,R,C]` with static shape in
+  the type/kind, functional op set, MxTile interpreter reference,
+  compile-time shape errors, differential native lowering.
+- Stage 1: kernel effect class + `Gpu.launch` + memory-space locality
+  states + masked IO + f32/f16 + naive MSL emission into MLX.
+- Stage 2: layout inference (blocked/fragment/shared-swizzle families,
+  `convert_layout` insertion), `simdgroup_matrix` dot, shared-memory
+  tiling. Stage 3: explicit layout annotations, autotuner, TritonGPU
+  emitter.
+
 ## How to Run
 
 - Minimal MIR golden tests
