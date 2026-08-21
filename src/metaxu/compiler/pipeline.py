@@ -140,10 +140,15 @@ def build_context_from_source(source: str, file_path: str = "<mem>") -> PhaseCon
     # run_pipeline promotes to BorrowCheckError (no "type-" prefix).
     from .spawn_capture_check import check_spawn_captures
     spawn_errors = check_spawn_captures(program, file_path=file_path)
-    if name_errors or spawn_errors:
+    # Tile shape checking (docs/gpu_tiles.md): statically-visible shape
+    # misuse of the Tile builtins is a compile-time `type-tile-shape`
+    # error; the mutable AST for the same reason as the passes above.
+    from .tile_shape_check import check_tile_shapes
+    tile_errors = check_tile_shapes(program, file_path=file_path)
+    if name_errors or spawn_errors or tile_errors:
         merged = dict(tables.constraints)
         merged[-2] = (tuple(merged.get(-2, ())) + tuple(name_errors)
-                      + tuple(spawn_errors))
+                      + tuple(spawn_errors) + tuple(tile_errors))
         tables = replace(tables, constraints=merged)
     return PhaseContext(
         source=source,

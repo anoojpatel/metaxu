@@ -79,12 +79,19 @@ LANGUAGE_VALUE_NAMES = frozenset({"null", "self", "resume"})
 #: (`codegen_llvm._RUNTIME_NAMES`, `codegen_clif._RUNTIME_NAMES`) but the
 #: interpreter has no shim for.  Calling `type_of` still fails loudly at run
 #: time — that is defence in depth, not a reason to call the *name* unknown.
-EXTRA_BUILTIN_NAMES = frozenset({"type_of", "Vec", "vector"})
+EXTRA_BUILTIN_NAMES = frozenset({"type_of", "Vec", "vector", "Tile"})
 
 #: Runtime builtins registered under a DOTTED name
 #: (`mir_interp._register_builtins`), reachable as `Type.method(...)` with
-#: no user declaration behind them.
-DOTTED_BUILTIN_NAMES = frozenset({"Vec.new"})
+#: no user declaration behind them.  Tile ops (docs/gpu_tiles.md Stage 0)
+#: are dotted statics ONLY — no method-position names, so `dot`/`sum`/`get`
+#: keep resolving to std/user code exactly as before.
+DOTTED_BUILTIN_NAMES = frozenset({
+    "Vec.new",
+    "Tile.zeros", "Tile.filled", "Tile.arange", "Tile.from_vec",
+    "Tile.to_vec", "Tile.add", "Tile.mul", "Tile.scale", "Tile.dot",
+    "Tile.sum", "Tile.transpose", "Tile.get", "Tile.rows", "Tile.cols",
+})
 
 #: Option/Result are language-provided enums (`hir._from_orig_expr` builds
 #: their variants even when no user enum declares them).

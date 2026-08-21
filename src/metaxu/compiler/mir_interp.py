@@ -293,6 +293,34 @@ class MxVector:
 
 
 @dataclass(frozen=True)
+class MxTile:
+    """A 2D tile value `Tile[T, R, C]` (docs/gpu_tiles.md, Stage 0).
+
+    The portable-core tile: an immutable row-major block with the shape
+    carried on the VALUE here (the interpreter is shape-dynamic and
+    raises loud errors; the static story — `tile:<elem>:<R>x<C>` kinds
+    and the compile-time shape checker — lives in the compiler).  Every
+    op produces a fresh tile: functional semantics until layouts exist
+    to make lane-local mutation provably sound (deliberate, documented).
+    Elements are uniformly int or uniformly float (`fkind`); mixing is a
+    loud error, never a coercion.
+    """
+    rows: int
+    cols: int
+    elements: tuple
+    fkind: bool  # True: float elements; False: int elements
+
+    def __repr__(self) -> str:
+        # Pinned print format, shared byte-for-byte with the native
+        # mx_tile_to_str: rows joined by "; ", elements by ", ".
+        body = "; ".join(
+            ", ".join(repr(self.elements[r * self.cols + c])
+                      for c in range(self.cols))
+            for r in range(self.rows))
+        return f"tile[{self.rows}x{self.cols}]({body})"
+
+
+@dataclass(frozen=True)
 class MxPtr:
     """A raw pointer into the interpreter's simulated C heap.
 
@@ -1651,6 +1679,23 @@ class MirInterpreter:
         self._builtins["to_string"] = lambda x: "()" if x is UNIT else str(x)
         self._builtins["len"] = _builtin_len
         self._builtins["assert"] = _builtin_assert
+        # --- Runtime library: Tile (docs/gpu_tiles.md Stage 0) --------------
+        # Dotted statics only in v1 (the Vec.new resolution path): no
+        # method-position names, no collisions with std/user `dot`/`sum`.
+        self._builtins["Tile.zeros"] = _tile_zeros
+        self._builtins["Tile.filled"] = _tile_filled
+        self._builtins["Tile.arange"] = _tile_arange
+        self._builtins["Tile.from_vec"] = _tile_from_vec
+        self._builtins["Tile.to_vec"] = _tile_to_vec
+        self._builtins["Tile.add"] = _tile_add
+        self._builtins["Tile.mul"] = _tile_mul
+        self._builtins["Tile.scale"] = _tile_scale
+        self._builtins["Tile.dot"] = _tile_dot
+        self._builtins["Tile.sum"] = _tile_sum
+        self._builtins["Tile.transpose"] = _tile_transpose
+        self._builtins["Tile.get"] = _tile_get
+        self._builtins["Tile.rows"] = _tile_rows
+        self._builtins["Tile.cols"] = _tile_cols
         # --- Runtime library: Vec (growable, mutable; see MxVec) ------------
         self._builtins["Vec.new"] = lambda: MxVec()
         # `[a, b, c]` / `[]` (HIR lowers ListLiteral to this): a fresh Vec,
@@ -2110,6 +2155,8 @@ def _runtime_type_name(v: Any) -> str:
         return "Unit"
     if isinstance(v, MxVec):
         return "Vec"
+    if isinstance(v, MxTile):
+        return "Tile"
     if isinstance(v, MxVector):
         # Matches the head type constructor name that `implement ... for
         # vector[T, N]` desugars to, so user impls on vectors dispatch.
@@ -2323,6 +2370,183 @@ def _builtin_len(x: Any) -> int:
     if isinstance(x, (MxVec, MxVector, str, list, tuple)):
         return len(x)
     raise InterpError(f"len: unsupported receiver type {_runtime_type_name(x)!r}")
+
+
+# ---------------------------------------------------------------------------
+# Tiles (docs/gpu_tiles.md, Stage 0): the portable-core reference semantics.
+#
+# All ops are dotted statics (`Tile.dot(a, b)`) — one resolution mechanism
+# (the Vec.new path), no method-name collisions with std/user code; method
+# sugar can arrive later through an ordinary std trait impl.  Every check
+# here is LOUD (InterpError, catchable) and its wording is the contract the
+# native runtime must reproduce byte-for-byte where the check is dynamic
+# there too (from_vec length, get bounds); checks that are STATIC natively
+# (shape/kind agreement — carried in `tile:` kinds) are also enforced at
+# compile time by the tile shape checker, so these dynamic forms are the
+# interpreter's strict backstop.  Accumulation order is pinned: row-major
+# for sum, k = 0..K-1 for dot — the native loops must match so float
+# results are bit-identical.
+# ---------------------------------------------------------------------------
+
+def _tile_shape(op: str, r: Any, c: Any) -> tuple:
+    for name, v in (("rows", r), ("cols", c)):
+        if isinstance(v, bool) or not isinstance(v, int):
+            raise InterpError(
+                f"{op}: {name} must be an integer, got "
+                f"{_runtime_type_name(v)!r}")
+    if r <= 0 or c <= 0:
+        raise InterpError(f"{op}: tile shape must be positive, got {r}x{c}")
+    return r, c
+
+
+def _tile_arg(op: str, t: Any) -> MxTile:
+    if not isinstance(t, MxTile):
+        raise InterpError(
+            f"{op}: expected a Tile, got {_runtime_type_name(t)!r}")
+    return t
+
+
+def _tile_elem_fkind(op: str, x: Any) -> bool:
+    if isinstance(x, bool) or not isinstance(x, (int, float)):
+        raise InterpError(
+            f"{op}: tile elements must be int or float, got "
+            f"{_runtime_type_name(x)!r}")
+    return isinstance(x, float)
+
+
+def _kname(fkind: bool) -> str:
+    return "float" if fkind else "int"
+
+
+def _tile_same(op: str, a: MxTile, b: MxTile) -> None:
+    if (a.rows, a.cols) != (b.rows, b.cols):
+        raise InterpError(f"{op}: shape mismatch: {a.rows}x{a.cols} vs "
+                          f"{b.rows}x{b.cols}")
+    if a.fkind != b.fkind:
+        raise InterpError(f"{op}: element kinds differ "
+                          f"({_kname(a.fkind)} vs {_kname(b.fkind)})")
+
+
+def _tile_zeros(r: Any, c: Any) -> MxTile:
+    r, c = _tile_shape("Tile.zeros", r, c)
+    return MxTile(r, c, (0.0,) * (r * c), True)
+
+
+def _tile_filled(r: Any, c: Any, x: Any) -> MxTile:
+    r, c = _tile_shape("Tile.filled", r, c)
+    fk = _tile_elem_fkind("Tile.filled", x)
+    return MxTile(r, c, (x,) * (r * c), fk)
+
+
+def _tile_arange(r: Any, c: Any) -> MxTile:
+    r, c = _tile_shape("Tile.arange", r, c)
+    return MxTile(r, c, tuple(range(r * c)), False)
+
+
+def _tile_from_vec(v: Any, r: Any, c: Any) -> MxTile:
+    r, c = _tile_shape("Tile.from_vec", r, c)
+    if not isinstance(v, MxVec):
+        raise InterpError(f"Tile.from_vec: expected a Vec, got "
+                          f"{_runtime_type_name(v)!r}")
+    if len(v.items) != r * c:
+        raise InterpError(
+            f"Tile.from_vec: Vec length {len(v.items)} does not fill "
+            f"{r}x{c} (= {r * c} elements)")
+    fks = {_tile_elem_fkind("Tile.from_vec", x) for x in v.items}
+    if len(fks) > 1:
+        raise InterpError(
+            "Tile.from_vec: mixed int and float elements in the Vec")
+    return MxTile(r, c, tuple(v.items), fks.pop())
+
+
+def _tile_to_vec(t: Any) -> MxVec:
+    t = _tile_arg("Tile.to_vec", t)
+    return MxVec(list(t.elements))  # fresh, mutable, row-major
+
+
+def _tile_add(a: Any, b: Any) -> MxTile:
+    a = _tile_arg("Tile.add", a)
+    b = _tile_arg("Tile.add", b)
+    _tile_same("Tile.add", a, b)
+    return MxTile(a.rows, a.cols,
+                  tuple(x + y for x, y in zip(a.elements, b.elements)),
+                  a.fkind)
+
+
+def _tile_mul(a: Any, b: Any) -> MxTile:
+    a = _tile_arg("Tile.mul", a)
+    b = _tile_arg("Tile.mul", b)
+    _tile_same("Tile.mul", a, b)
+    return MxTile(a.rows, a.cols,
+                  tuple(x * y for x, y in zip(a.elements, b.elements)),
+                  a.fkind)
+
+
+def _tile_scale(t: Any, s: Any) -> MxTile:
+    t = _tile_arg("Tile.scale", t)
+    sk = _tile_elem_fkind("Tile.scale", s)
+    if sk != t.fkind:
+        raise InterpError(
+            f"Tile.scale: scalar kind must match tile elements "
+            f"({_kname(t.fkind)} tile, {_kname(sk)} scalar)")
+    return MxTile(t.rows, t.cols, tuple(x * s for x in t.elements), t.fkind)
+
+
+def _tile_dot(a: Any, b: Any) -> MxTile:
+    a = _tile_arg("Tile.dot", a)
+    b = _tile_arg("Tile.dot", b)
+    if a.cols != b.rows:
+        raise InterpError(
+            f"Tile.dot: shape mismatch: {a.rows}x{a.cols} · "
+            f"{b.rows}x{b.cols} (inner dims {a.cols} and {b.rows})")
+    if a.fkind != b.fkind:
+        raise InterpError(f"Tile.dot: element kinds differ "
+                          f"({_kname(a.fkind)} vs {_kname(b.fkind)})")
+    R, K, C = a.rows, a.cols, b.cols
+    out = []
+    for i in range(R):
+        for j in range(C):
+            acc = 0.0 if a.fkind else 0
+            for k in range(K):  # pinned order: k ascending
+                acc = acc + a.elements[i * K + k] * b.elements[k * C + j]
+            out.append(acc)
+    return MxTile(R, C, tuple(out), a.fkind)
+
+
+def _tile_sum(t: Any) -> Any:
+    t = _tile_arg("Tile.sum", t)
+    acc = 0.0 if t.fkind else 0
+    for x in t.elements:  # pinned order: row-major
+        acc = acc + x
+    return acc
+
+
+def _tile_transpose(t: Any) -> MxTile:
+    t = _tile_arg("Tile.transpose", t)
+    out = tuple(t.elements[r * t.cols + c]
+                for c in range(t.cols) for r in range(t.rows))
+    return MxTile(t.cols, t.rows, out, t.fkind)
+
+
+def _tile_get(t: Any, i: Any, j: Any) -> Any:
+    t = _tile_arg("Tile.get", t)
+    for name, v in (("row", i), ("col", j)):
+        if isinstance(v, bool) or not isinstance(v, int):
+            raise InterpError(
+                f"Tile.get: {name} index must be an integer, got "
+                f"{_runtime_type_name(v)!r}")
+    if not (0 <= i < t.rows and 0 <= j < t.cols):
+        raise InterpError(f"Tile.get: index out of bounds: ({i}, {j}) "
+                          f"(shape {t.rows}x{t.cols})")
+    return t.elements[i * t.cols + j]
+
+
+def _tile_rows(t: Any) -> int:
+    return _tile_arg("Tile.rows", t).rows
+
+
+def _tile_cols(t: Any) -> int:
+    return _tile_arg("Tile.cols", t).cols
 
 
 # Contention as permission (docs/contention_as_permission.md). Wording is
