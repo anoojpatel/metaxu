@@ -1000,7 +1000,8 @@ _NATIVE_RT_CALLS = {"Vec.new", "push", "pop", "len", "to_string",
                     "Tile.zeros", "Tile.filled", "Tile.arange",
                     "Tile.from_vec", "Tile.to_vec", "Tile.add", "Tile.mul",
                     "Tile.scale", "Tile.dot", "Tile.sum", "Tile.transpose",
-                    "Tile.get", "Tile.rows", "Tile.cols"}
+                    "Tile.get", "Tile.rows", "Tile.cols", "Tile.load",
+                    "Tile.load_or", "Tile.store", "Tile.store_clipped"}
 
 # Extern C symbols the interpreter shims over its simulated heap
 # (mir_interp._ffi_*): natively these are DIRECT calls to the real libc
@@ -1156,6 +1157,10 @@ _RT_SIGS = {
     "mx_tile_rows": ("i64", ("ptr",)),
     "mx_tile_cols": ("i64", ("ptr",)),
     "mx_tile_to_str": ("ptr", ("ptr", "i64")),
+    "mx_tile_load": ("ptr", ("ptr", "i64", "i64", "i64")),
+    "mx_tile_load_or": ("ptr", ("ptr", "i64", "i64", "i64", "i64")),
+    "mx_tile_store": ("void", ("ptr", "i64", "ptr")),
+    "mx_tile_store_clipped": ("void", ("ptr", "i64", "ptr")),
     # Delimited failure recovery (try/catch, metaxu_effects.c).
     "mx_try": ("i64", ("ptr", "ptr", "ptr", "ptr")),
 }
@@ -3882,6 +3887,34 @@ def _infer_kinds(info: _Info, sigs: Dict[str, _Sig], structs: _StructTable,
             if _is_tile(get(args[0])):
                 elem, _r, _c = _tile_parts(get(args[0]))
                 ch = mark(dst, elem) or ch
+        elif op == "load" and len(args) == 4:
+            ch = mark(args[0], _vec_of(I64)) or ch
+            shape = ctor_shape(args[2], args[3])
+            if shape is not None and _is_vec(get(args[0])):
+                elem = _vec_elem(get(args[0]))
+                if elem == F64:
+                    ch = mark(dst, _tile_of(F64, *shape)) or ch
+                elif elem == I64 and assume_final:
+                    ch = mark(dst, _tile_of(I64, *shape)) or ch
+        elif op == "load_or" and len(args) == 5:
+            ch = mark(args[0], _vec_of(I64)) or ch
+            shape = ctor_shape(args[2], args[3])
+            if shape is not None:
+                vk = (_vec_elem(get(args[0])) if _is_vec(get(args[0]))
+                      else I64)
+                e = _join(get(args[4]), vk)
+                if e == F64:
+                    ch = mark(dst, _tile_of(F64, *shape)) or ch
+                    ch = mark(args[4], F64) or ch
+                    ch = mark(args[0], _vec_of(F64)) or ch
+                elif e == I64 and assume_final:
+                    ch = mark(dst, _tile_of(I64, *shape)) or ch
+        elif op in ("store", "store_clipped") and len(args) == 3:
+            ch = mark(args[0], _vec_of(I64)) or ch
+            if _is_tile(get(args[2])):
+                elem, _r, _c = _tile_parts(get(args[2]))
+                ch = mark(args[0], _vec_of(elem)) or ch
+            # dst is unit -> stays i64
         # rows/cols: i64 dst and i64-bottom receiver need no marks here;
         # the consistency check requires the receiver to be a tile.
         return ch
@@ -4843,7 +4876,8 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                 probs.append(f"{name} with {len(args)} arguments "
                              f"(expects {want})")
                 return
-            if top in ("zeros", "filled", "arange", "from_vec"):
+            if top in ("zeros", "filled", "arange", "from_vec", "load",
+                       "load_or"):
                 if not _is_tile(ty(dst)):
                     probs.append(
                         f"{name} result {dst!r} has kind {ty(dst)}: the "
@@ -4855,7 +4889,7 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                 if elem not in (I64, F64):
                     probs.append(f"{name} of {elem} elements "
                                  "(tiles hold int or float)")
-                elif top == "from_vec":
+                elif top in ("from_vec", "load", "load_or"):
                     vk = ty(args[0])
                     if not _is_vec(vk):
                         probs.append(f"{name} source {args[0]!r} has kind "
@@ -4863,9 +4897,33 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                     elif _vec_elem(vk) != elem:
                         probs.append(f"{name} of a Vec of {_vec_elem(vk)} "
                                      f"into a tile of {elem}")
+                    elif top == "load_or" and ty(args[4]) != elem:
+                        probs.append(f"{name} fill value {args[4]!r} is "
+                                     f"{ty(args[4])}, elements are {elem}")
                 elif top == "filled" and ty(args[2]) != elem:
                     probs.append(f"{name} fill value {args[2]!r} is "
                                  f"{ty(args[2])}, elements are {elem}")
+            elif top in ("store", "store_clipped"):
+                tk = ty(args[2])
+                if not _is_tile(tk):
+                    probs.append(f"{name} value {args[2]!r} has kind {tk}, "
+                                 "not a Tile (its shape must be statically "
+                                 "known)")
+                    return
+                elem, _r, _c = _tile_parts(tk)
+                vk = ty(args[0])
+                if elem not in (I64, F64):
+                    probs.append(f"{name} of {elem} elements "
+                                 "(tiles hold int or float)")
+                elif not _is_vec(vk):
+                    probs.append(f"{name} target {args[0]!r} has kind {vk}, "
+                                 "not a Vec")
+                elif _vec_elem(vk) != elem:
+                    probs.append(f"{name} of a tile of {elem} into a Vec "
+                                 f"of {_vec_elem(vk)}")
+                elif ty(args[1]) != I64:
+                    probs.append(f"{name} offset {args[1]!r} is "
+                                 f"{ty(args[1])}, not an int")
             elif top in ("add", "mul", "scale", "dot", "sum", "transpose",
                          "get", "to_vec", "rows", "cols"):
                 ka = ty(args[0])
@@ -8155,6 +8213,43 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                     f"  {w} = call i64 @mx_tile_get(ptr {a}, i64 {i}, "
                     f"i64 {j})  ; bounds raise catchably (interp wording)")
                 vec_elem_into(dst, elem, w, lines)
+            elif top == "load":
+                src = use(opargs[0], lines)
+                off = use(opargs[1], lines)
+                r = use(opargs[2], lines)
+                c = use(opargs[3], lines)
+                mod.runtime_syms.add("mx_tile_load")
+                v = fresh()
+                lines.append(
+                    f"  {v} = call ptr @mx_tile_load(ptr {src}, i64 {off}, "
+                    f"i64 {r}, i64 {c})  ; range raises catchably")
+                setval(dst, v, lines)
+            elif top == "load_or":
+                elem, _r, _c = _tile_parts(kind(dst))
+                src = use(opargs[0], lines)
+                off = use(opargs[1], lines)
+                r = use(opargs[2], lines)
+                c = use(opargs[3], lines)
+                w = to_word(elem, use(opargs[4], lines), lines)
+                mod.runtime_syms.add("mx_tile_load_or")
+                v = fresh()
+                lines.append(
+                    f"  {v} = call ptr @mx_tile_load_or(ptr {src}, "
+                    f"i64 {off}, i64 {r}, i64 {c}, i64 {w})"
+                    "  ; masked: out-of-range elements read `other`")
+                setval(dst, v, lines)
+            elif top in ("store", "store_clipped"):
+                tgt = use(opargs[0], lines)
+                off = use(opargs[1], lines)
+                t = use(opargs[2], lines)
+                sym = f"mx_tile_{top}"
+                mod.runtime_syms.add(sym)
+                lines.append(
+                    f"  call void @{sym}(ptr {tgt}, i64 {off}, ptr {t})"
+                    "  ; Vec write: contended-write guard applies"
+                    + ("" if top == "store"
+                       else "; masked: out-of-range writes nothing"))
+                setval(dst, "0", lines)  # unit
             else:  # rows / cols
                 a = use(opargs[0], lines)
                 sym = f"mx_tile_{top}"

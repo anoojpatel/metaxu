@@ -298,3 +298,270 @@ fn main() -> int {
     ir = llvm_from_source(src)
     assert count_placeholders(ir) >= 1
     assert "not statically resolvable" in ir
+
+
+# ---------------------------------------------------------------------------
+# Stage 1: the buffer <-> tile boundary (load/store + masked forms)
+# ---------------------------------------------------------------------------
+
+_LOAD_STORE_SRC = """
+fn main() -> int {
+    let @mut v = Vec.new();
+    let mut i = 0;
+    while i < 10 { v.push(i * i); i = i + 1 };
+    let t = Tile.load(v, 2, 2, 3);
+    print(t);
+    Tile.store(v, 0, Tile.scale(t, 10));
+    print(v[0]);
+    print(v[5]);
+    let edge = Tile.load_or(v, 8, 1, 4, 0 - 1);
+    print(edge);
+    Tile.store_clipped(v, 8, Tile.filled(1, 4, 7));
+    print(v[9]);
+    print(len(v));
+    let e = try { Tile.load(v, 8, 1, 4); 0 } catch m { print(m); 0 - 1 };
+    print(e);
+    0
+}
+"""
+
+_LOAD_STORE_OUT = [
+    "tile[2x3](4, 9, 16; 25, 36, 49)",
+    "40",    # store rewrote v[0..6) with 10x the loaded tile
+    "490",
+    "tile[1x4](64, 81, -1, -1)",   # masked load fills `other` past the end
+    "7",     # clipped store wrote only the in-range elements
+    "10",    # ...and never grew the Vec
+    "Tile.load: range [8, 12) outside Vec length 10",
+    "-1",
+]
+
+
+def test_interp_load_store_and_masked_semantics():
+    result, out = interp_run(_LOAD_STORE_SRC)
+    assert result == 0
+    assert out.splitlines() == _LOAD_STORE_OUT
+
+
+@needs_clang
+def test_native_load_store_matches_interp(tmp_path):
+    ir = assert_native_matches_interp(_LOAD_STORE_SRC, tmp_path)
+    assert count_placeholders(ir) == 0
+    assert "call ptr @mx_tile_load_or" in ir
+    assert "call void @mx_tile_store_clipped" in ir
+
+
+def test_interp_store_range_is_loud():
+    src = """
+fn main() -> int {
+    let @mut v = Vec.new();
+    v.push(1);
+    try { Tile.store(v, 0, Tile.filled(1, 2, 5)); 0 }
+    catch m { print(m); 1 }
+}
+"""
+    result, out = interp_run(src)
+    assert result == 1
+    assert out.splitlines() == [
+        "Tile.store: range [0, 2) outside Vec length 1"]
+
+
+# Tile stores are Vec WRITES: the contended-write permission applies
+# exactly as it does to push/pop/index stores.  A spawned kernel writing
+# a crossed buffer without a lock raises the canonical message on BOTH
+# engines (the same wording test_contention pins for the other mutators).
+from metaxu.compiler.tests.test_threads import THREAD_EFFECT  # noqa: E402
+
+_CONTENDED_TILE_STORE_SRC = THREAD_EFFECT + """
+fn main() -> int {
+    let @mut v = Vec.new();
+    v.push(1);
+    v.push(2);
+    let @mut handles = Vec.new();
+    unsafe {
+        let t = perform Thread.spawn(|| {
+            let msg = try { Tile.store(v, 0, Tile.filled(1, 1, 9)); "no error" }
+                      catch e { e };
+            print(msg);
+            0
+        });
+        handles.push(t);
+    }
+    perform Thread.join(handles[0]);
+    print(v[0]);
+    0
+}
+"""
+
+
+def test_interp_tile_store_takes_the_contended_guard():
+    from metaxu.compiler.mir_interp import _CONTENDED_WRITE_MSG
+    result, out = interp_run(_CONTENDED_TILE_STORE_SRC)
+    assert result == 0
+    assert out.splitlines() == [_CONTENDED_WRITE_MSG, "1"]
+
+
+@needs_clang
+def test_native_tile_store_contended_matches_interp(tmp_path):
+    ir = assert_native_matches_interp(_CONTENDED_TILE_STORE_SRC, tmp_path)
+    assert count_placeholders(ir) == 0
+
+
+# ---------------------------------------------------------------------------
+# Stage 1: the kernel seam — std.gpu's Gpu.launch effect
+# ---------------------------------------------------------------------------
+
+_VECADD_SRC = """
+from std.gpu import Gpu, run_grid;
+
+fn vecadd_kernel(pid: int, a: Vec, b: Vec, out: Vec) -> () {
+    let ta = Tile.load(a, pid * 4, 1, 4);
+    let tb = Tile.load(b, pid * 4, 1, 4);
+    Tile.store(out, pid * 4, Tile.add(ta, tb));
+    ()
+}
+
+fn main() -> int {
+    let @mut a = Vec.new();
+    let @mut b = Vec.new();
+    let @mut out = Vec.new();
+    let mut i = 0;
+    while i < 8 { a.push(i); b.push(i * 10); out.push(0); i = i + 1 };
+    perform Gpu.launch(2, fn(pid: int) -> vecadd_kernel(pid, a, b, out));
+    print(out[0]);
+    print(out[3]);
+    print(out[7]);
+    0
+}
+"""
+
+_MATMUL_SRC = """
+from std.gpu import Gpu, run_grid;
+
+fn mm_kernel(pid: int, a: Vec, b: Vec, c: Vec) -> () {
+    let ti = pid / 2;
+    let tj = pid % 2;
+    let mut k = 0;
+    let mut r = Tile.filled(2, 2, 0);
+    while k < 2 {
+        let ta = Tile.load(a, (ti * 2) * 4 + k * 2, 2, 2);
+        let tb = Tile.load(b, (k * 2) * 4 + tj * 2, 2, 2);
+        r = Tile.add(r, Tile.dot(ta, tb));
+        k = k + 1
+    };
+    Tile.store(c, (ti * 2) * 4 + tj * 2, r);
+    ()
+}
+
+fn main() -> int {
+    let @mut a = Vec.new();
+    let @mut b = Vec.new();
+    let @mut c = Vec.new();
+    let mut i = 0;
+    while i < 16 {
+        a.push(i);
+        b.push(if i % 5 == 0 { 1 } else { 0 });
+        c.push(0);
+        i = i + 1
+    };
+    perform Gpu.launch(4, fn(pid: int) -> mm_kernel(pid, a, b, c));
+    print(Tile.from_vec(c, 4, 4));
+    0
+}
+"""
+
+_RAGGED_SRC = """
+from std.gpu import Gpu, run_grid;
+
+fn double_kernel(pid: int, v: Vec) -> () {
+    let t = Tile.load_or(v, pid * 4, 1, 4, 0);
+    Tile.store_clipped(v, pid * 4, Tile.scale(t, 2));
+    ()
+}
+
+fn main() -> int {
+    let @mut v = Vec.new();
+    let mut i = 0;
+    while i < 10 { v.push(i + 1); i = i + 1 };
+    perform Gpu.launch(3, fn(pid: int) -> double_kernel(pid, v));
+    print(v[0]);
+    print(v[9]);
+    print(len(v));
+    0
+}
+"""
+
+
+def test_interp_vecadd_kernel():
+    _res, out = interp_run(_VECADD_SRC)
+    assert out.splitlines() == ["0", "33", "77"]
+
+
+def test_interp_matmul_kernel():
+    # A = row-major iota(4x4); B = indicator of multiples of 5 (a scattered
+    # 0/1 matrix), so the product is hand-checkable and int-exact.
+    _res, out = interp_run(_MATMUL_SRC)
+    assert out.splitlines() == [
+        "tile[4x4](3, 0, 2, 1; 4, 3, 0, 0; 19, 0, 10, 9; 12, 11, 0, 0)"]
+
+
+def test_interp_ragged_grid_uses_masked_forms():
+    # 10 elements, 3 instances of width 4: the last instance is ragged and
+    # must neither raise nor grow the Vec.
+    _res, out = interp_run(_RAGGED_SRC)
+    assert out.splitlines() == ["2", "20", "10"]
+
+
+def test_interp_launch_is_pid_ordered():
+    # The reference semantics: sequential, pid ascending — pinned so any
+    # future backend handler has a defined baseline to differ from.
+    src = """
+from std.gpu import Gpu, run_grid;
+fn main() -> int {
+    let @mut order = Vec.new();
+    perform Gpu.launch(3, fn(pid: int) -> order.push(pid * pid));
+    print(order[0]);
+    print(order[1]);
+    print(order[2]);
+    0
+}
+"""
+    _res, out = interp_run(src)
+    assert out.splitlines() == ["0", "1", "4"]
+
+
+def test_interp_launch_is_virtualizable_by_handlers():
+    # The whole point of launch-as-effect: a handler can observe or replace
+    # the launch without the kernel changing.
+    src = """
+from std.gpu import Gpu, run_grid;
+fn main() -> int {
+    let @mut out = Vec.new();
+    let mut i = 0;
+    while i < 4 { out.push(0); i = i + 1 };
+    let last = handle Gpu with {
+        launch(n, f) -> {
+            print("virtual launch of");
+            print(n);
+            run_grid(n, f);
+            resume(())
+        }
+    } in {
+        perform Gpu.launch(4, fn(pid: int) ->
+            Tile.store(out, pid, Tile.filled(1, 1, pid * pid)));
+        out[3]
+    };
+    print(last);
+    0
+}
+"""
+    _res, out = interp_run(src)
+    assert out.splitlines() == ["virtual launch of", "4", "9"]
+
+
+@needs_clang
+@pytest.mark.parametrize("src", [_VECADD_SRC, _MATMUL_SRC, _RAGGED_SRC],
+                         ids=["vecadd", "matmul", "ragged"])
+def test_native_kernels_match_interp(src, tmp_path):
+    ir = assert_native_matches_interp(src, tmp_path)
+    assert count_placeholders(ir) == 0

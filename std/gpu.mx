@@ -1,0 +1,39 @@
+# std.gpu — the kernel seam (docs/gpu_tiles.md, Stage 1).
+#
+# A launch is an EFFECT, which is the whole design: the handler owns what
+# "run this kernel over a grid" means.  With no handler installed the
+# default is the REFERENCE semantics — `run_grid`: instances run
+# sequentially in pid order 0..n-1 on the CPU, so every kernel is an
+# ordinary deterministic program both engines execute and differential
+# tests can pin.  Backends arrive as handlers (the MSL/MLX handler
+# intercepts launch and hands the kernel to Metal; a distribution handler
+# can virtualize it entirely), and tests can interpose recording or
+# fault-injecting handlers without touching kernel code.
+#
+# Kernel-side conventions (see docs/gpu_tiles.md):
+# - a kernel is any fn/closure taking the instance id `pid: int`;
+# - buffers are Vecs; tiles move through Tile.load / Tile.store and the
+#   masked forms Tile.load_or / Tile.store_clipped for ragged edges
+#   (kernels should prefer the masked forms — device kernels cannot
+#   raise, so the masked semantics are the portable ones);
+# - stores are Vec writes: the contended-write discipline applies
+#   exactly as everywhere else (docs/contention_as_permission.md).
+
+export {
+    Gpu,
+    run_grid
+}
+
+# The reference launch: sequential, pid-ordered, on this thread.
+fn run_grid(n: int, f: fn(int) -> ()) -> () {
+    let mut pid = 0;
+    while pid < n {
+        f(pid);
+        pid = pid + 1
+    };
+    ()
+}
+
+effect Gpu {
+    launch(n: int, f: fn(int) -> ()) -> () = run_grid(n, f)
+}

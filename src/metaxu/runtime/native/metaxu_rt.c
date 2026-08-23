@@ -868,6 +868,67 @@ int64_t mx_tile_cols(const mx_tile *t) {
     return t->cols;
 }
 
+/* Buffer <-> tile boundary (Stage 1).  Strict load/store raise on any
+ * out-of-range element; the masked forms are the kernel-side ragged-edge
+ * idiom (load_or reads `other`, store_clipped writes nothing) — wording
+ * and check ORDER byte-identical to mir_interp (stores: contended-write
+ * guard BEFORE the range check, like every Vec mutator). */
+
+mx_tile *mx_tile_load(const mx_vec *v, int64_t off, int64_t rows,
+                      int64_t cols) {
+    if (v == NULL) {
+        mx_rt_fail("Tile.load: expected a Vec, got NULL");
+    }
+    mx_tile *t = mx_tile_new(rows, cols);
+    int64_t n = rows * cols;
+    if (off < 0 || off + n > v->len) {
+        mx_rt_raise("Tile.load: range [%lld, %lld) outside Vec length %lld",
+                    (long long)off, (long long)(off + n), (long long)v->len);
+    }
+    memcpy(t->elems, v->data + off, (size_t)n * sizeof(int64_t));
+    return t;
+}
+
+mx_tile *mx_tile_load_or(const mx_vec *v, int64_t off, int64_t rows,
+                         int64_t cols, int64_t other) {
+    if (v == NULL) {
+        mx_rt_fail("Tile.load_or: expected a Vec, got NULL");
+    }
+    mx_tile *t = mx_tile_new(rows, cols);
+    int64_t n = rows * cols;
+    for (int64_t i = 0; i < n; i++) {
+        int64_t j = off + i;
+        t->elems[i] = (j >= 0 && j < v->len) ? v->data[j] : other;
+    }
+    return t;
+}
+
+void mx_tile_store(mx_vec *v, int64_t off, const mx_tile *t) {
+    mx_vec_check(v, "Tile.store");
+    mx_tile_check(t, "Tile.store");
+    mx__vec_write_check(v);  /* contended-write guard, canonical order */
+    int64_t n = t->rows * t->cols;
+    if (off < 0 || off + n > v->len) {
+        mx_rt_raise("Tile.store: range [%lld, %lld) outside Vec length "
+                    "%lld", (long long)off, (long long)(off + n),
+                    (long long)v->len);
+    }
+    memcpy(v->data + off, t->elems, (size_t)n * sizeof(int64_t));
+}
+
+void mx_tile_store_clipped(mx_vec *v, int64_t off, const mx_tile *t) {
+    mx_vec_check(v, "Tile.store_clipped");
+    mx_tile_check(t, "Tile.store_clipped");
+    mx__vec_write_check(v);  /* contended-write guard, canonical order */
+    int64_t n = t->rows * t->cols;
+    for (int64_t i = 0; i < n; i++) {
+        int64_t j = off + i;
+        if (j >= 0 && j < v->len) {  /* masked-out element writes nothing */
+            v->data[j] = t->elems[i];
+        }
+    }
+}
+
 /* repr(MxTile): "tile[RxC](e, e, ...; e, ...)" — rows joined by "; ",
  * byte-identical to the interpreter's MxTile.__repr__. */
 char *mx_tile_to_str(const mx_tile *t, int64_t is_f64) {
