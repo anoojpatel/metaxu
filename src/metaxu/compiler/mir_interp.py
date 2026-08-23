@@ -1696,6 +1696,8 @@ class MirInterpreter:
         self._builtins["Tile.get"] = _tile_get
         self._builtins["Tile.rows"] = _tile_rows
         self._builtins["Tile.cols"] = _tile_cols
+        self._builtins["Tile.load"] = _tile_load
+        self._builtins["Tile.load_or"] = _tile_load_or
         # --- Runtime library: Vec (growable, mutable; see MxVec) ------------
         self._builtins["Vec.new"] = lambda: MxVec()
         # `[a, b, c]` / `[]` (HIR lowers ListLiteral to this): a fresh Vec,
@@ -1732,6 +1734,19 @@ class MirInterpreter:
 
         self._builtins["push"] = _checked_push
         self._builtins["pop"] = _checked_pop
+
+        # Tile stores are Vec WRITES: same contended-write permission as
+        # every other mutating builtin (docs/contention_as_permission.md).
+        def _checked_tile_store(v: Any, off: Any, t: Any) -> Any:
+            _contended_write_check(v)
+            return _tile_store_unchecked(v, off, t)
+
+        def _checked_tile_store_clipped(v: Any, off: Any, t: Any) -> Any:
+            _contended_write_check(v)
+            return _tile_store_clipped_unchecked(v, off, t)
+
+        self._builtins["Tile.store"] = _checked_tile_store
+        self._builtins["Tile.store_clipped"] = _checked_tile_store_clipped
         # --- Runtime library: math methods on numbers -----------------------
         self._builtins["sqrt"] = _make_math_method("sqrt", math.sqrt)
         self._builtins["sin"] = _make_math_method("sin", math.sin)
@@ -2547,6 +2562,93 @@ def _tile_rows(t: Any) -> int:
 
 def _tile_cols(t: Any) -> int:
     return _tile_arg("Tile.cols", t).cols
+
+
+# -- Buffer <-> tile boundary (docs/gpu_tiles.md Stage 1) -------------------
+#
+# Kernels move tiles in and out of Vec buffers at an element offset: the
+# strict forms raise on any out-of-range element (host-side discipline);
+# the MASKED forms are the kernel-side idiom — kernels cannot raise, so a
+# ragged edge reads `other` and writes nothing, semantics pinned HERE
+# first per the design doc.  Stores are Vec WRITES and take the
+# contended-write guard exactly like push/pop/index-set (the wrapper is
+# bound in _register_builtins where the thread ctx lives).
+
+def _tile_off(op: str, off: Any) -> int:
+    if isinstance(off, bool) or not isinstance(off, int):
+        raise InterpError(f"{op}: offset must be an integer, got "
+                          f"{_runtime_type_name(off)!r}")
+    return off
+
+
+def _tile_vec(op: str, v: Any) -> MxVec:
+    if not isinstance(v, MxVec):
+        raise InterpError(f"{op}: expected a Vec, got "
+                          f"{_runtime_type_name(v)!r}")
+    return v
+
+
+def _tile_load(v: Any, off: Any, r: Any, c: Any) -> MxTile:
+    r, c = _tile_shape("Tile.load", r, c)
+    v = _tile_vec("Tile.load", v)
+    off = _tile_off("Tile.load", off)
+    n = r * c
+    if off < 0 or off + n > len(v.items):
+        raise InterpError(
+            f"Tile.load: range [{off}, {off + n}) outside Vec length "
+            f"{len(v.items)}")
+    elems = v.items[off:off + n]
+    fks = {_tile_elem_fkind("Tile.load", x) for x in elems}
+    if len(fks) > 1:
+        raise InterpError("Tile.load: mixed int and float elements "
+                          "in the Vec range")
+    return MxTile(r, c, tuple(elems), fks.pop())
+
+
+def _tile_load_or(v: Any, off: Any, r: Any, c: Any, other: Any) -> MxTile:
+    r, c = _tile_shape("Tile.load_or", r, c)
+    v = _tile_vec("Tile.load_or", v)
+    off = _tile_off("Tile.load_or", off)
+    fk = _tile_elem_fkind("Tile.load_or", other)
+    out = []
+    for i in range(r * c):
+        j = off + i
+        if 0 <= j < len(v.items):
+            x = v.items[j]
+            if _tile_elem_fkind("Tile.load_or", x) != fk:
+                raise InterpError(
+                    "Tile.load_or: Vec element kind differs from `other` "
+                    f"({_kname(_tile_elem_fkind('Tile.load_or', x))} vs "
+                    f"{_kname(fk)})")
+            out.append(x)
+        else:
+            out.append(other)  # masked-out element reads `other`
+    return MxTile(r, c, tuple(out), fk)
+
+
+def _tile_store_unchecked(v: Any, off: Any, t: Any) -> Any:
+    t = _tile_arg("Tile.store", t)
+    v = _tile_vec("Tile.store", v)
+    off = _tile_off("Tile.store", off)
+    n = t.rows * t.cols
+    if off < 0 or off + n > len(v.items):
+        raise InterpError(
+            f"Tile.store: range [{off}, {off + n}) outside Vec length "
+            f"{len(v.items)}")
+    for i, x in enumerate(t.elements):
+        v.items[off + i] = x
+    return UNIT
+
+
+def _tile_store_clipped_unchecked(v: Any, off: Any, t: Any) -> Any:
+    t = _tile_arg("Tile.store_clipped", t)
+    v = _tile_vec("Tile.store_clipped", v)
+    off = _tile_off("Tile.store_clipped", off)
+    for i, x in enumerate(t.elements):
+        j = off + i
+        if 0 <= j < len(v.items):  # masked-out element writes nothing
+            v.items[j] = x
+    return UNIT
 
 
 # Contention as permission (docs/contention_as_permission.md). Wording is

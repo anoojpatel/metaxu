@@ -45,6 +45,10 @@ TILE_ARITY = {
     "zeros": 2, "filled": 3, "arange": 2, "from_vec": 3, "to_vec": 1,
     "add": 2, "mul": 2, "scale": 2, "dot": 2, "sum": 1, "transpose": 1,
     "get": 3, "rows": 1, "cols": 1,
+    # Buffer <-> tile boundary (Stage 1): strict load/store raise on any
+    # out-of-range element; the masked forms (load_or reads `other`,
+    # store_clipped writes nothing) are the kernel-side ragged-edge idiom.
+    "load": 4, "load_or": 5, "store": 3, "store_clipped": 3,
 }
 
 
@@ -244,6 +248,16 @@ class _TileShapeChecker:
             if shape is None:
                 return None
             return _TileInfo(shape[0], shape[1], None)
+        if op == "load":
+            shape = self._ctor_shape(node, op, args[2], args[3])
+            if shape is None:
+                return None
+            return _TileInfo(shape[0], shape[1], None)
+        if op == "load_or":
+            shape = self._ctor_shape(node, op, args[2], args[3])
+            if shape is None:
+                return None
+            return _TileInfo(shape[0], shape[1], _lit_fkind(args[4]))
         if op in ("add", "mul"):
             a, b = infos[0], infos[1]
             if a is not None and b is not None:

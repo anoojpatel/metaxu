@@ -266,6 +266,16 @@ int64_t  mx_tile_get(const mx_tile *t, int64_t i, int64_t j);
 int64_t  mx_tile_rows(const mx_tile *t);
 int64_t  mx_tile_cols(const mx_tile *t);
 char    *mx_tile_to_str(const mx_tile *t, int64_t is_f64);
+/* Buffer <-> tile boundary (Stage 1): strict load/store raise on any
+ * out-of-range element; masked load_or reads `other` and store_clipped
+ * writes nothing for out-of-range elements.  Stores take the
+ * contended-write guard like every Vec mutator. */
+mx_tile *mx_tile_load(const mx_vec *v, int64_t off, int64_t rows,
+                      int64_t cols);
+mx_tile *mx_tile_load_or(const mx_vec *v, int64_t off, int64_t rows,
+                         int64_t cols, int64_t other);
+void     mx_tile_store(mx_vec *v, int64_t off, const mx_tile *t);
+void     mx_tile_store_clipped(mx_vec *v, int64_t off, const mx_tile *t);
 unsigned char *mx_fvec_as_bytes(const mx_fvec *v);
 
 /* --- Strings ------------------------------------------------------------ */
