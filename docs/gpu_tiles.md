@@ -127,6 +127,10 @@ per-lane register budget, swizzle bank-conflict freedom.
   annotations, the autotuner (the benchmark harness's paired-run
   methodology as a per-kernel search with a shape-keyed cache),
   TritonGPU-text emitter for NVIDIA/AMD.
+- **Stage 4 — distribution (multi-GPU / multi-node):** collectives as
+  sharding coercions + `Dist.*` effects + backend handlers (loopback →
+  MLX distributed → NCCL).  See "Stage 4: distribution" below — mostly
+  LIBRARY code on top of the language, with two compiler carve-outs.
 
 ## Stage 0 design (implementation notes)
 
@@ -164,6 +168,122 @@ per-lane register budget, swizzle bank-conflict freedom.
   leak by design, like fvec — documented, ASan-scoped accordingly.
 - **Differential gate:** every tile op tested through parsed source on
   both engines, byte-identical output, per the house conventions.
+
+## Stage 4: distribution (collectives, NCCL, and friends)
+
+Design of record for multi-GPU / multi-node, written down early because
+two decisions must be locked before Stage 1 so nothing needs redesign
+later.  Nothing in Stages 0-2 blocks on any of this.
+
+### The fourth regime
+
+Distribution extends the concurrency table with one more row, same
+shape as the others — a static map saying who owns which elements, plus
+explicit costed operations for redistributing:
+
+| boundary | disjointness proof | communication primitive |
+| --- | --- | --- |
+| lanes in a simdgroup | layout (static partition) | register shuffle |
+| threads in a threadgroup | barrier phasing | threadgroup memory |
+| host ↔ device | separateness at `Gpu.launch` | buffer transfer |
+| rank ↔ rank | sharding (static partition over a device mesh) | collectives |
+
+A layout maps tile coordinates to lanes; a **sharding maps global
+tensor coordinates to ranks over a mesh**.  Same algebra, bigger
+machines.
+
+### Collectives are sharding coercions (the GSPMD insight)
+
+There is no "all-reduce API" as a primitive concept.  A distributed
+tensor type `DTensor[T, M, N, mesh, spec]` says, per dimension: sharded
+over a mesh axis, replicated, or PARTIAL (each rank holds an unreduced
+addend — the state right after a local matmul of sharded operands).
+Every collective is then a typed conversion between specs:
+
+- partial → replicated = **all-reduce**
+- sharded → replicated = **all-gather**
+- partial → sharded = **reduce-scatter**
+- sharded on axis i → sharded on axis j = **all-to-all**
+
+`Dist.convert(t, new_spec)` is the whole blessed surface: before/after
+types are static (shape divisibility by mesh extents checked at
+compile time by the same const-shape machinery as tile shapes), the
+communication cost is visible in the program as a conversion, and the
+provenance diagnostics explain every one ("this all-gather exists
+because the matmul at line 30 needs B replicated along mesh axis x").
+Rank-explicit `send`/`recv` exist underneath as expert effect ops; the
+conversion surface is primary because it is the level where
+deadlock-freedom is checkable.
+
+### Effects are the mechanism, handlers are the backends
+
+`Dist.*` is an effect, which buys four things:
+
+1. **NCCL is a handler, not a language feature.**  The same program
+   runs under a handler lowering to `ncclAllReduce` on CUDA streams,
+   one calling MLX's `mx.distributed` (all-sum over MPI or the ring
+   backend — the Apple-first path, real today for Mac clusters over
+   Thunderbolt), an MPI handler, or the **loopback handler** simulating
+   N ranks as threads in one process — the deterministic single-machine
+   reference every backend is differentially tested against, no
+   cluster required.
+2. **Communicator lifecycle is capability-shaped**: the handle lives in
+   the handler's scope (`handle Dist with nccl(comm) in { ... }`); no
+   collective outside an installed handler, no global communicator
+   state, structural init/teardown ordering.
+3. **Async overlap and bucketing are handler policy**: a handler may
+   coalesce pending performs into one fused collective (DDP-style
+   gradient bucketing) and assign streams — without the user program
+   changing.  A nicer factoring than callback hooks.
+4. **Effect rows make communication visible in signatures**: a function
+   performing `Dist.*` says so in its type.
+
+### Safety analyses (the compiler carve-outs)
+
+Two checks are compiler work, in the style of the existing bounded
+checkers (inferred property + provenance, zero false positives):
+
+- **Deadlock via uniformity**: the classic NCCL hang is rank-divergent
+  control flow around a collective.  `Dist.rank()` is non-uniform; a
+  collective inside a branch whose condition is transitively
+  rank-dependent is flagged — the Rule-B/separateness pattern's next
+  instance, and a check raw NCCL users get only from discipline.
+- **In-flight buffer safety**: a buffer handed to an async conversion
+  is marked until its completion event; writes before that are the
+  raise — the contention-as-permission design's fourth appearance.
+
+### Locked now (so Stage 1+ stays compatible)
+
+1. **The mesh rides the same const-generic machinery as tile shapes.**
+2. **One distribution algebra**: sharding specs use the same
+   blocked-distribution vocabulary as layouts, so "distribution over
+   hardware" exists ONCE, instantiated at lane, threadgroup and mesh
+   scale.
+
+### Language-level vs compiler-level (the split, stated)
+
+Distribution is mostly a LIBRARY built on top of the language — which
+is the house philosophy (std-powered, like `Protected`): the `Dist`
+effect and its ops are an ordinary effect declaration; `DTensor` is
+std code wrapping tiles + a spec; every backend (loopback, MLX
+distributed, MPI, NCCL) is a handler plus runtime shims; bucketing/
+overlap policy is handler code.  The compiler owns exactly: (a) the
+two safety analyses above, (b) the const-generic/mesh machinery it
+already owns for tiles, and (c) — only if/when we add GSPMD-style
+AUTO-sharding, where the compiler chooses specs and inserts
+conversions itself — the propagation pass.  v1 keeps conversions
+explicit precisely so that stays optional.
+
+### Honesty about determinism
+
+Real all-reduce is not bit-deterministic across backends (NCCL's
+ring/tree orders float additions by topology).  The loopback reference
+pins a deterministic order (exact, testable semantics); integer
+collectives are exact everywhere; float differentials against real
+backends get DOCUMENTED TOLERANCES instead of byte-equality.  This is
+the first place the byte-identical discipline meets a genuinely
+nondeterministic substrate, and the contract is stated up front rather
+than discovered.
 
 ## What we are NOT doing (and why)
 
