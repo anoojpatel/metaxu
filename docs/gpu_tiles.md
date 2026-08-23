@@ -112,14 +112,36 @@ per-lane register budget, swizzle bank-conflict freedom.
   tested. Element types start at `float`(f64)/`int` — the tile
   machinery is width-agnostic and f32/f16 land as their own increment
   (Stage 1 needs them; the CPU reference does not).
-- **Stage 1 — the kernel seam:** `kernel fn` (gpu effect class),
-  `Gpu.launch` effect + handlers (CPU tile-interpreter handler first),
-  memory-space locality states, masked load/store (kernels cannot
-  raise; masked IO is the honest analog of loud bounds checks — the
-  semantics "masked-out lane reads `other`, writes nothing" is pinned
-  in the interpreter first), f32/f16 scalars, then naive-but-correct
-  MSL emission bound via `mx.fast.metal_kernel`, differential vs the
-  tile interpreter.
+- **Stage 1 — the kernel seam (1a/1b/1c landed):**
+  * **1a (landed):** the buffer <-> tile boundary — strict
+    `Tile.load`/`Tile.store` (catchable range raises) plus the masked
+    kernel-side forms `Tile.load_or` (out-of-range reads `other`) and
+    `Tile.store_clipped` (out-of-range writes nothing), semantics
+    pinned in the interpreter first; stores take the contended-write
+    guard like every Vec mutator (differential pins the raise).
+  * **1b (landed):** `std/gpu.mx` — `effect Gpu { launch(n, f) =
+    run_grid(n, f) }`, the launch as PURE LIBRARY: default = the
+    reference semantics (sequential, pid-ordered CPU grid), handlers =
+    backends/virtualization.  Zero compiler changes were needed; tiled
+    matmul / vecadd / ragged-grid kernels are differentially tested on
+    both engines, pid order and handler interposition pinned.
+  * **1c (landed):** the first MSL emitter (`emit_msl.py`) for the
+    documented kernel subset (masked forms only, INT tiles only until
+    f32, literal shapes, full CFG via a switch-machine since MSL has no
+    goto).  The emitted body is deliberately C++-compatible, so the
+    container tests compile it with clang++ and race it against the
+    interpreter END TO END; `scripts/emit_metal_harness.py` generates a
+    self-checking Mac harness (`mx.fast.metal_kernel` binding,
+    written-mask merge for clipped stores, interpreter-computed
+    expected values baked in, exit 0 on match).  Execution contract:
+    snapshot reads + mask-merged writes — cross-instance
+    read-after-write within one launch is outside the contract (racy
+    on real GPUs; the sequential reference would hide it).
+  * **Still open in Stage 1:** f32/f16 scalars (prerequisite for float
+    kernels on Metal — no f64 there), the `gpu` effect class (becomes
+    load-bearing when the MLX handler dispatches real launches), and
+    memory-space locality states (vacuous until threadgroup memory
+    arrives in Stage 2).
 - **Stage 2 — fast:** inferred layouts + `convert_layout`,
   `simdgroup_matrix` dot, threadgroup-memory tiling, software
   pipelining where it pays on Apple.
