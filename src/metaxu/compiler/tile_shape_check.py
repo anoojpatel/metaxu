@@ -49,6 +49,9 @@ TILE_ARITY = {
     # out-of-range element; the masked forms (load_or reads `other`,
     # store_clipped writes nothing) are the kernel-side ragged-edge idiom.
     "load": 4, "load_or": 5, "store": 3, "store_clipped": 3,
+    # 2D (row-strided) masked forms: element (i, j) maps to
+    # off + i*stride + j — the tile-of-a-matrix idiom.
+    "load_rows": 6, "store_rows": 4,
 }
 
 
@@ -258,6 +261,11 @@ class _TileShapeChecker:
             if shape is None:
                 return None
             return _TileInfo(shape[0], shape[1], _lit_fkind(args[4]))
+        if op == "load_rows":
+            shape = self._ctor_shape(node, op, args[3], args[4])
+            if shape is None:
+                return None
+            return _TileInfo(shape[0], shape[1], _lit_fkind(args[5]))
         if op in ("add", "mul"):
             a, b = infos[0], infos[1]
             if a is not None and b is not None:

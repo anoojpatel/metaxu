@@ -929,6 +929,41 @@ void mx_tile_store_clipped(mx_vec *v, int64_t off, const mx_tile *t) {
     }
 }
 
+/* 2D (row-strided) masked forms: element (i, j) maps to
+ * off + i*stride + j — the tile-of-a-matrix idiom.  Same masked
+ * semantics as load_or / store_clipped, per element. */
+
+mx_tile *mx_tile_load_rows(const mx_vec *v, int64_t off, int64_t stride,
+                           int64_t rows, int64_t cols, int64_t other) {
+    if (v == NULL) {
+        mx_rt_fail("Tile.load_rows: expected a Vec, got NULL");
+    }
+    mx_tile *t = mx_tile_new(rows, cols);
+    for (int64_t i = 0; i < rows; i++) {
+        for (int64_t j = 0; j < cols; j++) {
+            int64_t k = off + i * stride + j;
+            t->elems[i * cols + j] =
+                (k >= 0 && k < v->len) ? v->data[k] : other;
+        }
+    }
+    return t;
+}
+
+void mx_tile_store_rows(mx_vec *v, int64_t off, int64_t stride,
+                        const mx_tile *t) {
+    mx_vec_check(v, "Tile.store_rows");
+    mx_tile_check(t, "Tile.store_rows");
+    mx__vec_write_check(v);  /* contended-write guard, canonical order */
+    for (int64_t i = 0; i < t->rows; i++) {
+        for (int64_t j = 0; j < t->cols; j++) {
+            int64_t k = off + i * stride + j;
+            if (k >= 0 && k < v->len) {
+                v->data[k] = t->elems[i * t->cols + j];
+            }
+        }
+    }
+}
+
 /* repr(MxTile): "tile[RxC](e, e, ...; e, ...)" — rows joined by "; ",
  * byte-identical to the interpreter's MxTile.__repr__. */
 char *mx_tile_to_str(const mx_tile *t, int64_t is_f64) {
