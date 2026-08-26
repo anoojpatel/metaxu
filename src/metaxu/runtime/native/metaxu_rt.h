@@ -276,6 +276,11 @@ mx_tile *mx_tile_load_or(const mx_vec *v, int64_t off, int64_t rows,
                          int64_t cols, int64_t other);
 void     mx_tile_store(mx_vec *v, int64_t off, const mx_tile *t);
 void     mx_tile_store_clipped(mx_vec *v, int64_t off, const mx_tile *t);
+/* 2D row-strided masked forms: element (i,j) <-> off + i*stride + j. */
+mx_tile *mx_tile_load_rows(const mx_vec *v, int64_t off, int64_t stride,
+                           int64_t rows, int64_t cols, int64_t other);
+void     mx_tile_store_rows(mx_vec *v, int64_t off, int64_t stride,
+                            const mx_tile *t);
 unsigned char *mx_fvec_as_bytes(const mx_fvec *v);
 
 /* --- Strings ------------------------------------------------------------ */

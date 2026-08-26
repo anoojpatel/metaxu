@@ -1698,6 +1698,7 @@ class MirInterpreter:
         self._builtins["Tile.cols"] = _tile_cols
         self._builtins["Tile.load"] = _tile_load
         self._builtins["Tile.load_or"] = _tile_load_or
+        self._builtins["Tile.load_rows"] = _tile_load_rows
         # --- Runtime library: Vec (growable, mutable; see MxVec) ------------
         self._builtins["Vec.new"] = lambda: MxVec()
         # `[a, b, c]` / `[]` (HIR lowers ListLiteral to this): a fresh Vec,
@@ -1745,8 +1746,13 @@ class MirInterpreter:
             _contended_write_check(v)
             return _tile_store_clipped_unchecked(v, off, t)
 
+        def _checked_tile_store_rows(v, off, stride, t):
+            _contended_write_check(v)
+            return _tile_store_rows_unchecked(v, off, stride, t)
+
         self._builtins["Tile.store"] = _checked_tile_store
         self._builtins["Tile.store_clipped"] = _checked_tile_store_clipped
+        self._builtins["Tile.store_rows"] = _checked_tile_store_rows
         # --- Runtime library: math methods on numbers -----------------------
         self._builtins["sqrt"] = _make_math_method("sqrt", math.sqrt)
         self._builtins["sin"] = _make_math_method("sin", math.sin)
@@ -2624,6 +2630,53 @@ def _tile_load_or(v: Any, off: Any, r: Any, c: Any, other: Any) -> MxTile:
         else:
             out.append(other)  # masked-out element reads `other`
     return MxTile(r, c, tuple(out), fk)
+
+
+def _tile_load_rows(v: Any, off: Any, stride: Any, r: Any, c: Any,
+                    other: Any) -> MxTile:
+    """Masked STRIDED load: element (i, j) reads v[off + i*stride + j],
+    out-of-range elements read `other`.  This is the 2D form — a tile of
+    a row-major matrix has row stride = the matrix width; the flat
+    `Tile.load_or` is the stride == cols special case (a fact the
+    benchmark that motivated this op got wrong first: flat loads on a
+    matrix silently read the wrong elements, identically on both
+    engines, so only a ground-truth check caught it)."""
+    r, c = _tile_shape("Tile.load_rows", r, c)
+    v = _tile_vec("Tile.load_rows", v)
+    off = _tile_off("Tile.load_rows", off)
+    stride = _tile_off("Tile.load_rows", stride)
+    fk = _tile_elem_fkind("Tile.load_rows", other)
+    out = []
+    for i in range(r):
+        for j in range(c):
+            k = off + i * stride + j
+            if 0 <= k < len(v.items):
+                x = v.items[k]
+                if _tile_elem_fkind("Tile.load_rows", x) != fk:
+                    raise InterpError(
+                        "Tile.load_rows: Vec element kind differs from "
+                        f"`other` ({_kname(_tile_elem_fkind('Tile.load_rows', x))} "
+                        f"vs {_kname(fk)})")
+                out.append(x)
+            else:
+                out.append(other)
+    return MxTile(r, c, tuple(out), fk)
+
+
+def _tile_store_rows_unchecked(v: Any, off: Any, stride: Any,
+                               t: Any) -> Any:
+    """Masked STRIDED store: element (i, j) writes v[off + i*stride + j];
+    out-of-range elements write nothing (store_clipped's 2D form)."""
+    t = _tile_arg("Tile.store_rows", t)
+    v = _tile_vec("Tile.store_rows", v)
+    off = _tile_off("Tile.store_rows", off)
+    stride = _tile_off("Tile.store_rows", stride)
+    for i in range(t.rows):
+        for j in range(t.cols):
+            k = off + i * stride + j
+            if 0 <= k < len(v.items):
+                v.items[k] = t.elements[i * t.cols + j]
+    return UNIT
 
 
 def _tile_store_unchecked(v: Any, off: Any, t: Any) -> Any:

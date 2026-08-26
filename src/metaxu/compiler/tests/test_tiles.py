@@ -444,12 +444,12 @@ fn mm_kernel(pid: int, a: Vec, b: Vec, c: Vec) -> () {
     let mut k = 0;
     let mut r = Tile.filled(2, 2, 0);
     while k < 2 {
-        let ta = Tile.load(a, (ti * 2) * 4 + k * 2, 2, 2);
-        let tb = Tile.load(b, (k * 2) * 4 + tj * 2, 2, 2);
+        let ta = Tile.load_rows(a, (ti * 2) * 4 + k * 2, 4, 2, 2, 0);
+        let tb = Tile.load_rows(b, (k * 2) * 4 + tj * 2, 4, 2, 2, 0);
         r = Tile.add(r, Tile.dot(ta, tb));
         k = k + 1
     };
-    Tile.store(c, (ti * 2) * 4 + tj * 2, r);
+    Tile.store_rows(c, (ti * 2) * 4 + tj * 2, 4, r);
     ()
 }
 
@@ -498,11 +498,63 @@ def test_interp_vecadd_kernel():
 
 
 def test_interp_matmul_kernel():
-    # A = row-major iota(4x4); B = indicator of multiples of 5 (a scattered
-    # 0/1 matrix), so the product is hand-checkable and int-exact.
+    # TRUE 2D tiled matmul via the row-strided forms.  A = row-major
+    # iota(4x4); B = indicator of multiples of 5, which in a 4x4 row-major
+    # layout is exactly the IDENTITY (positions 0, 5, 10, 15) — so A · B
+    # must equal A, checkable at sight.  History: the first version of
+    # this test used the FLAT load/store forms and pinned a value that was
+    # not a matrix product at all — both engines agreed (differentials
+    # cannot catch a shared wrong idiom), and only an independent
+    # ground-truth check exposed it.  test_interp_matmul_ground_truth
+    # below keeps that check permanent.
     _res, out = interp_run(_MATMUL_SRC)
     assert out.splitlines() == [
-        "tile[4x4](3, 0, 2, 1; 4, 3, 0, 0; 19, 0, 10, 9; 12, 11, 0, 0)"]
+        "tile[4x4](0, 1, 2, 3; 4, 5, 6, 7; 8, 9, 10, 11; 12, 13, 14, 15)"]
+
+
+def test_interp_matmul_ground_truth():
+    # 8x8, 2x2 tiles, non-trivial A and B: the expected product is
+    # computed HERE, independently, in Python — never by the thing under
+    # test.  This is the check differentials structurally cannot provide.
+    n, nt = 8, 4
+    src = """
+from std.gpu import Gpu, run_grid;
+
+fn mm_kernel(pid: int, a: Vec, b: Vec, c: Vec) -> () {
+    let ti = pid / 4;
+    let tj = pid % 4;
+    let mut k = 0;
+    let mut r = Tile.filled(2, 2, 0);
+    while k < 4 {
+        let ta = Tile.load_rows(a, (ti * 2) * 8 + k * 2, 8, 2, 2, 0);
+        let tb = Tile.load_rows(b, (k * 2) * 8 + tj * 2, 8, 2, 2, 0);
+        r = Tile.add(r, Tile.dot(ta, tb));
+        k = k + 1
+    };
+    Tile.store_rows(c, (ti * 2) * 8 + tj * 2, 8, r);
+    ()
+}
+
+fn main() -> int {
+    let n = 8;
+    let @mut a = Vec.new();
+    let @mut b = Vec.new();
+    let @mut c = Vec.new();
+    let mut i = 0;
+    while i < n * n { a.push(i % 7); b.push((i * 3) % 11); c.push(0); i = i + 1 };
+    perform Gpu.launch(16, fn(pid: int) -> mm_kernel(pid, a, b, c));
+    let mut j = 0;
+    while j < n * n { print(c[j]); j = j + 1 };
+    0
+}
+"""
+    _res, out = interp_run(src)
+    got = [int(x) for x in out.split()]
+    A = [[(r * n + cc) % 7 for cc in range(n)] for r in range(n)]
+    B = [[((r * n + cc) * 3) % 11 for cc in range(n)] for r in range(n)]
+    truth = [sum(A[r][k] * B[k][cc] for k in range(n))
+             for r in range(n) for cc in range(n)]
+    assert got == truth
 
 
 def test_interp_ragged_grid_uses_masked_forms():

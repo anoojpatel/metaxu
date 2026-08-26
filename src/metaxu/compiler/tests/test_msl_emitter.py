@@ -95,6 +95,9 @@ def _differential(kernel_src: str, kernel: str, grid: int,
     assert shim == expect, (shim, expect)
 
 
+# TRUE 2D tiled matmul (row-strided forms — the flat forms silently read
+# the wrong elements for 2D tiles, a bug both engines shared until a
+# ground-truth check caught it; see test_tiles.py's matmul history note).
 _MM = """
 fn mm_kernel(pid: int, a: Vec, b: Vec, c: Vec) -> () {
     let ti = pid / 2;
@@ -102,12 +105,12 @@ fn mm_kernel(pid: int, a: Vec, b: Vec, c: Vec) -> () {
     let mut k = 0;
     let mut r = Tile.filled(2, 2, 0);
     while k < 2 {
-        let ta = Tile.load_or(a, (ti * 2) * 4 + k * 2, 2, 2, 0);
+        let ta = Tile.load_rows(a, (ti * 2) * 4 + k * 2, 4, 2, 2, 0);
         r = Tile.add(r, Tile.dot(ta,
-                Tile.load_or(b, (k * 2) * 4 + tj * 2, 2, 2, 0)));
+                Tile.load_rows(b, (k * 2) * 4 + tj * 2, 4, 2, 2, 0)));
         k = k + 1
     };
-    Tile.store_clipped(c, (ti * 2) * 4 + tj * 2, r);
+    Tile.store_rows(c, (ti * 2) * 4 + tj * 2, 4, r);
     ()
 }
 """
@@ -142,11 +145,17 @@ fn tr_kernel(pid: int, a: Vec, out: Vec) -> () {
 
 @needs_clangxx
 def test_matmul_kernel_shim_matches_interp():
-    _differential(_MM, "mm_kernel", 4, {
+    # B is the 4x4 identity (i % 5 == 0 hits 0, 5, 10, 15), so the shim
+    # must reproduce C == A — a ground-truth pin, not just a differential.
+    bufs = {
         "a": list(range(16)),
         "b": [1 if i % 5 == 0 else 0 for i in range(16)],
         "c": [0] * 16,
-    })
+    }
+    _differential(_MM, "mm_kernel", 4, bufs)
+    src = _driver(_MM, "mm_kernel", 4, bufs)
+    k = emit_msl_kernel(src, "mm_kernel")
+    assert _run_shim(k, 4, bufs) == list(range(16))  # C == A
 
 
 @needs_clangxx

@@ -1001,7 +1001,8 @@ _NATIVE_RT_CALLS = {"Vec.new", "push", "pop", "len", "to_string",
                     "Tile.from_vec", "Tile.to_vec", "Tile.add", "Tile.mul",
                     "Tile.scale", "Tile.dot", "Tile.sum", "Tile.transpose",
                     "Tile.get", "Tile.rows", "Tile.cols", "Tile.load",
-                    "Tile.load_or", "Tile.store", "Tile.store_clipped"}
+                    "Tile.load_or", "Tile.store", "Tile.store_clipped",
+                    "Tile.load_rows", "Tile.store_rows"}
 
 # Extern C symbols the interpreter shims over its simulated heap
 # (mir_interp._ffi_*): natively these are DIRECT calls to the real libc
@@ -1161,6 +1162,9 @@ _RT_SIGS = {
     "mx_tile_load_or": ("ptr", ("ptr", "i64", "i64", "i64", "i64")),
     "mx_tile_store": ("void", ("ptr", "i64", "ptr")),
     "mx_tile_store_clipped": ("void", ("ptr", "i64", "ptr")),
+    "mx_tile_load_rows": ("ptr", ("ptr", "i64", "i64", "i64", "i64",
+                                  "i64")),
+    "mx_tile_store_rows": ("void", ("ptr", "i64", "i64", "ptr")),
     # Delimited failure recovery (try/catch, metaxu_effects.c).
     "mx_try": ("i64", ("ptr", "ptr", "ptr", "ptr")),
 }
@@ -3915,6 +3919,25 @@ def _infer_kinds(info: _Info, sigs: Dict[str, _Sig], structs: _StructTable,
                 elem, _r, _c = _tile_parts(get(args[2]))
                 ch = mark(args[0], _vec_of(elem)) or ch
             # dst is unit -> stays i64
+        elif op == "load_rows" and len(args) == 6:
+            ch = mark(args[0], _vec_of(I64)) or ch
+            shape = ctor_shape(args[3], args[4])
+            if shape is not None:
+                vk = (_vec_elem(get(args[0])) if _is_vec(get(args[0]))
+                      else I64)
+                e = _join(get(args[5]), vk)
+                if e == F64:
+                    ch = mark(dst, _tile_of(F64, *shape)) or ch
+                    ch = mark(args[5], F64) or ch
+                    ch = mark(args[0], _vec_of(F64)) or ch
+                elif e == I64 and assume_final:
+                    ch = mark(dst, _tile_of(I64, *shape)) or ch
+        elif op == "store_rows" and len(args) == 4:
+            ch = mark(args[0], _vec_of(I64)) or ch
+            if _is_tile(get(args[3])):
+                elem, _r, _c = _tile_parts(get(args[3]))
+                ch = mark(args[0], _vec_of(elem)) or ch
+            # dst is unit -> stays i64
         # rows/cols: i64 dst and i64-bottom receiver need no marks here;
         # the consistency check requires the receiver to be a tile.
         return ch
@@ -4877,7 +4900,7 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                              f"(expects {want})")
                 return
             if top in ("zeros", "filled", "arange", "from_vec", "load",
-                       "load_or"):
+                       "load_or", "load_rows"):
                 if not _is_tile(ty(dst)):
                     probs.append(
                         f"{name} result {dst!r} has kind {ty(dst)}: the "
@@ -4889,22 +4912,24 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                 if elem not in (I64, F64):
                     probs.append(f"{name} of {elem} elements "
                                  "(tiles hold int or float)")
-                elif top in ("from_vec", "load", "load_or"):
+                elif top in ("from_vec", "load", "load_or", "load_rows"):
                     vk = ty(args[0])
+                    fill = {"load_or": 4, "load_rows": 5}.get(top)
                     if not _is_vec(vk):
                         probs.append(f"{name} source {args[0]!r} has kind "
                                      f"{vk}, not a Vec")
                     elif _vec_elem(vk) != elem:
                         probs.append(f"{name} of a Vec of {_vec_elem(vk)} "
                                      f"into a tile of {elem}")
-                    elif top == "load_or" and ty(args[4]) != elem:
-                        probs.append(f"{name} fill value {args[4]!r} is "
-                                     f"{ty(args[4])}, elements are {elem}")
+                    elif fill is not None and ty(args[fill]) != elem:
+                        probs.append(f"{name} fill value {args[fill]!r} is "
+                                     f"{ty(args[fill])}, elements are "
+                                     f"{elem}")
                 elif top == "filled" and ty(args[2]) != elem:
                     probs.append(f"{name} fill value {args[2]!r} is "
                                  f"{ty(args[2])}, elements are {elem}")
-            elif top in ("store", "store_clipped"):
-                tk = ty(args[2])
+            elif top in ("store", "store_clipped", "store_rows"):
+                tk = ty(args[3 if top == "store_rows" else 2])
                 if not _is_tile(tk):
                     probs.append(f"{name} value {args[2]!r} has kind {tk}, "
                                  "not a Tile (its shape must be statically "
@@ -8249,6 +8274,33 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                     "  ; Vec write: contended-write guard applies"
                     + ("" if top == "store"
                        else "; masked: out-of-range writes nothing"))
+                setval(dst, "0", lines)  # unit
+            elif top == "load_rows":
+                src = use(opargs[0], lines)
+                off = use(opargs[1], lines)
+                stride = use(opargs[2], lines)
+                r = use(opargs[3], lines)
+                c = use(opargs[4], lines)
+                w = to_word(_tile_parts(kind(dst))[0],
+                            use(opargs[5], lines), lines)
+                mod.runtime_syms.add("mx_tile_load_rows")
+                v = fresh()
+                lines.append(
+                    f"  {v} = call ptr @mx_tile_load_rows(ptr {src}, "
+                    f"i64 {off}, i64 {stride}, i64 {r}, i64 {c}, i64 {w})"
+                    "  ; strided masked load (2D tile of a matrix)")
+                setval(dst, v, lines)
+            elif top == "store_rows":
+                tgt = use(opargs[0], lines)
+                off = use(opargs[1], lines)
+                stride = use(opargs[2], lines)
+                t = use(opargs[3], lines)
+                mod.runtime_syms.add("mx_tile_store_rows")
+                lines.append(
+                    f"  call void @mx_tile_store_rows(ptr {tgt}, "
+                    f"i64 {off}, i64 {stride}, ptr {t})"
+                    "  ; strided masked store; contended-write guard "
+                    "applies")
                 setval(dst, "0", lines)  # unit
             else:  # rows / cols
                 a = use(opargs[0], lines)

@@ -47,8 +47,9 @@ _INT_BINOPS = {"+": "+", "-": "-", "*": "*", "/": "/", "%": "%",
                "==": "==", "!=": "!=", "<": "<", "<=": "<=",
                ">": ">", ">=": ">="}
 
-_TILE_OPS = {"filled", "arange", "load_or", "store_clipped", "add", "mul",
-             "scale", "dot", "sum", "transpose", "rows", "cols"}
+_TILE_OPS = {"filled", "arange", "load_or", "store_clipped", "load_rows",
+             "store_rows", "add", "mul", "scale", "dot", "sum",
+             "transpose", "rows", "cols"}
 
 
 class MslError(Exception):
@@ -356,9 +357,19 @@ def _emit(f: MirFunc) -> MslKernel:
                     buf_index(args[0], "Tile.load_or")
                     declare(dst, (cint(args[2], "Tile.load_or rows"),
                                   cint(args[3], "Tile.load_or cols")))
+                elif top == "load_rows":
+                    buf_index(args[0], "Tile.load_rows")
+                    declare(dst, (cint(args[3], "Tile.load_rows rows"),
+                                  cint(args[4], "Tile.load_rows cols")))
                 elif top == "store_clipped":
                     bi = buf_index(args[0], "Tile.store_clipped")
                     shape_of(args[2], "Tile.store_clipped")
+                    if bufs[bi] not in written:
+                        written.append(bufs[bi])
+                    declare(dst, None)  # unit
+                elif top == "store_rows":
+                    bi = buf_index(args[0], "Tile.store_rows")
+                    shape_of(args[3], "Tile.store_rows")
                     if bufs[bi] not in written:
                         written.append(bufs[bi])
                     declare(dst, None)  # unit
@@ -462,6 +473,32 @@ def _emit(f: MirFunc) -> MslKernel:
                     L.append(f"  long __j = {args[1]} + __i;")
                     L.append(f"  if (__j >= 0 && __j < lens[{bi}]) {{")
                     L.append(f"    {bn}_out[__j] = {args[2]}[__i];")
+                    L.append(f"    {bn}_wm[__j] = 1;")
+                    L.append("  }")
+                    L.append("}")
+                    L.append(f"{dst} = 0;")
+                elif top == "load_rows":
+                    r, c = shapes[dst]
+                    bi = bufs.index(args[0])
+                    L.append(f"for (int __r = 0; __r < {r}; __r++) "
+                             f"for (int __c = 0; __c < {c}; __c++) {{")
+                    L.append(f"  long __j = {args[1]} + __r * {args[2]} "
+                             f"+ __c;")
+                    L.append(f"  {dst}[__r * {c} + __c] = (__j >= 0 && "
+                             f"__j < lens[{bi}]) ? {args[0]}_in[__j] : "
+                             f"{args[5]};")
+                    L.append("}")
+                elif top == "store_rows":
+                    r, c = shapes[args[3]]
+                    bi = bufs.index(args[0])
+                    bn = args[0]
+                    L.append(f"for (int __r = 0; __r < {r}; __r++) "
+                             f"for (int __c = 0; __c < {c}; __c++) {{")
+                    L.append(f"  long __j = {args[1]} + __r * {args[2]} "
+                             f"+ __c;")
+                    L.append(f"  if (__j >= 0 && __j < lens[{bi}]) {{")
+                    L.append(f"    {bn}_out[__j] = {args[3]}[__r * {c} "
+                             f"+ __c];")
                     L.append(f"    {bn}_wm[__j] = 1;")
                     L.append("  }")
                     L.append("}")
