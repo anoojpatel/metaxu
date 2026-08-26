@@ -17,6 +17,14 @@ Pairs (ratio = metaxu/C, ~1.00 is parity):
     enum      construct+match a 3-case enum in a loop
     string    int -> string -> len           (allocation semantics)
     struct    by-value struct rebuild in a loop
+    tilemm    8x8-tiled 128^3 int matmul through Gpu.launch (Stage 1
+              kernel seam) vs plain C loops — the CPU tile-op cost:
+              every op is an opaque runtime call ALLOCATING a fresh
+              block (functional semantics).  Measured ~4x C at
+              landing; the payoff layer is Metal + Stage 2 layouts, and
+              the known CPU wins (op fusion, arena/reuse allocation,
+              the Vec-fast-path treatment for tile ops) are recorded in
+              docs/gpu_tiles.md rather than chased early.
 
 History: the first run of these diagnostics (2026-08, pre-inlining) put
 vecread at 2.57x, vecwrite at 2.86x and vecpush at 1.68x — every Vec
@@ -70,7 +78,7 @@ CFLAGS = ["-std=c11", "-O2", "-g", "-fPIC", "-Wall", "-Wextra",
           "-pthread", ALIGN]
 
 PAIRS = ["vecread", "vecwrite", "vecpush", "modloop", "closure", "enum",
-         "string", "struct"]
+         "string", "struct", "tilemm"]
 
 
 def build_runtime(out: Path) -> list[str]:

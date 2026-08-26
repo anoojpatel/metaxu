@@ -137,6 +137,19 @@ per-lane register budget, swizzle bank-conflict freedom.
     snapshot reads + mask-merged writes — cross-instance
     read-after-write within one launch is outside the contract (racy
     on real GPUs; the sequential reference would hide it).
+  * **Measured CPU cost of the tile abstraction (2026-08-26):** the
+    tilemm diagnostic (8x8-tiled 128^3 int matmul through `Gpu.launch`)
+    runs ~4x plain C loops natively, vs ~1.3x for the scalar-loop
+    metaxu version.  Expected and accepted for now: every tile op is an
+    opaque runtime call that ALLOCATES a fresh block (functional
+    semantics), and the launch adds a per-instance closure call.  The
+    known CPU wins — op fusion, arena/reuse allocation for provably
+    non-escaping tiles, the Vec-fast-path inline treatment for tile
+    ops — are deliberately deferred: the tile abstraction's performance
+    layer is Metal + Stage 2 layouts, and optimizing the CPU path first
+    would optimize the reference instead of the product.  The number is
+    tracked in benchmarks/diagnostics (tilemm row) so it cannot rot
+    silently.
   * **Still open in Stage 1:** f32/f16 scalars (prerequisite for float
     kernels on Metal — no f64 there), the `gpu` effect class (becomes
     load-bearing when the MLX handler dispatches real launches), and

@@ -1,0 +1,35 @@
+from std.gpu import Gpu, run_grid;
+
+fn mm_kernel(pid: int, a: Vec, b: Vec, c: Vec) -> () {
+    let nt = 16;
+    let n = 128;
+    let ti = pid / nt;
+    let tj = pid % nt;
+    let mut k = 0;
+    let mut r = Tile.filled(8, 8, 0);
+    while k < nt {
+        let ta = Tile.load_rows(a, (ti * 8) * n + k * 8, n, 8, 8, 0);
+        let tb = Tile.load_rows(b, (k * 8) * n + tj * 8, n, 8, 8, 0);
+        r = Tile.add(r, Tile.dot(ta, tb));
+        k = k + 1
+    };
+    Tile.store_rows(c, (ti * 8) * n + tj * 8, n, r);
+    ()
+}
+
+fn main() -> int {
+    let n = 128;
+    let @mut a = Vec.new();
+    let @mut b = Vec.new();
+    let @mut c = Vec.new();
+    let mut i = 0;
+    while i < n * n { a.push(i % 7); b.push(i % 5); c.push(0); i = i + 1 };
+    let mut rep = 0;
+    while rep < 20 {
+        perform Gpu.launch(256, fn(pid: int) -> mm_kernel(pid, a, b, c));
+        rep = rep + 1
+    };
+    print(c[0]);
+    print(c[n * n - 1]);
+    0
+}
