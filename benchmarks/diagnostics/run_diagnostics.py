@@ -21,9 +21,14 @@ Pairs (ratio = metaxu/C, ~1.00 is parity):
               kernel seam) vs plain C loops — the CPU tile-op cost:
               every op is an opaque runtime call ALLOCATING a fresh
               block (functional semantics).  Measured ~4x C at
-              landing; the payoff layer is Metal + Stage 2 layouts, and
-              the known CPU wins (op fusion, arena/reuse allocation,
-              the Vec-fast-path treatment for tile ops) are recorded in
+              landing — and proven INCIDENTAL, not intrinsic: the MSL
+              emitter's lowering of the SAME kernel (tiles as stack
+              arrays, zero allocation, ops inlined) runs at ~0.9-1.0x C
+              through the C++ shim.  The tile MODEL is at C parity; the
+              4x is entirely the reference lowering's allocation-per-op
+              + opaque calls.  The payoff layer is Metal + Stage 2
+              layouts; the known CPU wins (op fusion, arena/reuse
+              allocation, the Vec-fast-path treatment) are recorded in
               docs/gpu_tiles.md rather than chased early.
 
 History: the first run of these diagnostics (2026-08, pre-inlining) put

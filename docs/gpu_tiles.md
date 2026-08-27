@@ -149,7 +149,12 @@ per-lane register budget, swizzle bank-conflict freedom.
     layer is Metal + Stage 2 layouts, and optimizing the CPU path first
     would optimize the reference instead of the product.  The number is
     tracked in benchmarks/diagnostics (tilemm row) so it cannot rot
-    silently.
+    silently.  **The 4x is proven incidental, not intrinsic**: the MSL
+    emitter's lowering of the SAME kernel (tiles as stack arrays, zero
+    allocation, ops inlined — measured through the C++ shim on the same
+    128^3 workload) runs at ~0.9-1.0x C.  The tile model costs nothing;
+    only the functional reference lowering does — which also bounds
+    what Stage 2's fused CPU lowering can recover: all of it.
   * **Still open in Stage 1:** f32/f16 scalars (prerequisite for float
     kernels on Metal — no f64 there), the `gpu` effect class (becomes
     load-bearing when the MLX handler dispatches real launches), and
