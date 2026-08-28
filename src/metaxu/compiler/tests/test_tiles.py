@@ -160,9 +160,72 @@ def _expect_reject(src: str, fragment: str) -> None:
      "(int tile, float scalar)"),
     ("fn main() -> int { Tile.sum(Tile.dot(Tile.zeros(2,2))); 0 }",
      "Tile.dot: expects 2 arguments, got 1"),
+    # f32 element kind (Stage 1d): f32 mixes with neither int nor f64.
+    ("fn main() -> int { let f = Tile.to_f32(Tile.zeros(2,2));"
+     " Tile.sum(Tile.add(f, Tile.zeros(2,2))); 0 }",
+     "Tile.add: element kinds differ (f32 vs float)"),
+    ("fn main() -> int { let f = Tile.to_f32(Tile.arange(2,2));"
+     " Tile.sum(Tile.dot(f, Tile.arange(2,2))); 0 }",
+     "Tile.dot: element kinds differ (f32 vs int)"),
+    ("fn main() -> int { let f = Tile.to_f32(Tile.zeros(2,2));"
+     " Tile.sum(Tile.scale(f, 2)); 0 }",
+     "Tile.scale: scalar kind must match tile elements (f32 tile, "
+     "int scalar; f32 tiles scale by float scalars)"),
 ])
 def test_static_shape_misuse_is_a_compile_error(src, fragment):
     _expect_reject(src, fragment)
+
+
+# f32 (docs/gpu_tiles.md Stage 1d): elements are the f32-representable
+# double; every op rounds once through float.  The values below are
+# PINNED — they are what real float arithmetic produces (0.1f is
+# 0.10000000149011612, four of them sum to 0.4000000059604645, etc.),
+# and all three engines must reproduce them bit for bit.
+_F32_SRC = """
+fn main() -> int {
+    let a = Tile.filled(2, 2, 0.1);
+    let f = Tile.to_f32(a);
+    print(f);
+    print(Tile.sum(f));
+    print(Tile.add(f, f));
+    print(Tile.dot(f, f));
+    print(Tile.scale(f, 3.0));
+    print(Tile.mul(f, f));
+    print(Tile.get(Tile.transpose(f), 1, 0));
+    print(Tile.to_f64(f));
+    print(Tile.to_f32(Tile.arange(2, 2)));
+    print(Tile.sum(Tile.to_f64(Tile.arange(2, 2))));
+    let v = Tile.to_vec(f);
+    print(v[3]);
+    0
+}
+"""
+
+_F32_OUT = [
+    "tile[2x2](0.10000000149011612, 0.10000000149011612; "
+    "0.10000000149011612, 0.10000000149011612)",
+    "0.4000000059604645",       # f32 accumulation, widened
+    "tile[2x2](0.20000000298023224, 0.20000000298023224; "
+    "0.20000000298023224, 0.20000000298023224)",
+    "tile[2x2](0.020000001415610313, 0.020000001415610313; "
+    "0.020000001415610313, 0.020000001415610313)",
+    "tile[2x2](0.30000001192092896, 0.30000001192092896; "
+    "0.30000001192092896, 0.30000001192092896)",  # factor rounds to f32
+    "tile[2x2](0.010000000707805157, 0.010000000707805157; "
+    "0.010000000707805157, 0.010000000707805157)",
+    "0.10000000149011612",
+    "tile[2x2](0.10000000149011612, 0.10000000149011612; "
+    "0.10000000149011612, 0.10000000149011612)",  # widening is exact
+    "tile[2x2](0.0, 1.0; 2.0, 3.0)",              # int -> f32 is total
+    "6.0",
+    "0.10000000149011612",                        # to_vec widens
+]
+
+
+def test_interp_f32_rounding_semantics_pinned():
+    result, out = interp_run(_F32_SRC)
+    assert result == 0
+    assert out.splitlines() == _F32_OUT
 
 
 def test_branch_rebind_suppresses_static_checking():
@@ -616,4 +679,47 @@ fn main() -> int {
                          ids=["vecadd", "matmul", "ragged"])
 def test_native_kernels_match_interp(src, tmp_path):
     ir = assert_native_matches_interp(src, tmp_path)
+    assert count_placeholders(ir) == 0
+
+
+@needs_clang
+def test_native_f32_semantics_match_interp(tmp_path):
+    # The pinned f32 rounding program, natively: mx_tile_* with ekind
+    # code 2 must reproduce the interpreter's struct-rounded values byte
+    # for byte (including reprs and the widened scalar prints).
+    ir = assert_native_matches_interp(_F32_SRC, tmp_path)
+    assert count_placeholders(ir) == 0
+    assert "mx_tile_to_f32" in ir and "mx_tile_to_f64" in ir
+
+
+_F32_KERNEL_SRC = """
+from std.gpu import Gpu, run_grid;
+
+fn fk(pid: int, a: Vec, out: Vec) -> () {
+    let t = Tile.to_f32(Tile.load_rows(a, pid * 4, 4, 1, 4, 0.0));
+    Tile.store_rows(out, pid * 4, 4, Tile.scale(t, 0.5));
+    ()
+}
+
+fn main() -> int {
+    let @mut a = Vec.new();
+    let @mut out = Vec.new();
+    let mut i = 0;
+    let mut x = 0.1;
+    while i < 8 { a.push(x); out.push(0.0); x = x + 1.0; i = i + 1 };
+    perform Gpu.launch(2, fn(pid: int) -> fk(pid, a, out));
+    let mut j = 0;
+    while j < 8 { print(out[j]); j = j + 1 };
+    0
+}
+"""
+
+
+@needs_clang
+def test_native_f32_kernel_matches_interp(tmp_path):
+    # An f32 kernel through std.gpu's reference launch, natively: the
+    # fused-load idiom (to_f32 of a float-filled strided load) runs
+    # unfused on CPU — load f64s, round, scale with per-op rounding —
+    # and must match the interpreter bit for bit.
+    ir = assert_native_matches_interp(_F32_KERNEL_SRC, tmp_path)
     assert count_placeholders(ir) == 0

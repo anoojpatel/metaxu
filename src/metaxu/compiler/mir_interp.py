@@ -23,6 +23,7 @@ Usage:
 from __future__ import annotations
 
 import math
+import struct as _structmod
 import threading
 from dataclasses import dataclass, field
 from queue import SimpleQueue
@@ -302,13 +303,19 @@ class MxTile:
     and the compile-time shape checker — lives in the compiler).  Every
     op produces a fresh tile: functional semantics until layouts exist
     to make lane-local mutation provably sound (deliberate, documented).
-    Elements are uniformly int or uniformly float (`fkind`); mixing is a
-    loud error, never a coercion.
+    Elements are uniformly one kind (`ekind`: "int", "f64" or "f32");
+    mixing is a loud error, never a coercion.  f32 (docs/gpu_tiles.md
+    Stage 1d) is a TILE element kind only — language scalars stay f64 —
+    stored as the f32-REPRESENTABLE double (widened bits), with every
+    arithmetic op rounding its result to f32.  That representation is
+    what makes f32 bit-exact across all three engines: adding/multiplying
+    two f32-representable values in f64 and rounding once IS the
+    correctly-rounded f32 operation.
     """
     rows: int
     cols: int
     elements: tuple
-    fkind: bool  # True: float elements; False: int elements
+    ekind: str  # "int" | "f64" | "f32"
 
     def __repr__(self) -> str:
         # Pinned print format, shared byte-for-byte with the native
@@ -1698,6 +1705,8 @@ class MirInterpreter:
         self._builtins["Tile.cols"] = _tile_cols
         self._builtins["Tile.load"] = _tile_load
         self._builtins["Tile.load_or"] = _tile_load_or
+        self._builtins["Tile.to_f32"] = _tile_to_f32
+        self._builtins["Tile.to_f64"] = _tile_to_f64
         self._builtins["Tile.load_rows"] = _tile_load_rows
         # --- Runtime library: Vec (growable, mutable; see MxVec) ------------
         self._builtins["Vec.new"] = lambda: MxVec()
@@ -2427,41 +2436,54 @@ def _tile_arg(op: str, t: Any) -> MxTile:
     return t
 
 
-def _tile_elem_fkind(op: str, x: Any) -> bool:
+def _tile_elem_ekind(op: str, x: Any) -> str:
     if isinstance(x, bool) or not isinstance(x, (int, float)):
         raise InterpError(
             f"{op}: tile elements must be int or float, got "
             f"{_runtime_type_name(x)!r}")
-    return isinstance(x, float)
+    return "f64" if isinstance(x, float) else "int"
 
 
-def _kname(fkind: bool) -> str:
-    return "float" if fkind else "int"
+def _kname(ekind: str) -> str:
+    """Element-kind name in diagnostics ("float" is the language's name
+    for f64; "f32" names the device-width tile kind)."""
+    return {"int": "int", "f64": "float", "f32": "f32"}[ekind]
+
+
+def _f32(x: float) -> float:
+    """Round a double to the nearest f32, returned as the widened double
+    (the f32-representable value).  Every f32 tile op rounds through
+    this; _F32_PACK round-trips through IEEE binary32 exactly."""
+    return _structmod.unpack("f", _structmod.pack("f", x))[0]
+
+
+def _tile_zero(ekind: str) -> Any:
+    return 0 if ekind == "int" else 0.0
 
 
 def _tile_same(op: str, a: MxTile, b: MxTile) -> None:
     if (a.rows, a.cols) != (b.rows, b.cols):
         raise InterpError(f"{op}: shape mismatch: {a.rows}x{a.cols} vs "
                           f"{b.rows}x{b.cols}")
-    if a.fkind != b.fkind:
+    if a.ekind != b.ekind:
         raise InterpError(f"{op}: element kinds differ "
-                          f"({_kname(a.fkind)} vs {_kname(b.fkind)})")
+                          f"({_kname(a.ekind)} vs {_kname(b.ekind)})")
 
 
 def _tile_zeros(r: Any, c: Any) -> MxTile:
     r, c = _tile_shape("Tile.zeros", r, c)
-    return MxTile(r, c, (0.0,) * (r * c), True)
+    return MxTile(r, c, (0.0,) * (r * c), "f64")
 
 
 def _tile_filled(r: Any, c: Any, x: Any) -> MxTile:
     r, c = _tile_shape("Tile.filled", r, c)
-    fk = _tile_elem_fkind("Tile.filled", x)
-    return MxTile(r, c, (x,) * (r * c), fk)
+    ek = _tile_elem_ekind("Tile.filled", x)
+    return MxTile(r, c, (x,) * (r * c), ek)
 
 
 def _tile_arange(r: Any, c: Any) -> MxTile:
     r, c = _tile_shape("Tile.arange", r, c)
-    return MxTile(r, c, tuple(range(r * c)), False)
+    return MxTile(r, c, tuple(range(r * c)), "int")
 
 
 def _tile_from_vec(v: Any, r: Any, c: Any) -> MxTile:
@@ -2473,7 +2495,7 @@ def _tile_from_vec(v: Any, r: Any, c: Any) -> MxTile:
         raise InterpError(
             f"Tile.from_vec: Vec length {len(v.items)} does not fill "
             f"{r}x{c} (= {r * c} elements)")
-    fks = {_tile_elem_fkind("Tile.from_vec", x) for x in v.items}
+    fks = {_tile_elem_ekind("Tile.from_vec", x) for x in v.items}
     if len(fks) > 1:
         raise InterpError(
             "Tile.from_vec: mixed int and float elements in the Vec")
@@ -2489,28 +2511,45 @@ def _tile_add(a: Any, b: Any) -> MxTile:
     a = _tile_arg("Tile.add", a)
     b = _tile_arg("Tile.add", b)
     _tile_same("Tile.add", a, b)
-    return MxTile(a.rows, a.cols,
-                  tuple(x + y for x, y in zip(a.elements, b.elements)),
-                  a.fkind)
+    if a.ekind == "f32":  # per-op rounding (see MxTile docstring)
+        elems = tuple(_f32(x + y)
+                      for x, y in zip(a.elements, b.elements))
+    else:
+        elems = tuple(x + y for x, y in zip(a.elements, b.elements))
+    return MxTile(a.rows, a.cols, elems, a.ekind)
 
 
 def _tile_mul(a: Any, b: Any) -> MxTile:
     a = _tile_arg("Tile.mul", a)
     b = _tile_arg("Tile.mul", b)
     _tile_same("Tile.mul", a, b)
-    return MxTile(a.rows, a.cols,
-                  tuple(x * y for x, y in zip(a.elements, b.elements)),
-                  a.fkind)
+    if a.ekind == "f32":
+        elems = tuple(_f32(x * y)
+                      for x, y in zip(a.elements, b.elements))
+    else:
+        elems = tuple(x * y for x, y in zip(a.elements, b.elements))
+    return MxTile(a.rows, a.cols, elems, a.ekind)
 
 
 def _tile_scale(t: Any, s: Any) -> MxTile:
     t = _tile_arg("Tile.scale", t)
-    sk = _tile_elem_fkind("Tile.scale", s)
-    if sk != t.fkind:
+    sk = _tile_elem_ekind("Tile.scale", s)
+    if t.ekind == "f32":
+        # Language scalars are f64: the factor rounds to f32 first, the
+        # multiply rounds per element — matching (float)s in C exactly.
+        if sk != "f64":
+            raise InterpError(
+                f"Tile.scale: scalar kind must match tile elements "
+                f"(f32 tile, {_kname(sk)} scalar; f32 tiles scale by "
+                "float scalars)")
+        sf = _f32(s)
+        return MxTile(t.rows, t.cols,
+                      tuple(_f32(x * sf) for x in t.elements), "f32")
+    if sk != t.ekind:
         raise InterpError(
             f"Tile.scale: scalar kind must match tile elements "
-            f"({_kname(t.fkind)} tile, {_kname(sk)} scalar)")
-    return MxTile(t.rows, t.cols, tuple(x * s for x in t.elements), t.fkind)
+            f"({_kname(t.ekind)} tile, {_kname(sk)} scalar)")
+    return MxTile(t.rows, t.cols, tuple(x * s for x in t.elements), t.ekind)
 
 
 def _tile_dot(a: Any, b: Any) -> MxTile:
@@ -2520,33 +2559,38 @@ def _tile_dot(a: Any, b: Any) -> MxTile:
         raise InterpError(
             f"Tile.dot: shape mismatch: {a.rows}x{a.cols} · "
             f"{b.rows}x{b.cols} (inner dims {a.cols} and {b.rows})")
-    if a.fkind != b.fkind:
+    if a.ekind != b.ekind:
         raise InterpError(f"Tile.dot: element kinds differ "
-                          f"({_kname(a.fkind)} vs {_kname(b.fkind)})")
+                          f"({_kname(a.ekind)} vs {_kname(b.ekind)})")
     R, K, C = a.rows, a.cols, b.cols
     out = []
+    f32 = a.ekind == "f32"
     for i in range(R):
         for j in range(C):
-            acc = 0.0 if a.fkind else 0
+            acc = _tile_zero(a.ekind)
             for k in range(K):  # pinned order: k ascending
-                acc = acc + a.elements[i * K + k] * b.elements[k * C + j]
+                x = a.elements[i * K + k] * b.elements[k * C + j]
+                if f32:  # round the product, then the accumulation
+                    acc = _f32(acc + _f32(x))
+                else:
+                    acc = acc + x
             out.append(acc)
-    return MxTile(R, C, tuple(out), a.fkind)
+    return MxTile(R, C, tuple(out), a.ekind)
 
 
 def _tile_sum(t: Any) -> Any:
     t = _tile_arg("Tile.sum", t)
-    acc = 0.0 if t.fkind else 0
+    acc = _tile_zero(t.ekind)
     for x in t.elements:  # pinned order: row-major
-        acc = acc + x
-    return acc
+        acc = _f32(acc + x) if t.ekind == "f32" else acc + x
+    return acc  # f32 results reach the language as the widened double
 
 
 def _tile_transpose(t: Any) -> MxTile:
     t = _tile_arg("Tile.transpose", t)
     out = tuple(t.elements[r * t.cols + c]
                 for c in range(t.cols) for r in range(t.rows))
-    return MxTile(t.cols, t.rows, out, t.fkind)
+    return MxTile(t.cols, t.rows, out, t.ekind)
 
 
 def _tile_get(t: Any, i: Any, j: Any) -> Any:
@@ -2560,6 +2604,28 @@ def _tile_get(t: Any, i: Any, j: Any) -> Any:
         raise InterpError(f"Tile.get: index out of bounds: ({i}, {j}) "
                           f"(shape {t.rows}x{t.cols})")
     return t.elements[i * t.cols + j]
+
+
+# -- f32 conversions (docs/gpu_tiles.md Stage 1d) ---------------------------
+#
+# f32 exists as a TILE element kind only; language scalars stay f64.  The
+# two conversions are the whole new surface: everything else is the
+# existing ops extended to the "f32" ekind.  Elements are stored as the
+# f32-REPRESENTABLE double, so widening back (to_f64 / sum / get /
+# store_rows into a Vec) is exact and free.
+
+def _tile_to_f32(t: Any) -> MxTile:
+    t = _tile_arg("Tile.to_f32", t)
+    if t.ekind == "f32":
+        return MxTile(t.rows, t.cols, t.elements, "f32")
+    return MxTile(t.rows, t.cols,
+                  tuple(_f32(float(x)) for x in t.elements), "f32")
+
+
+def _tile_to_f64(t: Any) -> MxTile:
+    t = _tile_arg("Tile.to_f64", t)
+    return MxTile(t.rows, t.cols,
+                  tuple(float(x) for x in t.elements), "f64")
 
 
 def _tile_rows(t: Any) -> int:
@@ -2604,7 +2670,7 @@ def _tile_load(v: Any, off: Any, r: Any, c: Any) -> MxTile:
             f"Tile.load: range [{off}, {off + n}) outside Vec length "
             f"{len(v.items)}")
     elems = v.items[off:off + n]
-    fks = {_tile_elem_fkind("Tile.load", x) for x in elems}
+    fks = {_tile_elem_ekind("Tile.load", x) for x in elems}
     if len(fks) > 1:
         raise InterpError("Tile.load: mixed int and float elements "
                           "in the Vec range")
@@ -2615,16 +2681,16 @@ def _tile_load_or(v: Any, off: Any, r: Any, c: Any, other: Any) -> MxTile:
     r, c = _tile_shape("Tile.load_or", r, c)
     v = _tile_vec("Tile.load_or", v)
     off = _tile_off("Tile.load_or", off)
-    fk = _tile_elem_fkind("Tile.load_or", other)
+    fk = _tile_elem_ekind("Tile.load_or", other)
     out = []
     for i in range(r * c):
         j = off + i
         if 0 <= j < len(v.items):
             x = v.items[j]
-            if _tile_elem_fkind("Tile.load_or", x) != fk:
+            if _tile_elem_ekind("Tile.load_or", x) != fk:
                 raise InterpError(
                     "Tile.load_or: Vec element kind differs from `other` "
-                    f"({_kname(_tile_elem_fkind('Tile.load_or', x))} vs "
+                    f"({_kname(_tile_elem_ekind('Tile.load_or', x))} vs "
                     f"{_kname(fk)})")
             out.append(x)
         else:
@@ -2645,17 +2711,17 @@ def _tile_load_rows(v: Any, off: Any, stride: Any, r: Any, c: Any,
     v = _tile_vec("Tile.load_rows", v)
     off = _tile_off("Tile.load_rows", off)
     stride = _tile_off("Tile.load_rows", stride)
-    fk = _tile_elem_fkind("Tile.load_rows", other)
+    fk = _tile_elem_ekind("Tile.load_rows", other)
     out = []
     for i in range(r):
         for j in range(c):
             k = off + i * stride + j
             if 0 <= k < len(v.items):
                 x = v.items[k]
-                if _tile_elem_fkind("Tile.load_rows", x) != fk:
+                if _tile_elem_ekind("Tile.load_rows", x) != fk:
                     raise InterpError(
                         "Tile.load_rows: Vec element kind differs from "
-                        f"`other` ({_kname(_tile_elem_fkind('Tile.load_rows', x))} "
+                        f"`other` ({_kname(_tile_elem_ekind('Tile.load_rows', x))} "
                         f"vs {_kname(fk)})")
                 out.append(x)
             else:

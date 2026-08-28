@@ -52,6 +52,8 @@ TILE_ARITY = {
     # 2D (row-strided) masked forms: element (i, j) maps to
     # off + i*stride + j — the tile-of-a-matrix idiom.
     "load_rows": 6, "store_rows": 4,
+    # f32 conversions (Stage 1d): f32 is a tile ELEMENT kind only.
+    "to_f32": 1, "to_f64": 1,
 }
 
 
@@ -59,13 +61,12 @@ TILE_ARITY = {
 class _TileInfo:
     """Static knowledge about one tile value.
 
-    ``fkind`` is True (float elements), False (int elements) or None
-    (statically unknown — e.g. `Tile.from_vec`, whose element kind is the
-    Vec's runtime content).
+    ``ekind`` is "int", "f64", "f32" or None (statically unknown — e.g.
+    `Tile.from_vec`, whose element kind is the Vec's runtime content).
     """
     rows: int
     cols: int
-    fkind: Optional[bool]
+    ekind: Optional[str]
 
 
 def _lit_int(node: Any) -> Optional[int]:
@@ -76,21 +77,21 @@ def _lit_int(node: Any) -> Optional[int]:
     return None
 
 
-def _lit_fkind(node: Any) -> Optional[bool]:
+def _lit_ekind(node: Any) -> Optional[str]:
     """Element kind of a literal scalar argument, when decidable."""
     if isinstance(node, fast.Literal):
         v = node.value
         if isinstance(v, bool):
             return None
         if isinstance(v, float):
-            return True
+            return "f64"
         if isinstance(v, int):
-            return False
+            return "int"
     return None
 
 
-def _kname(fk: bool) -> str:
-    return "float" if fk else "int"
+def _kname(ek: str) -> str:
+    return {"int": "int", "f64": "float", "f32": "f32"}[ek]
 
 
 class _TileShapeChecker:
@@ -240,12 +241,13 @@ class _TileShapeChecker:
             if shape is None:
                 return None
             # zeros builds float tiles, arange int tiles (mir_interp).
-            return _TileInfo(shape[0], shape[1], op == "zeros")
+            return _TileInfo(shape[0], shape[1],
+                             "f64" if op == "zeros" else "int")
         if op == "filled":
             shape = self._ctor_shape(node, op, args[0], args[1])
             if shape is None:
                 return None
-            return _TileInfo(shape[0], shape[1], _lit_fkind(args[2]))
+            return _TileInfo(shape[0], shape[1], _lit_ekind(args[2]))
         if op == "from_vec":
             shape = self._ctor_shape(node, op, args[1], args[2])
             if shape is None:
@@ -260,12 +262,12 @@ class _TileShapeChecker:
             shape = self._ctor_shape(node, op, args[2], args[3])
             if shape is None:
                 return None
-            return _TileInfo(shape[0], shape[1], _lit_fkind(args[4]))
+            return _TileInfo(shape[0], shape[1], _lit_ekind(args[4]))
         if op == "load_rows":
             shape = self._ctor_shape(node, op, args[3], args[4])
             if shape is None:
                 return None
-            return _TileInfo(shape[0], shape[1], _lit_fkind(args[5]))
+            return _TileInfo(shape[0], shape[1], _lit_ekind(args[5]))
         if op in ("add", "mul"):
             a, b = infos[0], infos[1]
             if a is not None and b is not None:
@@ -273,24 +275,33 @@ class _TileShapeChecker:
                     self.report(node, f"Tile.{op}: shape mismatch: "
                                       f"{a.rows}x{a.cols} vs {b.rows}x{b.cols}")
                     return None
-                if a.fkind is not None and b.fkind is not None \
-                        and a.fkind != b.fkind:
+                if a.ekind is not None and b.ekind is not None \
+                        and a.ekind != b.ekind:
                     self.report(node, f"Tile.{op}: element kinds differ "
-                                      f"({_kname(a.fkind)} vs "
-                                      f"{_kname(b.fkind)})")
+                                      f"({_kname(a.ekind)} vs "
+                                      f"{_kname(b.ekind)})")
                     return None
-                fk = a.fkind if a.fkind is not None else b.fkind
-                return _TileInfo(a.rows, a.cols, fk)
+                ek = a.ekind if a.ekind is not None else b.ekind
+                return _TileInfo(a.rows, a.cols, ek)
             return None
         if op == "scale":
             t = infos[0]
-            sk = _lit_fkind(args[1])
-            if t is not None and t.fkind is not None and sk is not None \
-                    and sk != t.fkind:
-                self.report(node, f"Tile.scale: scalar kind must match tile "
-                                  f"elements ({_kname(t.fkind)} tile, "
-                                  f"{_kname(sk)} scalar)")
-                return None
+            sk = _lit_ekind(args[1])
+            if t is not None and t.ekind is not None and sk is not None:
+                if t.ekind == "f32":
+                    # Language scalars are f64; f32 tiles scale by float
+                    # scalars (the factor rounds to f32 — mir_interp).
+                    if sk != "f64":
+                        self.report(node, "Tile.scale: scalar kind must "
+                                          "match tile elements (f32 tile, "
+                                          f"{_kname(sk)} scalar; f32 tiles "
+                                          "scale by float scalars)")
+                        return None
+                elif sk != t.ekind:
+                    self.report(node, f"Tile.scale: scalar kind must match "
+                                      f"tile elements ({_kname(t.ekind)} "
+                                      f"tile, {_kname(sk)} scalar)")
+                    return None
             return t
         if op == "dot":
             a, b = infos[0], infos[1]
@@ -301,19 +312,27 @@ class _TileShapeChecker:
                                       f"{b.rows}x{b.cols} (inner dims "
                                       f"{a.cols} and {b.rows})")
                     return None
-                if a.fkind is not None and b.fkind is not None \
-                        and a.fkind != b.fkind:
+                if a.ekind is not None and b.ekind is not None \
+                        and a.ekind != b.ekind:
                     self.report(node, f"Tile.dot: element kinds differ "
-                                      f"({_kname(a.fkind)} vs "
-                                      f"{_kname(b.fkind)})")
+                                      f"({_kname(a.ekind)} vs "
+                                      f"{_kname(b.ekind)})")
                     return None
-                fk = a.fkind if a.fkind is not None else b.fkind
-                return _TileInfo(a.rows, b.cols, fk)
+                ek = a.ekind if a.ekind is not None else b.ekind
+                return _TileInfo(a.rows, b.cols, ek)
             return None
         if op == "transpose":
             t = infos[0]
             if t is not None:
-                return _TileInfo(t.cols, t.rows, t.fkind)
+                return _TileInfo(t.cols, t.rows, t.ekind)
+            return None
+        if op in ("to_f32", "to_f64"):
+            # Total, shape-preserving conversions (mir_interp): to_f32
+            # rounds any element kind to f32, to_f64 widens any to f64.
+            t = infos[0]
+            if t is not None:
+                return _TileInfo(t.rows, t.cols,
+                                 "f32" if op == "to_f32" else "f64")
             return None
         if op == "get":
             t = infos[0]
