@@ -742,18 +742,26 @@ static void mx_tile_same(const mx_tile *a, const mx_tile *b,
     }
 }
 
-/* Elementwise add/mul: is_f64 selects the arithmetic; words in, words out. */
+/* f32 elements (ekind 2) live as the f32-REPRESENTABLE double: adding or
+ * multiplying two such values in double and rounding once through float
+ * IS the correctly-rounded f32 op (24+24 < 53 significand bits), which is
+ * what keeps all three engines bit-identical.  mx_f32r is that rounding. */
+static double mx_f32r(double x) { return (double)(float)x; }
+
+/* Elementwise add/mul: ekind selects the arithmetic (0 int, 1 f64,
+ * 2 f32 = f64 op + one rounding); words in, words out. */
 #define MX_TILE_EW(name, fop, iop)                                          \
-    mx_tile *name(const mx_tile *a, const mx_tile *b, int64_t is_f64) {     \
+    mx_tile *name(const mx_tile *a, const mx_tile *b, int64_t ekind) {      \
         mx_tile_same(a, b, #name);                                          \
         mx_tile *out = mx_tile_new(a->rows, a->cols);                       \
         int64_t n = a->rows * a->cols;                                      \
         for (int64_t i = 0; i < n; i++) {                                   \
-            if (is_f64) {                                                   \
+            if (ekind != 0) {                                               \
                 double x, y, r;                                             \
                 memcpy(&x, &a->elems[i], sizeof x);                         \
                 memcpy(&y, &b->elems[i], sizeof y);                         \
                 r = fop;                                                    \
+                if (ekind == 2) r = mx_f32r(r);                             \
                 memcpy(&out->elems[i], &r, sizeof r);                       \
             } else {                                                        \
                 int64_t x = a->elems[i], y = b->elems[i];                   \
@@ -766,16 +774,21 @@ static void mx_tile_same(const mx_tile *a, const mx_tile *b,
 MX_TILE_EW(mx_tile_add, x + y, x + y)
 MX_TILE_EW(mx_tile_mul, x * y, x * y)
 
-mx_tile *mx_tile_scale(const mx_tile *t, int64_t sword, int64_t is_f64) {
+mx_tile *mx_tile_scale(const mx_tile *t, int64_t sword, int64_t ekind) {
     mx_tile_check(t, "Tile.scale");
     mx_tile *out = mx_tile_new(t->rows, t->cols);
     int64_t n = t->rows * t->cols;
     for (int64_t i = 0; i < n; i++) {
-        if (is_f64) {
+        if (ekind != 0) {
             double x, s, r;
             memcpy(&x, &t->elems[i], sizeof x);
             memcpy(&s, &sword, sizeof s);
+            /* f32 tiles scale by a LANGUAGE (f64) scalar: the factor
+             * rounds to f32 first, the multiply rounds per element —
+             * exactly (float)s in C, exactly mir_interp. */
+            if (ekind == 2) s = mx_f32r(s);
             r = x * s;
+            if (ekind == 2) r = mx_f32r(r);
             memcpy(&out->elems[i], &r, sizeof r);
         } else {
             out->elems[i] = t->elems[i] * sword;
@@ -784,7 +797,7 @@ mx_tile *mx_tile_scale(const mx_tile *t, int64_t sword, int64_t is_f64) {
     return out;
 }
 
-mx_tile *mx_tile_dot(const mx_tile *a, const mx_tile *b, int64_t is_f64) {
+mx_tile *mx_tile_dot(const mx_tile *a, const mx_tile *b, int64_t ekind) {
     mx_tile_check(a, "Tile.dot");
     mx_tile_check(b, "Tile.dot");
     if (a->cols != b->rows) {
@@ -797,13 +810,18 @@ mx_tile *mx_tile_dot(const mx_tile *a, const mx_tile *b, int64_t is_f64) {
     mx_tile *out = mx_tile_new(R, C);
     for (int64_t i = 0; i < R; i++) {
         for (int64_t j = 0; j < C; j++) {
-            if (is_f64) {
+            if (ekind != 0) {
                 double acc = 0.0;
                 for (int64_t k = 0; k < K; k++) {  /* pinned: k ascending */
                     double x, y;
                     memcpy(&x, &a->elems[i * K + k], sizeof x);
                     memcpy(&y, &b->elems[k * C + j], sizeof y);
-                    acc = acc + x * y;
+                    if (ekind == 2) {
+                        /* round the product, then the accumulation */
+                        acc = mx_f32r(acc + mx_f32r(x * y));
+                    } else {
+                        acc = acc + x * y;
+                    }
                 }
                 memcpy(&out->elems[i * C + j], &acc, sizeof acc);
             } else {
@@ -818,15 +836,15 @@ mx_tile *mx_tile_dot(const mx_tile *a, const mx_tile *b, int64_t is_f64) {
     return out;
 }
 
-int64_t mx_tile_sum(const mx_tile *t, int64_t is_f64) {
+int64_t mx_tile_sum(const mx_tile *t, int64_t ekind) {
     mx_tile_check(t, "Tile.sum");
     int64_t n = t->rows * t->cols;
-    if (is_f64) {
+    if (ekind != 0) {
         double acc = 0.0;
         for (int64_t i = 0; i < n; i++) {  /* pinned: row-major */
             double x;
             memcpy(&x, &t->elems[i], sizeof x);
-            acc = acc + x;
+            acc = (ekind == 2) ? mx_f32r(acc + x) : acc + x;
         }
         int64_t w;
         memcpy(&w, &acc, sizeof w);
@@ -835,6 +853,43 @@ int64_t mx_tile_sum(const mx_tile *t, int64_t is_f64) {
     int64_t acc = 0;
     for (int64_t i = 0; i < n; i++) acc = acc + t->elems[i];
     return acc;
+}
+
+/* f32 conversions (docs/gpu_tiles.md Stage 1d): total and shape-preserving.
+ * src_ekind says how to READ the words (0 int, 1/2 double bits); the
+ * result of to_f32 is every element rounded through float and stored back
+ * as double bits, of to_f64 every element widened to double bits. */
+mx_tile *mx_tile_to_f32(const mx_tile *t, int64_t src_ekind) {
+    mx_tile_check(t, "Tile.to_f32");
+    mx_tile *out = mx_tile_new(t->rows, t->cols);
+    int64_t n = t->rows * t->cols;
+    for (int64_t i = 0; i < n; i++) {
+        double x;
+        if (src_ekind == 0) {
+            x = (double)t->elems[i];
+        } else {
+            memcpy(&x, &t->elems[i], sizeof x);
+        }
+        x = mx_f32r(x);
+        memcpy(&out->elems[i], &x, sizeof x);
+    }
+    return out;
+}
+
+mx_tile *mx_tile_to_f64(const mx_tile *t, int64_t src_ekind) {
+    mx_tile_check(t, "Tile.to_f64");
+    mx_tile *out = mx_tile_new(t->rows, t->cols);
+    int64_t n = t->rows * t->cols;
+    for (int64_t i = 0; i < n; i++) {
+        double x;
+        if (src_ekind == 0) {
+            x = (double)t->elems[i];
+        } else {
+            memcpy(&x, &t->elems[i], sizeof x);
+        }
+        memcpy(&out->elems[i], &x, sizeof x);
+    }
+    return out;
 }
 
 mx_tile *mx_tile_transpose(const mx_tile *t) {

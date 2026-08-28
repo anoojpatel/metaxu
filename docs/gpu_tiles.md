@@ -155,11 +155,36 @@ per-lane register budget, swizzle bank-conflict freedom.
     128^3 workload) runs at ~0.9-1.0x C.  The tile model costs nothing;
     only the functional reference lowering does — which also bounds
     what Stage 2's fused CPU lowering can recover: all of it.
-  * **Still open in Stage 1:** f32/f16 scalars (prerequisite for float
-    kernels on Metal — no f64 there), the `gpu` effect class (becomes
-    load-bearing when the MLX handler dispatches real launches), and
-    memory-space locality states (vacuous until threadgroup memory
-    arrives in Stage 2).
+  * **1d (landed): f32 tiles + float Metal kernels.**  f32 is a TILE
+    ELEMENT kind only — language scalars stay f64, and the whole new
+    surface is `Tile.to_f32` / `Tile.to_f64` (total, shape-preserving).
+    Representation: elements are stored as the f32-REPRESENTABLE double
+    (widened bits), and every op rounds its result to f32 once — which
+    is bit-exactly the correctly-rounded f32 op, because adding or
+    multiplying two f32-representables is exact in f64 (24+24 < 53
+    significand bits).  That one invariant is what keeps all three
+    engines bit-identical: the interpreter rounds via struct pack/unpack,
+    the C runtime via `(double)(float)x` (ekind code 2 on the arithmetic
+    entry points; 0 int, 1 f64), and the C++ shim compiles with
+    `-ffp-contract=off` so no FMA re-associates the pinned
+    round-product-then-round-accumulate dot order.  Scalar boundaries
+    (sum, get, scale's factor — rounded to f32 first, exactly `(float)s`
+    in C — to_vec, stores) cross as f64.  In MSL kernels, f64 tiles
+    still do not exist: a float-filled masked load must be wrapped
+    DIRECTLY in `Tile.to_f32(...)`, and the pair fuses into one direct
+    float-buffer load (on the device the buffer IS float32); float
+    buffers hold f32-representable values by the boundary rule (the
+    host rounds once), the Mac harness compares float outputs with a
+    tolerance (Metal compiles fast-math — the container-side shim is
+    the bit-exact leg), and the f32 matmul is pinned against an
+    independently computed blocked-accumulation product (per-block dot,
+    then tile add — a different f32 association than a flat k loop, and
+    part of the pinned semantics).
+  * **Still open in Stage 1:** f16 (same recipe: representable-widening
+    + round-per-op; lands when a kernel needs it), the `gpu` effect
+    class (becomes load-bearing when the MLX handler dispatches real
+    launches), and memory-space locality states (vacuous until
+    threadgroup memory arrives in Stage 2).
 - **Stage 2 — fast:** inferred layouts + `convert_layout`,
   `simdgroup_matrix` dot, threadgroup-memory tiling, software
   pipelining where it pays on Apple.

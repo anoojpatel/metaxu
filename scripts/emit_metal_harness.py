@@ -45,16 +45,37 @@ def main() -> int:
 
     source = Path(args.source).read_text()
 
-    buffers: dict[str, list[int]] = {}
+    # Values parse as ints unless written with a decimal point / exponent
+    # (float buffers are the f32 increment: 1.5 stays float, 3 stays int).
+    def num(x: str):
+        try:
+            return int(x)
+        except ValueError:
+            return float(x)
+
+    buffers: dict[str, list] = {}
     for spec in args.buf:
         name, _, csv = spec.partition("=")
-        buffers[name] = [int(x) for x in csv.split(",") if x != ""]
+        buffers[name] = [num(x) for x in csv.split(",") if x != ""]
 
     try:
         kern = emit_msl_kernel(source, args.kernel)
     except MslError as e:
         print(f"kernel not emittable: {e}", file=sys.stderr)
         return 1
+    # A float-typed buffer holds F32-REPRESENTABLE values everywhere: on
+    # the device it IS float32, so the host rounds once at the boundary —
+    # otherwise unwritten elements would differ between the f64 CPU
+    # reference Vec and the float32 Metal buffer after the mask merge.
+    import struct
+
+    def f32r(x) -> float:
+        return struct.unpack("f", struct.pack("f", float(x)))[0]
+
+    for b, vals in list(buffers.items()):
+        if kern.buf_types.get(b) == "float":
+            buffers[b] = [f32r(x) for x in vals]
+
     missing = [b for b in kern.in_bufs if b not in buffers]
     if missing:
         print(f"missing --buf for kernel buffers: {', '.join(missing)} "
