@@ -2,7 +2,7 @@
 <style>
 /* ============================================================
    Metaxu — documentation as a landing page.
-   Committed single theme: warm near-black, phosphor amber.
+   Committed single theme: dimmed light blue-green, eggshell trim.
    ============================================================ */
 @font-face {
   font-family: 'Hasklig';
@@ -21,17 +21,17 @@
 }
 
 :root {
-  --bg:      #161310;
-  --panel:   #1c1813;
-  --panel2:  #211c14;
-  --line:    #2e2921;
-  --line2:   #3a342a;
-  --fg:      #ede6d8;
-  --mut:     #9a9080;
-  --dim:     #6f675a;
-  --acc:     #e2a33c;
-  --acc-dim: #6b5527;
-  --cell:    #221d13;
+  --bg:      #e7ebe6;
+  --panel:   #f2efe3;
+  --panel2:  #edefe4;
+  --line:    #cbd4cc;
+  --line2:   #b2c0b6;
+  --fg:      #24403c;
+  --mut:     #4c5f59;
+  --dim:     #67786f;
+  --acc:     #21756a;
+  --acc-dim: #9cbfb5;
+  --cell:    #dfe5de;
   --mono: 'Hasklig', 'Source Code Pro', ui-monospace, 'SF Mono', Menlo, monospace;
   --sans: "Helvetica Neue", Helvetica, "Neue Haas Grotesk", Arial, sans-serif;
   --serif: 'Source Serif 4 Display', Georgia, 'Times New Roman', serif;
@@ -53,7 +53,7 @@ body {
 a { color: var(--fg); text-decoration: underline; text-decoration-color: var(--dim); text-underline-offset: 3px; }
 a:hover { color: var(--acc); text-decoration-color: var(--acc); }
 a:focus-visible, button:focus-visible { outline: 2px solid var(--acc); outline-offset: 3px; border-radius: 1px; }
-::selection { background: var(--acc); color: #16130c; }
+::selection { background: var(--acc); color: #f2efe3; }
 
 .wrap { max-width: 1128px; margin: 0 auto; padding: 0 28px; }
 
@@ -101,9 +101,9 @@ a:focus-visible, button:focus-visible { outline: 2px solid var(--acc); outline-o
   text-decoration: none; padding: 11px 18px; border: 1px solid var(--line2);
   letter-spacing: .02em; color: var(--fg);
 }
-.cta a.primary { background: var(--acc); border-color: var(--acc); color: #1a1508; }
+.cta a.primary { background: var(--acc); border-color: var(--acc); color: #f2efe3; }
 .cta a:hover { border-color: var(--acc); color: var(--acc); }
-.cta a.primary:hover { background: #efb658; border-color: #efb658; color: #1a1508; }
+.cta a.primary:hover { background: #2a8a7d; border-color: #2a8a7d; color: #f2efe3; }
 .statusline {
   font-family: var(--mono); font-size: 12px; color: var(--dim);
   letter-spacing: .02em; line-height: 1.9;
@@ -114,7 +114,7 @@ a:focus-visible, button:focus-visible { outline: 2px solid var(--acc); outline-o
 .spinfig pre {
   margin: 0; font-family: var(--mono); font-size: 13px; line-height: 1.08;
   letter-spacing: 0; white-space: pre; user-select: none; cursor: crosshair;
-  color: var(--acc); text-shadow: 0 0 20px rgba(226, 163, 60, .25);
+  color: var(--acc); text-shadow: 0 0 18px rgba(33, 117, 106, .18);
   font-feature-settings: "calt" 0, "liga" 0; /* raw glyphs, no joining */
 }
 .spinfig figcaption {
@@ -172,11 +172,11 @@ p { max-width: 68ch; }
   display: block; white-space: pre;
 }
 .tok-k { color: var(--acc); }
-.tok-t { color: #d9c9a3; }
-.tok-s { color: #a9b47e; }
-.tok-n { color: #cfa06a; }
-.tok-c { color: #766d5e; }
-.tok-m { color: #c98f6b; }
+.tok-t { color: #3e5c74; }
+.tok-s { color: #5c7a3f; }
+.tok-n { color: #7a5c36; }
+.tok-c { color: #7d8a80; }
+.tok-m { color: #4e7a8a; }
 .lig-demo { font-family: var(--mono); font-feature-settings: "calt" 1, "liga" 1; color: var(--fg); font-size: 15px; }
 
 /* ---------- pipeline ---------- */
@@ -339,8 +339,8 @@ footer .wrap { display: flex; justify-content: space-between; gap: 24px; flex-wr
       <p class="thesis">A systems language with algebraic effects, mode-based
       memory safety, and tile-level GPU kernels compiled to Metal.</p>
       <p class="subthesis">Native code through LLVM. Safety from <em>modes</em>,
-      not lifetime annotations. Every backend differentially tested against a
-      reference interpreter &mdash; <em>byte for byte</em>.</p>
+      not lifetime annotations. Every backend is differentially tested
+      against a reference interpreter, <em>byte for byte</em>.</p>
       <div class="cta">
         <a class="primary" href="https://github.com/anoojpatel/metaxu">GitHub &#8599;</a>
         <a href="#ideas">Documentation &#8595;</a>
@@ -352,7 +352,7 @@ footer .wrap { display: flex; justify-content: space-between; gap: 24px; flex-wr
     </div>
     <figure class="spinfig" aria-hidden="true">
       <pre id="vortex" aria-label="An interactive ASCII vortex, breathing in and out"> </pre>
-      <figcaption>the vortex &mdash; stir it &middot; drag the cursor across to steer the spin</figcaption>
+      <figcaption>move the cursor to stir; left to right steers the spin</figcaption>
     </figure>
   </div>
 </section>
@@ -368,11 +368,11 @@ footer .wrap { display: flex; justify-content: space-between; gap: 24px; flex-wr
       <div class="card">
         <span class="idx mono">effects</span>
         <h3>Effects are the machine model</h3>
-        <p>Threads, mutexes, streams, GPU kernel launches &mdash; all
+        <p>Threads, mutexes, streams, and GPU kernel launches are all
         <b>algebraic effects with handlers</b>, backed by real delimited
         continuations (native <span class="mono">try</span>/<span class="mono">catch</span>,
         streams, generators).</p>
-        <p>A handler can virtualize any of them &mdash; which is how the
+        <p>A handler can virtualize any of them, so the
         <b>same program</b> runs on a test double, a thread pool, or a GPU.</p>
         <div class="chips"><span>perform</span><span>handle &hellip; with</span><span>resume</span><span>effect Gpu</span></div>
       </div>
@@ -384,7 +384,7 @@ footer .wrap { display: flex; justify-content: space-between; gap: 24px; flex-wr
         asking you to annotate them.</p>
         <p>Thread-safety is <b>inferred, never declared</b>: crossing a value
         into another thread marks it, and unsynchronized writes to crossed
-        values are caught &mdash; statically where provable, dynamically
+        values are caught: statically where provable, dynamically
         otherwise, with the same error wording either way.</p>
         <div class="chips"><span>@local / @global</span><span>@mut / @const</span><span>once / separate / many</span></div>
       </div>
@@ -392,10 +392,10 @@ footer .wrap { display: flex; justify-content: space-between; gap: 24px; flex-wr
         <span class="idx mono">reference</span>
         <h3>The interpreter is the spec</h3>
         <p>Every backend is differentially tested against a <b>strict reference
-        interpreter</b>, byte for byte &mdash; output, error messages, float
+        interpreter</b>, byte for byte: output, error messages, float
         formatting.</p>
-        <p>A whole class of &ldquo;silently wrong code&rdquo; bugs is
-        <b>structurally hunted</b> this way, instead of discovered by users.</p>
+        <p>A whole class of silently-wrong-code bugs is
+        <b>found by these tests</b> instead of by users.</p>
         <div class="chips"><span>interpreter == native</span><span>ASan-scoped</span><span>pinned goldens</span></div>
       </div>
     </div>
@@ -407,9 +407,9 @@ footer .wrap { display: flex; justify-content: space-between; gap: 24px; flex-wr
   <div class="wrap">
     <p class="eyebrow">// a taste</p>
     <h2>Streams are effects. Kernels are functions.</h2>
-    <p class="lede">Set in Hasklig with contextual ligatures on &mdash; pairs like
-    <span class="lig-demo">-&gt; =&gt; &gt;= !=</span> join into single glyphs, the way
-    they read in your head.</p>
+    <p class="lede">Code is set in Hasklig with contextual ligatures enabled:
+    pairs like <span class="lig-demo">-&gt; =&gt; &gt;= !=</span> render as
+    single glyphs.</p>
 
     <div class="codeblock">
       <header><span>streams.mx</span><span class="note">consumers are handlers</span></header>
@@ -443,7 +443,7 @@ fn filter(producer, pred) -> fn() -> Unit {
     </div>
 
     <div class="codeblock">
-      <header><span>matmul_kernel.mx</span><span class="note">the flagship: a tile-level GPU kernel &mdash; no raw pointers</span></header>
+      <header><span>matmul_kernel.mx</span><span class="note">a tile-level GPU kernel, no raw pointers</span></header>
       <pre><code class="mx">// A GPU kernel: one instance per output tile, masked edges, no raw pointers.
 from std.gpu import Gpu, run_grid;
 
@@ -461,8 +461,8 @@ fn mm_kernel(pid: int, a: Vec, b: Vec, c: Vec) -> () {
     ()
 }
 // perform Gpu.launch(256, fn(pid: int) -> mm_kernel(pid, a, b, c));
-// — the default handler runs it deterministically on CPU;
-//   the Metal handler runs it on your GPU. Same kernel.</code></pre>
+// The default handler runs it deterministically on CPU;
+//   the Metal handler runs it on the GPU. Same kernel.</code></pre>
     </div>
   </div>
 </section>
@@ -536,7 +536,7 @@ fn mm_kernel(pid: int, a: Vec, b: Vec, c: Vec) -> () {
         <!-- differential bracket: interpreter <-> native -->
         <path class="edge" d="M 678 132 h 12 v 56 h -12"/>
         <text class="xs" x="702" y="148">differentially tested,</text>
-        <text class="xs" x="702" y="162">byte for byte &#8212; output,</text>
+        <text class="xs" x="702" y="162">byte for byte: output,</text>
         <text class="xs" x="702" y="176">errors, float formatting</text>
 
         <!-- msl note -->
@@ -545,7 +545,7 @@ fn mm_kernel(pid: int, a: Vec, b: Vec, c: Vec) -> () {
         <text class="xs" x="702" y="272">handler, end to end</text>
       </svg>
       </div>
-      <figcaption>src/metaxu/compiler &mdash; Python front end; backends are thin
+      <figcaption>src/metaxu/compiler: Python front end; backends are thin
       text emitters over MIR.</figcaption>
     </figure>
   </div>
@@ -555,12 +555,12 @@ fn mm_kernel(pid: int, a: Vec, b: Vec, c: Vec) -> () {
 <section id="performance">
   <div class="wrap">
     <p class="eyebrow">// measured</p>
-    <h2>Speed against C, measured honestly</h2>
-    <p class="lede">Every race asserts output equality between the Metaxu program
-    and its hand-written C twin before a single timing is taken. Same clang, same
+    <h2>Performance against C</h2>
+    <p class="lede">Every benchmark asserts output equality between the Metaxu
+    program and its hand-written C twin before any timing runs. Same clang, same
     <span class="mono">-O2</span>, <span class="mono">-falign-functions=64</span>
-    everywhere, alternating run order, medians &mdash; unaligned microbenchmarks
-    measure linker luck, not your compiler.</p>
+    everywhere, alternating run order, medians. Alignment is pinned because
+    unaligned microbenchmarks mostly measure code placement.</p>
 
     <div class="tablewrap">
       <table class="bench">
@@ -582,22 +582,21 @@ fn mm_kernel(pid: int, a: Vec, b: Vec, c: Vec) -> () {
     </div>
     <p class="pinned"><b>//</b> every number on this page is from a pinned
     benchmark or test gate in the repository (benchmarks/suite, 2026-08-19,
-    clang -O2, 15 rounds). Absolute times move on a shared container; trust the
-    paired, interleaved ratios.</p>
+    clang -O2, 15 rounds). Absolute times vary on a shared container; the
+    paired, interleaved ratios are the stable signal.</p>
 
     <div class="notes">
       <div>
-        <h4>orbit at 0.99x is the ergonomics headline</h4>
+        <h4>orbit at 0.99x: value semantics at C speed</h4>
         <p>The Metaxu version rebuilds an immutable 4-field struct every step
-        &mdash; value semantics, no mutation in sight &mdash; and costs the same
-        as C mutating doubles in place. SROA/mem2reg dissolve the abstraction
-        completely.</p>
+        and costs the same as C mutating doubles in place. SROA and mem2reg
+        remove the struct entirely at -O2.</p>
       </div>
       <div>
-        <h4>nsieve&rsquo;s 9% is a chosen trade</h4>
+        <h4>nsieve&rsquo;s 9% is the bounds-check price</h4>
         <p>It sat at ~1.4x when every <span class="mono">v[i]</span> was an
         opaque runtime call; inline fast paths closed most of that. The rest is
-        the checked-indexing price: out-of-bounds is a loud error, and data
+        the checked-indexing price: out-of-bounds is a runtime error, and data
         races on crossed vecs are caught. Bounds-checked Vec loops generally
         run ~1.3&ndash;1.7x C.</p>
       </div>
@@ -605,8 +604,8 @@ fn mm_kernel(pid: int, a: Vec, b: Vec, c: Vec) -> () {
         <h4>effects have a measured price</h4>
         <p>A handler crossing costs ~280 ns; each pipeline element crosses
         filter, map and sum. Threads reach parity once the work amortizes
-        ~2.5 ms of flat spawn cost &mdash; four threads turn 40M elements
-        around 3.4x faster than the serial pass in the same binary.</p>
+        ~2.5 ms of flat spawn cost: four threads process 40M elements
+        about 3.4x faster than the serial pass in the same binary.</p>
       </div>
     </div>
   </div>
@@ -615,10 +614,10 @@ fn mm_kernel(pid: int, a: Vec, b: Vec, c: Vec) -> () {
 <!-- ================= gpu ================= -->
 <section id="gpu">
   <div class="wrap">
-    <p class="eyebrow">// gpu tiles &mdash; in progress</p>
+    <p class="eyebrow">// gpu tiles, in progress</p>
     <h2>Triton-class tile kernels, Apple-first</h2>
     <p class="lede">Kernels are programs over <span class="mono">Tile[T, R, C]</span>
-    values with shapes static in the type &mdash; not per-thread code. The tile
+    values with shapes static in the type, not per-thread code. The tile
     semantics, shape checker and (later) layout inference are target-neutral;
     backends are thin text emitters. Metal Shading Language first, bound into
     MLX; textual TritonGPU MLIR later for NVIDIA/AMD.</p>
@@ -637,7 +636,7 @@ fn mm_kernel(pid: int, a: Vec, b: Vec, c: Vec) -> () {
         <div class="body"><b>The kernel seam.</b> Strict and masked
         buffer&#8596;tile IO (<code>Tile.load_or</code>,
         <code>Tile.store_clipped</code>); <code>Gpu.launch</code> as pure
-        library &mdash; <code>effect Gpu { launch(n, f) = run_grid(n, f) }</code>,
+        library: <code>effect Gpu { launch(n, f) = run_grid(n, f) }</code>,
         default handler = the sequential CPU reference, zero compiler changes;
         and the first MSL emitter with a self-checking Mac harness
         (<code>mx.fast.metal_kernel</code>, interpreter-computed expected values
@@ -648,8 +647,8 @@ fn mm_kernel(pid: int, a: Vec, b: Vec, c: Vec) -> () {
         <div class="body"><b>f32 tiles &#8594; float Metal kernels.</b>
         f32 is a tile <i>element</i> kind (language scalars stay f64):
         elements live as f32-representable doubles and every op rounds
-        once &mdash; bit-identical across interpreter, native and the
-        C++-shimmed MSL lowering, pinned against an independently
+        once, so results are bit-identical across the interpreter, native,
+        and the C++-shimmed MSL lowering, pinned against an independently
         computed f32 matmul.</div>
       </div>
       <div class="stage">
@@ -657,10 +656,10 @@ fn mm_kernel(pid: int, a: Vec, b: Vec, c: Vec) -> () {
         <div class="body"><b>The Metal runtime handler.</b> Install
         <code>run_metal</code> over <code>Gpu.launch</code> and the same
         kernel dispatches through <code>mx.fast.metal_kernel</code> on
-        Apple silicon &mdash; or a bit-exact shim engine elsewhere, which
-        is how the handler is differentially tested with no GPU in the
-        container. Everything outside the contract errs loudly; never a
-        silent CPU fallback.</div>
+        Apple silicon, or through a bit-exact shim engine elsewhere; the
+        shim is how the handler is tested with no GPU in the container.
+        Anything outside the contract is an error; there is no silent
+        CPU fallback.</div>
       </div>
       <div class="stage">
         <div class="tag mono">Stage 1, open <span class="st">next</span></div>
@@ -677,23 +676,22 @@ fn mm_kernel(pid: int, a: Vec, b: Vec, c: Vec) -> () {
     </div>
 
     <div class="callout">
-      <h3>The 4x that turned out to be incidental</h3>
+      <h3>The 4x tile overhead is incidental, not intrinsic</h3>
       <p>Measured 2026-08-26: the tiled 128&sup3; matmul running through
       <span class="mono">Gpu.launch</span> on the CPU reference costs
-      <b>~4x plain C loops</b> &mdash; every tile op is an opaque runtime call
-      that allocates a fresh block, by design, because the reference is
-      functional and optimizing it would optimize the reference instead of the
-      product.</p>
-      <p>So we lowered the <b>same kernel</b> through the MSL emitter &mdash;
-      tiles as stack arrays, zero allocation, ops inlined &mdash; and raced it
-      on the same workload:</p>
+      <b>~4x plain C loops</b>. Every tile op is an opaque runtime call that
+      allocates a fresh block; the reference lowering is functional by
+      design, and stays unoptimized on purpose.</p>
+      <p>Lowering the <b>same kernel</b> through the MSL emitter (tiles as
+      stack arrays, zero allocation, ops inlined) and racing it on the same
+      workload gives:</p>
       <p class="figures">functional CPU reference &nbsp;<span class="r">~4x C</span>
       &nbsp;&nbsp;&middot;&nbsp;&nbsp; MSL-style lowering of the same kernel
       &nbsp;<span class="r">~0.9&ndash;1.0x C</span></p>
-      <p><b>The tile model costs nothing; only the reference lowering does</b>
-      &mdash; which also bounds what a future fused CPU lowering can recover:
-      all of it. The number is tracked in benchmarks/diagnostics so it cannot
-      rot silently.</p>
+      <p><b>The tile model itself costs nothing; the reference lowering
+      does.</b> That also bounds what a future fused CPU lowering can
+      recover. The number is tracked in benchmarks/diagnostics so it stays
+      visible.</p>
     </div>
   </div>
 </section>
@@ -702,19 +700,19 @@ fn mm_kernel(pid: int, a: Vec, b: Vec, c: Vec) -> () {
 <section id="philosophy">
   <div class="wrap">
     <p class="eyebrow">// why &ldquo;metaxu&rdquo;</p>
-    <h2>A wall is also what transmits the taps</h2>
+    <h2>Why the name</h2>
     <div class="philo">
       <div>
         <blockquote>The name comes from Simone Weil&rsquo;s metaxu: the wall
-        between two prison cells is a barrier &mdash; and the medium the
-        prisoners tap through.</blockquote>
-        <p>Metaxu wants to be that wall: a bridge between high-level
-        abstractions and low-level performance, connecting human intention to
-        machine execution. Systems programming that is powerful without
-        demanding you earn it first.</p>
-        <p>And accessible on the inside, too &mdash; the compiler is a readable
-        Python front end with text-emitting backends, built so that anyone can
-        learn how compilers are made.</p>
+        between two prison cells separates the prisoners, and is also what
+        they tap messages through.</blockquote>
+        <p>Metaxu aims to be that kind of intermediary: a bridge between
+        high-level abstractions and low-level performance. The goal is
+        systems programming that is safe and fast without a steep
+        annotation burden.</p>
+        <p>The compiler itself is meant to be readable: a Python front end
+        with text-emitting backends, built so that anyone can learn how
+        compilers are made.</p>
         <div class="inspo">
           <h4>// deeply inspired by</h4>
           <ul>
@@ -740,7 +738,7 @@ fn mm_kernel(pid: int, a: Vec, b: Vec, c: Vec) -> () {
           <text x="30" y="112">intention</text>
           <text x="490" y="112" text-anchor="end">execution</text>
         </svg>
-        <figcaption>metaxu, n. &mdash; that which separates also connects.</figcaption>
+        <figcaption>the wall between cells, and the tapping through it.</figcaption>
       </figure>
     </div>
   </div>
