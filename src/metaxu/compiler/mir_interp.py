@@ -700,6 +700,7 @@ class MirInterpreter:
             "EFFECT_MUTEX_UNLOCK": self._rt_mutex_unlock,
             "EFFECT_SPAWN": self._rt_thread_spawn,
             "EFFECT_JOIN": self._rt_thread_join,
+            "EFFECT_METAL_LAUNCH": self._rt_metal_launch,
         }
         self._next_mutex_id: int = 1
         self._next_thread_id: int = 1
@@ -2123,6 +2124,145 @@ class MirInterpreter:
             # uncatchable otherwise, exactly as if raised here.
             raise t.error
         return t.result
+
+    # ------------------------------------------------------------------
+    # The Metal launch shim (docs/gpu_tiles.md — handlers as backends):
+    # `std.gpu.run_metal(n, f)` performs Metal.launch, whose runtime
+    # symbol lands here.  The closure `f` must be the canonical launch
+    # idiom — `fn(pid) -> kernel(pid, buf, buf, ...)` — because the
+    # kernel must exist AS A FUNCTION for the MSL emitter; anything else
+    # is a loud error, never a silent CPU fallback.
+    # ------------------------------------------------------------------
+
+    _METAL_IDIOM = ("the Metal handler launches `fn(pid) -> "
+                    "kernel(pid, buffers...)` where `kernel` is a named "
+                    "function and every buffer is a captured Vec")
+
+    def _introspect_launch_closure(self, clo: "MxClosure"):
+        """(kernel MirFunc, [buffer MxVecs] in kernel-parameter order)."""
+        lam = self._funcs.get(clo.func_name)
+        if lam is None:
+            raise InterpError(
+                f"Metal.launch: no func {clo.func_name!r} for closure")
+        params = lam.param_names()
+        if len(params) != 1:
+            raise InterpError(
+                f"Metal.launch: the launched closure takes {len(params)} "
+                f"parameters, expected exactly the instance id — "
+                + self._METAL_IDIOM)
+        pid = params[0]
+        if len(lam.blocks) != 1:
+            raise InterpError(
+                "Metal.launch: the launched closure must be a single "
+                "kernel call — " + self._METAL_IDIOM)
+        copies: Dict[str, str] = {}
+        call = None
+        for op in lam.blocks[0].ops:
+            if op[0] == "params":
+                continue
+            if op[0] != "let":
+                raise InterpError(
+                    f"Metal.launch: op {op[0]!r} in the launched closure "
+                    "— " + self._METAL_IDIOM)
+            _, dst, rhs, aa = op
+            if rhs[0] == "copy":
+                copies[dst] = aa[0]
+            elif rhs[0] in ("const", "const_ty"):
+                continue
+            elif rhs[0] == "call":
+                if call is not None:
+                    raise InterpError(
+                        "Metal.launch: the launched closure makes more "
+                        "than one call — " + self._METAL_IDIOM)
+                call = (str(rhs[1]), list(aa))
+            else:
+                raise InterpError(
+                    f"Metal.launch: {rhs[0]!r} in the launched closure "
+                    "— " + self._METAL_IDIOM)
+        if call is None:
+            raise InterpError(
+                "Metal.launch: the launched closure calls no kernel — "
+                + self._METAL_IDIOM)
+        kname, kargs = call
+
+        def root(n: str) -> str:
+            seen = set()
+            while n in copies and n not in seen:
+                seen.add(n)
+                n = copies[n]
+            return n
+
+        if not kargs or root(kargs[0]) != pid:
+            raise InterpError(
+                f"Metal.launch: the kernel's first argument must be the "
+                f"instance id {pid!r} unchanged — " + self._METAL_IDIOM)
+        bufs: List[Any] = []
+        for a in kargs[1:]:
+            r = root(a)
+            if r not in clo.captured:
+                raise InterpError(
+                    f"Metal.launch: kernel argument {a!r} is not a "
+                    "captured value — " + self._METAL_IDIOM)
+            v = clo.captured[r]
+            if isinstance(v, MxCell):
+                v = v.value
+            if not isinstance(v, MxVec):
+                raise InterpError(
+                    f"Metal.launch: kernel buffer argument {a!r} is a "
+                    f"{_runtime_type_name(v)!r}, expected a Vec — "
+                    + self._METAL_IDIOM)
+            bufs.append(v)
+        kfunc = self._funcs.get(kname)
+        if kfunc is None:
+            raise InterpError(f"Metal.launch: kernel {kname!r} is not a "
+                              "module function")
+        return kfunc, bufs
+
+    def _rt_metal_launch(self, args: List[Any]) -> Any:
+        from .emit_msl import MslError, _emit
+        from .metal_launch import MetalLaunchError
+        from . import metal_launch as _engine
+
+        if len(args) != 2:
+            raise InterpError(
+                f"EFFECT_METAL_LAUNCH expects (n, f), got {len(args)} "
+                "arguments")
+        n, f = args
+        if isinstance(n, bool) or not isinstance(n, int) or n < 0:
+            raise InterpError(
+                f"Metal.launch: grid size must be a non-negative int, "
+                f"got {n!r}")
+        if not isinstance(f, MxClosure):
+            raise InterpError(
+                f"Metal.launch: expected a closure, got "
+                f"{_runtime_type_name(f)!r}")
+        kfunc, vecs = self._introspect_launch_closure(f)
+        try:
+            kern = _emit(kfunc)
+        except MslError as e:
+            raise InterpError(
+                f"Metal.launch: kernel {kfunc.name!r} is outside the MSL "
+                f"subset: {e}") from e
+        if len(kern.in_bufs) != len(vecs):
+            raise InterpError(
+                f"Metal.launch: kernel {kfunc.name!r} declares "
+                f"{len(kern.in_bufs)} buffers, the closure passes "
+                f"{len(vecs)}")
+        # The launch WRITES its output Vecs: same contended-write
+        # permission as every mutating builtin, checked before dispatch.
+        by_name = dict(zip(kern.in_bufs, vecs))
+        for b in kern.out_bufs:
+            v = by_name[b]
+            if v.contended and self._ctx().write_permit == 0:
+                raise InterpError(_CONTENDED_WRITE_MSG)
+        buffers = {b: list(v.items) for b, v in by_name.items()}
+        try:
+            merged = _engine.run(kern, n, buffers)
+        except MetalLaunchError as e:
+            raise InterpError(f"Metal.launch: {e}") from e
+        for b, vals in merged.items():
+            by_name[b].items[:] = vals
+        return None  # unit
 
     def _builtin_vec_comprehension(self, n: Any, fn: Any, iterable: Any) -> Any:
         """Evaluate `vector[T, N](expr for targets in iterable)` at runtime."""

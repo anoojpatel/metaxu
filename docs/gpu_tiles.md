@@ -180,11 +180,35 @@ per-lane register budget, swizzle bank-conflict freedom.
     independently computed blocked-accumulation product (per-block dot,
     then tile add — a different f32 association than a flat k loop, and
     part of the pinned semantics).
+  * **1e (landed): the Metal runtime handler.**  The Metal backend as a
+    HANDLER'S TOOL, exactly as the design promised: `std.gpu.run_metal
+    (n, f)` performs `Metal.launch` (`with EFFECT_METAL_LAUNCH`), and
+    the idiomatic use installs it over `Gpu.launch` so kernel code
+    never changes.  The runtime shim introspects the canonical launch
+    closure — `fn(pid) -> kernel(pid, buffers...)`, a named kernel,
+    captured Vec buffers, MIR-verified — emits the kernel's MSL, and
+    dispatches on the best engine (`compiler/metal_launch.py`):
+    `mx.fast.metal_kernel` on Apple silicon, else the clang++ shim with
+    `-ffp-contract=off` — which is bit-exact with the CPU reference and
+    is what makes the HANDLER differentially testable in a container
+    with no Metal (test_metal_launch.py pins metal-handler output ==
+    default-handler output, int matmul and f32, byte for byte).
+    Outputs write back mask-merged into the Vecs, behind the same
+    contended-write guard as every Vec mutator.  Everything outside the
+    contract is a LOUD catchable error — kernel outside the subset,
+    non-Vec buffer, non-canonical closure, float buffer holding
+    non-f32-representable values (the device buffer IS float32; a
+    silent round would diverge from the CPU handler on unwritten
+    merged elements), no engine installed — never a silent CPU
+    fallback.  Native binaries compile Metal-using programs
+    placeholder-free but abort loudly at dispatch (`mx_metal_launch`):
+    the MSL emitter and closure introspection live in the host, and a
+    quiet CPU fallback would misreport where the kernel ran.
   * **Still open in Stage 1:** f16 (same recipe: representable-widening
     + round-per-op; lands when a kernel needs it), the `gpu` effect
-    class (becomes load-bearing when the MLX handler dispatches real
-    launches), and memory-space locality states (vacuous until
-    threadgroup memory arrives in Stage 2).
+    class (now that the Metal handler dispatches real launches), and
+    memory-space locality states (vacuous until threadgroup memory
+    arrives in Stage 2).
 - **Stage 2 — fast:** inferred layouts + `convert_layout`,
   `simdgroup_matrix` dot, threadgroup-memory tiling, software
   pipelining where it pays on Apple.

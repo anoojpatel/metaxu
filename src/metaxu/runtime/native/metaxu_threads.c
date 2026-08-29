@@ -216,3 +216,18 @@ int64_t mx_mutex_unlock(int64_t handle) {
         mx_thr_fatal("EFFECT_MUTEX_UNLOCK: pthread_mutex_unlock failed", rc);
     return 0; /* unit */
 }
+
+/* EFFECT_METAL_LAUNCH: Metal dispatch needs the compiler's MSL emitter
+ * and closure introspection, which live in the interpreter/Mac host --
+ * a native binary reaching here gets the reason and a hard stop, never
+ * a silent CPU fallback (run under the default Gpu handler for that). */
+int64_t mx_metal_launch(int64_t n) {
+    fflush(stdout);
+    fprintf(stderr,
+            "Metal.launch: native binaries cannot dispatch Metal yet "
+            "(grid %lld) -- run through the interpreter (mlx or the "
+            "clang++ shim engine), or use the default Gpu handler for "
+            "the CPU reference\n", (long long)n);
+    fflush(stderr);
+    abort();
+}
