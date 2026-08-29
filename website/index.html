@@ -110,20 +110,18 @@ a:focus-visible, button:focus-visible { outline: 2px solid var(--acc); outline-o
 }
 .statusline b { color: var(--mut); font-weight: 500; }
 
-.tilefig { margin: 0; justify-self: end; width: 100%; max-width: 380px; }
-.tilefig svg { display: block; width: 100%; height: auto; }
-.tg rect { fill: var(--cell); animation: sweep 5.6s linear infinite; }
-@keyframes sweep {
-  0%   { fill: #221d13; }
-  4.5% { fill: #e2a33c; }
-  9%   { fill: #6b5527; }
-  17%  { fill: #221d13; }
-  100% { fill: #221d13; }
+.spinfig { margin: 0; justify-self: end; width: 100%; max-width: 400px; }
+.spinfig pre {
+  margin: 0; font-family: var(--mono); font-size: 13px; line-height: 1.08;
+  letter-spacing: 0; white-space: pre; user-select: none; cursor: crosshair;
+  color: var(--acc); text-shadow: 0 0 20px rgba(226, 163, 60, .25);
+  font-feature-settings: "calt" 0, "liga" 0; /* raw glyphs, no joining */
 }
-.tilefig figcaption {
+.spinfig figcaption {
   font-family: var(--mono); font-size: 11.5px; color: var(--dim);
   margin-top: 14px; letter-spacing: .02em;
 }
+@media (max-width: 440px) { .spinfig pre { font-size: 9.5px; } }
 
 /* ---------- sections ---------- */
 section { border-top: 1px solid var(--line); padding: 78px 0; }
@@ -298,7 +296,7 @@ footer .wrap { display: flex; justify-content: space-between; gap: 24px; flex-wr
 /* ---------- responsive ---------- */
 @media (max-width: 940px) {
   .hero .wrap { grid-template-columns: 1fr; }
-  .tilefig { justify-self: start; max-width: 320px; }
+  .spinfig { justify-self: start; max-width: 360px; }
   .cards { grid-template-columns: 1fr; }
   .card { border-left: none; border-top: 1px solid var(--line); }
   .card:first-child { border-top: none; }
@@ -310,9 +308,9 @@ footer .wrap { display: flex; justify-content: space-between; gap: 24px; flex-wr
 /* ---------- reduced motion ---------- */
 @media (prefers-reduced-motion: reduce) {
   html { scroll-behavior: auto; }
-  .tg rect, .pipe .spine, .wall-sig, .wall-tap { animation: none; }
-  .tg rect.diag { fill: var(--acc-dim); }
+  .pipe .spine, .wall-sig, .wall-tap { animation: none; }
   .wall-tap { opacity: .35; }
+  /* the vortex renders one static frame (see the script) */
 }
 </style>
 
@@ -352,76 +350,9 @@ footer .wrap { display: flex; justify-content: space-between; gap: 24px; flex-wr
         <b>~2000</b> tests &middot; <b>1.00&ndash;1.09x</b> C on measured suites
       </p>
     </div>
-    <figure class="tilefig" aria-hidden="true">
-      <svg viewBox="0 0 358 358" role="img" aria-label="An 8 by 8 tile grid animating a diagonal kernel sweep">
-        <g class="tg">
-      <rect x="4" y="4" width="38" height="38" rx="2" style="animation-delay:-0.0s"/>
-      <rect x="48" y="4" width="38" height="38" rx="2" style="animation-delay:-0.4s"/>
-      <rect x="92" y="4" width="38" height="38" rx="2" style="animation-delay:-0.8s"/>
-      <rect x="136" y="4" width="38" height="38" rx="2" style="animation-delay:-1.2s"/>
-      <rect x="180" y="4" width="38" height="38" rx="2" style="animation-delay:-1.6s"/>
-      <rect x="224" y="4" width="38" height="38" rx="2" style="animation-delay:-2.0s"/>
-      <rect x="268" y="4" width="38" height="38" rx="2" style="animation-delay:-2.4s"/>
-      <rect class="diag" x="312" y="4" width="38" height="38" rx="2" style="animation-delay:-2.8s"/>
-      <rect x="4" y="48" width="38" height="38" rx="2" style="animation-delay:-0.4s"/>
-      <rect x="48" y="48" width="38" height="38" rx="2" style="animation-delay:-0.8s"/>
-      <rect x="92" y="48" width="38" height="38" rx="2" style="animation-delay:-1.2s"/>
-      <rect x="136" y="48" width="38" height="38" rx="2" style="animation-delay:-1.6s"/>
-      <rect x="180" y="48" width="38" height="38" rx="2" style="animation-delay:-2.0s"/>
-      <rect x="224" y="48" width="38" height="38" rx="2" style="animation-delay:-2.4s"/>
-      <rect class="diag" x="268" y="48" width="38" height="38" rx="2" style="animation-delay:-2.8s"/>
-      <rect x="312" y="48" width="38" height="38" rx="2" style="animation-delay:-3.2s"/>
-      <rect x="4" y="92" width="38" height="38" rx="2" style="animation-delay:-0.8s"/>
-      <rect x="48" y="92" width="38" height="38" rx="2" style="animation-delay:-1.2s"/>
-      <rect x="92" y="92" width="38" height="38" rx="2" style="animation-delay:-1.6s"/>
-      <rect x="136" y="92" width="38" height="38" rx="2" style="animation-delay:-2.0s"/>
-      <rect x="180" y="92" width="38" height="38" rx="2" style="animation-delay:-2.4s"/>
-      <rect class="diag" x="224" y="92" width="38" height="38" rx="2" style="animation-delay:-2.8s"/>
-      <rect x="268" y="92" width="38" height="38" rx="2" style="animation-delay:-3.2s"/>
-      <rect x="312" y="92" width="38" height="38" rx="2" style="animation-delay:-3.6s"/>
-      <rect x="4" y="136" width="38" height="38" rx="2" style="animation-delay:-1.2s"/>
-      <rect x="48" y="136" width="38" height="38" rx="2" style="animation-delay:-1.6s"/>
-      <rect x="92" y="136" width="38" height="38" rx="2" style="animation-delay:-2.0s"/>
-      <rect x="136" y="136" width="38" height="38" rx="2" style="animation-delay:-2.4s"/>
-      <rect class="diag" x="180" y="136" width="38" height="38" rx="2" style="animation-delay:-2.8s"/>
-      <rect x="224" y="136" width="38" height="38" rx="2" style="animation-delay:-3.2s"/>
-      <rect x="268" y="136" width="38" height="38" rx="2" style="animation-delay:-3.6s"/>
-      <rect x="312" y="136" width="38" height="38" rx="2" style="animation-delay:-4.0s"/>
-      <rect x="4" y="180" width="38" height="38" rx="2" style="animation-delay:-1.6s"/>
-      <rect x="48" y="180" width="38" height="38" rx="2" style="animation-delay:-2.0s"/>
-      <rect x="92" y="180" width="38" height="38" rx="2" style="animation-delay:-2.4s"/>
-      <rect class="diag" x="136" y="180" width="38" height="38" rx="2" style="animation-delay:-2.8s"/>
-      <rect x="180" y="180" width="38" height="38" rx="2" style="animation-delay:-3.2s"/>
-      <rect x="224" y="180" width="38" height="38" rx="2" style="animation-delay:-3.6s"/>
-      <rect x="268" y="180" width="38" height="38" rx="2" style="animation-delay:-4.0s"/>
-      <rect x="312" y="180" width="38" height="38" rx="2" style="animation-delay:-4.4s"/>
-      <rect x="4" y="224" width="38" height="38" rx="2" style="animation-delay:-2.0s"/>
-      <rect x="48" y="224" width="38" height="38" rx="2" style="animation-delay:-2.4s"/>
-      <rect class="diag" x="92" y="224" width="38" height="38" rx="2" style="animation-delay:-2.8s"/>
-      <rect x="136" y="224" width="38" height="38" rx="2" style="animation-delay:-3.2s"/>
-      <rect x="180" y="224" width="38" height="38" rx="2" style="animation-delay:-3.6s"/>
-      <rect x="224" y="224" width="38" height="38" rx="2" style="animation-delay:-4.0s"/>
-      <rect x="268" y="224" width="38" height="38" rx="2" style="animation-delay:-4.4s"/>
-      <rect x="312" y="224" width="38" height="38" rx="2" style="animation-delay:-4.8s"/>
-      <rect x="4" y="268" width="38" height="38" rx="2" style="animation-delay:-2.4s"/>
-      <rect class="diag" x="48" y="268" width="38" height="38" rx="2" style="animation-delay:-2.8s"/>
-      <rect x="92" y="268" width="38" height="38" rx="2" style="animation-delay:-3.2s"/>
-      <rect x="136" y="268" width="38" height="38" rx="2" style="animation-delay:-3.6s"/>
-      <rect x="180" y="268" width="38" height="38" rx="2" style="animation-delay:-4.0s"/>
-      <rect x="224" y="268" width="38" height="38" rx="2" style="animation-delay:-4.4s"/>
-      <rect x="268" y="268" width="38" height="38" rx="2" style="animation-delay:-4.8s"/>
-      <rect x="312" y="268" width="38" height="38" rx="2" style="animation-delay:-5.2s"/>
-      <rect class="diag" x="4" y="312" width="38" height="38" rx="2" style="animation-delay:-2.8s"/>
-      <rect x="48" y="312" width="38" height="38" rx="2" style="animation-delay:-3.2s"/>
-      <rect x="92" y="312" width="38" height="38" rx="2" style="animation-delay:-3.6s"/>
-      <rect x="136" y="312" width="38" height="38" rx="2" style="animation-delay:-4.0s"/>
-      <rect x="180" y="312" width="38" height="38" rx="2" style="animation-delay:-4.4s"/>
-      <rect x="224" y="312" width="38" height="38" rx="2" style="animation-delay:-4.8s"/>
-      <rect x="268" y="312" width="38" height="38" rx="2" style="animation-delay:-5.2s"/>
-      <rect x="312" y="312" width="38" height="38" rx="2" style="animation-delay:-5.6s"/>
-        </g>
-      </svg>
-      <figcaption>Tile[T, 8, 8] &mdash; one kernel instance per output tile</figcaption>
+    <figure class="spinfig" aria-hidden="true">
+      <pre id="vortex" aria-label="An interactive ASCII vortex, breathing in and out"> </pre>
+      <figcaption>the vortex &mdash; stir it &middot; drag the cursor across to steer the spin</figcaption>
     </figure>
   </div>
 </section>
@@ -822,6 +753,75 @@ fn mm_kernel(pid: int, a: Vec, b: Vec, c: Vec) -> () {
 </footer>
 
 <script>
+/* The hero vortex: a spiral field sampled onto a character grid — the
+   ASCII density ramp IS the brightness.  It breathes (a slow global
+   fade in and out), and the pointer stirs it: a local glow, a swirl
+   distortion around the cursor, and horizontal position steering the
+   spin speed and direction.  Reduced motion gets one static frame. */
+(function () {
+  var el = document.getElementById('vortex');
+  if (!el) return;
+  var W = 46, H = 24, AX = 0.52;             // cell aspect: width/height
+  var RAMP = ' `.,:;-=+*xX#%@';
+  var CX = W / 2 - 0.5, CY = H / 2 - 0.5;
+  var RMAX = Math.min(CX * AX, CY) + 0.5;
+  var reduced = window.matchMedia
+    && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  var mx = -1e3, my = -1e3;                  // pointer, in cell coords
+  var speed = 0.9, targetSpeed = 0.9, phase = 0, lastT = null;
+
+  function render(breath) {
+    var rows = [];
+    for (var y = 0; y < H; y++) {
+      var line = '';
+      for (var x = 0; x < W; x++) {
+        var dx = (x - CX) * AX, dy = y - CY;
+        var r = Math.sqrt(dx * dx + dy * dy);
+        if (r > RMAX) { line += ' '; continue; }
+        var th = Math.atan2(dy, dx);
+        // the stir: a gaussian bump around the cursor twists the local
+        // phase and adds glow, so the arms bend toward your hand
+        var gx = (x - mx) * AX, gy = y - my;
+        var g = Math.exp(-(gx * gx + gy * gy) / 7);
+        var edge = 1 - r / RMAX;             // arms die out at the rim
+        var v = Math.sin(3 * th + r * 1.15 - phase - g * 2.6)
+                * edge * breath + g * 0.85;
+        // rectified: the arms' troughs fade to BLANK, so the breathing
+        // really breathes — at low breath the figure all but vanishes
+        var i = Math.round(Math.max(0, v) * (RAMP.length - 1));
+        line += RAMP[i >= RAMP.length ? RAMP.length - 1 : i];
+      }
+      rows.push(line);
+    }
+    el.textContent = rows.join('\n');
+  }
+
+  if (reduced) { phase = 1.7; render(0.9); return; }
+
+  el.addEventListener('pointermove', function (e) {
+    var b = el.getBoundingClientRect();
+    mx = (e.clientX - b.left) / b.width * W;
+    my = (e.clientY - b.top) / b.height * H;
+    // horizontal position steers the spin: left = backward, right = fast
+    targetSpeed = 0.25 + ((e.clientX - b.left) / b.width - 0.5) * 3.6;
+  });
+  el.addEventListener('pointerleave', function () {
+    mx = my = -1e3; targetSpeed = 0.9;
+  });
+
+  function tick(t) {
+    if (lastT === null) lastT = t;
+    var dt = Math.min(t - lastT, 64); lastT = t;
+    speed += (targetSpeed - speed) * 0.06;
+    phase += speed * dt * 0.0022;
+    // the fade in and out: dips to a whisper, swells back (~12s cycle)
+    var breath = 0.5 + 0.4 * Math.sin(t * 0.00052);
+    render(breath);
+    requestAnimationFrame(tick);
+  }
+  requestAnimationFrame(tick);
+})();
+
 (function () {
   var RE = new RegExp(
     '(\\/\\/[^\\n]*|#[^\\n]*)' +           // 1 comment
