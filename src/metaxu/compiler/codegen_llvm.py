@@ -1068,6 +1068,12 @@ _EFFECT_PRIMITIVES = {
     "EFFECT_MUTEX_CREATE": ("mx_mutex_create", 0),  # () -> handle
     "EFFECT_MUTEX_LOCK": ("mx_mutex_lock", 1),      # (handle) -> unit
     "EFFECT_MUTEX_UNLOCK": ("mx_mutex_unlock", 1),  # (handle) -> unit
+    # Metal launches are interpreter/Mac-hosted (the runtime introspects
+    # the closure and emits MSL — machinery a native binary does not
+    # carry).  The native primitive exists so std.gpu's Metal effect
+    # compiles placeholder-free everywhere, and FAILS LOUDLY if a native
+    # binary actually dispatches one (never a silent CPU fallback).
+    "EFFECT_METAL_LAUNCH": ("mx_metal_launch", 2),  # (n, closure) -> abort
 }
 
 # The synthesized module-constant initializer (hir.py): its globals_decl
@@ -1174,6 +1180,7 @@ _RT_SIGS = {
     "mx_tile_store_rows": ("void", ("ptr", "i64", "i64", "ptr")),
     "mx_tile_to_f32": ("ptr", ("ptr", "i64")),
     "mx_tile_to_f64": ("ptr", ("ptr", "i64")),
+    "mx_metal_launch": ("i64", ("i64",)),
     # Delimited failure recovery (try/catch, metaxu_effects.c).
     "mx_try": ("i64", ("ptr", "ptr", "ptr", "ptr")),
 }
@@ -5101,6 +5108,10 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                     f"EFFECT_JOIN result {pdst!r} has kind {ty(pdst)}, "
                     "which does not decode from the child's result word "
                     "(word kinds only; aggregates demote)")
+        elif symbol == "EFFECT_METAL_LAUNCH":
+            # The native primitive aborts before reading its arguments,
+            # so any kinds are fine — nothing to validate.
+            pass
         else:  # EFFECT_MUTEX_CREATE / _LOCK / _UNLOCK
             for a in pargs:
                 if ty(a) != I64:
@@ -9444,6 +9455,14 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                             f"  {v} = call i64 @mx_mutex_create()"
                             "  ; ERRORCHECK mutex; opaque immortal handle "
                             "word")
+                        setval(dst, v, lines)
+                    elif symbol == "EFFECT_METAL_LAUNCH":
+                        n0 = use(opargs[0], lines)
+                        v = fresh()
+                        lines.append(
+                            f"  {v} = call i64 @mx_metal_launch(i64 {n0})"
+                            "  ; Metal is interpreter/Mac-hosted: aborts "
+                            "with the reason, never a silent CPU fallback")
                         setval(dst, v, lines)
                     else:  # EFFECT_MUTEX_LOCK / EFFECT_MUTEX_UNLOCK
                         a = use(opargs[0], lines)

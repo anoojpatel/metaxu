@@ -653,9 +653,19 @@ fn mm_kernel(pid: int, a: Vec, b: Vec, c: Vec) -> () {
         computed f32 matmul.</div>
       </div>
       <div class="stage">
+        <div class="tag mono">Stage 1e <span class="st landed">landed</span></div>
+        <div class="body"><b>The Metal runtime handler.</b> Install
+        <code>run_metal</code> over <code>Gpu.launch</code> and the same
+        kernel dispatches through <code>mx.fast.metal_kernel</code> on
+        Apple silicon &mdash; or a bit-exact shim engine elsewhere, which
+        is how the handler is differentially tested with no GPU in the
+        container. Everything outside the contract errs loudly; never a
+        silent CPU fallback.</div>
+      </div>
+      <div class="stage">
         <div class="tag mono">Stage 1, open <span class="st">next</span></div>
-        <div class="body">The MLX runtime handler dispatching real launches;
-        f16 by the same recipe; the <code>gpu</code> effect class.</div>
+        <div class="body">f16 by the same recipe; the <code>gpu</code>
+        effect class.</div>
       </div>
       <div class="stage">
         <div class="tag mono">Stages 2&ndash;3 <span class="st">ahead</span></div>

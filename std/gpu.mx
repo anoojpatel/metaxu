@@ -21,7 +21,9 @@
 
 export {
     Gpu,
-    run_grid
+    run_grid,
+    Metal,
+    run_metal
 }
 
 # The reference launch: sequential, pid-ordered, on this thread.
@@ -36,4 +38,25 @@ fn run_grid(n: int, f: fn(int) -> ()) -> () {
 
 effect Gpu {
     launch(n: int, f: fn(int) -> ()) -> () = run_grid(n, f)
+}
+
+# The Metal backend, AS A HANDLER'S TOOL.  `run_metal(n, f)` hands the
+# launch to the runtime's Metal engine: the closure must be the
+# canonical launch idiom `fn(pid) -> kernel(pid, buffers...)` (a named
+# kernel, captured Vec buffers) so the runtime can emit the kernel's MSL
+# and dispatch it — through mlx.fast.metal_kernel on Apple silicon, or
+# the bit-exact clang++ shim elsewhere.  Anything outside the kernel
+# subset, a missing engine, or a non-representable float buffer is a
+# LOUD error, never a silent CPU fallback.  The idiomatic use installs
+# it as the Gpu handler, so kernel code never changes:
+#
+#     handle Gpu with {
+#         launch(n, f) -> { run_metal(n, f); resume(()) }
+#     } in { perform Gpu.launch(grid, fn(pid: int) -> k(pid, a, out)) }
+effect Metal = {
+    fn launch(n: int, f: fn(int) -> ()) -> () with EFFECT_METAL_LAUNCH
+}
+
+fn run_metal(n: int, f: fn(int) -> ()) -> () {
+    perform Metal.launch(n, f)
 }

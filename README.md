@@ -118,9 +118,11 @@ pass, and the benchmark suites (`benchmarks/suite`,
 numbers with an alignment-controlled, rotation-interleaved methodology.
 Current work: the GPU tile pipeline (Stage 1 landed: kernel seam, MSL
 emitter, f32 tiles with bit-exact rounding across all three engines,
-float Metal kernels, Mac self-check harness; next: the MLX runtime
-handler, then layouts and `simdgroup_matrix`). See
-`docs/compiler_roadmap.md` and `docs/gpu_tiles.md`.
+float Metal kernels, Mac self-check harness, and the Metal runtime
+handler — `run_metal` installed over `Gpu.launch` dispatches kernels
+through MLX on a Mac or a bit-exact shim engine elsewhere; next:
+layouts and `simdgroup_matrix`). See `docs/compiler_roadmap.md` and
+`docs/gpu_tiles.md`.
 
 ## Installation
 

@@ -73,6 +73,12 @@ int64_t mx_mutex_create(void);
 int64_t mx_mutex_lock(int64_t handle);
 int64_t mx_mutex_unlock(int64_t handle);
 
+/* EFFECT_METAL_LAUNCH: Metal dispatch is interpreter/Mac-hosted (the
+ * runtime introspects the closure and emits MSL -- machinery a native
+ * binary does not carry), so the native primitive exists only to FAIL
+ * LOUDLY, never to fall back to the CPU silently. */
+int64_t mx_metal_launch(int64_t n);
+
 /* Contention permission (docs/contention_as_permission.md): the calling
  * thread's held-mutex count.  _Thread_local, bumped by mx_mutex_lock
  * (+1, only after a SUCCESSFUL lock -- a failed ERRORCHECK lock never
