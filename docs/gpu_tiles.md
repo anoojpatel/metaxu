@@ -237,7 +237,8 @@ per-lane register budget, swizzle bank-conflict freedom.
     half BUFFERS for MSL kernels (f16 compute landed in 1f).
 - **Stage 2 — fast:** inferred layouts + `convert_layout`,
   `simdgroup_matrix` dot, threadgroup-memory tiling, software
-  pipelining where it pays on Apple.
+  pipelining where it pays on Apple.  Execution-model mapping (how
+  per-pid instances meet simdgroups): `docs/simdgroup_plan.md`.
 - **Stage 3 — expert surface:** Gluon-style explicit layout
   annotations, the autotuner (the benchmark harness's paired-run
   methodology as a per-kernel search with a shape-keyed cache),
