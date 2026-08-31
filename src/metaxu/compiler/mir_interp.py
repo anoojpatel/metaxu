@@ -303,19 +303,21 @@ class MxTile:
     and the compile-time shape checker — lives in the compiler).  Every
     op produces a fresh tile: functional semantics until layouts exist
     to make lane-local mutation provably sound (deliberate, documented).
-    Elements are uniformly one kind (`ekind`: "int", "f64" or "f32");
-    mixing is a loud error, never a coercion.  f32 (docs/gpu_tiles.md
-    Stage 1d) is a TILE element kind only — language scalars stay f64 —
-    stored as the f32-REPRESENTABLE double (widened bits), with every
-    arithmetic op rounding its result to f32.  That representation is
-    what makes f32 bit-exact across all three engines: adding/multiplying
-    two f32-representable values in f64 and rounding once IS the
-    correctly-rounded f32 operation.
+    Elements are uniformly one kind (`ekind`: "int", "f64", "f32" or
+    "f16"); mixing is a loud error, never a coercion.  f32 (docs/
+    gpu_tiles.md Stage 1d) and f16 (Stage 1f) are TILE element kinds
+    only — language scalars stay f64 — stored as the REPRESENTABLE
+    double (widened bits), with every arithmetic op rounding its result
+    to the element width once.  That representation is what makes them
+    bit-exact across all three engines: adding/multiplying two
+    representable values in f64 and rounding once IS the correctly
+    rounded narrow op (24+24 < 53 for f32, 11+11 < 53 for f16
+    significand bits).
     """
     rows: int
     cols: int
     elements: tuple
-    ekind: str  # "int" | "f64" | "f32"
+    ekind: str  # "int" | "f64" | "f32" | "f16"
 
     def __repr__(self) -> str:
         # Pinned print format, shared byte-for-byte with the native
@@ -1707,6 +1709,7 @@ class MirInterpreter:
         self._builtins["Tile.load"] = _tile_load
         self._builtins["Tile.load_or"] = _tile_load_or
         self._builtins["Tile.to_f32"] = _tile_to_f32
+        self._builtins["Tile.to_f16"] = _tile_to_f16
         self._builtins["Tile.to_f64"] = _tile_to_f64
         self._builtins["Tile.load_rows"] = _tile_load_rows
         # --- Runtime library: Vec (growable, mutable; see MxVec) ------------
@@ -2586,8 +2589,8 @@ def _tile_elem_ekind(op: str, x: Any) -> str:
 
 def _kname(ekind: str) -> str:
     """Element-kind name in diagnostics ("float" is the language's name
-    for f64; "f32" names the device-width tile kind)."""
-    return {"int": "int", "f64": "float", "f32": "f32"}[ekind]
+    for f64; "f32"/"f16" name the device-width tile kinds)."""
+    return {"int": "int", "f64": "float", "f32": "f32", "f16": "f16"}[ekind]
 
 
 def _f32(x: float) -> float:
@@ -2595,6 +2598,14 @@ def _f32(x: float) -> float:
     (the f32-representable value).  Every f32 tile op rounds through
     this; _F32_PACK round-trips through IEEE binary32 exactly."""
     return _structmod.unpack("f", _structmod.pack("f", x))[0]
+
+
+def _f16(x: float) -> float:
+    """Round a double to the nearest f16 (IEEE binary16, round-to-
+    nearest-even — Python's 'e' struct format), returned as the widened
+    double.  Every f16 tile op rounds through this; it matches the C
+    runtime's (double)(_Float16)x bit for bit."""
+    return _structmod.unpack("e", _structmod.pack("e", x))[0]
 
 
 def _tile_zero(ekind: str) -> Any:
@@ -2654,6 +2665,9 @@ def _tile_add(a: Any, b: Any) -> MxTile:
     if a.ekind == "f32":  # per-op rounding (see MxTile docstring)
         elems = tuple(_f32(x + y)
                       for x, y in zip(a.elements, b.elements))
+    elif a.ekind == "f16":
+        elems = tuple(_f16(x + y)
+                      for x, y in zip(a.elements, b.elements))
     else:
         elems = tuple(x + y for x, y in zip(a.elements, b.elements))
     return MxTile(a.rows, a.cols, elems, a.ekind)
@@ -2665,6 +2679,9 @@ def _tile_mul(a: Any, b: Any) -> MxTile:
     _tile_same("Tile.mul", a, b)
     if a.ekind == "f32":
         elems = tuple(_f32(x * y)
+                      for x, y in zip(a.elements, b.elements))
+    elif a.ekind == "f16":
+        elems = tuple(_f16(x * y)
                       for x, y in zip(a.elements, b.elements))
     else:
         elems = tuple(x * y for x, y in zip(a.elements, b.elements))
@@ -2685,6 +2702,17 @@ def _tile_scale(t: Any, s: Any) -> MxTile:
         sf = _f32(s)
         return MxTile(t.rows, t.cols,
                       tuple(_f32(x * sf) for x in t.elements), "f32")
+    if t.ekind == "f16":
+        # Same rule as f32: the f64 factor rounds to f16 first, the
+        # multiply rounds per element — matching (double)(_Float16)s in C.
+        if sk != "f64":
+            raise InterpError(
+                f"Tile.scale: scalar kind must match tile elements "
+                f"(f16 tile, {_kname(sk)} scalar; f16 tiles scale by "
+                "float scalars)")
+        sf = _f16(s)
+        return MxTile(t.rows, t.cols,
+                      tuple(_f16(x * sf) for x in t.elements), "f16")
     if sk != t.ekind:
         raise InterpError(
             f"Tile.scale: scalar kind must match tile elements "
@@ -2705,6 +2733,7 @@ def _tile_dot(a: Any, b: Any) -> MxTile:
     R, K, C = a.rows, a.cols, b.cols
     out = []
     f32 = a.ekind == "f32"
+    f16 = a.ekind == "f16"
     for i in range(R):
         for j in range(C):
             acc = _tile_zero(a.ekind)
@@ -2712,6 +2741,8 @@ def _tile_dot(a: Any, b: Any) -> MxTile:
                 x = a.elements[i * K + k] * b.elements[k * C + j]
                 if f32:  # round the product, then the accumulation
                     acc = _f32(acc + _f32(x))
+                elif f16:
+                    acc = _f16(acc + _f16(x))
                 else:
                     acc = acc + x
             out.append(acc)
@@ -2722,8 +2753,13 @@ def _tile_sum(t: Any) -> Any:
     t = _tile_arg("Tile.sum", t)
     acc = _tile_zero(t.ekind)
     for x in t.elements:  # pinned order: row-major
-        acc = _f32(acc + x) if t.ekind == "f32" else acc + x
-    return acc  # f32 results reach the language as the widened double
+        if t.ekind == "f32":
+            acc = _f32(acc + x)
+        elif t.ekind == "f16":
+            acc = _f16(acc + x)
+        else:
+            acc = acc + x
+    return acc  # f32/f16 results reach the language as the widened double
 
 
 def _tile_transpose(t: Any) -> MxTile:
@@ -2746,20 +2782,30 @@ def _tile_get(t: Any, i: Any, j: Any) -> Any:
     return t.elements[i * t.cols + j]
 
 
-# -- f32 conversions (docs/gpu_tiles.md Stage 1d) ---------------------------
+# -- f32/f16 conversions (docs/gpu_tiles.md Stage 1d/1f) --------------------
 #
-# f32 exists as a TILE element kind only; language scalars stay f64.  The
-# two conversions are the whole new surface: everything else is the
-# existing ops extended to the "f32" ekind.  Elements are stored as the
-# f32-REPRESENTABLE double, so widening back (to_f64 / sum / get /
-# store_rows into a Vec) is exact and free.
+# f32 and f16 exist as TILE element kinds only; language scalars stay
+# f64.  The conversions are the whole new surface: everything else is the
+# existing ops extended to the narrow ekinds.  Elements are stored as the
+# REPRESENTABLE double, so widening back (to_f64 / to_f32 of an f16 tile /
+# sum / get / store_rows into a Vec) is exact and free (f16 values are
+# exactly f32-representable).
 
 def _tile_to_f32(t: Any) -> MxTile:
     t = _tile_arg("Tile.to_f32", t)
     if t.ekind == "f32":
         return MxTile(t.rows, t.cols, t.elements, "f32")
+    # f16 elements are f32-representable, so _f32 is an exact widening.
     return MxTile(t.rows, t.cols,
                   tuple(_f32(float(x)) for x in t.elements), "f32")
+
+
+def _tile_to_f16(t: Any) -> MxTile:
+    t = _tile_arg("Tile.to_f16", t)
+    if t.ekind == "f16":
+        return MxTile(t.rows, t.cols, t.elements, "f16")
+    return MxTile(t.rows, t.cols,
+                  tuple(_f16(float(x)) for x in t.elements), "f16")
 
 
 def _tile_to_f64(t: Any) -> MxTile:

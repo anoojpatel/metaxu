@@ -256,15 +256,16 @@ mx_tile *mx_tile_filled(int64_t rows, int64_t cols, int64_t word);
 mx_tile *mx_tile_arange(int64_t rows, int64_t cols);
 mx_tile *mx_tile_from_vec(const mx_vec *v, int64_t rows, int64_t cols);
 mx_vec  *mx_tile_to_vec(const mx_tile *t);
-/* ekind codes for tile arithmetic: 0 = int, 1 = f64, 2 = f32 (elements
- * stored as the f32-representable double; every op rounds through float —
- * docs/gpu_tiles.md Stage 1d). */
+/* ekind codes for tile arithmetic: 0 = int, 1 = f64, 2 = f32, 3 = f16
+ * (narrow elements stored as the representable double; every op rounds
+ * through float / _Float16 — docs/gpu_tiles.md Stage 1d/1f). */
 mx_tile *mx_tile_add(const mx_tile *a, const mx_tile *b, int64_t ekind);
 mx_tile *mx_tile_mul(const mx_tile *a, const mx_tile *b, int64_t ekind);
 mx_tile *mx_tile_scale(const mx_tile *t, int64_t sword, int64_t ekind);
 mx_tile *mx_tile_dot(const mx_tile *a, const mx_tile *b, int64_t ekind);
 int64_t  mx_tile_sum(const mx_tile *t, int64_t ekind);
 mx_tile *mx_tile_to_f32(const mx_tile *t, int64_t src_ekind);
+mx_tile *mx_tile_to_f16(const mx_tile *t, int64_t src_ekind);
 mx_tile *mx_tile_to_f64(const mx_tile *t, int64_t src_ekind);
 mx_tile *mx_tile_transpose(const mx_tile *t);
 int64_t  mx_tile_get(const mx_tile *t, int64_t i, int64_t j);

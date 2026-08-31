@@ -292,6 +292,121 @@ def test_f32_ragged_scale_kernel_shim_matches_interp():
     _differential(_FSCALE, "fscale_kernel", 3, {"v": vals})
 
 
+# f16 kernels (docs/gpu_tiles.md Stage 1f): COMPUTE-ONLY — buffers stay
+# float, f16 tiles arise via Tile.to_f16 inside the kernel and convert
+# back through Tile.to_f32 before storing.  The C++ shim maps `half` to
+# _Float16 and stays the bit-exact leg.
+
+def _f16r(x) -> float:
+    """Round a value to the f16-representable double (IEEE binary16,
+    round-to-nearest-even — Python's 'e' struct format)."""
+    import struct
+    return struct.unpack("e", struct.pack("e", float(x)))[0]
+
+
+_HMM = """
+fn hmm_kernel(pid: int, a: Vec, b: Vec, c: Vec) -> () {
+    let ti = pid / 2;
+    let tj = pid % 2;
+    let mut k = 0;
+    let mut r = Tile.to_f16(Tile.filled(2, 2, 0));
+    while k < 2 {
+        let ta = Tile.to_f16(Tile.to_f32(
+            Tile.load_rows(a, (ti * 2) * 4 + k * 2, 4, 2, 2, 0.0)));
+        let tb = Tile.to_f16(Tile.to_f32(
+            Tile.load_rows(b, (k * 2) * 4 + tj * 2, 4, 2, 2, 0.0)));
+        r = Tile.add(r, Tile.dot(ta, tb));
+        k = k + 1
+    };
+    Tile.store_rows(c, (ti * 2) * 4 + tj * 2, 4, Tile.to_f32(r));
+    ()
+}
+"""
+
+_HSCALE = """
+fn hscale_kernel(pid: int, v: Vec) -> () {
+    let t = Tile.to_f16(Tile.to_f32(Tile.load_or(v, pid * 4, 1, 4, 0.0)));
+    Tile.store_clipped(v, pid * 4, Tile.to_f32(Tile.scale(t, 0.3)));
+    ()
+}
+"""
+
+
+@needs_clangxx
+def test_f16_matmul_kernel_shim_matches_interp():
+    # B is the 4x4 identity, so beyond the differential the shim must
+    # reproduce C == round_f16(A) exactly (multiplying by 1.0 and adding
+    # 0.0 are exact in f16; the store widens exactly to f32).
+    a = [_f32r(i * 0.1) for i in range(16)]
+    bufs = {
+        "a": a,
+        "b": [1.0 if i % 5 == 0 else 0.0 for i in range(16)],
+        "c": [0.0] * 16,
+    }
+    _differential(_HMM, "hmm_kernel", 4, bufs)
+    src = _driver(_HMM, "hmm_kernel", 4, bufs)
+    k = emit_msl_kernel(src, "hmm_kernel")
+    assert k.buf_types == {"a": "float", "b": "float", "c": "float"}
+    assert k.uses_half
+    assert _run_shim(k, 4, bufs) == [_f16r(x) for x in a]
+
+
+@needs_clangxx
+def test_f16_matmul_ground_truth_independent():
+    # The differential alone cannot catch an idiom both engines share:
+    # pin the f16 matmul against a product computed HERE, in Python, with
+    # explicit per-op 'e' rounding and the kernel's BLOCKED accumulation
+    # (per-block dot — round product, then accumulation — combined
+    # through Tile.add, each step rounding once to f16).
+    import random
+    rng = random.Random(11)
+    a = [_f32r(rng.uniform(-1, 1)) for _ in range(16)]
+    b = [_f32r(rng.uniform(-1, 1)) for _ in range(16)]
+    bufs = {"a": a, "b": b, "c": [0.0] * 16}
+    ah = [_f16r(x) for x in a]   # Tile.to_f16 of the loaded f32 tiles
+    bh = [_f16r(x) for x in b]
+    expect = [0.0] * 16
+    for i in range(4):
+        for j in range(4):
+            r = 0.0
+            for kb in range(2):
+                acc = 0.0
+                for kk in range(2):  # pinned order: k ascending
+                    gk = kb * 2 + kk
+                    acc = _f16r(acc + _f16r(ah[i * 4 + gk] *
+                                            bh[gk * 4 + j]))
+                r = _f16r(r + acc)   # Tile.add rounds once per element
+            expect[i * 4 + j] = r    # Tile.to_f32 widens exactly
+    src = _driver(_HMM, "hmm_kernel", 4, bufs)
+    k = emit_msl_kernel(src, "hmm_kernel")
+    assert _run_shim(k, 4, bufs) == expect
+    _differential(_HMM, "hmm_kernel", 4, bufs)
+
+
+@needs_clangxx
+def test_f16_ragged_scale_kernel_shim_matches_interp():
+    # Masked semantics through an f16 round-trip: the factor 0.3 rounds
+    # once to f16, each product rounds once, the store widens exactly,
+    # and the merge keeps unwritten tail elements bit-identical.
+    vals = [_f32r((i + 1) * 0.7) for i in range(10)]
+    _differential(_HSCALE, "hscale_kernel", 3, {"v": vals})
+
+
+def test_f16_shim_typedef_present_only_when_used():
+    # The _Float16 typedef (and its loud #error guard) appears exactly
+    # when the kernel declares half values — an int kernel's shim must
+    # stay compilable on toolchains without _Float16.
+    hk = emit_msl_kernel(_driver(_HSCALE, "hscale_kernel", 1,
+                                 {"v": [0.0] * 4}), "hscale_kernel")
+    assert hk.uses_half
+    assert "typedef _Float16 half;" in hk.cpp_wrapper()
+    assert "__FLT16_MANT_DIG__" in hk.cpp_wrapper()
+    ik = emit_msl_kernel(_driver(_MM, "mm_kernel", 4, {
+        "a": [0] * 16, "b": [0] * 16, "c": [0] * 16}), "mm_kernel")
+    assert not ik.uses_half
+    assert "_Float16" not in ik.cpp_wrapper()
+
+
 # ---------------------------------------------------------------------------
 # Subset rejections: out-of-subset kernels fail LOUDLY with the reason
 # ---------------------------------------------------------------------------
@@ -342,6 +457,21 @@ def _kernel_module(body: str) -> str:
      " let a = Tile.to_f32(Tile.filled(1, 2, 0));"
      " Tile.store_clipped(v, 0, Tile.scale(a, pid)); () }",
      "Tile.scale"),
+    # f16 subset edges (Stage 1f): compute-only — stores need to_f32
+    # first; f16 mixes with nothing; scale factors are float literals.
+    ("fn k(pid: int, v: Vec) -> () {"
+     " let t = Tile.to_f16(Tile.filled(1, 2, 0));"
+     " Tile.store_clipped(v, 0, t); () }",
+     "compute-only"),
+    ("fn k(pid: int, v: Vec) -> () {"
+     " let a = Tile.to_f16(Tile.filled(1, 2, 0));"
+     " let b = Tile.filled(1, 2, pid * 0);"
+     " Tile.store_clipped(v, 0, Tile.to_f32(Tile.add(a, b))); () }",
+     "element kinds differ"),
+    ("fn k(pid: int, v: Vec) -> () {"
+     " let a = Tile.to_f16(Tile.filled(1, 2, 0));"
+     " Tile.store_clipped(v, 0, Tile.to_f32(Tile.scale(a, pid))); () }",
+     "f16 tiles scale by float literals"),
 ])
 def test_out_of_subset_kernels_are_rejected(body, fragment):
     with pytest.raises(MslError) as ei:

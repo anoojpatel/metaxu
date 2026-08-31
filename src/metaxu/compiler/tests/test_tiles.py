@@ -171,6 +171,21 @@ def _expect_reject(src: str, fragment: str) -> None:
      " Tile.sum(Tile.scale(f, 2)); 0 }",
      "Tile.scale: scalar kind must match tile elements (f32 tile, "
      "int scalar; f32 tiles scale by float scalars)"),
+    # f16 element kind (Stage 1f): f16 mixes with NOTHING — not int, not
+    # f64, not f32.
+    ("fn main() -> int { let h = Tile.to_f16(Tile.zeros(2,2));"
+     " Tile.sum(Tile.add(h, Tile.zeros(2,2))); 0 }",
+     "Tile.add: element kinds differ (f16 vs float)"),
+    ("fn main() -> int { let h = Tile.to_f16(Tile.arange(2,2));"
+     " Tile.sum(Tile.dot(h, Tile.arange(2,2))); 0 }",
+     "Tile.dot: element kinds differ (f16 vs int)"),
+    ("fn main() -> int { let h = Tile.to_f16(Tile.zeros(2,2));"
+     " Tile.sum(Tile.mul(h, Tile.to_f32(Tile.zeros(2,2)))); 0 }",
+     "Tile.mul: element kinds differ (f16 vs f32)"),
+    ("fn main() -> int { let h = Tile.to_f16(Tile.zeros(2,2));"
+     " Tile.sum(Tile.scale(h, 2)); 0 }",
+     "Tile.scale: scalar kind must match tile elements (f16 tile, "
+     "int scalar; f16 tiles scale by float scalars)"),
 ])
 def test_static_shape_misuse_is_a_compile_error(src, fragment):
     _expect_reject(src, fragment)
@@ -226,6 +241,64 @@ def test_interp_f32_rounding_semantics_pinned():
     result, out = interp_run(_F32_SRC)
     assert result == 0
     assert out.splitlines() == _F32_OUT
+
+
+# f16 (docs/gpu_tiles.md Stage 1f): elements are the f16-representable
+# double; every op rounds once through IEEE binary16.  The values below
+# are PINNED — computed with Python's struct 'e' round-trip
+# (struct.unpack("e", struct.pack("e", x))[0]: f16(0.1) is
+# 0.0999755859375, four of them sum to 0.39990234375, etc.), which IS
+# real _Float16 arithmetic, and all three engines must reproduce them bit
+# for bit.
+_F16_SRC = """
+fn main() -> int {
+    let a = Tile.filled(2, 2, 0.1);
+    let h = Tile.to_f16(a);
+    print(h);
+    print(Tile.sum(h));
+    print(Tile.add(h, h));
+    print(Tile.dot(h, h));
+    print(Tile.scale(h, 3.0));
+    print(Tile.mul(h, h));
+    print(Tile.get(Tile.transpose(h), 1, 0));
+    print(Tile.to_f64(h));
+    print(Tile.to_f32(h));
+    print(Tile.to_f16(Tile.arange(2, 2)));
+    print(Tile.to_f16(Tile.to_f32(a)));
+    let v = Tile.to_vec(h);
+    print(v[3]);
+    0
+}
+"""
+
+_F16_OUT = [
+    "tile[2x2](0.0999755859375, 0.0999755859375; "
+    "0.0999755859375, 0.0999755859375)",
+    "0.39990234375",            # f16 accumulation, widened
+    "tile[2x2](0.199951171875, 0.199951171875; "
+    "0.199951171875, 0.199951171875)",
+    "tile[2x2](0.019989013671875, 0.019989013671875; "
+    "0.019989013671875, 0.019989013671875)",  # round product, then acc
+    "tile[2x2](0.2998046875, 0.2998046875; "
+    "0.2998046875, 0.2998046875)",            # factor rounds to f16
+    "tile[2x2](0.0099945068359375, 0.0099945068359375; "
+    "0.0099945068359375, 0.0099945068359375)",
+    "0.0999755859375",
+    "tile[2x2](0.0999755859375, 0.0999755859375; "
+    "0.0999755859375, 0.0999755859375)",      # widening is exact
+    "tile[2x2](0.0999755859375, 0.0999755859375; "
+    "0.0999755859375, 0.0999755859375)",      # f16 -> f32 is exact too
+    "tile[2x2](0.0, 1.0; 2.0, 3.0)",          # int -> f16 is total
+    "tile[2x2](0.0999755859375, 0.0999755859375; "
+    "0.0999755859375, 0.0999755859375)",      # f16(f32(x)) == f16(x)
+    "0.0999755859375",                        # to_vec widens
+]
+
+
+def test_interp_f16_rounding_semantics_pinned():
+    result, out = interp_run(_F16_SRC)
+    assert result == 0
+    assert out.splitlines() == _F16_OUT
 
 
 def test_branch_rebind_suppresses_static_checking():
@@ -723,3 +796,49 @@ def test_native_f32_kernel_matches_interp(tmp_path):
     # and must match the interpreter bit for bit.
     ir = assert_native_matches_interp(_F32_KERNEL_SRC, tmp_path)
     assert count_placeholders(ir) == 0
+
+
+@needs_clang
+def test_native_f16_semantics_match_interp(tmp_path):
+    # The pinned f16 rounding program, natively: mx_tile_* with ekind
+    # code 3 must reproduce the interpreter's struct-'e'-rounded values
+    # byte for byte (mx_f16r is (double)(_Float16)x — the same IEEE
+    # binary16 round-to-nearest-even).
+    ir = assert_native_matches_interp(_F16_SRC, tmp_path)
+    assert count_placeholders(ir) == 0
+    assert "mx_tile_to_f16" in ir
+
+
+_F16_KERNEL_SRC = """
+from std.gpu import Gpu, run_grid;
+
+fn hk(pid: int, a: Vec, out: Vec) -> () {
+    let h = Tile.to_f16(Tile.to_f32(
+        Tile.load_rows(a, pid * 4, 4, 1, 4, 0.0)));
+    Tile.store_rows(out, pid * 4, 4, Tile.to_f32(Tile.scale(h, 0.3)));
+    ()
+}
+
+fn main() -> int {
+    let @mut a = Vec.new();
+    let @mut out = Vec.new();
+    let mut i = 0;
+    let mut x = 0.1;
+    while i < 8 { a.push(x); out.push(0.0); x = x + 1.0; i = i + 1 };
+    perform Gpu.launch(2, fn(pid: int) -> hk(pid, a, out));
+    let mut j = 0;
+    while j < 8 { print(out[j]); j = j + 1 };
+    0
+}
+"""
+
+
+@needs_clang
+def test_native_f16_kernel_matches_interp(tmp_path):
+    # An f16 compute kernel through std.gpu's reference launch, natively:
+    # f16 tiles arise via Tile.to_f16 and convert back through Tile.to_f32
+    # before storing (the MSL compute-only rule, exercised here on CPU) —
+    # the per-op f16 rounding must match the interpreter bit for bit.
+    ir = assert_native_matches_interp(_F16_KERNEL_SRC, tmp_path)
+    assert count_placeholders(ir) == 0
+    assert "mx_tile_to_f16" in ir

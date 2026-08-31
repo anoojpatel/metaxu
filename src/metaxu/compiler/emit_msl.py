@@ -19,13 +19,18 @@ never wrong code):
   * signature `fn k(pid: int, b1: Vec, b2: Vec, ...) -> ()` — parameter 0
     is the instance id, every other parameter is a buffer whose element
     type (long or float) the kernel's own usage decides;
-  * int scalars for arithmetic/control flow; INT and F32 tiles — Metal
-    has no f64, so f64 tiles are outside the subset.  The ONLY way an
-    f64 tile may appear is as the immediate operand of `Tile.to_f32`
+  * int scalars for arithmetic/control flow; INT, F32 and F16 tiles —
+    Metal has no f64, so f64 tiles are outside the subset.  The ONLY way
+    an f64 tile may appear is as the immediate operand of `Tile.to_f32`
     wrapped around a float-filled masked load: the pair fuses into one
     direct float-buffer load (`Tile.to_f32(Tile.load_rows(v, ..., 0.0))`
     — on CPU that reads f64s and rounds; on the device the buffer IS
     float32, so the fused load is the same op);
+  * f16 tiles (Stage 1f) are COMPUTE-ONLY in kernels: buffers stay
+    long/float, an f16 tile arises via `Tile.to_f16` of an int/f32 tile
+    inside the kernel, and it must convert back through `Tile.to_f32`
+    before storing (a half store raises MslError with exactly that fix —
+    half buffers wait until a workload needs the bandwidth);
   * float literals are allowed and round exactly like the CPU engines
     (a double literal cast to float once, at the point of use);
   * the MASKED buffer forms only (`Tile.load_or` / `Tile.store_clipped`
@@ -33,8 +38,8 @@ never wrong code):
     forms are host-side;
   * tile ops: filled / arange / load_or / store_clipped / load_rows /
     store_rows / add / mul / scale / dot / sum / transpose / rows /
-    cols / to_f32; int binops; any control flow the language produces
-    (the switch-machine handles the CFG);
+    cols / to_f32 / to_f16; int binops; any control flow the language
+    produces (the switch-machine handles the CFG);
   * literal tile shapes (same rule as the native backend's kinds).
 
 f32 rounding parity (docs/gpu_tiles.md Stage 1d): f32 elements are
@@ -45,6 +50,17 @@ round-product-then-round-accumulate order is bit-identical to the
 interpreter; Metal's compiler is fast-math, so the generated Mac harness
 compares float buffers with a tolerance instead of bit equality (the
 container-side shim differential stays exact).
+
+f16 rounding parity (Stage 1f): the same recipe in `half`.  The C++ shim
+maps `half` to clang's `_Float16`, whose arithmetic on x86-64 uses float
+excess precision rounded at each assignment/cast — and rounding an exact
+half+half or half*half result to float and then to half equals rounding
+it to half directly (24 >= 2*11 + 2, the innocuous-double-rounding
+bound), so every emitted half op still rounds correctly ONCE.  The dot
+product casts the product to half explicitly ((half)(x*y)) so the pinned
+round-product-then-round-accumulate order survives excess precision.
+Conversions also single-round: (half) of a float equals rounding the
+original f64 straight to f16 by the same bound.
 
 Execution contract (documented, enforced by construction): buffer READS
 see the launch-entry snapshot, WRITES land in fresh output buffers merged
@@ -70,7 +86,7 @@ _INT_BINOPS = {"+": "+", "-": "-", "*": "*", "/": "/", "%": "%",
 
 _TILE_OPS = {"filled", "arange", "load_or", "store_clipped", "load_rows",
              "store_rows", "add", "mul", "scale", "dot", "sum",
-             "transpose", "rows", "cols", "to_f32"}
+             "transpose", "rows", "cols", "to_f32", "to_f16"}
 
 
 class MslError(Exception):
@@ -96,6 +112,7 @@ class MslKernel:
     out_bufs: List[str]          # the subset the kernel writes
     buf_types: Dict[str, str]    # buffer -> "long" | "float"
     body: str                    # references <b>_in / <b>_out / <b>_wm / lens
+    uses_half: bool = False      # body declares f16 (`half`) values
 
     def _bt(self, b: str) -> str:
         return self.buf_types.get(b, "long")
@@ -117,6 +134,16 @@ class MslKernel:
             "#include <cstdio>",
             "#include <cstdlib>",
             "#include <vector>",
+            *([
+                "// `half` is MSL-native; the shim maps it to _Float16,",
+                "// whose correct rounding is the f16 parity contract —",
+                "// an unsupported toolchain must fail loudly here.",
+                "#if !defined(__FLT16_MANT_DIG__)",
+                "#error \"f16 kernels need _Float16 (clang on x86-64/"
+                "arm64 provides it)\"",
+                "#endif",
+                "typedef _Float16 half;",
+            ] if self.uses_half else []),
             "struct uint3 { unsigned x, y, z; };",
             "static_assert(sizeof(long) == 8, \"long must be 64-bit\");",
             f"static void kernel_body({', '.join(params)}) {{",
@@ -377,8 +404,11 @@ def _emit(f: MirFunc) -> MslKernel:
         return shapes[n]
 
     def ek_of(n: str) -> str:
-        """Element type of a declared value: float scalars/tiles or long."""
+        """Element type of a declared value: half/float scalars/tiles or
+        long."""
         d = decls.get(n, "long")
+        if d.startswith("half"):
+            return "half"
         return "float" if d.startswith("float") else "long"
 
     def declare(dst: str, shape: Optional[Tuple[int, int]],
@@ -457,7 +487,7 @@ def _emit(f: MirFunc) -> MslKernel:
                     if a in shapes or a in f64loads:
                         raise MslError("elementwise operators on tiles use "
                                        "Tile.add/Tile.mul in kernels")
-                    if ek_of(a) == "float":
+                    if ek_of(a) in ("float", "half"):
                         raise MslError(
                             "float scalar arithmetic is outside the kernel "
                             "subset (float values flow through tile ops; "
@@ -492,7 +522,7 @@ def _emit(f: MirFunc) -> MslKernel:
                                 "an f32 accumulator)")
                     elif top == "to_f64":
                         hint = (" (Metal has no f64; kernels stay in "
-                                "int/f32)")
+                                "int/f32/f16)")
                     raise MslError(
                         f"Tile.{top} is outside the kernel subset{hint}")
                 if top == "filled":
@@ -547,9 +577,21 @@ def _emit(f: MirFunc) -> MslKernel:
                         declare(dst, shape, "float")
                     else:
                         declare(dst, shape_of(src, "Tile.to_f32"), "float")
+                elif top == "to_f16":
+                    # f16 tiles are compute-only: they arise HERE, from an
+                    # int/f32 tile already in the kernel (a float-filled
+                    # load still fuses into Tile.to_f32 — shape_of raises
+                    # with that fix if one reaches us).
+                    declare(dst, shape_of(args[0], "Tile.to_f16"), "half")
                 elif top == "store_clipped":
                     bi = buf_index(args[0], "Tile.store_clipped")
                     shape_of(args[2], "Tile.store_clipped")
+                    if ek_of(args[2]) == "half":
+                        raise MslError(
+                            "Tile.store_clipped of an f16 tile: f16 tiles "
+                            "are compute-only in kernels (buffers stay "
+                            "long/float) — convert back first: "
+                            "Tile.store_clipped(v, off, Tile.to_f32(t))")
                     set_buf_type(args[0], ek_of(args[2]),
                                  "Tile.store_clipped")
                     if bufs[bi] not in written:
@@ -558,6 +600,13 @@ def _emit(f: MirFunc) -> MslKernel:
                 elif top == "store_rows":
                     bi = buf_index(args[0], "Tile.store_rows")
                     shape_of(args[3], "Tile.store_rows")
+                    if ek_of(args[3]) == "half":
+                        raise MslError(
+                            "Tile.store_rows of an f16 tile: f16 tiles "
+                            "are compute-only in kernels (buffers stay "
+                            "long/float) — convert back first: "
+                            "Tile.store_rows(v, off, stride, "
+                            "Tile.to_f32(t))")
                     set_buf_type(args[0], ek_of(args[3]), "Tile.store_rows")
                     if bufs[bi] not in written:
                         written.append(bufs[bi])
@@ -572,10 +621,22 @@ def _emit(f: MirFunc) -> MslKernel:
                 elif top == "scale":
                     sh = shape_of(args[0], "Tile.scale")
                     ek = ek_of(args[0])
-                    if ek_of(args[1]) != ek:
+                    sk = ek_of(args[1])
+                    if ek == "half":
+                        # Language scalars are f64 and kernel float
+                        # consts are float: the factor rounds once more
+                        # to half at the use ((half) of a float equals
+                        # rounding the f64 straight to f16 — module
+                        # docstring).
+                        if sk != "float":
+                            raise MslError(
+                                f"Tile.scale: half tile scaled by a "
+                                f"{sk} scalar in a kernel (f16 tiles "
+                                "scale by float literals)")
+                    elif sk != ek:
                         raise MslError(
                             f"Tile.scale: {ek} tile scaled by a "
-                            f"{ek_of(args[1])} scalar in a kernel (f32 "
+                            f"{sk} scalar in a kernel (f32 "
                             "tiles scale by float literals, int tiles by "
                             "ints)")
                     declare(dst, sh, ek)
@@ -699,11 +760,22 @@ def _emit(f: MirFunc) -> MslKernel:
                         ltop, largs, _s, _b, _o = f64loads[fused_from[dst]]
                         emit_masked_load(dst, ltop, largs)
                     else:
+                        # (float) of a half widens exactly; of a long it
+                        # rounds once, matching the CPU engines.
                         r, c = shapes[dst]
                         src_ek = ek_of(args[0])
                         expr = (f"{args[0]}[__i]" if src_ek == "float"
                                 else f"(float){args[0]}[__i]")
                         L += loop(dst, r * c, expr)
+                elif top == "to_f16":
+                    # (half) of a float or long rounds once — equal to
+                    # rounding the CPU engines' f64 straight to f16
+                    # (module docstring).
+                    r, c = shapes[dst]
+                    src_ek = ek_of(args[0])
+                    expr = (f"{args[0]}[__i]" if src_ek == "half"
+                            else f"(half){args[0]}[__i]")
+                    L += loop(dst, r * c, expr)
                 elif top == "store_clipped":
                     r, c = shapes[args[2]]
                     bi = bufs.index(args[0])
@@ -738,18 +810,37 @@ def _emit(f: MirFunc) -> MslKernel:
                               f"{args[0]}[__i] {o} {args[1]}[__i]")
                 elif top == "scale":
                     r, c = shapes[dst]
-                    L += loop(dst, r * c, f"{args[0]}[__i] * {args[1]}")
+                    if ek_of(dst) == "half":
+                        # The float factor rounds once to half at the
+                        # use; the product then rounds per element at
+                        # the assignment.
+                        L += loop(dst, r * c,
+                                  f"{args[0]}[__i] * (half){args[1]}")
+                    else:
+                        L += loop(dst, r * c, f"{args[0]}[__i] * {args[1]}")
                 elif top == "dot":
                     ra, ca = shapes[args[0]]
                     _rb, cb = shapes[args[1]]
                     acc_ty = ek_of(dst)
-                    zero = "0.0f" if acc_ty == "float" else "0"
+                    zero = {"float": "0.0f", "half": "(half)0",
+                            "long": "0"}[acc_ty]
                     L.append(f"for (int __r = 0; __r < {ra}; __r++) "
                              f"for (int __c = 0; __c < {cb}; __c++) {{")
                     L.append(f"  {acc_ty} __acc = {zero};")
-                    L.append(f"  for (int __k = 0; __k < {ca}; __k++) "
-                             f"__acc += {args[0]}[__r * {ca} + __k] * "
-                             f"{args[1]}[__k * {cb} + __c];")
+                    if acc_ty == "half":
+                        # Explicit rounding steps: _Float16 excess
+                        # precision (float) would otherwise evaluate
+                        # acc + x*y in float and round ONCE — breaking
+                        # the pinned round-product-then-round-accumulate
+                        # order (module docstring).
+                        L.append(f"  for (int __k = 0; __k < {ca}; __k++) "
+                                 f"__acc = (half)(__acc + "
+                                 f"(half)({args[0]}[__r * {ca} + __k] * "
+                                 f"{args[1]}[__k * {cb} + __c]));")
+                    else:
+                        L.append(f"  for (int __k = 0; __k < {ca}; __k++) "
+                                 f"__acc += {args[0]}[__r * {ca} + __k] * "
+                                 f"{args[1]}[__k * {cb} + __c];")
                     L.append(f"  {dst}[__r * {cb} + __c] = __acc;")
                     L.append("}")
                 elif top == "transpose":
@@ -778,4 +869,6 @@ def _emit(f: MirFunc) -> MslKernel:
     return MslKernel(name=f.name, pid_var=pid, in_bufs=bufs,
                      out_bufs=written,
                      buf_types={b: buf_types.get(b, "long") for b in bufs},
-                     body="\n".join(L))
+                     body="\n".join(L),
+                     uses_half=any(d.startswith("half")
+                                   for d in decls.values()))

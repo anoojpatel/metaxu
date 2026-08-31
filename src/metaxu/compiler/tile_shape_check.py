@@ -52,8 +52,9 @@ TILE_ARITY = {
     # 2D (row-strided) masked forms: element (i, j) maps to
     # off + i*stride + j — the tile-of-a-matrix idiom.
     "load_rows": 6, "store_rows": 4,
-    # f32 conversions (Stage 1d): f32 is a tile ELEMENT kind only.
-    "to_f32": 1, "to_f64": 1,
+    # f32/f16 conversions (Stage 1d/1f): f32 and f16 are tile ELEMENT
+    # kinds only.
+    "to_f32": 1, "to_f16": 1, "to_f64": 1,
 }
 
 
@@ -61,8 +62,9 @@ TILE_ARITY = {
 class _TileInfo:
     """Static knowledge about one tile value.
 
-    ``ekind`` is "int", "f64", "f32" or None (statically unknown — e.g.
-    `Tile.from_vec`, whose element kind is the Vec's runtime content).
+    ``ekind`` is "int", "f64", "f32", "f16" or None (statically unknown —
+    e.g. `Tile.from_vec`, whose element kind is the Vec's runtime
+    content).
     """
     rows: int
     cols: int
@@ -91,7 +93,7 @@ def _lit_ekind(node: Any) -> Optional[str]:
 
 
 def _kname(ek: str) -> str:
-    return {"int": "int", "f64": "float", "f32": "f32"}[ek]
+    return {"int": "int", "f64": "float", "f32": "f32", "f16": "f16"}[ek]
 
 
 class _TileShapeChecker:
@@ -297,6 +299,15 @@ class _TileShapeChecker:
                                           f"{_kname(sk)} scalar; f32 tiles "
                                           "scale by float scalars)")
                         return None
+                elif t.ekind == "f16":
+                    # Same rule: the f64 factor rounds to f16 first
+                    # (mir_interp).
+                    if sk != "f64":
+                        self.report(node, "Tile.scale: scalar kind must "
+                                          "match tile elements (f16 tile, "
+                                          f"{_kname(sk)} scalar; f16 tiles "
+                                          "scale by float scalars)")
+                        return None
                 elif sk != t.ekind:
                     self.report(node, f"Tile.scale: scalar kind must match "
                                       f"tile elements ({_kname(t.ekind)} "
@@ -326,13 +337,15 @@ class _TileShapeChecker:
             if t is not None:
                 return _TileInfo(t.cols, t.rows, t.ekind)
             return None
-        if op in ("to_f32", "to_f64"):
-            # Total, shape-preserving conversions (mir_interp): to_f32
-            # rounds any element kind to f32, to_f64 widens any to f64.
+        if op in ("to_f32", "to_f16", "to_f64"):
+            # Total, shape-preserving conversions (mir_interp): to_f32 /
+            # to_f16 round any element kind to the target width, to_f64
+            # widens any to f64.
             t = infos[0]
             if t is not None:
                 return _TileInfo(t.rows, t.cols,
-                                 "f32" if op == "to_f32" else "f64")
+                                 {"to_f32": "f32", "to_f16": "f16",
+                                  "to_f64": "f64"}[op])
             return None
         if op == "get":
             t = infos[0]
