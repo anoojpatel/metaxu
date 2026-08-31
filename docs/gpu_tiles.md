@@ -112,7 +112,7 @@ per-lane register budget, swizzle bank-conflict freedom.
   tested. Element types start at `float`(f64)/`int` — the tile
   machinery is width-agnostic and f32/f16 land as their own increment
   (Stage 1 needs them; the CPU reference does not).
-- **Stage 1 — the kernel seam (1a/1b/1c landed):**
+- **Stage 1 — the kernel seam (1a-1f landed):**
   * **1a (landed):** the buffer <-> tile boundary — strict
     `Tile.load`/`Tile.store` (catchable range raises) plus the masked
     kernel-side forms `Tile.load_or` (out-of-range reads `other`) and
@@ -204,11 +204,37 @@ per-lane register budget, swizzle bank-conflict freedom.
     placeholder-free but abort loudly at dispatch (`mx_metal_launch`):
     the MSL emitter and closure introspection live in the host, and a
     quiet CPU fallback would misreport where the kernel ran.
-  * **Still open in Stage 1:** f16 (same recipe: representable-widening
-    + round-per-op; lands when a kernel needs it), the `gpu` effect
-    class (now that the Metal handler dispatches real launches), and
-    memory-space locality states (vacuous until threadgroup memory
-    arrives in Stage 2).
+  * **1f (landed): f16 tiles.**  The f32 recipe verbatim at half
+    width: f16 is a TILE ELEMENT kind only (`Tile.to_f16`, total and
+    shape-preserving; ekind code 3), elements are stored as the
+    f16-REPRESENTABLE double, and every op rounds its result once —
+    exact because adding/multiplying two f16-representables is exact in
+    f64 (11+11 < 53).  The interpreter rounds via struct `'e'`
+    (IEEE binary16, round-to-nearest-even), the C runtime via
+    `(double)(_Float16)x` (guarded by `#error` where `_Float16` is
+    missing — an unsupported toolchain fails at build, never silently),
+    and the same static rules apply (f16 mixes with nothing; `Tile.scale`
+    of an f16 tile takes a LANGUAGE f64 scalar whose factor rounds to
+    f16 first).  Widenings (`to_f32`/`to_f64` of an f16 tile, sum, get,
+    to_vec, stores) are exact.  SCOPING CHOICE — MSL f16 is
+    COMPUTE-ONLY: buffers stay long/float, an f16 tile arises via
+    `Tile.to_f16` of an int/f32 tile inside the kernel, and it must
+    convert back through `Tile.to_f32` before storing (a half store is
+    an MslError naming exactly that fix).  Half buffers would drag
+    typed plumbing through the C++ shim stdin protocol, the MLX
+    harness, and metal_launch's buffer boundary for no present workload;
+    they land when a kernel needs the bandwidth.  In the C++ shim,
+    `half` maps to `_Float16` (x86-64 excess precision is innocuous
+    here: rounding an exact half op to float then half equals rounding
+    it once, 24 >= 2*11+2, and the emitted dot casts its product to
+    half explicitly to keep the pinned round-product-then-
+    round-accumulate order), so the shim leg stays bit-exact — pinned
+    by an f16 matmul differential plus an independent blocked-
+    accumulation ground truth in Python 'e' arithmetic.
+  * **Still open in Stage 1:** the `gpu` effect class (now that the
+    Metal handler dispatches real launches), memory-space locality
+    states (vacuous until threadgroup memory arrives in Stage 2), and
+    half BUFFERS for MSL kernels (f16 compute landed in 1f).
 - **Stage 2 — fast:** inferred layouts + `convert_layout`,
   `simdgroup_matrix` dot, threadgroup-memory tiling, software
   pipelining where it pays on Apple.

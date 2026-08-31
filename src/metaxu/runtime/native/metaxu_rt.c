@@ -748,8 +748,25 @@ static void mx_tile_same(const mx_tile *a, const mx_tile *b,
  * what keeps all three engines bit-identical.  mx_f32r is that rounding. */
 static double mx_f32r(double x) { return (double)(float)x; }
 
+/* f16 elements (ekind 3, docs/gpu_tiles.md Stage 1f) follow the same
+ * recipe (11+11 < 53); mx_f16r matches the interpreter's struct 'e'
+ * round-trip bit for bit.  _Float16 is required — an unsupported
+ * toolchain must fail LOUDLY at build, never emulate approximately. */
+#if !defined(__FLT16_MANT_DIG__)
+#error "f16 tiles need _Float16 (clang on x86-64/arm64 provides it)"
+#endif
+static double mx_f16r(double x) { return (double)(_Float16)x; }
+
+/* One rounding step for a narrow float ekind (2 f32, 3 f16); identity
+ * for f64. */
+static double mx_ekr(int64_t ekind, double x) {
+    if (ekind == 2) return mx_f32r(x);
+    if (ekind == 3) return mx_f16r(x);
+    return x;
+}
+
 /* Elementwise add/mul: ekind selects the arithmetic (0 int, 1 f64,
- * 2 f32 = f64 op + one rounding); words in, words out. */
+ * 2 f32 / 3 f16 = f64 op + one rounding); words in, words out. */
 #define MX_TILE_EW(name, fop, iop)                                          \
     mx_tile *name(const mx_tile *a, const mx_tile *b, int64_t ekind) {      \
         mx_tile_same(a, b, #name);                                          \
@@ -761,7 +778,7 @@ static double mx_f32r(double x) { return (double)(float)x; }
                 memcpy(&x, &a->elems[i], sizeof x);                         \
                 memcpy(&y, &b->elems[i], sizeof y);                         \
                 r = fop;                                                    \
-                if (ekind == 2) r = mx_f32r(r);                             \
+                r = mx_ekr(ekind, r);                                       \
                 memcpy(&out->elems[i], &r, sizeof r);                       \
             } else {                                                        \
                 int64_t x = a->elems[i], y = b->elems[i];                   \
@@ -783,12 +800,13 @@ mx_tile *mx_tile_scale(const mx_tile *t, int64_t sword, int64_t ekind) {
             double x, s, r;
             memcpy(&x, &t->elems[i], sizeof x);
             memcpy(&s, &sword, sizeof s);
-            /* f32 tiles scale by a LANGUAGE (f64) scalar: the factor
-             * rounds to f32 first, the multiply rounds per element —
-             * exactly (float)s in C, exactly mir_interp. */
-            if (ekind == 2) s = mx_f32r(s);
+            /* f32/f16 tiles scale by a LANGUAGE (f64) scalar: the factor
+             * rounds to the element width first, the multiply rounds per
+             * element — exactly (float)s / (_Float16)s in C, exactly
+             * mir_interp. */
+            s = mx_ekr(ekind, s);
             r = x * s;
-            if (ekind == 2) r = mx_f32r(r);
+            r = mx_ekr(ekind, r);
             memcpy(&out->elems[i], &r, sizeof r);
         } else {
             out->elems[i] = t->elems[i] * sword;
@@ -816,9 +834,9 @@ mx_tile *mx_tile_dot(const mx_tile *a, const mx_tile *b, int64_t ekind) {
                     double x, y;
                     memcpy(&x, &a->elems[i * K + k], sizeof x);
                     memcpy(&y, &b->elems[k * C + j], sizeof y);
-                    if (ekind == 2) {
+                    if (ekind == 2 || ekind == 3) {
                         /* round the product, then the accumulation */
-                        acc = mx_f32r(acc + mx_f32r(x * y));
+                        acc = mx_ekr(ekind, acc + mx_ekr(ekind, x * y));
                     } else {
                         acc = acc + x * y;
                     }
@@ -844,7 +862,7 @@ int64_t mx_tile_sum(const mx_tile *t, int64_t ekind) {
         for (int64_t i = 0; i < n; i++) {  /* pinned: row-major */
             double x;
             memcpy(&x, &t->elems[i], sizeof x);
-            acc = (ekind == 2) ? mx_f32r(acc + x) : acc + x;
+            acc = mx_ekr(ekind, acc + x);
         }
         int64_t w;
         memcpy(&w, &acc, sizeof w);
@@ -855,10 +873,12 @@ int64_t mx_tile_sum(const mx_tile *t, int64_t ekind) {
     return acc;
 }
 
-/* f32 conversions (docs/gpu_tiles.md Stage 1d): total and shape-preserving.
- * src_ekind says how to READ the words (0 int, 1/2 double bits); the
- * result of to_f32 is every element rounded through float and stored back
- * as double bits, of to_f64 every element widened to double bits. */
+/* f32/f16 conversions (docs/gpu_tiles.md Stage 1d/1f): total and shape-
+ * preserving.  src_ekind says how to READ the words (0 int, 1/2/3 double
+ * bits); the result of to_f32 / to_f16 is every element rounded through
+ * the narrow width and stored back as double bits, of to_f64 every
+ * element widened to double bits (f32/f16-representables pass through
+ * exactly). */
 mx_tile *mx_tile_to_f32(const mx_tile *t, int64_t src_ekind) {
     mx_tile_check(t, "Tile.to_f32");
     mx_tile *out = mx_tile_new(t->rows, t->cols);
@@ -871,6 +891,23 @@ mx_tile *mx_tile_to_f32(const mx_tile *t, int64_t src_ekind) {
             memcpy(&x, &t->elems[i], sizeof x);
         }
         x = mx_f32r(x);
+        memcpy(&out->elems[i], &x, sizeof x);
+    }
+    return out;
+}
+
+mx_tile *mx_tile_to_f16(const mx_tile *t, int64_t src_ekind) {
+    mx_tile_check(t, "Tile.to_f16");
+    mx_tile *out = mx_tile_new(t->rows, t->cols);
+    int64_t n = t->rows * t->cols;
+    for (int64_t i = 0; i < n; i++) {
+        double x;
+        if (src_ekind == 0) {
+            x = (double)t->elems[i];
+        } else {
+            memcpy(&x, &t->elems[i], sizeof x);
+        }
+        x = mx_f16r(x);
         memcpy(&out->elems[i], &x, sizeof x);
     }
     return out;
