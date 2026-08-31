@@ -668,9 +668,17 @@ fn mm_kernel(pid: int, a: Vec, b: Vec, c: Vec) -> () {
         CPU fallback.</div>
       </div>
       <div class="stage">
+        <div class="tag mono">Stage 1f <span class="st landed">landed</span></div>
+        <div class="body"><b>f16 tiles.</b> The f32 recipe at half width:
+        elements stored as f16-representable doubles, one rounding per op,
+        bit-identical across all three engines. In device kernels f16 is
+        compute-only for now (convert back to f32 to store).</div>
+      </div>
+      <div class="stage">
         <div class="tag mono">Stage 1, open <span class="st">next</span></div>
-        <div class="body">f16 by the same recipe; the <code>gpu</code>
-        effect class.</div>
+        <div class="body">The <code>gpu</code> effect class; half device
+        buffers. Stage 2 planning is written up in
+        <code>docs/simdgroup_plan.md</code>.</div>
       </div>
       <div class="stage">
         <div class="tag mono">Stages 2&ndash;3 <span class="st">ahead</span></div>
