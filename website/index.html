@@ -103,6 +103,7 @@ a:focus-visible, button:focus-visible { outline: 2px solid var(--acc); outline-o
   color: var(--acc); text-shadow: 0 0 18px rgba(33, 117, 106, .18);
   font-feature-settings: "calt" 0, "liga" 0; /* raw glyphs, no joining */
 }
+.heroviz pre b { font-weight: 500; color: #1b5f56; }
 .vizcap {
   font-family: var(--mono); font-size: 11.5px; color: var(--dim);
   margin: 12px 0 34px; letter-spacing: .02em;
@@ -807,27 +808,46 @@ fn mm_kernel(pid: int, a: Vec, b: Vec, c: Vec) -> () {
         var gx = (x - mx) * AX, gy = y - my;
         var g = Math.exp(-(gx * gx + gy * gy) / 7);
         var edge = 1 - r / RMAX;             // arms die out at the rim
-        // two arms, low pitch; the gamma (< 1) is what makes the
+        // four arms, low pitch; the gamma (< 1) is what makes each
         // bright band WIDE instead of a thin ridge
-        var band = Math.sin(2 * th + r * 0.55 - phase - g * 2.2);
+        var band = Math.sin(4 * th + r * 0.6 - phase - g * 2.2);
         var v = Math.pow(Math.max(0, band), 0.5) * edge * breath
                 + g * 0.9;
         var i2 = Math.round(v * (RAMP.length - 1));
-        row.push(RAMP[i2 >= RAMP.length ? RAMP.length - 1 : i2]);
+        if (i2 >= RAMP.length) i2 = RAMP.length - 1;
+        // the top of the ramp renders BOLD (Hasklig Medium): the arm
+        // cores and the cursor knot carry visible weight
+        row.push(i2 >= 10 ? [RAMP[i2], 1] : [RAMP[i2], 0]);
       }
       grid.push(row);
     }
-    // the particle layer, drawn over the field
+    // the particle layer, drawn over the field — always bold
     for (var p = 0; p < P.length; p++) {
       var q = P[p];
       var px = Math.round(CX + (q.r * Math.cos(q.th)) / AX);
       var py = Math.round(CY + q.r * Math.sin(q.th));
       if (px < 0 || px >= W || py < 0 || py >= H) continue;
       var tw = Math.sin(t * 0.0011 + q.blink);   // slow twinkle
-      grid[py][px] = tw > 0.3 ? '@' : tw > -0.4 ? '*' : '+';
+      grid[py][px] = [tw > 0.3 ? '@' : tw > -0.4 ? '*' : '+', 1];
     }
-    el.textContent = grid.map(function (r2) { return r2.join(''); })
-                         .join('\n');
+    // emit as <b> runs (RAMP and particle chars need no HTML escaping)
+    var out = '';
+    for (var y2 = 0; y2 < H; y2++) {
+      var row2 = grid[y2], run = '', bold = 0;
+      for (var x2 = 0; x2 < W; x2++) {
+        var cell = row2[x2];
+        var ch = cell.length === 1 ? cell : cell[0];
+        var bo = cell.length === 1 ? 0 : cell[1];
+        if (bo !== bold) {
+          out += bold ? '<b>' + run + '</b>' : run;
+          run = ''; bold = bo;
+        }
+        run += ch;
+      }
+      out += bold ? '<b>' + run + '</b>' : run;
+      out += '\n';
+    }
+    el.innerHTML = out;
   }
 
   if (reduced) { render(0.9, 0); return; }
