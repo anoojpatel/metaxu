@@ -353,8 +353,8 @@ footer .wrap { display: flex; justify-content: space-between; gap: 24px; flex-wr
         <div class="body"><b>Front end to native code.</b> Parser, multi-file
         modules, desugaring, a frozen AST, SimpleSub inference with hard
         conflict detection, HIR, MIR, and a strict reference interpreter that
-        defines the semantics. 19 example programs compile and run natively
-        with pinned outputs; two negative fixtures must be rejected.</div>
+        defines the semantics. <b>19 example programs compile and run
+        natively</b> with pinned outputs; two negative fixtures must be rejected.</div>
       </div>
       <div class="stage">
         <div class="tag mono">enforcement <span class="st landed">landed</span></div>
@@ -371,7 +371,7 @@ footer .wrap { display: flex; justify-content: space-between; gap: 24px; flex-wr
         single-shot continuations in the interpreter; native
         <code>try</code>/<code>catch</code>; real OS threads and mutexes
         behind <code>Thread</code>/<code>Mutex</code> effects (pthreads
-        natively); handler crossings measured at ~280 ns; an Ante-modeled
+        natively); handler crossings measured at <b>~280 ns</b>; an Ante-modeled
         stdlib where effects are the idiom.</div>
       </div>
       <div class="stage">
@@ -442,9 +442,9 @@ footer .wrap { display: flex; justify-content: space-between; gap: 24px; flex-wr
       </div>
       <div class="stage">
         <div class="tag mono">Stage 1, open <span class="st">next</span></div>
-        <div class="body">The <code>gpu</code> effect class; half device
-        buffers. Stage 2 planning is written up in
-        <code>docs/simdgroup_plan.md</code>.</div>
+        <div class="body"><b>Still open in Stage 1.</b> The
+        <code>gpu</code> effect class; half device buffers. Stage 2
+        planning is written up in <code>docs/simdgroup_plan.md</code>.</div>
       </div>
     </div>
 
@@ -454,10 +454,10 @@ footer .wrap { display: flex; justify-content: space-between; gap: 24px; flex-wr
         <div class="body"><b>Fast on the device.</b> Inferred layouts with
         costed <code>convert_layout</code>; <code>simdgroup_matrix</code> dot;
         threadgroup-memory tiling. The execution-model decision is written up
-        in <span class="mono">docs/simdgroup_plan.md</span>: one launch
-        instance becomes one simdgroup, the emitter distributes tiles across
-        lanes, and kernels, the contract, and the reference interpreter stay
-        unchanged. First increment: grid plumbing with idle lanes, then
+        in <span class="mono">docs/simdgroup_plan.md</span>: <b>one launch
+        instance becomes one simdgroup</b>, the emitter distributes tiles
+        across lanes, and kernels, the contract, and the reference
+        interpreter stay unchanged. First increment: grid plumbing with idle lanes, then
         <code>simdgroup_float8x8</code> for the 8x8 dot.</div>
       </div>
       <div class="stage">
@@ -470,8 +470,9 @@ footer .wrap { display: flex; justify-content: space-between; gap: 24px; flex-wr
       <div class="stage">
         <div class="tag mono">Stage 4 <span class="st">ahead</span></div>
         <div class="body"><b>Distribution.</b> Multi-GPU and multi-node as
-        library code on top of the language: collectives are sharding-spec
-        coercions (an all-reduce is a partial-to-replicated conversion),
+        library code on top of the language: <b>collectives are sharding-spec
+        coercions</b> (an all-reduce is a partial-to-replicated
+        conversion),
         <code>Dist.*</code> effects, and handlers as backends (loopback for
         tests, MLX distributed, NCCL). The compiler owns only the uniformity
         and deadlock check, in-flight buffer marking, and the const-generic
@@ -488,25 +489,25 @@ footer .wrap { display: flex; justify-content: space-between; gap: 24px; flex-wr
     <div class="stages">
       <div class="stage">
         <div class="tag mono">1</div>
-        <div class="body">Stage 2 increment one: per-simdgroup dispatch
-        plumbing (same body, lanes 1&ndash;31 idle), verifiable on a Mac
-        against the unchanged reference.</div>
+        <div class="body"><b>Per-simdgroup dispatch plumbing.</b>
+        Stage 2 increment one: same body, lanes 1&ndash;31 idle,
+        verifiable on a Mac against the unchanged reference.</div>
       </div>
       <div class="stage">
         <div class="tag mono">2</div>
-        <div class="body">Stage 2 increment two:
-        <code>simdgroup_float8x8</code> for the 8x8 f32 dot, then f16;
-        measure before widening op coverage.</div>
+        <div class="body"><b><code>simdgroup_float8x8</code> for the
+        8x8 dot.</b> Stage 2 increment two: f32 first, then f16; measure
+        before widening op coverage.</div>
       </div>
       <div class="stage">
         <div class="tag mono">3</div>
-        <div class="body">The <code>gpu</code> effect class and half device
-        buffers (f16 kernels are compute-only until then).</div>
+        <div class="body"><b>The <code>gpu</code> effect class and half
+        device buffers.</b> f16 kernels are compute-only until then.</div>
       </div>
       <div class="stage">
         <div class="tag mono">4</div>
-        <div class="body">First real-Metal validation runs of the generated
-        harnesses on Apple silicon.</div>
+        <div class="body"><b>First real-Metal validation runs.</b> The
+        generated harnesses, on Apple silicon.</div>
       </div>
     </div>
   </div>
