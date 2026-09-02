@@ -1,4 +1,4 @@
-<title>Metaxu</title>
+<title>Metaxu Roadmap</title>
 <style>
 /* ============================================================
    Metaxu — documentation as a landing page.
@@ -324,15 +324,12 @@ footer .wrap { display: flex; justify-content: space-between; gap: 24px; flex-wr
 
 <header class="top">
   <div class="wrap">
-    <a class="brand" href="#top">METAXU</a>
+    <a class="brand" href="index.html">METAXU</a>
     <nav class="topnav" aria-label="Sections">
-      <a href="#ideas">ideas</a>
-      <a href="#taste">code</a>
-      <a href="#pipeline">pipeline</a>
-      <a href="#performance">performance</a>
-      <a href="#gpu">gpu</a>
-      <a href="#philosophy">philosophy</a>
-      <a href="roadmap.html">roadmap</a>
+      <a href="#compiler">compiler</a>
+      <a href="#gpu-stages">gpu stages</a>
+      <a href="#next">next</a>
+      <a href="index.html">home</a>
       <a href="https://github.com/anoojpatel/metaxu">github &#8599;</a>
     </nav>
   </div>
@@ -340,362 +337,177 @@ footer .wrap { display: flex; justify-content: space-between; gap: 24px; flex-wr
 
 <main id="top">
 
-<!-- ================= hero ================= -->
-<section class="hero" style="border-top:none">
+<section id="compiler" style="border-top:none">
   <div class="wrap">
-    <figure class="heroviz">
-      <h1 class="wordmark">Metaxu</h1>
-      <pre id="vortex" aria-hidden="true"> </pre>
-    </figure>
-    <p class="vizcap">move the cursor to stir; left to right steers the spin</p>
-    <p class="thesis">A systems language with algebraic effects, mode-based
-    memory safety, and tile-level GPU kernels compiled to Metal.</p>
-    <p class="subthesis">Native code through LLVM. Safety from <em>modes</em>,
-    not lifetime annotations. Every backend is differentially tested
-    against a reference interpreter, <em>byte for byte</em>.</p>
-    <div class="cta">
-      <a class="primary" href="https://github.com/anoojpatel/metaxu">GitHub &#8599;</a>
-      <a href="#ideas">Documentation &#8595;</a>
-    </div>
-    <p class="statusline">
-      <b>19/19</b> examples compile &amp; run natively, outputs pinned &middot;
-      <b>~2000</b> tests &middot; <b>1.00&ndash;1.09x</b> C on measured suites
-    </p>
-  </div>
-</section>
+    <p class="eyebrow">// roadmap</p>
+    <h2>Where the language is, and where it goes</h2>
+    <p class="lede">The sources of truth are <span class="mono">docs/gpu_tiles.md</span>
+    (the GPU design of record), <span class="mono">docs/simdgroup_plan.md</span>
+    (the Stage 2 execution-model plan) and <span class="mono">docs/compiler_roadmap.md</span>.
+    This page is the summary. Landed means merged with tests and both example
+    gates green.</p>
 
-<!-- ================= three ideas ================= -->
-<section id="ideas">
-  <div class="wrap">
-    <p class="eyebrow">// three ideas</p>
-    <h2>What the language is built around</h2>
-    <p class="lede">Metaxu compiles to native code through LLVM. Three decisions
-    shape everything else.</p>
-    <div class="cards">
-      <div class="card">
-        <span class="idx mono">effects</span>
-        <h3>Effects are the machine model</h3>
-        <p>Threads, mutexes, streams, and GPU kernel launches are all
-        <b>algebraic effects with handlers</b>, backed by real delimited
-        continuations (native <span class="mono">try</span>/<span class="mono">catch</span>,
-        streams, generators).</p>
-        <p>A handler can virtualize any of them, so the
-        <b>same program</b> runs on a test double, a thread pool, or a GPU.</p>
-        <div class="chips"><span>perform</span><span>handle &hellip; with</span><span>resume</span><span>effect Gpu</span></div>
+    <div class="stages">
+      <div class="stage">
+        <div class="tag mono">pipeline <span class="st landed">landed</span></div>
+        <div class="body"><b>Front end to native code.</b> Parser, multi-file
+        modules, desugaring, a frozen AST, SimpleSub inference with hard
+        conflict detection, HIR, MIR, and a strict reference interpreter that
+        defines the semantics. 19 example programs compile and run natively
+        with pinned outputs; two negative fixtures must be rejected.</div>
       </div>
-      <div class="card">
-        <span class="idx mono">modes</span>
-        <h3>Modes instead of lifetimes</h3>
-        <p>Memory safety comes from a small set of <b>inferred modal axes</b>,
-        checked by a borrow checker that propagates properties instead of
-        asking you to annotate them.</p>
-        <p>Thread-safety is <b>inferred, never declared</b>: crossing a value
-        into another thread marks it, and unsynchronized writes to crossed
-        values are caught: statically where provable, dynamically
-        otherwise, with the same error wording either way.</p>
-        <div class="chips"><span>@local / @global</span><span>@mut / @const</span><span>once / separate / many</span></div>
+      <div class="stage">
+        <div class="tag mono">enforcement <span class="st landed">landed</span></div>
+        <div class="body"><b>Modes instead of lifetimes.</b> Borrow checking
+        over locality (<code>@local</code>/<code>@global</code>), mutability,
+        and linearity; deep field-mode rules; locality propagation with
+        provenance diagnostics; inferred thread-safety (send/sync) with
+        contention-as-permission write guards. Undefined names are
+        compile-time errors, not silent drops.</div>
       </div>
-      <div class="card">
-        <span class="idx mono">reference</span>
-        <h3>The interpreter is the spec</h3>
-        <p>Every backend is differentially tested against a <b>strict reference
-        interpreter</b>, byte for byte: output, error messages, float
-        formatting.</p>
-        <p>A whole class of silently-wrong-code bugs is
-        <b>found by these tests</b> instead of by users.</p>
-        <div class="chips"><span>interpreter == native</span><span>ASan-scoped</span><span>pinned goldens</span></div>
+      <div class="stage">
+        <div class="tag mono">effects <span class="st landed">landed</span></div>
+        <div class="body"><b>Effects as the machine model.</b> Delimited
+        single-shot continuations in the interpreter; native
+        <code>try</code>/<code>catch</code>; real OS threads and mutexes
+        behind <code>Thread</code>/<code>Mutex</code> effects (pthreads
+        natively); handler crossings measured at ~280 ns; an Ante-modeled
+        stdlib where effects are the idiom.</div>
+      </div>
+      <div class="stage">
+        <div class="tag mono">native perf <span class="st landed">landed</span></div>
+        <div class="body"><b>1.00&ndash;1.09x C on measured suites.</b> LLVM
+        backend differentially tested byte for byte against the interpreter;
+        inline Vec fast paths with TBAA and cold noreturn error paths;
+        alignment-pinned, rotation-interleaved benchmark methodology
+        (benchmarks/suite, benchmarks/diagnostics, benchmarks/contention).</div>
       </div>
     </div>
   </div>
 </section>
 
-<!-- ================= code taste ================= -->
-<section id="taste">
+<section id="gpu-stages">
   <div class="wrap">
-    <p class="eyebrow">// a taste</p>
-    <h2>Streams are effects. Kernels are functions.</h2>
-    <p class="lede">Code is set in Hasklig with contextual ligatures enabled:
-    pairs like <span class="lig-demo">-&gt; =&gt; &gt;= !=</span> render as
-    single glyphs.</p>
+    <p class="eyebrow">// gpu tiles</p>
+    <h2>The staged path to device kernels</h2>
+    <p class="lede">Stage numbers follow <span class="mono">docs/gpu_tiles.md</span>.
+    The rule for every stage: interpreter semantics first, then backends
+    differentially tested against them.</p>
 
-    <div class="codeblock">
-      <header><span>streams.mx</span><span class="note">consumers are handlers</span></header>
-      <pre><code class="mx">// Streams are effects; consumers are handlers.
-from std.stream import iota, map, filter, sum;
-
-fn main() -> int {
-    let total = sum(filter(map(iota(200000), fn(x: int) -> x * 2),
-                           fn(x: int) -> x > 5));
-    print(total);
-    0
-}</code></pre>
-    </div>
-
-    <div class="codeblock">
-      <header><span>std/stream.mx</span><span class="note">what a consumer looks like inside the stdlib</span></header>
-      <pre><code class="mx"># Re-emit only elements with pred(x) true.
-fn filter(producer, pred) -> fn() -> Unit {
-    fn() {
-        handle Emit with {
-            emit(x) -> {
-                if pred(x) { perform Emit.emit(x) } else { () };
-                resume(())
-            }
-        } in {
-            producer();
-            ()
-        }
-    }
-}</code></pre>
-    </div>
-
-    <div class="codeblock">
-      <header><span>matmul_kernel.mx</span><span class="note">a tile-level GPU kernel, no raw pointers</span></header>
-      <pre><code class="mx">// A GPU kernel: one instance per output tile, masked edges, no raw pointers.
-from std.gpu import Gpu, run_grid;
-
-fn mm_kernel(pid: int, a: Vec, b: Vec, c: Vec) -> () {
-    let ti = pid / 16;  let tj = pid % 16;
-    let mut k = 0;
-    let mut r = Tile.filled(8, 8, 0);
-    while k < 16 {
-        let ta = Tile.load_rows(a, (ti * 8) * 128 + k * 8, 128, 8, 8, 0);
-        let tb = Tile.load_rows(b, (k * 8) * 128 + tj * 8, 128, 8, 8, 0);
-        r = Tile.add(r, Tile.dot(ta, tb));
-        k = k + 1
-    };
-    Tile.store_rows(c, (ti * 8) * 128 + tj * 8, 128, r);
-    ()
-}
-// perform Gpu.launch(256, fn(pid: int) -> mm_kernel(pid, a, b, c));
-// The default handler runs it deterministically on CPU;
-//   the Metal handler runs it on the GPU. Same kernel.</code></pre>
-    </div>
-  </div>
-</section>
-
-<!-- ================= pipeline ================= -->
-<section id="pipeline">
-  <div class="wrap">
-    <p class="eyebrow">// the pipeline</p>
-    <h2>One front end, three backends, one semantics</h2>
-    <p class="lede">The interpreter is the semantics of record. The LLVM backend
-    must match it byte for byte; the Metal emitter is tested against the CPU
-    handler running the same kernel.</p>
-    <figure class="diagram">
-      <div class="scrollx">
-      <svg class="pipe" viewBox="0 0 960 330" role="img"
-           aria-label="Compilation pipeline: source through parser, module resolution, desugar and typecheck, then HIR and MIR, fanning out to the reference interpreter, the LLVM native backend, and the Metal backend via MSL.">
-        <!-- animated spine (behind boxes) -->
-        <path class="spine" d="M 10 46 H 585 M 585 74 V 96 H 40 V 146 M 154 168 H 200"/>
-
-        <!-- row A -->
-        <g>
-          <rect class="box" x="10"  y="28" width="72"  height="36"/>
-          <text x="46" y="50" text-anchor="middle">source</text>
-          <rect class="box" x="106" y="28" width="72"  height="36"/>
-          <text x="142" y="50" text-anchor="middle">parser</text>
-          <rect class="box" x="202" y="28" width="118" height="36"/>
-          <text x="261" y="50" text-anchor="middle">modules</text>
-          <rect class="box" x="344" y="28" width="88"  height="36"/>
-          <text x="388" y="50" text-anchor="middle">desugar</text>
-          <rect class="box" x="456" y="18" width="258" height="56"/>
-          <text x="585" y="41" text-anchor="middle">typecheck</text>
-          <text class="sm" x="585" y="60" text-anchor="middle">SimpleSub inference + borrow/modes</text>
-        </g>
-        <!-- arrowheads row A -->
-        <path class="arrowhead" d="M 100 46 l -7 -3.5 v 7 z"/>
-        <path class="arrowhead" d="M 196 46 l -7 -3.5 v 7 z"/>
-        <path class="arrowhead" d="M 338 46 l -7 -3.5 v 7 z"/>
-        <path class="arrowhead" d="M 450 46 l -7 -3.5 v 7 z"/>
-        <path class="arrowhead" d="M 40 146 l -3.5 -7 h 7 z"/>
-
-        <!-- row B -->
-        <g>
-          <rect class="box" x="10" y="150" width="60" height="36"/>
-          <text x="40" y="172" text-anchor="middle">HIR</text>
-          <rect class="box" x="94" y="150" width="60" height="36"/>
-          <text x="124" y="172" text-anchor="middle">MIR</text>
-        </g>
-        <path class="arrowhead" d="M 88 168 l -7 -3.5 v 7 z"/>
-
-        <!-- fan edges -->
-        <path class="edge" d="M 154 168 H 200 M 200 132 V 262 M 200 132 H 262 M 200 188 H 262 M 200 262 H 262"/>
-        <path class="arrowhead" d="M 262 132 l -7 -3.5 v 7 z"/>
-        <path class="arrowhead" d="M 262 188 l -7 -3.5 v 7 z"/>
-        <path class="arrowhead" d="M 262 262 l -7 -3.5 v 7 z"/>
-
-        <!-- backends -->
-        <g>
-          <rect class="box ref" x="268" y="112" width="392" height="40"/>
-          <text x="286" y="136">reference interpreter</text>
-          <text class="sm accent" x="642" y="136" text-anchor="end">the semantics</text>
-
-          <rect class="box" x="268" y="168" width="392" height="40"/>
-          <text x="286" y="192">LLVM &#8594; clang &#8594; native</text>
-          <text class="sm" x="642" y="192" text-anchor="end">1.00&#8211;1.09x C</text>
-
-          <rect class="box" x="268" y="242" width="392" height="40"/>
-          <text x="286" y="266">MSL &#8594; Metal via MLX</text>
-          <text class="sm" x="642" y="266" text-anchor="end">tile kernels</text>
-        </g>
-
-        <!-- differential bracket: interpreter <-> native -->
-        <path class="edge" d="M 678 132 h 12 v 56 h -12"/>
-        <text class="xs" x="702" y="148">differentially tested,</text>
-        <text class="xs" x="702" y="162">byte for byte: output,</text>
-        <text class="xs" x="702" y="176">errors, float formatting</text>
-
-        <!-- msl note -->
-        <path class="edge" d="M 678 252 h 12 v 20 h -12"/>
-        <text class="xs" x="702" y="258">raced against the CPU</text>
-        <text class="xs" x="702" y="272">handler, end to end</text>
-      </svg>
+    <div class="stages">
+      <div class="stage">
+        <div class="tag mono">Stage 0 <span class="st landed">landed</span></div>
+        <div class="body"><b>The portable core, no GPU anywhere.</b>
+        <code>Tile[T,R,C]</code> with compile-time shape errors, deterministic
+        interpreter semantics as the reference, a native tile runtime, and a
+        differential gate: 19 tests, byte-identical output on both engines,
+        including catchable bounds raises.</div>
       </div>
-      <figcaption>src/metaxu/compiler: Python front end; backends are thin
-      text emitters over MIR.</figcaption>
-    </figure>
-  </div>
-</section>
-
-<!-- ================= performance ================= -->
-<section id="performance">
-  <div class="wrap">
-    <p class="eyebrow">// measured</p>
-    <h2>Performance against C</h2>
-    <p class="lede">Every benchmark asserts output equality between the Metaxu
-    program and its hand-written C twin before any timing runs. Same clang, same
-    <span class="mono">-O2</span>, <span class="mono">-falign-functions=64</span>
-    everywhere, alternating run order, medians. Alignment is pinned because
-    unaligned microbenchmarks mostly measure code placement.</p>
-
-    <div class="tablewrap">
-      <table class="bench">
-        <thead>
-          <tr>
-            <th>benchmark</th><th>what it stresses</th>
-            <th class="num">metaxu</th><th class="num">c</th><th class="num">ratio</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr><td>fib(35)</td><td class="what">recursion, calls</td><td class="num">30.6 ms</td><td class="num">30.0 ms</td><td class="ratio">1.02x</td></tr>
-          <tr><td>mandelbrot 800&sup2;</td><td class="what">float ALU, branches</td><td class="num">49.0 ms</td><td class="num">49.6 ms</td><td class="ratio">0.99x</td></tr>
-          <tr><td>orbit 20M steps</td><td class="what">struct-per-step rebuild</td><td class="num">164.8 ms</td><td class="num">166.3 ms</td><td class="ratio">0.99x</td></tr>
-          <tr><td>nsieve 3&times;2M</td><td class="what">Vec indexing, bounds-checked</td><td class="num">82.8 ms</td><td class="num">75.9 ms</td><td class="ratio">1.09x</td></tr>
-          <tr><td>par_sum 40M &times; (1+4 thr)</td><td class="what">OS threads, join values</td><td class="num">59.2 ms</td><td class="num">56.8 ms</td><td class="ratio">1.04x</td></tr>
-          <tr><td>pipeline 200k</td><td class="what">3-stage effects pipeline (metaxu-only)</td><td class="num">166.1 ms</td><td class="num">&mdash;</td><td class="ratio">~830 ns/elem</td></tr>
-        </tbody>
-      </table>
+      <div class="stage">
+        <div class="tag mono">Stage 1a&ndash;1c <span class="st landed">landed</span></div>
+        <div class="body"><b>The kernel seam.</b> Strict and masked
+        buffer&#8596;tile IO (<code>Tile.load_or</code>,
+        <code>Tile.store_clipped</code>); <code>Gpu.launch</code> as pure
+        library: <code>effect Gpu { launch(n, f) = run_grid(n, f) }</code>,
+        default handler = the sequential CPU reference, zero compiler changes;
+        and the first MSL emitter with a self-checking Mac harness
+        (<code>mx.fast.metal_kernel</code>, interpreter-computed expected values
+        baked in).</div>
+      </div>
+      <div class="stage">
+        <div class="tag mono">Stage 1d <span class="st landed">landed</span></div>
+        <div class="body"><b>f32 tiles &#8594; float Metal kernels.</b>
+        f32 is a tile <i>element</i> kind (language scalars stay f64):
+        elements live as f32-representable doubles and every op rounds
+        once, so results are bit-identical across the interpreter, native,
+        and the C++-shimmed MSL lowering, pinned against an independently
+        computed f32 matmul.</div>
+      </div>
+      <div class="stage">
+        <div class="tag mono">Stage 1e <span class="st landed">landed</span></div>
+        <div class="body"><b>The Metal runtime handler.</b> Install
+        <code>run_metal</code> over <code>Gpu.launch</code> and the same
+        kernel dispatches through <code>mx.fast.metal_kernel</code> on
+        Apple silicon, or through a bit-exact shim engine elsewhere; the
+        shim is how the handler is tested with no GPU in the container.
+        Anything outside the contract is an error; there is no silent
+        CPU fallback.</div>
+      </div>
+      <div class="stage">
+        <div class="tag mono">Stage 1f <span class="st landed">landed</span></div>
+        <div class="body"><b>f16 tiles.</b> The f32 recipe at half width:
+        elements stored as f16-representable doubles, one rounding per op,
+        bit-identical across all three engines. In device kernels f16 is
+        compute-only for now (convert back to f32 to store).</div>
+      </div>
+      <div class="stage">
+        <div class="tag mono">Stage 1, open <span class="st">next</span></div>
+        <div class="body">The <code>gpu</code> effect class; half device
+        buffers. Stage 2 planning is written up in
+        <code>docs/simdgroup_plan.md</code>.</div>
+      </div>
     </div>
-    <p class="pinned"><b>//</b> every number on this page is from a pinned
-    benchmark or test gate in the repository (benchmarks/suite, 2026-08-19,
-    clang -O2, 15 rounds). Absolute times vary on a shared container; the
-    paired, interleaved ratios are the stable signal.</p>
 
-    <div class="notes">
-      <div>
-        <h4>orbit at 0.99x: value semantics at C speed</h4>
-        <p>The Metaxu version rebuilds an immutable 4-field struct every step
-        and costs the same as C mutating doubles in place. SROA and mem2reg
-        remove the struct entirely at -O2.</p>
+    <div class="stages" style="margin-top:40px">
+      <div class="stage">
+        <div class="tag mono">Stage 2 <span class="st">ahead</span></div>
+        <div class="body"><b>Fast on the device.</b> Inferred layouts with
+        costed <code>convert_layout</code>; <code>simdgroup_matrix</code> dot;
+        threadgroup-memory tiling. The execution-model decision is written up
+        in <span class="mono">docs/simdgroup_plan.md</span>: one launch
+        instance becomes one simdgroup, the emitter distributes tiles across
+        lanes, and kernels, the contract, and the reference interpreter stay
+        unchanged. First increment: grid plumbing with idle lanes, then
+        <code>simdgroup_float8x8</code> for the 8x8 dot.</div>
       </div>
-      <div>
-        <h4>nsieve&rsquo;s 9% is the bounds-check price</h4>
-        <p>It sat at ~1.4x when every <span class="mono">v[i]</span> was an
-        opaque runtime call; inline fast paths closed most of that. The rest is
-        the checked-indexing price: out-of-bounds is a runtime error, and data
-        races on crossed vecs are caught. Bounds-checked Vec loops generally
-        run ~1.3&ndash;1.7x C.</p>
+      <div class="stage">
+        <div class="tag mono">Stage 3 <span class="st">ahead</span></div>
+        <div class="body"><b>The expert surface.</b> Explicit Gluon-style
+        layout annotations; an autotuner reusing the benchmark harness's
+        paired-run methodology as a per-kernel search with a shape-keyed
+        cache; a textual TritonGPU-dialect MLIR emitter for NVIDIA/AMD.</div>
       </div>
-      <div>
-        <h4>effects have a measured price</h4>
-        <p>A handler crossing costs ~280 ns; each pipeline element crosses
-        filter, map and sum. Threads reach parity once the work amortizes
-        ~2.5 ms of flat spawn cost: four threads process 40M elements
-        about 3.4x faster than the serial pass in the same binary.</p>
+      <div class="stage">
+        <div class="tag mono">Stage 4 <span class="st">ahead</span></div>
+        <div class="body"><b>Distribution.</b> Multi-GPU and multi-node as
+        library code on top of the language: collectives are sharding-spec
+        coercions (an all-reduce is a partial-to-replicated conversion),
+        <code>Dist.*</code> effects, and handlers as backends (loopback for
+        tests, MLX distributed, NCCL). The compiler owns only the uniformity
+        and deadlock check, in-flight buffer marking, and the const-generic
+        mesh.</div>
       </div>
     </div>
   </div>
 </section>
 
-<!-- ================= gpu ================= -->
-<section id="gpu">
+<section id="next">
   <div class="wrap">
-    <p class="eyebrow">// gpu tiles, in progress</p>
-    <h2>Triton-class tile kernels, Apple-first</h2>
-    <p class="lede">Kernels are programs over <span class="mono">Tile[T, R, C]</span>
-    values with shapes static in the type, not per-thread code. The tile
-    semantics, shape checker and (later) layout inference are target-neutral;
-    backends are thin text emitters. Metal Shading Language first, bound into
-    MLX; textual TritonGPU MLIR later for NVIDIA/AMD.</p>
-
-    <div class="callout">
-      <h3>The 4x tile overhead is incidental, not intrinsic</h3>
-      <p>Measured 2026-08-26: the tiled 128&sup3; matmul running through
-      <span class="mono">Gpu.launch</span> on the CPU reference costs
-      <b>~4x plain C loops</b>. Every tile op is an opaque runtime call that
-      allocates a fresh block; the reference lowering is functional by
-      design, and stays unoptimized on purpose.</p>
-      <p>Lowering the <b>same kernel</b> through the MSL emitter (tiles as
-      stack arrays, zero allocation, ops inlined) and racing it on the same
-      workload gives:</p>
-      <p class="figures">functional CPU reference &nbsp;<span class="r">~4x C</span>
-      &nbsp;&nbsp;&middot;&nbsp;&nbsp; MSL-style lowering of the same kernel
-      &nbsp;<span class="r">~0.9&ndash;1.0x C</span></p>
-      <p><b>The tile model itself costs nothing; the reference lowering
-      does.</b> That also bounds what a future fused CPU lowering can
-      recover. The number is tracked in benchmarks/diagnostics so it stays
-      visible.</p>
-    </div>
-    <p class="pinned"><b>//</b> the staged plan, landed and ahead, lives on
-    the <a href="roadmap.html">roadmap page</a>.</p>
-  </div>
-</section>
-
-<!-- ================= philosophy ================= -->
-<section id="philosophy">
-  <div class="wrap">
-    <p class="eyebrow">// why &ldquo;metaxu&rdquo;</p>
-    <h2>Why the name</h2>
-    <div class="philo">
-      <div>
-        <blockquote>The name comes from Simone Weil&rsquo;s metaxu: the wall
-        between two prison cells separates the prisoners, and is also what
-        they tap messages through.</blockquote>
-        <p>Metaxu aims to be that kind of intermediary: a bridge between
-        high-level abstractions and low-level performance. The goal is
-        systems programming that is safe and fast without a steep
-        annotation burden.</p>
-        <p>The compiler itself is meant to be readable: a Python front end
-        with text-emitting backends, built so that anyone can learn how
-        compilers are made.</p>
-        <div class="inspo">
-          <h4>// deeply inspired by</h4>
-          <ul>
-            <li><a href="https://ante-lang.org">Ante</a></li>
-            <li><a href="https://hylo-lang.org">Hylo</a></li>
-            <li><a href="https://github.com/adam-mcdaniel/sage">Sage</a></li>
-            <li><a href="https://blog.janestreet.com/oxidizing-ocaml-locality/">Oxidized OCaml</a></li>
-            <li><a href="https://rust-lang.org">Rust</a></li>
-            <li><a href="https://ziglang.org">Zig</a></li>
-            <li><a href="https://www.python.org">Python</a></li>
-          </ul>
-        </div>
+    <p class="eyebrow">// next</p>
+    <h2>The near-term queue</h2>
+    <div class="stages">
+      <div class="stage">
+        <div class="tag mono">1</div>
+        <div class="body">Stage 2 increment one: per-simdgroup dispatch
+        plumbing (same body, lanes 1&ndash;31 idle), verifiable on a Mac
+        against the unchanged reference.</div>
       </div>
-      <figure class="wallfig" aria-hidden="true">
-        <svg viewBox="0 0 520 150">
-          <line class="wall-sig" x1="30" y1="75" x2="252" y2="75"/>
-          <line class="wall-sig" x1="268" y1="75" x2="490" y2="75"/>
-          <line class="wall-wall" x1="258" y1="18" x2="258" y2="132"/>
-          <line class="wall-wall" x1="262" y1="18" x2="262" y2="132"/>
-          <circle class="wall-tap" cx="260" cy="75" r="10"/>
-          <circle class="wall-tap t2" cx="260" cy="75" r="22"/>
-          <circle class="wall-tap t3" cx="260" cy="75" r="34"/>
-          <text x="30" y="112">intention</text>
-          <text x="490" y="112" text-anchor="end">execution</text>
-        </svg>
-        <figcaption>the wall between cells, and the tapping through it.</figcaption>
-      </figure>
+      <div class="stage">
+        <div class="tag mono">2</div>
+        <div class="body">Stage 2 increment two:
+        <code>simdgroup_float8x8</code> for the 8x8 f32 dot, then f16;
+        measure before widening op coverage.</div>
+      </div>
+      <div class="stage">
+        <div class="tag mono">3</div>
+        <div class="body">The <code>gpu</code> effect class and half device
+        buffers (f16 kernels are compute-only until then).</div>
+      </div>
+      <div class="stage">
+        <div class="tag mono">4</div>
+        <div class="body">First real-Metal validation runs of the generated
+        harnesses on Apple silicon.</div>
+      </div>
     </div>
   </div>
 </section>
@@ -706,163 +518,12 @@ fn mm_kernel(pid: int, a: Vec, b: Vec, c: Vec) -> () {
   <div class="wrap">
     <span class="footmark">METAXU</span>
     <nav class="footlinks" aria-label="Footer">
+      <a href="index.html">home</a>
       <a href="https://github.com/anoojpatel/metaxu">github.com/anoojpatel/metaxu</a>
-      <a href="https://github.com/anoojpatel/metaxu/blob/main/docs/index.md">documentation</a>
       <a href="https://github.com/anoojpatel/metaxu/blob/main/docs/gpu_tiles.md">gpu tiles: design of record</a>
-      <a href="roadmap.html">roadmap</a>
-      <a href="https://github.com/anoojpatel/metaxu/tree/main/benchmarks/suite">benchmark suite</a>
+      <a href="https://github.com/anoojpatel/metaxu/blob/main/docs/simdgroup_plan.md">simdgroup plan</a>
     </nav>
-    <p class="footnote">// a Python front end, an LLVM back end, an MSL emitter,
-    and one interpreter that all of them must agree with.</p>
+    <p class="footnote">// landed means merged with tests and both example
+    gates green; ahead means designed, not built.</p>
   </div>
 </footer>
-
-<script>
-/* The hero vortex: a two-arm spiral field sampled onto a character
-   grid (the density ramp is the brightness) with a layer of particles
-   drifting along the flow.  The field turns slowly and breathes; the
-   pointer stirs it: a local glow, a swirl bend around the cursor, and
-   horizontal position steering the spin speed and direction.  Reduced
-   motion renders one static frame. */
-(function () {
-  var el = document.getElementById('vortex');
-  if (!el) return;
-  var W = 72, H = 30, AX = 0.52;             // cell aspect: width/height
-  var RAMP = ' `.,:;-=+*xX#%@';
-  var CX = W / 2 - 0.5, CY = H / 2 - 0.5;
-  var RMAX = Math.min(CX * AX, CY) + 0.5;
-  var reduced = window.matchMedia
-    && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-  var mx = -1e3, my = -1e3;                  // pointer, in cell coords
-  var speed = 1, targetSpeed = 1, phase = 1.7, lastT = null;
-
-  // Particles ride the same rotation: inner ones orbit faster, all
-  // drift slowly inward and respawn at the rim.
-  var P = [];
-  for (var i = 0; i < 46; i++) {
-    P.push({
-      r: 1.5 + Math.random() * (RMAX - 1.8),
-      th: Math.random() * Math.PI * 2,
-      blink: Math.random() * Math.PI * 2,
-    });
-  }
-
-  function render(breath, t) {
-    var grid = [];
-    for (var y = 0; y < H; y++) {
-      var row = [];
-      for (var x = 0; x < W; x++) {
-        var dx = (x - CX) * AX, dy = y - CY;
-        var r = Math.sqrt(dx * dx + dy * dy);
-        if (r > RMAX) { row.push(' '); continue; }
-        var th = Math.atan2(dy, dx);
-        var gx = (x - mx) * AX, gy = y - my;
-        var g = Math.exp(-(gx * gx + gy * gy) / 7);
-        var edge = 1 - r / RMAX;             // arms die out at the rim
-        // four arms, low pitch; the gamma (< 1) is what makes each
-        // bright band WIDE instead of a thin ridge
-        var band = Math.sin(4 * th + r * 0.6 - phase - g * 2.2);
-        var v = Math.pow(Math.max(0, band), 0.5) * edge * breath
-                + g * 0.9;
-        var i2 = Math.round(v * (RAMP.length - 1));
-        if (i2 >= RAMP.length) i2 = RAMP.length - 1;
-        // the top of the ramp renders BOLD (Hasklig Medium): the arm
-        // cores and the cursor knot carry visible weight
-        row.push(i2 >= 10 ? [RAMP[i2], 1] : [RAMP[i2], 0]);
-      }
-      grid.push(row);
-    }
-    // the particle layer, drawn over the field — always bold
-    for (var p = 0; p < P.length; p++) {
-      var q = P[p];
-      var px = Math.round(CX + (q.r * Math.cos(q.th)) / AX);
-      var py = Math.round(CY + q.r * Math.sin(q.th));
-      if (px < 0 || px >= W || py < 0 || py >= H) continue;
-      var tw = Math.sin(t * 0.0011 + q.blink);   // slow twinkle
-      grid[py][px] = [tw > 0.3 ? '@' : tw > -0.4 ? '*' : '+', 1];
-    }
-    // emit as <b> runs (RAMP and particle chars need no HTML escaping)
-    var out = '';
-    for (var y2 = 0; y2 < H; y2++) {
-      var row2 = grid[y2], run = '', bold = 0;
-      for (var x2 = 0; x2 < W; x2++) {
-        var cell = row2[x2];
-        var ch = cell.length === 1 ? cell : cell[0];
-        var bo = cell.length === 1 ? 0 : cell[1];
-        if (bo !== bold) {
-          out += bold ? '<b>' + run + '</b>' : run;
-          run = ''; bold = bo;
-        }
-        run += ch;
-      }
-      out += bold ? '<b>' + run + '</b>' : run;
-      out += '\n';
-    }
-    el.innerHTML = out;
-  }
-
-  if (reduced) { render(0.9, 0); return; }
-
-  el.addEventListener('pointermove', function (e) {
-    var b = el.getBoundingClientRect();
-    mx = (e.clientX - b.left) / b.width * W;
-    my = (e.clientY - b.top) / b.height * H;
-    // horizontal position steers the spin: left = backward, right = fast
-    targetSpeed = 0.3 + ((e.clientX - b.left) / b.width - 0.5) * 3;
-  });
-  el.addEventListener('pointerleave', function () {
-    mx = my = -1e3; targetSpeed = 1;
-  });
-
-  function tick(t) {
-    if (lastT === null) lastT = t;
-    var dt = Math.min(t - lastT, 64); lastT = t;
-    speed += (targetSpeed - speed) * 0.05;
-    var w = speed * dt * 0.00028;              // much slower than before
-    phase += w;
-    for (var p = 0; p < P.length; p++) {
-      var q = P[p];
-      // inner particles orbit faster (flow-like), all drift inward
-      q.th += w * (1 + 9 / (1.5 + q.r));
-      q.r -= dt * 0.00028;
-      if (q.r < 1.2) {
-        q.r = RMAX - 0.4;
-        q.th = Math.random() * Math.PI * 2;
-        q.blink = Math.random() * Math.PI * 2;
-      }
-    }
-    // the fade in and out: dips to a whisper, swells back (~18s cycle)
-    var breath = 0.52 + 0.38 * Math.sin(t * 0.00035);
-    render(breath, t);
-    requestAnimationFrame(tick);
-  }
-  requestAnimationFrame(tick);
-})();
-
-(function () {
-  var RE = new RegExp(
-    '(\\/\\/[^\\n]*|#[^\\n]*)' +           // 1 comment
-    '|("(?:[^"\\\\]|\\\\.)*")' +           // 2 string
-    '|(\\b(?:fn|let|mut|while|perform|effect|handle|resume|match|from|import|try|catch|if|else|in|with|performs|export)\\b)' + // 3 keyword
-    '|(@[a-z_]+)' +                        // 4 mode annotation
-    '|\\b(\\d+(?:\\.\\d+)?)\\b' +          // 5 number
-    '|\\b([A-Z][A-Za-z0-9_]*)\\b',         // 6 type / dotted-static head
-    'g');
-  function esc(s) {
-    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-  }
-  document.querySelectorAll('code.mx').forEach(function (el) {
-    var src = el.textContent, out = '', last = 0, m;
-    RE.lastIndex = 0;
-    while ((m = RE.exec(src)) !== null) {
-      out += esc(src.slice(last, m.index));
-      var cls = m[1] ? 'tok-c' : m[2] ? 'tok-s' : m[3] ? 'tok-k'
-              : m[4] ? 'tok-m' : m[5] ? 'tok-n' : 'tok-t';
-      out += '<span class="' + cls + '">' + esc(m[0]) + '</span>';
-      last = m.index + m[0].length;
-    }
-    out += esc(src.slice(last));
-    el.innerHTML = out;
-  });
-})();
-</script>
