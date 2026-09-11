@@ -24,8 +24,22 @@ session still had verbatim in context.
   2148 passed + 1 skip after all six).
 
 ## Lost and needing regeneration (after base restore)
-- Book chapters 02-07, 09, 11-17 (written by subagents; harness-green;
-  regenerate with the same briefs — note guards/bare-variants/bool
-  formatting now WORK, so briefs change accordingly).
 - test_match_guards.py content is IN FIX_PLAN.md. The const-field and
   rebinding regression tests are in FIX_PLAN.md too.
+
+## Reconstructed as UNVERIFIED drafts (2026-09-11, post-reset)
+Book chapters 02-07, 09, 11-17 were reconstructed in docs/book/ from
+the pre-reset agents' completion reports (recovered from the session
+transcript) plus a ground-truth brief. The compiler in this checkout
+predates the language, so NONE of their examples have been executed.
+
+Verification debt, to be paid on the restored 258af2d tree, in order:
+1. Apply FIX_PLAN.md (all six fixes; the drafts assume the post-fix
+   semantics: bools print 1/0, bare `Shape::Dot`, match guards,
+   immutable plain `let`, @const field writes rejected, coherence as
+   a pinnable error).
+2. Run `pytest src/metaxu/compiler/tests/test_book_examples.py`.
+   Expect failures where a draft invented a pin; fix the pins (or the
+   example) until green. Chapters 01, 08, 10 and README were carried
+   verbatim from green versions and should pass unchanged.
+3. Rebuild website/book/ with scripts/build_book_site.py.
