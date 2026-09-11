@@ -6,6 +6,7 @@
 <p style="text-align: center;">
 A systems language with algebraic effects, mode-based memory safety,
 and tile-level GPU kernels <br>
+[<a href="docs/book/README.md">The Metaxu Book</a>] &middot;
 [<a href="docs/index.md">Documentation</a>]
 </p>
 </div>
