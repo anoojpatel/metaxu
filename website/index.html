@@ -369,8 +369,8 @@ footer .wrap { display: flex; justify-content: space-between; gap: 24px; flex-wr
     </div>
     <p class="statusline">
       one semantics, three backends: <b>interpreter &middot; LLVM native
-      &middot; Metal</b> &middot; native speed measured at
-      <b>1.00&ndash;1.09x C</b>
+      &middot; Metal</b> &middot; early microbenchmarks land
+      <b>near plain C</b>, asterisks included
     </p>
   </div>
 </section>
@@ -460,12 +460,13 @@ fn main() -> int {
 <section id="performance">
   <div class="wrap">
     <p class="eyebrow">// measured</p>
-    <h2>Performance against C</h2>
-    <p class="lede">Native performance is measured, not promised. Each
-    benchmark asserts output equality with its hand-written C twin before
-    any timing runs. Both sides use the same clang
+    <h2>Microbenchmarks against C</h2>
+    <p class="lede">Five small kernels, each with a hand-written C twin.
+    A Metaxu build asserts output equality with its twin before any
+    timing runs. Both sides use the same clang
     at <span class="mono">-O2</span> with function alignment pinned; runs
-    alternate order; the ratio is a median of 15 rounds.</p>
+    alternate order; the ratio is a median of 15 rounds. What a table
+    like this can and can't tell you is spelled out below it.</p>
 
     <div class="tablewrap">
       <table class="bench">
@@ -489,6 +490,16 @@ fn main() -> int {
     benchmark or test gate in the repository (benchmarks/suite, 2026-08-19,
     clang -O2, 15 rounds). Absolute times vary on a shared container; the
     paired, interleaved ratios are the stable signal.</p>
+    <p class="pinned"><b>// the asterisks.</b> These are microbenchmarks,
+    and microbenchmarks reward whoever wrote them. The kernels are tiny
+    and fit in cache. The C twins are straightforward ports, not code a
+    C expert spent a week tuning, and a determined person could tilt
+    either column. Nothing here exercises heavy allocation, large working
+    sets, or a real program's shape. We keep the table because it pins
+    regressions and keeps performance in view while the language grows,
+    not as a scoreboard against C. Read every ratio as "in the same
+    neighborhood," nothing finer. This is where performance work starts,
+    not where it ends.</p>
 
   </div>
 </section>
