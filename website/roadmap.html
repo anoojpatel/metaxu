@@ -369,9 +369,9 @@ footer .wrap { display: flex; justify-content: space-between; gap: 24px; flex-wr
         <div class="tag mono">done</div>
         <div class="body"><b>Programs compile to native code.</b> An LLVM
         backend whose output must match the interpreter byte for byte,
-        including error messages and float formatting. Measured at
-        1.00&ndash;1.09x C on recursion, float, struct, and sieve
-        benchmarks.</div>
+        including error messages and float formatting. Small paired
+        microbenchmarks land near plain C; they exist to pin regressions
+        and keep performance in view, not to score points against C.</div>
       </div>
       <div class="stage">
         <div class="tag mono">done</div>
