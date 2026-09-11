@@ -335,7 +335,8 @@ footer .wrap { display: flex; justify-content: space-between; gap: 24px; flex-wr
   <div class="wrap">
     <a class="brand" href="#top">METAXU</a>
     <nav class="topnav" aria-label="Sections">
-      <a href="#about">about</a>
+      <a href="#why">why</a>
+      <a href="#design">design</a>
       <a href="#code">code</a>
       <a href="#performance">performance</a>
       <a href="https://github.com/anoojpatel/metaxu/tree/main/docs/book">book</a>
@@ -357,36 +358,73 @@ footer .wrap { display: flex; justify-content: space-between; gap: 24px; flex-wr
     <p class="vizcap">move the cursor to stir; left to right steers the spin</p>
     <p class="thesis">A systems language with algebraic effects, mode-based
     memory safety, and tile-level GPU kernels compiled to Metal.</p>
-    <p class="subthesis">Native code through LLVM. Safety from
-    <em>modes</em>, not lifetimes. Every backend is tested byte for byte
-    against a reference interpreter.</p>
+    <p class="subthesis">You write what should happen; <em>handlers</em>
+    decide where it runs: a test, a thread pool, an Apple GPU. Memory safety
+    comes from inferred <em>modes</em>, with no lifetime annotations. And the
+    compiler is readable Python that emits text, built so you can learn from
+    it.</p>
     <div class="cta">
       <a class="primary" href="https://github.com/anoojpatel/metaxu">GitHub &#8599;</a>
       <a href="https://github.com/anoojpatel/metaxu/tree/main/docs/book">Read the book</a>
     </div>
     <p class="statusline">
-      <b>19/19</b> examples compile &amp; run natively, outputs pinned &middot;
-      <b>~2000</b> tests &middot; <b>1.00&ndash;1.09x</b> C on measured suites
+      one semantics, three backends: <b>interpreter &middot; LLVM native
+      &middot; Metal</b> &middot; native speed measured at
+      <b>1.00&ndash;1.09x C</b>
     </p>
   </div>
 </section>
 
 <!-- ================= code taste ================= -->
-<section id="about">
+<section id="why">
   <div class="wrap">
-    <p class="eyebrow">// what it is</p>
-    <h2>Three decisions shape the language</h2>
-    <p>Concurrency is algebraic effects. Threads, mutexes, streams, and GPU
-    kernel launches are operations that handlers interpret, so the same
-    program runs on a test double, a thread pool, or a GPU.</p>
-    <p>Memory safety comes from modes: locality, mutability, and linearity,
-    checked by a borrow checker that propagates properties instead of asking
-    for annotations. There are no lifetimes. Thread-safety is never declared;
-    crossing a value into another thread marks it, and unsynchronized writes
-    are caught.</p>
-    <p>A strict interpreter defines the semantics. The native backend has to
-    match it byte for byte, including error messages and float formatting.
-    Bugs that would ship silently get caught by that contract instead.</p>
+    <p class="eyebrow">// why</p>
+    <h2>A wall can carry a message</h2>
+    <p>The name is Simone Weil&rsquo;s <em>metaxu</em>: the wall between two
+    prison cells separates the prisoners, and it&rsquo;s also what they tap
+    messages through. That&rsquo;s the goal. The barrier between your intent
+    and the machine should be the thing that transmits it: high-level code,
+    low-level results, nothing lost between them.</p>
+    <p>The second goal is access. Systems languages tend to gatekeep, and
+    compilers tend to be black boxes. Metaxu&rsquo;s compiler is plain Python
+    that emits text at every step, written to be read, so that learning how a
+    language works is part of using one.</p>
+    <div class="chips" style="margin-top:20px">
+      <span><a href="https://ante-lang.org" style="text-decoration:none;color:inherit">Ante</a></span>
+      <span><a href="https://hylo-lang.org" style="text-decoration:none;color:inherit">Hylo</a></span>
+      <span><a href="https://oxcaml.org" style="text-decoration:none;color:inherit">OxCaml</a></span>
+      <span><a href="https://rust-lang.org" style="text-decoration:none;color:inherit">Rust</a></span>
+      <span><a href="https://ziglang.org" style="text-decoration:none;color:inherit">Zig</a></span>
+      <span><a href="https://python.org" style="text-decoration:none;color:inherit">Python</a></span>
+    </div>
+  </div>
+</section>
+
+<section id="design">
+  <div class="wrap">
+    <p class="eyebrow">// design</p>
+    <h2>Three decisions shape everything</h2>
+    <p><b>Effects are the machine model.</b> Most languages weld their
+    concurrency in: threads are threads, exceptions are exceptions, async
+    needs its own keywords. Here they&rsquo;re all one thing, an
+    <em>effect</em>: an operation a function performs without saying how
+    it&rsquo;s done. A handler upstream decides that. It&rsquo;s why the same
+    kernel function runs on a sequential CPU loop under a test and on a Metal
+    GPU in production, unchanged.</p>
+    <p><b>Modes replace lifetimes.</b> Memory safety without a garbage
+    collector usually means lifetime annotations. Metaxu instead tracks a few
+    small properties of each value: local to its region or free to escape,
+    mutable or shared, consumable once or many times. The checker infers and
+    propagates them; you annotate to demand a guarantee, not to satisfy the
+    compiler. Thread-safety follows the same rule. Nothing is declared
+    <span class="mono">Send</span>: capture a shared value in a spawned
+    closure and unsynchronized writes to it become errors, caught statically
+    where provable and at run time otherwise, with one wording either way.</p>
+    <p><b>The interpreter is the spec.</b> A strict reference interpreter
+    defines what every program means, and each backend must reproduce it byte
+    for byte: stdout, exit codes, error messages, float formatting. A backend
+    that gets something subtly wrong fails a differential test before it
+    reaches a user.</p>
   </div>
 </section>
 
@@ -397,10 +435,11 @@ footer .wrap { display: flex; justify-content: space-between; gap: 24px; flex-wr
     <p class="lede">One mechanism carries exceptions, generators, threads,
     and GPU launches. Here it carries a stream: each element flows from
     <span class="mono">iota</span> through two handlers into
-    <span class="mono">sum</span>, one at a time, with no intermediate
-    collections.</p>
+    <span class="mono">sum</span> by suspending and resuming, one element at
+    a time. No iterator protocol, no intermediate collections. It prints
+    <span class="mono">39999799994</span>.</p>
     <div class="codeblock">
-      <header><span>streams.mx</span><span class="note">runs in the book: docs/book/08-effects.md</span></header>
+      <header><span>streams.mx</span><span class="note">chapter 8 of the book, where this example runs as a test</span></header>
       <pre><code class="mx">from std.stream import iota, map, filter, sum;
 
 fn main() -> int {
@@ -410,9 +449,10 @@ fn main() -> int {
     0
 }</code></pre>
     </div>
-    <p class="pinned"><b>//</b> every construct on this page is documented in
-    <a href="https://github.com/anoojpatel/metaxu/tree/main/docs/book">the
-    Metaxu Book</a>, whose examples run in CI with pinned output.</p>
+    <p class="pinned"><b>//</b> <a
+    href="https://github.com/anoojpatel/metaxu/tree/main/docs/book">The
+    Metaxu Book</a> documents the whole language, and every example in it
+    runs as a test on every commit. Nothing on this page can quietly rot.</p>
   </div>
 </section>
 
@@ -421,8 +461,9 @@ fn main() -> int {
   <div class="wrap">
     <p class="eyebrow">// measured</p>
     <h2>Performance against C</h2>
-    <p class="lede">Each benchmark asserts output equality with its
-    hand-written C twin before any timing runs. Both sides use the same clang
+    <p class="lede">Native performance is measured, not promised. Each
+    benchmark asserts output equality with its hand-written C twin before
+    any timing runs. Both sides use the same clang
     at <span class="mono">-O2</span> with function alignment pinned; runs
     alternate order; the ratio is a median of 15 rounds.</p>
 
