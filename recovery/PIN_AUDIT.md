@@ -22,3 +22,26 @@ Syntax/semantics guesses to vet:
 10. `let a: vector[int, 3] = [1, 2, 3];` coercion, elementwise `+`,
     value-semantics pin `print(a[0])` = 1 after mutating a copy.
 11. `print(v.pop())` pins popped value 30 (pop returns the element).
+
+## Chapters 15-17
+
+Taken verbatim from the report: `ptr_read: use after free (<*heap#1>)`,
+`one value is required to be Int and String`,
+`<mem>:4:5: undefined function 'helpr'; did you mean 'helper'?`,
+len-precedence 999/5, iota/sum values.
+Invented, vet first:
+1. ch15 ModuleError wording: "cannot import private name 'shave' from
+   module 'geometry'" (class + non-pinnability from report, words mine).
+2. ch15 ReservedNameError wording for `__tmp`.
+3. ch15 `export a, b;` list syntax, `import geometry;` sibling form,
+   and the reconstructed norun main.mx import head.
+4. ch16 slot-granular heap (malloc counts slots not bytes) and the
+   104/105 byte reads.
+5. ch16 messages: `free: double free (<*heap#1>)`, the out-of-bounds
+   wording (em-dash inside per report), `ptr_write: readonly snapshot`,
+   heap identity for string snapshots.
+6. ch16 `is_null(f)` as the null test name.
+7. ch17 caret-excerpt format, `type check failed:` prefix, 2:13
+   location for the Int/String fence.
+8. ch17 `run_pipeline_ctx` import path, `ctx.mir.dump()`, abridged MIR
+   dump (display-only).
