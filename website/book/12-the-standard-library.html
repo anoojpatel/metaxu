@@ -1,0 +1,242 @@
+<title>The standard library · The Metaxu Book</title>
+<link rel="stylesheet" href="style.css">
+<header class="top">
+  <div class="inner">
+    <a class="brand" href="../index.html">Metaxu</a>
+    <nav class="topnav">
+      <a href="index.html">the book</a>
+      <a href="../roadmap.html">roadmap</a>
+      <a href="https://github.com/anoojpatel/metaxu">github &#8599;</a>
+    </nav>
+  </div>
+</header>
+<main>
+<h1>The standard library</h1>
+<p><code>std/</code> is written in Metaxu. The modules lean on the language&#x27;s own mechanisms, effects especially, so reading them is a second pass over chapters 8 and 9 with working code. This chapter tours the everyday modules, one small program each; <code>from std.vec import map;</code> is the import form used throughout, and chapter 15 covers the module system itself. Four modules get their own chapters and only a pointer here: streams (8), sync (11), gpu (13), and the fail family (9).</p>
+<h2>The prelude</h2>
+<p>Some names need no import: <code>print</code>, <code>Vec</code>, <code>Option</code> with <code>Some</code> and <code>None</code>, <code>to_string</code>, <code>len</code>, the operators. They&#x27;re the vocabulary every chapter so far has been using.</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">fn main() -&gt; int {
+    let words = &quot;one two&quot;;
+    print(words.len());
+    let n = 3;
+    print(n.to_string() + &quot;!&quot;);
+    print(Some(n));
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>7
+3!
+Option::Some(3)</code></pre></div>
+<p>The last line is the default rendering for enum values: type, variant, payload. Stable across both engines, like all printing.</p>
+<h2>std.option and std.result</h2>
+<p>Combinators for the two workhorse enums, so a pipeline doesn&#x27;t need a <code>match</code> at every step.</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">from std.option import unwrap_or;
+from std.result import to_option;
+
+fn main() -&gt; int {
+    print(unwrap_or(Some(41), 0) + 1);
+    print(unwrap_or(None, 7));
+    print(unwrap_or(to_option(Ok(20)), 0) * 2);
+    print(unwrap_or(to_option(Err(&quot;no parse&quot;)), 0 - 1));
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>42
+7
+40
+-1</code></pre></div>
+<p><code>to_option</code> forgets the error, which is often what the edge of a pipeline wants. Chapter 9 discusses when these types are the right tool and when a raise is.</p>
+<h2>std.iter</h2>
+<p>Iteration helpers that work with <code>for</code>. The one to know is <code>zip</code>, which pairs two collections positionally into tuples:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">from std.iter import zip;
+
+fn main() -&gt; int {
+    let names = [&quot;ada&quot;, &quot;alan&quot;];
+    let years = [1815, 1912];
+    for pair in zip(names, years) {
+        match pair {
+            (name, year) =&gt; print(name, year)
+        }
+    }
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>ada 1815
+alan 1912</code></pre></div>
+<p>The tuple pattern takes each pair apart; <code>print</code> with two arguments joins them with a space. <code>zip</code> stops at the shorter input.</p>
+<h2>std.vec</h2>
+<p>Transformations over <code>Vec</code> as plain functions. Each returns a fresh Vec (or a scalar) and leaves its input alone.</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">from std.vec import map, filter, sum;
+
+fn main() -&gt; int {
+    let v = [1, 2, 3, 4];
+    print(sum(filter(v, fn(x) -&gt; x &gt; 2)));
+    let scaled = map(v, fn(x) -&gt; x * 10);
+    print(scaled[0]);
+    print(sum(scaled));
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>7
+10
+100</code></pre></div>
+<p>For pipelines too large to materialize, <code>std.stream</code> does the same shapes element at a time; the pointer section below says where.</p>
+<h2>std.sort</h2>
+<p>Sorting and searching. <code>sort</code> returns an ordered copy; <code>binary_search</code> finds a value&#x27;s index in an ordered Vec, as an <code>Option</code>:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">from std.sort import sort, binary_search;
+
+fn main() -&gt; int {
+    let s = sort([9, 3, 7]);
+    print(s[0], s[1], s[2]);
+    match binary_search(s, 7) {
+        Some(i) =&gt; print(i)
+        None =&gt; print(&quot;absent&quot;)
+    };
+    match binary_search(s, 8) {
+        Some(i) =&gt; print(i)
+        None =&gt; print(&quot;absent&quot;)
+    };
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>3 7 9
+1
+absent</code></pre></div>
+<p><code>binary_search</code> on an unsorted Vec is allowed to answer nonsense; that&#x27;s what the name promises and no more. Sort first.</p>
+<h2>std.map</h2>
+<p>A key-value map. <code>insert</code> adds; <code>get</code> answers with an <code>Option</code>, so a missing key is a value, not a raise:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">from std.map import Map;
+
+fn main() -&gt; int {
+    let @mut ages = Map.new();
+    ages.insert(&quot;ada&quot;, 36);
+    ages.insert(&quot;alan&quot;, 41);
+    print(ages.len());
+    match ages.get(&quot;ada&quot;) {
+        Some(a) =&gt; print(a)
+        None =&gt; print(&quot;absent&quot;)
+    };
+    match ages.get(&quot;grace&quot;) {
+        Some(a) =&gt; print(a)
+        None =&gt; print(&quot;absent&quot;)
+    };
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>2
+36
+absent</code></pre></div>
+<p>Like <code>Vec</code>, a <code>Map</code> has identity semantics: two bindings to one map alias one table, and the thread rules of chapter 11 apply to it the same way.</p>
+<h2>std.string</h2>
+<p>Chapter 5 covered what strings do on their own: <code>+</code>, <code>len</code>, indexing, ordering. <code>std.string</code> adds the take-apart and put-together helpers:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">from std.string import split, join, to_upper;
+
+fn main() -&gt; int {
+    let parts = split(&quot;effects,modes,tiles&quot;, &quot;,&quot;);
+    print(parts.len());
+    print(parts[1]);
+    print(join(parts, &quot; + &quot;));
+    print(to_upper(&quot;metaxu&quot;));
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>3
+modes
+effects + modes + tiles
+METAXU</code></pre></div>
+<p><code>split</code> yields a <code>Vec</code> of strings, so everything from <code>std.vec</code> and <code>std.sort</code> applies to its result directly.</p>
+<h2>std.parse</h2>
+<p>Text to numbers, with failure as data: &quot;not a number&quot; is an expected answer for input you didn&#x27;t write, so <code>parse_int</code> returns an <code>Option</code> rather than raising.</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">from std.parse import parse_int;
+
+fn main() -&gt; int {
+    match parse_int(&quot;42&quot;) {
+        Some(n) =&gt; print(n)
+        None =&gt; print(&quot;not a number&quot;)
+    };
+    match parse_int(&quot;4x2&quot;) {
+        Some(n) =&gt; print(n)
+        None =&gt; print(&quot;not a number&quot;)
+    };
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>42
+not a number</code></pre></div>
+<p>Pair it with <code>unwrap_or</code> from <code>std.option</code> when a default is the right recovery.</p>
+<h2>std.math</h2>
+<p>Arithmetic beyond the operators: <code>abs</code>, <code>min</code>, <code>max</code>, integer <code>pow</code>, and float functions that follow the float formatting rules chapter 2 pinned.</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">from std.math import abs, min, max, pow;
+
+fn main() -&gt; int {
+    print(abs(0 - 5));
+    print(min(3, 4), max(3, 4));
+    print(pow(2, 10));
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>5
+3 4
+1024</code></pre></div>
+<h2>std.random</h2>
+<p>A seeded pseudorandom generator. The seed fixes the stream: same seed, same draws, run after run, on both engines. This example pins the properties rather than the constants; the module&#x27;s own tests pin the exact streams.</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">from std.random import Rng;
+
+fn main() -&gt; int {
+    let @mut a = Rng.seed(2024);
+    let @mut b = Rng.seed(2024);
+    let x = a.range(0, 100);
+    print(x == b.range(0, 100));
+    print(x &gt;= 0);
+    print(x &lt; 100);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>1
+1
+1</code></pre></div>
+<p>Two generators from one seed agree draw for draw, and <code>range(lo, hi)</code> stays in its half-open bounds. (Bools print as <code>1</code> and <code>0</code>, matching the native representation.) Determinism by default keeps tests reproducible; code that wants real entropy seeds from outside.</p>
+<h2>std.state</h2>
+<p>Chapter 8 built a counter from operations with a handler holding the cell. <code>std.state</code> is that construction packaged: <code>with_state(initial, f)</code> runs <code>f</code> under a state handler, and <code>get</code>/<code>put</code> are the operations.</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">from std.state import get, put, with_state;
+
+fn main() -&gt; int {
+    let r = with_state(10, fn() -&gt; int {
+        put(get() * 4);
+        put(get() + 2);
+        get()
+    });
+    print(r);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>42</code></pre></div>
+<p>The block never touches a mutable binding; the mutation lives in the handler, and a test can swap in a recording handler without changing the block.</p>
+<h2>std.log</h2>
+<p>Leveled logging with a fixed line format, so grep works:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">from std.log import info, warn;
+
+fn main() -&gt; int {
+    info(&quot;starting up&quot;);
+    warn(&quot;low disk&quot;);
+    print(&quot;done&quot;);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>[info] starting up
+[warn] low disk
+done</code></pre></div>
+<p>Logging is an effect underneath, which is the useful part: a handler above your code can redirect, filter, or silence it without a configuration system.</p>
+<h2>std.test</h2>
+<p>Assertion helpers and a runner. A test is a name and a thunk returning a bool; <code>run_tests</code> runs a Vec of them and returns how many passed, leaving the reporting format to you:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">from std.test import run_tests;
+
+fn main() -&gt; int {
+    let suite = [
+        (&quot;addition&quot;, fn() -&gt; bool { 1 + 1 == 2 }),
+        (&quot;ordering&quot;, fn() -&gt; bool { &quot;a&quot; &lt; &quot;b&quot; }),
+        (&quot;length&quot;, fn() -&gt; bool { &quot;four&quot;.len() == 4 })
+    ];
+    let passed = run_tests(suite);
+    print(passed.to_string() + &quot; of 3 passed&quot;);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>3 of 3 passed</code></pre></div>
+<p><code>std.test</code> is for testing Metaxu programs in Metaxu; the compiler&#x27;s own suite is pytest, and the book&#x27;s examples run under the harness the README describes.</p>
+<h2>The modules with chapters of their own</h2>
+<p><code>std.stream</code> builds lazy pipelines (<code>iota</code>, <code>map</code>, <code>filter</code>, <code>sum</code>, <code>for_</code>) from a single <code>Emit</code> effect: no intermediate collections, elements flowing one at a time through suspending handlers. Chapter 8 walks the mechanism.</p>
+<p><code>std.sync</code> is the sanctioned answer to shared mutation across threads: <code>protect</code> pairs a value with its own mutex, and <code>read</code>/<code>write</code>/<code>update</code> are the only doors in. Chapter 11 shows four threads driving one counter to exactly a thousand.</p>
+<p><code>std.gpu</code> exposes <code>Tile</code> values and <code>Gpu.launch</code>, an effect with a CPU default so kernel code runs anywhere, plus a Metal handler for real hardware. Chapter 13.</p>
+<p><code>std.fail</code>, <code>std.throw</code>, and <code>std.early_return</code> are the abort pattern packaged three ways, worked through at the end of chapter 9.</p>
+<p>That&#x27;s the tour. The habit the library rewards most: when a module surprises you, open <code>std/</code> and read it. It&#x27;s short, it&#x27;s Metaxu, and after chapter 8 none of it is magic.</p>
+<nav class="pager"><a href="11-threads-and-sharing.html">&#8592; Threads and sharing</a><a href="13-gpu-tiles.html">GPU tiles &#8594;</a></nav>
+</main>
+<script src="book.js"></script>

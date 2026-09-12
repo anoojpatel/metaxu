@@ -1,0 +1,131 @@
+<title>Threads and sharing · The Metaxu Book</title>
+<link rel="stylesheet" href="style.css">
+<header class="top">
+  <div class="inner">
+    <a class="brand" href="../index.html">Metaxu</a>
+    <nav class="topnav">
+      <a href="index.html">the book</a>
+      <a href="../roadmap.html">roadmap</a>
+      <a href="https://github.com/anoojpatel/metaxu">github &#8599;</a>
+    </nav>
+  </div>
+</header>
+<main>
+<h1>Threads and sharing</h1>
+<p>Chapter 8 ended on effects that map straight onto the runtime instead of onto user handlers. Threads are those effects. <code>Thread.spawn</code> and <code>Thread.join</code> are ordinary operations: a program performs them, a handler can interpose, and when none does, the <code>with EFFECT_SPAWN</code> declarations bind them to real OS threads, pthreads natively and host threads in the interpreter. The unusual part is not the API. It&#x27;s that the checker decides what may cross into a spawned closure by reading your code, with no Send or Sync annotations anywhere.</p>
+<h2>Spawn and join</h2>
+<p>The declaration comes first. <code>extern type Thread[T]</code> names an opaque runtime type; the effect declaration binds each operation to its runtime implementation:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">extern type Thread[T];
+
+effect Thread = {
+    fn spawn[T](f: fn() -&gt; @global T) -&gt; @global Thread[T] with EFFECT_SPAWN
+    fn join[T](thread: @global Thread[T]) -&gt; @global T with EFFECT_JOIN
+}
+
+fn main() -&gt; int {
+    let t = perform Thread.spawn(|| {
+        21 * 2
+    });
+    let answer = perform Thread.join(t);
+    print(answer);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>42</code></pre></div>
+<p><code>spawn</code> takes a zero-argument closure, starts it on its own thread, and returns a handle. <code>join</code> blocks until the closure finishes and hands back its value. The <code>with EFFECT_SPAWN</code> clause is the entire foreign interface: it tells the checker no handler is required in scope, and tells the emitter which runtime call to make. You write this prelude once per file; <code>std.sync</code> writes the same one.</p>
+<p>The child may run whenever the OS likes; the example is deterministic anyway, because nothing prints until <code>join</code> has the result. Every runnable example here keeps that discipline, since the harness pins stdout byte for byte.</p>
+<p>There is a <code>Mutex</code> effect in the same style, its operations bound by <code>EFFECT_MUTEX_LOCK</code> and <code>EFFECT_MUTEX_UNLOCK</code>. You&#x27;ll rarely perform it directly: <code>std.sync</code> wraps it, pairing each lock with the data it guards, and that pairing is why the wrapper is the blessed surface.</p>
+<h2>What a closure may capture</h2>
+<p>Chapter 10 stated the rule; this chapter lives by it. At every spawn the checker looks at what the closure captures. Values without identity cross freely. A <code>Vec</code> is different: two handles alias one buffer, so a second thread writing through a captured handle is a race. The checker rejects and names the capture:</p>
+<p><code></code>`metaxu error extern type Thread[T];</p>
+<p>effect Thread = { fn spawn<a href="f: fn(">T</a> -&gt; @global T) -&gt; @global Thread[T] with EFFECT_SPAWN fn join<a href="thread: @global Thread[T]">T</a> -&gt; @global T with EFFECT_JOIN }</p>
+<p>fn main() -&gt; int { let @mut shared = Vec.new(); shared.push(1); let t = perform Thread.spawn(|| { shared.push(2); 0 }); perform Thread.join(t); 0 }</p>
+<div class="fence"><span class="label">text</span><pre><code></code></pre></div>
+<p>captures AND WRITES &#x27;shared&#x27;, which has shared mutable identity</p>
+<div class="fence"><span class="label">text</span><pre><code>
+The diagnostic is the model in one line. Capturing is fine.
+Reading is fine: crossing a value into another thread weakens
+access, it does not revoke it. Writes need a permission, and no
+`Send` bound or wrapper type is involved anywhere.
+
+## std.sync
+
+The sanctioned permission is `std.sync.protect`, which pairs a
+value with its own mutex. `read(p)` takes the lock, copies the
+value out, and releases. `write(p, v)` replaces the value under the
+lock. `update(p, f)` applies a function under the lock, the form
+you want for read-modify-write, since a separate `read` then
+`write` would let another thread slip between them. Four threads,
+250 locked increments each:
+</code></pre></div>
+<p>from std.sync import protect, read, update;</p>
+<p>extern type Thread[T];</p>
+<p>effect Thread = { fn spawn<a href="f: fn(">T</a> -&gt; @global T) -&gt; @global Thread[T] with EFFECT_SPAWN fn join<a href="thread: @global Thread[T]">T</a> -&gt; @global T with EFFECT_JOIN }</p>
+<p>fn main() -&gt; int { let counter = protect(0); let @mut handles = Vec.new(); let mut i = 0; while i &lt; 4 { handles.push(perform Thread.spawn(|| { let mut j = 0; while j &lt; 250 { update(counter, fn(n: int) -&gt; n + 1); j = j + 1; } 0 })); i = i + 1; } for t in handles { perform Thread.join(t); } print(read(counter)); 0 }</p>
+<div class="fence"><span class="label">text</span><pre><code></code></pre></div>
+<p>1000</p>
+<div class="fence"><span class="label">text</span><pre><code>
+The interleaving of those thousand increments is up to the
+scheduler, and the count is 1000 regardless: each increment is
+atomic with respect to the others, so the interleaving stops
+mattering. A protected value captures cleanly into any number of
+closures; the checker recognizes `protect` as exactly the
+permission it was asking for.
+
+## Contention as permission
+
+Suppose you dodge the static check. The write below hides inside a
+helper, and the capture checker doesn&#x27;t chase writes through calls,
+so the program compiles. It still can&#x27;t race: spawning marks the
+captured `nums` as contended, and an unpermitted write to a
+contended value raises, with one wording on both engines. The child
+catches it with `try` and returns the message as its value, so
+`join` surfaces it deterministically:
+</code></pre></div>
+<p>extern type Thread[T];</p>
+<p>effect Thread = { fn spawn<a href="f: fn(">T</a> -&gt; @global T) -&gt; @global Thread[T] with EFFECT_SPAWN fn join<a href="thread: @global Thread[T]">T</a> -&gt; @global T with EFFECT_JOIN }</p>
+<p>fn bump(v: Vec[int]) -&gt; () { v.push(99); () }</p>
+<p>fn main() -&gt; int { let @mut nums = Vec.new(); nums.push(7); let t = perform Thread.spawn(|| { let seen = nums[0];    # reads stay free: seen is 7 try { bump(nums); &quot;wrote &quot; + seen.to_string() } catch e { e } }); print(perform Thread.join(t)); print(nums[0]); 0 }</p>
+<div class="fence"><span class="label">text</span><pre><code></code></pre></div>
+<p>contended write to a value with shared mutable identity; protect it with std.sync 7</p>
+<div class="fence"><span class="label">text</span><pre><code>
+The raise speaks the same shared-mutable-identity vocabulary as
+the compile error, because it&#x27;s the same rule enforced later. The
+child&#x27;s read of `nums[0]` succeeded; the write did not, so the
+parent&#x27;s Vec still holds one element. This is contention as
+permission: caught statically where provable, dynamically
+otherwise, one behavior either way. Chapter 10 called that the
+honest cost of having no lifetimes; this is the dynamic half.
+
+## Virtualizing spawn
+
+A runtime binding is a default, not a monopoly. Install a handler
+over the mapping and the perform goes to you instead; no OS thread
+is created:
+</code></pre></div>
+<p>extern type Thread[T];</p>
+<p>effect Thread = { fn spawn<a href="f: fn(">T</a> -&gt; @global T) -&gt; @global Thread[T] with EFFECT_SPAWN fn join<a href="thread: @global Thread[T]">T</a> -&gt; @global T with EFFECT_JOIN }</p>
+<p>fn main() -&gt; int { let r = handle Thread with { spawn(f) -&gt; { print(&quot;no thread spawned&quot;); resume(f()) } join(t) -&gt; resume(t) } in { let t = perform Thread.spawn(|| { 3 + 4 }); perform Thread.join(t) }; print(r); 0 }</p>
+<div class="fence"><span class="label">text</span><pre><code></code></pre></div>
+<p>no thread spawned 7</p>
+<div class="fence"><span class="label">text</span><pre><code>
+This handler runs the closure inline and resumes with its result. A
+`Thread[T]` is whatever the handler says it is; here it&#x27;s the
+finished value, and `join` hands it straight back. Tests use this
+shape to make scheduling deterministic, and a `suspend`-class
+handler (chapter 8) can hold the continuations and interleave them
+instead, which is a cooperative scheduler in a page of code.
+
+## Scopes and failures
+
+Two facts round out the model, both about isolation. A spawned
+closure starts with a fresh handler stack: parent handlers do not
+span into the child, so runtime-bound operations and defaults work
+there but anything else raises `No handler for effect ...` in the
+child. And a raise the child doesn&#x27;t catch is held and rethrown at
+`join`, where an ordinary `try` catches it. Nothing about a
+thread&#x27;s failure is asynchronous: you meet it exactly where you
+asked for the result.
+</code></pre></div>
+<nav class="pager"><a href="10-modes-and-memory.html">&#8592; Modes and memory</a><a href="12-the-standard-library.html">The standard library &#8594;</a></nav>
+</main>
+<script src="book.js"></script>

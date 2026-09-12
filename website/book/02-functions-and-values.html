@@ -1,0 +1,146 @@
+<title>Functions and values · The Metaxu Book</title>
+<link rel="stylesheet" href="style.css">
+<header class="top">
+  <div class="inner">
+    <a class="brand" href="../index.html">Metaxu</a>
+    <nav class="topnav">
+      <a href="index.html">the book</a>
+      <a href="../roadmap.html">roadmap</a>
+      <a href="https://github.com/anoojpatel/metaxu">github &#8599;</a>
+    </nav>
+  </div>
+</header>
+<main>
+<h1>Functions and values</h1>
+<p>Chapter 1 ran a program. This chapter is the expression language it was written in: functions, blocks and their values, what a name may do after you bind it, and functions passed around as values.</p>
+<h2>Declaring functions</h2>
+<p>A function names its parameters with types and declares its return type. The body is a block, and the block&#x27;s last expression is the function&#x27;s value. No <code>return</code> needed on the happy path.</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">fn add(a: int, b: int) -&gt; int {
+    a + b
+}
+
+fn main() -&gt; int {
+    print(add(3, 4));
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>7</code></pre></div>
+<p>Statements inside a block end with <code>;</code>; the tail expression doesn&#x27;t, and dropping the semicolon is what marks it as the tail. That&#x27;s why <code>main</code> ends with a bare <code>0</code> in every example in this book.</p>
+<h2>Early return</h2>
+<p><code>return</code> exists for leaving before the tail. Here the else-less <code>if</code> is a statement (its value is unit), so it takes a <code>;</code> like any other expression used as a statement; the function&#x27;s real value is the tail <code>n</code> below it.</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">fn magnitude(n: int) -&gt; int {
+    if n &lt; 0 {
+        return 0 - n;
+    };
+    n
+}
+
+fn main() -&gt; int {
+    print(magnitude(0 - 7));
+    print(magnitude(4));
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>7
+4</code></pre></div>
+<p>One thing you might expect from Rust that Metaxu does not have: a freestanding block expression. <code>let z = { let a = 1; a + 1 };</code> is a parse error. Blocks are valued in exactly three places: function bodies, <code>if</code>/<code>else</code> arms, and <code>match</code> arms.</p>
+<h2><code>let</code> is immutable</h2>
+<p><code>let</code> binds a name once. Assigning to it again is not a runtime mistake, it&#x27;s a program the compiler refuses:</p>
+<p><code></code>`metaxu error fn main() -&gt; int { let count = 1; count = 2; 0 }</p>
+<div class="fence"><span class="label">text</span><pre><code></code></pre></div>
+<p>cannot assign twice to immutable binding</p>
+<div class="fence"><span class="label">text</span><pre><code>
+The full diagnostic names the binding and tells you the fix: declare
+it mutable with `let mut`. A `mut` binding may be reassigned freely.
+Separately, a fresh `let` of the same name is always fine; that&#x27;s
+shadowing, a new binding that hides the old one rather than changing
+it.
+</code></pre></div>
+<p>fn main() -&gt; int { let x = 1; let x = x + 10;      # shadowing: a new x, computed from the old print(x);</p>
+<p>let mut total = 0;   # mutation: one binding, reassigned total = total + 5; total = total + 7; print(total); 0 }</p>
+<div class="fence"><span class="label">text</span><pre><code></code></pre></div>
+<p>11 12</p>
+<div class="fence"><span class="label">text</span><pre><code>
+There is a third form, `let @mut`, which makes the binding mutable
+and also claims the `@mut` mode on the value itself, the exclusive
+right to mutate it that the borrow checker tracks. Chapter 10 covers
+modes; until then, the idiom to recognize is
+`let @mut v = Vec.new();` for collections you intend to grow.
+
+## `if` is an expression
+
+`if cond { } else { }` produces a value, so it goes anywhere an
+expression goes, including the right side of a `let`. Comparisons
+produce bools, and bools print as `1` and `0`: native code erases
+bools to integers, and the interpreter formats them the same way so
+the two engines agree byte for byte.
+</code></pre></div>
+<p>fn main() -&gt; int { let n = 7; let label = if n &gt; 5 { &quot;big&quot; } else { &quot;small&quot; }; print(label); print(n &gt; 5); print(n &gt; 50); 0 }</p>
+<div class="fence"><span class="label">text</span><pre><code></code></pre></div>
+<p>big 1 0</p>
+<div class="fence"><span class="label">text</span><pre><code>
+An `if` without an `else` is unit, so it can&#x27;t be a value; use it as
+a statement. Both arms of a valued `if` must agree on their type,
+which chapter 6 has more to say about.
+
+## `while`
+
+`while` repeats a block while its condition holds. This also shows
+`print` with two arguments: it joins them with a single space.
+</code></pre></div>
+<p>fn main() -&gt; int { let mut i = 1; let mut sum = 0; while i &lt; 5 { sum = sum + i; i = i + 1; } print(&quot;sum&quot;, sum); 0 }</p>
+<div class="fence"><span class="label">text</span><pre><code></code></pre></div>
+<p>sum 10</p>
+<div class="fence"><span class="label">text</span><pre><code>
+`for` loops iterate collections, so they wait for chapter 5.
+
+## Numbers and strings
+
+Ints and floats are separate types with the usual arithmetic. Floats
+always print with their point (`5.0`, not `5`). Strings concatenate
+with `+`, but only with other strings: gluing a number on takes
+`.to_string()`. For anything beyond a single `+`, an f-string
+interpolates a bound name in place.
+</code></pre></div>
+<p>fn main() -&gt; int { print(7 * 6); print(2.5 * 2.0); let price = 3; print(&quot;price: &quot; + price.to_string()); let name = &quot;Metaxu&quot;; print(f&quot;hello from {name}&quot;); 0 }</p>
+<div class="fence"><span class="label">text</span><pre><code></code></pre></div>
+<p>42 5.0 price: 3 hello from Metaxu</p>
+<div class="fence"><span class="label">text</span><pre><code>
+Chapter 5 covers the rest of the string surface: length, indexing,
+ordering.
+
+## Functions are values
+
+A lambda is written `fn(x: int) -&gt; expr`, or with a block body and a
+declared return type, `fn(x: int) -&gt; int { ... }`. There is no `|x|`
+form. Lambda types read the same way the expressions do:
+`fn(int) -&gt; int` is a function from int to int, and a parameter of
+that type accepts named functions and lambdas alike. Lambdas capture
+the bindings around them.
+</code></pre></div>
+<p>fn apply_twice(f: fn(int) -&gt; int, x: int) -&gt; int { f(f(x)) }</p>
+<p>fn main() -&gt; int { let double = fn(x: int) -&gt; x * 2; print(double(21)); print(apply_twice(double, 5));</p>
+<p>let step = 10; let add_step = fn(n: int) -&gt; int { n + step }; print(add_step(32)); 0 }</p>
+<div class="fence"><span class="label">text</span><pre><code></code></pre></div>
+<p>42 20 42</p>
+<div class="fence"><span class="label">text</span><pre><code>
+Chapter 8 builds a lot on this: handlers receive functions, streams
+are functions performing effects.
+
+## Arguments are copies
+
+A scalar argument arrives in the callee as its own value. The
+function can compute with it, but nothing it does reaches the
+caller&#x27;s binding (parameters are immutable, same as plain `let`).
+</code></pre></div>
+<p>fn bump(n: int) -&gt; int { n + 1 }</p>
+<p>fn main() -&gt; int { let n = 41; print(bump(n)); print(n); 0 }</p>
+<div class="fence"><span class="label">text</span><pre><code></code></pre></div>
+<p>42 41</p>
+<div class="fence"><span class="label">text</span><pre><code>
+Collections behave differently: a `Vec` is a handle, and two handles
+can share one buffer. That distinction gets its own section in
+chapter 5, and the rules for who may mutate what through which handle
+are chapter 10&#x27;s subject.
+</code></pre></div>
+<nav class="pager"><a href="01-getting-started.html">&#8592; Getting started</a><a href="03-structs-and-enums.html">Structs and enums &#8594;</a></nav>
+</main>
+<script src="book.js"></script>

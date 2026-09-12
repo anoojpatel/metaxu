@@ -1,0 +1,135 @@
+<title>Structs and enums · The Metaxu Book</title>
+<link rel="stylesheet" href="style.css">
+<header class="top">
+  <div class="inner">
+    <a class="brand" href="../index.html">Metaxu</a>
+    <nav class="topnav">
+      <a href="index.html">the book</a>
+      <a href="../roadmap.html">roadmap</a>
+      <a href="https://github.com/anoojpatel/metaxu">github &#8599;</a>
+    </nav>
+  </div>
+</header>
+<main>
+<h1>Structs and enums</h1>
+<p>Two ways to build a type: a struct holds several values at once (all the fields, every time), an enum holds one of several alternatives (exactly one variant at a time). Product and sum. Everything else in Metaxu&#x27;s data modeling, including <code>Option</code> and the trees in this chapter, is these two plus generics.</p>
+<h2>Structs</h2>
+<p>Declare the fields with their types; construct with a literal that names every field; read with <code>.</code>:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">struct Point { x: int, y: int }
+
+fn main() -&gt; int {
+    let p = Point { x: 3, y: 4 };
+    print(p.x + p.y);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>7</code></pre></div>
+<p>Field types are checked at the literal, not discovered at runtime:</p>
+<p><code></code>`metaxu error struct Point { x: int, y: int }</p>
+<p>fn main() -&gt; int { let p = Point { x: &quot;three&quot;, y: 4 }; 0 }</p>
+<div class="fence"><span class="label">text</span><pre><code></code></pre></div>
+<p>type mismatch for field &#x27;x&#x27; of Point</p>
+<div class="fence"><span class="label">text</span><pre><code>
+One naming caution: `from` is a reserved word (it belongs to import
+syntax), so it can&#x27;t be a field name. A `Segment` goes `a` to `b`, or
+`start` to `stop`, not `from` to `to`.
+
+## Mutating fields
+
+Field assignment needs a mutable binding, and it reaches through
+nested structs: a dotted path on the left of `=` works to any depth.
+</code></pre></div>
+<p>struct Point { x: int, y: int } struct Segment { a: Point, b: Point }</p>
+<p>fn main() -&gt; int { let mut s = Segment { a: Point { x: 0, y: 0 }, b: Point { x: 4, y: 0 } }; s.b.y = 3; print(s.b.x + s.b.y); 0 }</p>
+<div class="fence"><span class="label">text</span><pre><code></code></pre></div>
+<p>7</p>
+<div class="fence"><span class="label">text</span><pre><code>
+Fields can also carry modes in the declaration, like
+`@const name: string` or `@mut n: int`. A `@const` field rejects
+assignment at compile time no matter how mutable the binding is.
+That&#x27;s chapter 10&#x27;s territory; here it&#x27;s enough to know the syntax
+exists.
+
+## Structs in and out of functions
+
+Functions take and return structs like any other value. Building a
+new struct from an old one is the plain way to express an update:
+</code></pre></div>
+<p>struct Point { x: int, y: int }</p>
+<p>fn shift(p: Point, dx: int) -&gt; Point { Point { x: p.x + dx, y: p.y } }</p>
+<p>fn main() -&gt; int { let p = Point { x: 1, y: 2 }; let q = shift(p, 9); print(q.x); print(q.y); 0 }</p>
+<div class="fence"><span class="label">text</span><pre><code></code></pre></div>
+<p>10 2</p>
+<div class="fence"><span class="label">text</span><pre><code>
+## Generic structs
+
+A type parameter in square brackets makes the struct generic. The
+literal doesn&#x27;t repeat the type; the checker infers it from the
+fields, and both fields have to agree on what `T` is (chapter 6 shows
+the rejection when they don&#x27;t).
+</code></pre></div>
+<p>struct Pair[T] { a: T, b: T }</p>
+<p>fn main() -&gt; int { let ints = Pair { a: 1, b: 2 }; let words = Pair { a: &quot;left&quot;, b: &quot;right&quot; }; print(ints.a + ints.b); print(words.b); 0 }</p>
+<div class="fence"><span class="label">text</span><pre><code></code></pre></div>
+<p>3 right</p>
+<div class="fence"><span class="label">text</span><pre><code>
+## Tuples
+
+For a quick aggregate that doesn&#x27;t deserve a name, a tuple groups
+values positionally. A `let` with a tuple pattern takes it apart
+again:
+</code></pre></div>
+<p>fn min_max(a: int, b: int) -&gt; (int, int) { if a &lt; b { (a, b) } else { (b, a) } }</p>
+<p>fn main() -&gt; int { let (lo, hi) = min_max(9, 4); print(lo); print(hi); 0 }</p>
+<div class="fence"><span class="label">text</span><pre><code></code></pre></div>
+<p>4 9</p>
+<div class="fence"><span class="label">text</span><pre><code>
+## Enums
+
+An enum lists its variants. A variant can be bare, like `Dot`, or
+carry a payload, like `Circle(int)`. Construction is qualified with
+`::`, and a payload-less variant is written bare, no parentheses,
+in both construction and pattern position. Consuming an enum means
+matching on it; chapter 4 is all about `match`, so this example uses
+only the basics.
+</code></pre></div>
+<p>enum Shape { Dot, Circle(int), Rect(int, int) }</p>
+<p>fn area_ish(s: Shape) -&gt; int { match s { Shape::Dot =&gt; 0 Shape::Circle(r) =&gt; 3 * r * r Shape::Rect(w, h) =&gt; w * h } }</p>
+<p>fn main() -&gt; int { print(area_ish(Shape::Dot)); print(area_ish(Shape::Circle(2))); print(area_ish(Shape::Rect(2, 5))); 0 }</p>
+<div class="fence"><span class="label">text</span><pre><code></code></pre></div>
+<p>0 12 10</p>
+<div class="fence"><span class="label">text</span><pre><code>
+The value knows which variant it is; there&#x27;s no way to read a
+`Circle`&#x27;s radius without going through a pattern that proves you
+have a `Circle`. That proof obligation is the point of sum types.
+
+## Recursive generic enums
+
+Variants can hold the enum&#x27;s own type, which is how linked structures
+are declared. No pointers, no lifetimes, just the type mentioning
+itself:
+</code></pre></div>
+<p>enum Tree[T] { Leaf, Node(Tree[T], T, Tree[T]) }</p>
+<p>fn tree_sum(t: Tree[int]) -&gt; int { match t { Tree::Leaf =&gt; 0 Tree::Node(l, v, r) =&gt; tree_sum(l) + v + tree_sum(r) } }</p>
+<p>fn main() -&gt; int { let t = Tree::Node( Tree::Node(Tree::Leaf, 1, Tree::Leaf), 2, Tree::Node(Tree::Leaf, 3, Tree::Leaf)); print(tree_sum(t)); 0 }</p>
+<div class="fence"><span class="label">text</span><pre><code></code></pre></div>
+<p>6</p>
+<div class="fence"><span class="label">text</span><pre><code>
+## Option is just an enum
+
+The standard library&#x27;s `Option` is an enum with variants `Some(T)`
+and `None`, and its variants are in scope unqualified. Printing one
+shows the qualified form.
+</code></pre></div>
+<p>fn describe(o: Option[int]) -&gt; string { match o { Some(v) =&gt; &quot;got &quot; + v.to_string() None =&gt; &quot;nothing&quot; } }</p>
+<p>fn main() -&gt; int { print(describe(Some(21))); print(describe(None)); print(Some(3)); 0 }</p>
+<div class="fence"><span class="label">text</span><pre><code></code></pre></div>
+<p>got 21 nothing Option::Some(3)</p>
+<div class="fence"><span class="label">text</span><pre><code>
+`Option` replaces every &quot;might not be there&quot; convention: no null, no
+sentinel values. Chapter 9 tours the combinators in `std.option` that
+make it pleasant at scale. First, though, patterns deserve a full
+chapter.
+</code></pre></div>
+<nav class="pager"><a href="02-functions-and-values.html">&#8592; Functions and values</a><a href="04-pattern-matching.html">Pattern matching &#8594;</a></nav>
+</main>
+<script src="book.js"></script>

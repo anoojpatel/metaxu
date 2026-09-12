@@ -1,0 +1,166 @@
+<title>Vectors and collections · The Metaxu Book</title>
+<link rel="stylesheet" href="style.css">
+<header class="top">
+  <div class="inner">
+    <a class="brand" href="../index.html">Metaxu</a>
+    <nav class="topnav">
+      <a href="index.html">the book</a>
+      <a href="../roadmap.html">roadmap</a>
+      <a href="https://github.com/anoojpatel/metaxu">github &#8599;</a>
+    </nav>
+  </div>
+</header>
+<main>
+<h1>Vectors and collections</h1>
+<p>Two vector types, on purpose. <code>Vec</code> is the growable workhorse: heap storage, identity semantics, push and pop. <code>vector[T, N]</code> is fixed-size and value-semantic, sized in its type, built for the numeric and GPU work in chapter 13. Strings round the chapter out.</p>
+<h2>Vec</h2>
+<p><code>Vec.new()</code> makes an empty vector. Growing it is mutation, so the binding is declared <code>let @mut</code>, the collection idiom from chapter 2. Indexing reads and writes with <code>[]</code>, <code>.len()</code> counts, <code>.pop()</code> removes and returns the last element.</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">fn main() -&gt; int {
+    let @mut v = Vec.new();
+    v.push(10);
+    v.push(20);
+    v.push(30);
+    print(v.len());
+    print(v[1]);
+    v[1] = 25;
+    print(v[1]);
+    print(v.pop());
+    print(v.len());
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>3
+20
+25
+30
+2</code></pre></div>
+<h2>Literals</h2>
+<p>A bracketed list builds a <code>Vec</code> with its elements in place. Without <code>@mut</code> it&#x27;s a perfectly good immutable sequence.</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">fn main() -&gt; int {
+    let primes = [2, 3, 5, 7];
+    print(primes.len());
+    print(primes[3]);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>4
+7</code></pre></div>
+<h2>A Vec is a handle</h2>
+<p>Binding a <code>Vec</code> to a second name does not copy the elements. Both names are handles on one buffer, and a push through either is visible through both. This is what chapter 10 calls shared mutable identity, and it&#x27;s the property that makes the thread checker in chapter 11 care about <code>Vec</code> specifically.</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">fn main() -&gt; int {
+    let @mut a = Vec.new();
+    a.push(1);
+    let b = a;
+    a.push(2);
+    print(b.len());
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>2</code></pre></div>
+<h2>Out of bounds is a runtime error you can catch</h2>
+<p>Indexing past the end and popping an empty <code>Vec</code> raise at runtime (the messages are <code>index out of bounds</code> and <code>pop: Vec is empty</code>). <code>try</code>/<code>catch</code> contains them; execution continues after the <code>catch</code> block. Chapter 9 covers the machinery.</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">fn main() -&gt; int {
+    let @mut v = Vec.new();
+    v.push(1);
+    try {
+        print(v[5]);
+    } catch e {
+        print(&quot;index 5 is out of bounds&quot;);
+    };
+    try {
+        v.pop();
+        v.pop();
+    } catch e {
+        print(&quot;popped too far&quot;);
+    };
+    print(&quot;still running&quot;);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>index 5 is out of bounds
+popped too far
+still running</code></pre></div>
+<p>Compile errors are different: nothing catches those, because the program never runs.</p>
+<h2>for loops</h2>
+<p><code>for</code> iterates a <code>Vec</code> front to back, binding each element in turn.</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">fn main() -&gt; int {
+    let names = [&quot;ada&quot;, &quot;grace&quot;, &quot;alan&quot;];
+    for name in names {
+        print(name);
+    }
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>ada
+grace
+alan</code></pre></div>
+<h2>Ranges, and the index idiom</h2>
+<p><code>for</code> also iterates ranges. <code>0..5</code> counts 0 through 4; the upper bound is excluded, so a range&#x27;s length is exactly the difference. When you need the position as well as the element, the plain <code>while</code> over indices does it:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">fn main() -&gt; int {
+    let mut sum = 0;
+    for i in 0..5 {
+        sum = sum + i;
+    }
+    print(sum);
+
+    let v = [3, 1, 4];
+    let mut i = 0;
+    let mut total = 0;
+    while i &lt; v.len() {
+        total = total + v[i];
+        i = i + 1;
+    }
+    print(total);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>10
+8</code></pre></div>
+<h2>Sorting</h2>
+<p><code>std.sort</code> provides <code>sort</code> (and <code>binary_search</code>, which chapter 12 shows). <code>sort</code> gives you back the sorted vector; the original handle is untouched.</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">from std.sort import sort;
+
+fn main() -&gt; int {
+    let v = [3, 1, 2];
+    let s = sort(v);
+    print(s[0]);
+    print(s[1]);
+    print(s[2]);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>1
+2
+3</code></pre></div>
+<p><code>std.vec</code> collects the everyday <code>Vec</code> helpers the same way; the standard library tour in chapter 12 goes module by module.</p>
+<h2>Fixed-size vectors</h2>
+<p><code>vector[T, N]</code> carries its length in its type. Arithmetic on two of them is elementwise, and unlike <code>Vec</code>, assignment copies: a <code>vector</code> is a value, not a handle, so writing through one binding never shows through another. A fresh <code>vector[int, N]</code> with no elements given starts zeroed. Mixing lengths is a runtime error, not a compile error, so keep the <code>N</code>s honest yourself.</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">fn main() -&gt; int {
+    let a: vector[int, 3] = [1, 2, 3];
+    let b: vector[int, 3] = [10, 20, 30];
+    let c = a + b;
+    print(c[0]);
+    print(c[2]);
+
+    let mut d = a;
+    d[0] = 99;
+    print(d[0]);
+    print(a[0]);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>11
+33
+99
+1</code></pre></div>
+<p>That last pair of prints is the value semantics: <code>d</code> diverged, <code>a</code> didn&#x27;t. The GPU tiles in chapter 13 push this same idea much further.</p>
+<h2>Strings</h2>
+<p>Strings know their length, index to 1-character strings, concatenate with <code>+</code>, and order lexicographically with <code>&lt;</code> (bools print as <code>1</code> and <code>0</code>, per chapter 2).</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">fn main() -&gt; int {
+    let word = &quot;metaxu&quot;;
+    print(word.len());
+    print(word[0]);
+    print(word + &quot;!&quot;);
+    print(&quot;apple&quot; &lt; &quot;banana&quot;);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>6
+m
+metaxu!
+1</code></pre></div>
+<p>There is no separate char type; the element of a string is a string. <code>std.string</code> has the split/join/case helpers, and chapter 12 shows them alongside the rest of the library.</p>
+<nav class="pager"><a href="04-pattern-matching.html">&#8592; Pattern matching</a><a href="06-types-and-inference.html">Types and inference &#8594;</a></nav>
+</main>
+<script src="book.js"></script>
