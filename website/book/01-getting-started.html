@@ -47,15 +47,12 @@ fn main() -&gt; int {
                      -&gt; LLVM -&gt; clang        (native, differentially tested)
                      -&gt; MSL -&gt; Metal via MLX (GPU tile kernels)</code></pre></div>
 <p>Undefined names, type conflicts, and mode violations are compile errors, not runtime surprises. The checker would rather stop you than guess:</p>
-<p><code></code>`metaxu error fn main() -&gt; int { print(1 + &quot;a&quot;); 0 }</p>
-<div class="fence"><span class="label">text</span><pre><code></code></pre></div>
-<p>type check failed</p>
-<div class="fence"><span class="label">text</span><pre><code>
-The rest of the book walks the language from the bottom up. Chapters 2
-through 7 are the core language; 8 through 11 are what makes Metaxu
-distinctive (effects, modes, inferred thread-safety); 12 through 14
-tour the library, the GPU story, and the native backend.
-</code></pre></div>
+<div class="fence error"><span class="label">metaxu · rejected</span><pre><code class="mx">fn main() -&gt; int {
+    print(1 + &quot;a&quot;);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>type check failed</code></pre></div>
+<p>The rest of the book walks the language from the bottom up. Chapters 2 through 7 are the core language; 8 through 11 are what makes Metaxu distinctive (effects, modes, inferred thread-safety); 12 through 14 tour the library, the GPU story, and the native backend.</p>
 <nav class="pager"><a href="index.html">&#8592; Contents</a><a href="02-functions-and-values.html">Functions and values &#8594;</a></nav>
 </main>
 <script src="book.js"></script>

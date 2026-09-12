@@ -1,4 +1,4 @@
-<title>examples/app/main.mx (import head) · The Metaxu Book</title>
+<title>Modules and imports · The Metaxu Book</title>
 <link rel="stylesheet" href="style.css">
 <header class="top">
   <div class="inner">
@@ -83,65 +83,42 @@ fn main() -&gt; int {
     geometry.mx    # exports area
     util.mx        # exports clamp</code></pre></div>
 <p><code>main.mx</code> opens by naming what it needs. Sibling files import by module name; the standard library imports look exactly like they do in a single file:</p>
-<p><code></code>`metaxu norun</p>
-<h1>examples/app/main.mx (import head)</h1>
-<p>import geometry; from util import clamp; from std.stream import iota, sum;</p>
-<p>fn main() -&gt; int { print(geometry.area(clamp(sum(iota(10)), 1, 6), 2)); 0 }</p>
-<div class="fence"><span class="label">text</span><pre><code>
-This is the book&#x27;s one display-only fence in this chapter: the
-harness extracts single-source programs, and a multi-file layout has
-no single source to extract. The program itself runs through the
-example gate, which is where its behavior is pinned.
+<div class="fence"><span class="label">metaxu · display only</span><pre><code class="mx"># examples/app/main.mx (import head)
+import geometry;
+from util import clamp;
+from std.stream import iota, sum;
 
-Each file&#x27;s `export` works as in a `module` block, with one default
-worth knowing: a file with no `export` statement exports nothing, so
-a library file that forgets its exports is unusable rather than
-accidentally wide open.
+fn main() -&gt; int {
+    print(geometry.area(clamp(sum(iota(10)), 1, 6), 2));
+    0
+}</code></pre></div>
+<p>This is the book&#x27;s one display-only fence in this chapter: the harness extracts single-source programs, and a multi-file layout has no single source to extract. The program itself runs through the example gate, which is where its behavior is pinned.</p>
+<p>Each file&#x27;s <code>export</code> works as in a <code>module</code> block, with one default worth knowing: a file with no <code>export</code> statement exports nothing, so a library file that forgets its exports is unusable rather than accidentally wide open.</p>
+<h2>Name precedence</h2>
+<p>When a plain call could mean two things, the resolver prefers the nearest definition. Your own top-level <code>fn len</code> beats the builtin <code>len</code> in call position:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">fn len(s: string) -&gt; int {
+    999
+}
 
-## Name precedence
-
-When a plain call could mean two things, the resolver prefers the
-nearest definition. Your own top-level `fn len` beats the builtin
-`len` in call position:
-</code></pre></div>
-<p>fn len(s: string) -&gt; int { 999 }</p>
-<p>fn main() -&gt; int { print(len(&quot;hello&quot;)); print(&quot;hello&quot;.len()); 0 }</p>
-<div class="fence"><span class="label">text</span><pre><code></code></pre></div>
-<p>999 5</p>
-<div class="fence"><span class="label">text</span><pre><code>
-The method spelling still reaches the builtin, because method
-dispatch resolves through the receiver (chapter 7&#x27;s UFCS rules), not
-through the plain-call namespace. The precedence order for a plain
-name is: local and file-level definitions, then imported names, then
-builtins. Shadowing a builtin is legal and silent, which is a reason
-to keep import lists short enough to read.
-
-## The `__` prefix is not yours
-
-Names beginning with two underscores belong to the compiler. The
-desugarer manufactures bindings like `__guard_scrut_at12` when it
-rewrites match guards, and the borrow checker deliberately skips
-`__`-prefixed names so those generated lowerings never trip a false
-positive. That bargain only holds if user code can&#x27;t claim the
-prefix, so declaring one is rejected up front:
-</code></pre></div>
-<p>fn main() -&gt; int { let __tmp = 1; print(__tmp); 0 }</p>
-<div class="fence"><span class="label">text</span><pre><code></code></pre></div>
-<p>ReservedNameError: &lt;mem&gt;:2:9: &#x27;__tmp&#x27;: names beginning with &#x27;__&#x27; are reserved for compiler-generated bindings</p>
-<div class="fence"><span class="label">text</span><pre><code>
-Same caveat as the visibility rejection above: `ReservedNameError` is
-a plain `CompileError`, so this is a quoted diagnostic in a plain
-fence rather than a harness-pinned `error` block.
-
-## Where this leaves you
-
-Modules here are a naming discipline, not a compilation-unit design.
-One file per concern, an `export` list you can read in one glance,
-`from`-imports for the names you use often, qualified paths for the
-ones you don&#x27;t. Chapter 12 tours what `std` itself exports; chapter
-17 shows where module resolution sits in the pipeline, which is
-early, right after the parser and before any type is inferred.
-</code></pre></div>
+fn main() -&gt; int {
+    print(len(&quot;hello&quot;));
+    print(&quot;hello&quot;.len());
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>999
+5</code></pre></div>
+<p>The method spelling still reaches the builtin, because method dispatch resolves through the receiver (chapter 7&#x27;s UFCS rules), not through the plain-call namespace. The precedence order for a plain name is: local and file-level definitions, then imported names, then builtins. Shadowing a builtin is legal and silent, which is a reason to keep import lists short enough to read.</p>
+<h2>The <code>__</code> prefix is not yours</h2>
+<p>Names beginning with two underscores belong to the compiler. The desugarer manufactures bindings like <code>__guard_scrut_at12</code> when it rewrites match guards, and the borrow checker deliberately skips <code>__</code>-prefixed names so those generated lowerings never trip a false positive. That bargain only holds if user code can&#x27;t claim the prefix, so declaring one is rejected up front:</p>
+<div class="fence"><span class="label">text</span><pre><code>fn main() -&gt; int {
+    let __tmp = 1;
+    print(__tmp);
+    0
+}</code></pre></div>
+<div class="fence"><span class="label">text</span><pre><code>ReservedNameError: &lt;mem&gt;:2:9: &#x27;__tmp&#x27;: names beginning with &#x27;__&#x27; are reserved for compiler-generated bindings</code></pre></div>
+<p>Same caveat as the visibility rejection above: <code>ReservedNameError</code> is a plain <code>CompileError</code>, so this is a quoted diagnostic in a plain fence rather than a harness-pinned <code>error</code> block.</p>
+<h2>Where this leaves you</h2>
+<p>Modules here are a naming discipline, not a compilation-unit design. One file per concern, an <code>export</code> list you can read in one glance, <code>from</code>-imports for the names you use often, qualified paths for the ones you don&#x27;t. Chapter 12 tours what <code>std</code> itself exports; chapter 17 shows where module resolution sits in the pipeline, which is early, right after the parser and before any type is inferred.</p>
 <nav class="pager"><a href="14-compiling-to-native.html">&#8592; Compiling to native</a><a href="16-unsafe-and-ffi.html">Unsafe and FFI &#8594;</a></nav>
 </main>
 <script src="book.js"></script>

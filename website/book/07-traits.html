@@ -55,106 +55,120 @@ fn main() -&gt; int {
 <div class="fence output"><span class="label">output</span><pre><code>42</code></pre></div>
 <h2>One block per trait and type</h2>
 <p>For a given trait and type there is exactly one <code>implement</code> block. A second is rejected at compile time, even with an identical body:</p>
-<p><code></code>`metaxu error trait Show { fn show(self) -&gt; string; }</p>
-<p>struct Dog { name: string }</p>
-<p>implement Show for Dog { fn show(self) -&gt; string { &quot;dog&quot; } }</p>
-<p>implement Show for Dog { fn show(self) -&gt; string { &quot;DOG&quot; } }</p>
-<p>fn main() -&gt; int { print(Dog { name: &quot;rex&quot; }.show()); 0 }</p>
-<div class="fence"><span class="label">text</span><pre><code></code></pre></div>
-<p>more than one implement block</p>
-<div class="fence"><span class="label">text</span><pre><code>
-Coherence keeps dispatch predictable: which code runs for `d.show()`
-never depends on import order or which file the checker read first.
+<div class="fence error"><span class="label">metaxu · rejected</span><pre><code class="mx">trait Show { fn show(self) -&gt; string; }
 
-## Inherent implementations and statics
+struct Dog { name: string }
 
-Drop the trait and you get an inherent implementation: methods that
-belong to the type itself. A function without `self` is a static,
-called through the type name; that&#x27;s the idiomatic constructor.
-</code></pre></div>
-<p>struct Counter { n: int }</p>
-<p>implement Counter { fn make() -&gt; Counter { Counter { n: 0 } } fn bump(self) -&gt; Counter { Counter { n: self.n + 1 } } fn get(self) -&gt; int { self.n } }</p>
-<p>fn main() -&gt; int { let c = Counter.make(); print(c.bump().bump().get()); 0 }</p>
-<div class="fence"><span class="label">text</span><pre><code></code></pre></div>
-<p>2</p>
-<div class="fence"><span class="label">text</span><pre><code>
-`Counter.make()` reaches the static through the type; `.bump()`
-dispatches on the value. No trait needed, because no second type will
-share this interface.
+implement Show for Dog {
+    fn show(self) -&gt; string { &quot;dog&quot; }
+}
 
-## Conditional implementations
+implement Show for Dog {
+    fn show(self) -&gt; string { &quot;DOG&quot; }
+}
 
-A generic type can implement a trait on the condition that its
-parameter does. The `where` clause states the condition; the body
-gets to use it.
-</code></pre></div>
-<p>trait Show { fn show(self) -&gt; string; }</p>
-<p>struct Pair[T] { a: T, b: T }</p>
-<p>implement Show for int { fn show(self) -&gt; string { self.to_string() } }</p>
-<p>implement Show for Pair[T] where T: Show { fn show(self) -&gt; string { &quot;(&quot; + self.a.show() + &quot;, &quot; + self.b.show() + &quot;)&quot; } }</p>
-<p>fn main() -&gt; int { let p = Pair { a: 1, b: 2 }; print(p.show()); 0 }</p>
-<div class="fence"><span class="label">text</span><pre><code></code></pre></div>
-<p>(1, 2)</p>
-<div class="fence"><span class="label">text</span><pre><code>
-`Pair[int]` is showable because int is; note that builtin types take
-implementations like any other. A `Pair` of a type without `Show`
-simply lacks the method, and a `where` bound asking for it fails as
-chapter 6 pinned, naming the missing block.
+fn main() -&gt; int {
+    print(Dog { name: &quot;rex&quot; }.show());
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>more than one implement block</code></pre></div>
+<p>Coherence keeps dispatch predictable: which code runs for <code>d.show()</code> never depends on import order or which file the checker read first.</p>
+<h2>Inherent implementations and statics</h2>
+<p>Drop the trait and you get an inherent implementation: methods that belong to the type itself. A function without <code>self</code> is a static, called through the type name; that&#x27;s the idiomatic constructor.</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">struct Counter { n: int }
 
-## Your methods beat the builtins
+implement Counter {
+    fn make() -&gt; Counter { Counter { n: 0 } }
+    fn bump(self) -&gt; Counter { Counter { n: self.n + 1 } }
+    fn get(self) -&gt; int { self.n }
+}
 
-Numbers and bools come with a builtin `to_string`; other values have
-a default rendering. An implementation you write takes precedence for
-your type:
-</code></pre></div>
-<p>struct Temp { celsius: int }</p>
-<p>implement Temp { fn to_string(self) -&gt; string { self.celsius.to_string() + &quot; C&quot; } }</p>
-<p>fn main() -&gt; int { let t = Temp { celsius: 20 }; print(t.to_string()); 0 }</p>
-<div class="fence"><span class="label">text</span><pre><code></code></pre></div>
-<p>20 C</p>
-<div class="fence"><span class="label">text</span><pre><code>
-Inside the method, `self.celsius.to_string()` is the builtin working
-on an int. Outside, `t.to_string()` is yours. Same name, two levels,
-no conflict.
+fn main() -&gt; int {
+    let c = Counter.make();
+    print(c.bump().bump().get());
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>2</code></pre></div>
+<p><code>Counter.make()</code> reaches the static through the type; <code>.bump()</code> dispatches on the value. No trait needed, because no second type will share this interface.</p>
+<h2>Conditional implementations</h2>
+<p>A generic type can implement a trait on the condition that its parameter does. The <code>where</code> clause states the condition; the body gets to use it.</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">trait Show { fn show(self) -&gt; string; }
 
-## Call position and method position
+struct Pair[T] { a: T, b: T }
 
-Method syntax also works on plain functions: `x.f(y)` with no
-matching implementation looks for a free function `f` and passes `x`
-as its first argument. Going the other way, a plain call prefers your
-functions over builtins of the same name.
-</code></pre></div>
-<p>fn double(n: int) -&gt; int { n * 2 }</p>
-<p>fn len(s: string) -&gt; int { 99 }</p>
-<p>fn main() -&gt; int { print(&quot;hello&quot;.len()); print(21.double()); print(len(&quot;hello&quot;)); 0 }</p>
-<div class="fence"><span class="label">text</span><pre><code></code></pre></div>
-<p>5 42 99</p>
-<div class="fence"><span class="label">text</span><pre><code>
-Three lookups, three rules. `&quot;hello&quot;.len()` in method position finds
-the builtin string length. `21.double()` has nothing builtin to find
-and falls through to the free `double`: uniform function call syntax,
-the reason library functions chain like methods. `len(&quot;hello&quot;)` in
-call position resolves to the `len` you wrote, shadowing the builtin.
-Chapter 15 returns to precedence across modules.
+implement Show for int {
+    fn show(self) -&gt; string { self.to_string() }
+}
 
-## When no implementation exists
+implement Show for Pair[T] where T: Show {
+    fn show(self) -&gt; string {
+        &quot;(&quot; + self.a.show() + &quot;, &quot; + self.b.show() + &quot;)&quot;
+    }
+}
 
-A `where` bound turns a missing implementation into a compile error.
-Without one, dispatch happens at runtime, and a receiver whose type
-has no block for the method raises. `try` catches it like any raise;
-chapter 9 covers those.
-</code></pre></div>
-<p>trait Show { fn show(self) -&gt; string; }</p>
-<p>struct Dog { name: string } struct Rock { kg: int }</p>
-<p>implement Show for Dog { fn show(self) -&gt; string { &quot;dog &quot; + self.name } }</p>
-<p>fn main() -&gt; int { print(Dog { name: &quot;rex&quot; }.show()); let r = Rock { kg: 3 }; let msg = try { r.show() } catch e { &quot;no show for Rock&quot; }; print(msg); 0 }</p>
-<div class="fence"><span class="label">text</span><pre><code></code></pre></div>
-<p>dog rex no show for Rock</p>
-<div class="fence"><span class="label">text</span><pre><code>
-The raised error names the trait and the type, so the fix is never a
-mystery. But prefer the static version: put `where T: Show` on the
-generic function and the mistake can&#x27;t reach runtime at all.
-</code></pre></div>
+fn main() -&gt; int {
+    let p = Pair { a: 1, b: 2 };
+    print(p.show());
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>(1, 2)</code></pre></div>
+<p><code>Pair[int]</code> is showable because int is; note that builtin types take implementations like any other. A <code>Pair</code> of a type without <code>Show</code> simply lacks the method, and a <code>where</code> bound asking for it fails as chapter 6 pinned, naming the missing block.</p>
+<h2>Your methods beat the builtins</h2>
+<p>Numbers and bools come with a builtin <code>to_string</code>; other values have a default rendering. An implementation you write takes precedence for your type:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">struct Temp { celsius: int }
+
+implement Temp {
+    fn to_string(self) -&gt; string { self.celsius.to_string() + &quot; C&quot; }
+}
+
+fn main() -&gt; int {
+    let t = Temp { celsius: 20 };
+    print(t.to_string());
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>20 C</code></pre></div>
+<p>Inside the method, <code>self.celsius.to_string()</code> is the builtin working on an int. Outside, <code>t.to_string()</code> is yours. Same name, two levels, no conflict.</p>
+<h2>Call position and method position</h2>
+<p>Method syntax also works on plain functions: <code>x.f(y)</code> with no matching implementation looks for a free function <code>f</code> and passes <code>x</code> as its first argument. Going the other way, a plain call prefers your functions over builtins of the same name.</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">fn double(n: int) -&gt; int { n * 2 }
+
+fn len(s: string) -&gt; int { 99 }
+
+fn main() -&gt; int {
+    print(&quot;hello&quot;.len());
+    print(21.double());
+    print(len(&quot;hello&quot;));
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>5
+42
+99</code></pre></div>
+<p>Three lookups, three rules. <code>&quot;hello&quot;.len()</code> in method position finds the builtin string length. <code>21.double()</code> has nothing builtin to find and falls through to the free <code>double</code>: uniform function call syntax, the reason library functions chain like methods. <code>len(&quot;hello&quot;)</code> in call position resolves to the <code>len</code> you wrote, shadowing the builtin. Chapter 15 returns to precedence across modules.</p>
+<h2>When no implementation exists</h2>
+<p>A <code>where</code> bound turns a missing implementation into a compile error. Without one, dispatch happens at runtime, and a receiver whose type has no block for the method raises. <code>try</code> catches it like any raise; chapter 9 covers those.</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">trait Show { fn show(self) -&gt; string; }
+
+struct Dog { name: string }
+struct Rock { kg: int }
+
+implement Show for Dog {
+    fn show(self) -&gt; string { &quot;dog &quot; + self.name }
+}
+
+fn main() -&gt; int {
+    print(Dog { name: &quot;rex&quot; }.show());
+    let r = Rock { kg: 3 };
+    let msg = try {
+        r.show()
+    } catch e {
+        &quot;no show for Rock&quot;
+    };
+    print(msg);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>dog rex
+no show for Rock</code></pre></div>
+<p>The raised error names the trait and the type, so the fix is never a mystery. But prefer the static version: put <code>where T: Show</code> on the generic function and the mistake can&#x27;t reach runtime at all.</p>
 <nav class="pager"><a href="06-types-and-inference.html">&#8592; Types and inference</a><a href="08-effects.html">Effects &#8594;</a></nav>
 </main>
 <script src="book.js"></script>

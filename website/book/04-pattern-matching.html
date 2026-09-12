@@ -52,71 +52,99 @@ many: 7</code></pre></div>
 <p>Order matters: <code>other</code> above the literals would win every time. The compiler doesn&#x27;t reorder arms for you; it only insists the set of them is complete.</p>
 <h2>Exhaustiveness</h2>
 <p>Completeness is checked against the type. Leave out a variant and the diagnostic names what&#x27;s missing:</p>
-<p><code></code>`metaxu error enum Color { Red, Green, Blue }</p>
-<p>fn main() -&gt; int { let c = Color::Red; let n = match c { Color::Red =&gt; 1 Color::Green =&gt; 2 }; print(n); 0 }</p>
-<div class="fence"><span class="label">text</span><pre><code></code></pre></div>
-<p>missing variants Blue</p>
-<div class="fence"><span class="label">text</span><pre><code>
-The check is shallow where literals are involved. Matching
-`Some(1)` handles one particular `Some`, not the variant; as far as
-the checker is concerned, `Some` itself is still uncovered:
-</code></pre></div>
-<p>fn main() -&gt; int { let o = Some(1); let n = match o { Some(1) =&gt; 1 None =&gt; 0 }; print(n); 0 }</p>
-<div class="fence"><span class="label">text</span><pre><code></code></pre></div>
-<p>missing variants Some</p>
-<div class="fence"><span class="label">text</span><pre><code>
-The fix is an arm that covers the rest of the variant. Nested
-patterns compose however you need: a literal inside a constructor, a
-binder inside a constructor, in any order, first fit wins.
-</code></pre></div>
-<p>fn main() -&gt; int { let o = Some(1); let n = match o { Some(1) =&gt; 100 Some(v) =&gt; v None =&gt; 0 }; print(n); 0 }</p>
-<div class="fence"><span class="label">text</span><pre><code></code></pre></div>
-<p>100</p>
-<div class="fence"><span class="label">text</span><pre><code>
-## Tuples and nesting
+<div class="fence error"><span class="label">metaxu · rejected</span><pre><code class="mx">enum Color { Red, Green, Blue }
 
-Tuple patterns take positional aggregates apart, and everything nests.
-Int components still need a catch-all, since no list of int literals
-is ever complete.
-</code></pre></div>
-<p>fn main() -&gt; int { let p = (3, 0); let spot = match p { (0, 0) =&gt; &quot;origin&quot; (x, 0) =&gt; &quot;x axis at &quot; + x.to_string() _ =&gt; &quot;elsewhere&quot; }; print(spot); 0 }</p>
-<div class="fence"><span class="label">text</span><pre><code></code></pre></div>
-<p>x axis at 3</p>
-<div class="fence"><span class="label">text</span><pre><code>
-## Guards
+fn main() -&gt; int {
+    let c = Color::Red;
+    let n = match c {
+        Color::Red =&gt; 1
+        Color::Green =&gt; 2
+    };
+    print(n);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>missing variants Blue</code></pre></div>
+<p>The check is shallow where literals are involved. Matching <code>Some(1)</code> handles one particular <code>Some</code>, not the variant; as far as the checker is concerned, <code>Some</code> itself is still uncovered:</p>
+<div class="fence error"><span class="label">metaxu · rejected</span><pre><code class="mx">fn main() -&gt; int {
+    let o = Some(1);
+    let n = match o {
+        Some(1) =&gt; 1
+        None =&gt; 0
+    };
+    print(n);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>missing variants Some</code></pre></div>
+<p>The fix is an arm that covers the rest of the variant. Nested patterns compose however you need: a literal inside a constructor, a binder inside a constructor, in any order, first fit wins.</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">fn main() -&gt; int {
+    let o = Some(1);
+    let n = match o {
+        Some(1) =&gt; 100
+        Some(v) =&gt; v
+        None =&gt; 0
+    };
+    print(n);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>100</code></pre></div>
+<h2>Tuples and nesting</h2>
+<p>Tuple patterns take positional aggregates apart, and everything nests. Int components still need a catch-all, since no list of int literals is ever complete.</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">fn main() -&gt; int {
+    let p = (3, 0);
+    let spot = match p {
+        (0, 0) =&gt; &quot;origin&quot;
+        (x, 0) =&gt; &quot;x axis at &quot; + x.to_string()
+        _ =&gt; &quot;elsewhere&quot;
+    };
+    print(spot);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>x axis at 3</code></pre></div>
+<h2>Guards</h2>
+<p>A guard is an extra condition on an arm: <code>pattern if cond =&gt; body</code>. The arm is taken only when the pattern fits and the condition holds; a failing guard falls through to the arms below, in order. Binders from the pattern are in scope in the guard.</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">fn classify(n: int) -&gt; string {
+    match n {
+        v if v &gt; 100 =&gt; &quot;big&quot;
+        v if v &gt; 10 =&gt; &quot;medium&quot;
+        v if v &gt; 0 =&gt; &quot;small&quot;
+        _ =&gt; &quot;non-positive&quot;
+    }
+}
 
-A guard is an extra condition on an arm: `pattern if cond =&gt; body`.
-The arm is taken only when the pattern fits and the condition holds;
-a failing guard falls through to the arms below, in order. Binders
-from the pattern are in scope in the guard.
-</code></pre></div>
-<p>fn classify(n: int) -&gt; string { match n { v if v &gt; 100 =&gt; &quot;big&quot; v if v &gt; 10 =&gt; &quot;medium&quot; v if v &gt; 0 =&gt; &quot;small&quot; _ =&gt; &quot;non-positive&quot; } }</p>
-<p>fn main() -&gt; int { print(classify(500)); print(classify(42)); print(classify(3)); print(classify(0)); 0 }</p>
-<div class="fence"><span class="label">text</span><pre><code></code></pre></div>
-<p>big medium small non-positive</p>
-<div class="fence"><span class="label">text</span><pre><code>
-Guarded arms do not count toward exhaustiveness. The compiler can&#x27;t
-know whether `v &gt; 100` will hold, so the unguarded arms below must
-still cover the type on their own; delete the `_` arm above and the
-program is rejected. One restriction: handler arms (chapter 8) do not
-take guards. `pattern if cond =&gt;` is a `match` form only.
+fn main() -&gt; int {
+    print(classify(500));
+    print(classify(42));
+    print(classify(3));
+    print(classify(0));
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>big
+medium
+small
+non-positive</code></pre></div>
+<p>Guarded arms do not count toward exhaustiveness. The compiler can&#x27;t know whether <code>v &gt; 100</code> will hold, so the unguarded arms below must still cover the type on their own; delete the <code>_</code> arm above and the program is rejected. One restriction: handler arms (chapter 8) do not take guards. <code>pattern if cond =&gt;</code> is a <code>match</code> form only.</p>
+<h2>if let and while let</h2>
+<p>When you care about exactly one pattern, a full <code>match</code> is ceremony. <code>if let</code> runs its block when the pattern fits, and <code>while let</code> loops as long as it keeps fitting, rebinding the pattern&#x27;s names on each pass.</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">fn step(n: int) -&gt; Option[int] {
+    if n &gt; 0 { Some(n - 1) } else { None }
+}
 
-## if let and while let
-
-When you care about exactly one pattern, a full `match` is ceremony.
-`if let` runs its block when the pattern fits, and `while let` loops
-as long as it keeps fitting, rebinding the pattern&#x27;s names on each
-pass.
-</code></pre></div>
-<p>fn step(n: int) -&gt; Option[int] { if n &gt; 0 { Some(n - 1) } else { None } }</p>
-<p>fn main() -&gt; int { if let Some(v) = step(10) { print(v); }; let mut n = 3; while let Some(m) = step(n) { print(m); n = m; } 0 }</p>
-<div class="fence"><span class="label">text</span><pre><code></code></pre></div>
-<p>9 2 1 0</p>
-<div class="fence"><span class="label">text</span><pre><code>
-The `while let` stops the moment `step` answers `None`. Chapter 9
-leans on these forms constantly, because `Option` and `Result` are
-where one-pattern questions come from.
-</code></pre></div>
+fn main() -&gt; int {
+    if let Some(v) = step(10) {
+        print(v);
+    };
+    let mut n = 3;
+    while let Some(m) = step(n) {
+        print(m);
+        n = m;
+    }
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>9
+2
+1
+0</code></pre></div>
+<p>The <code>while let</code> stops the moment <code>step</code> answers <code>None</code>. Chapter 9 leans on these forms constantly, because <code>Option</code> and <code>Result</code> are where one-pattern questions come from.</p>
 <nav class="pager"><a href="03-structs-and-enums.html">&#8592; Structs and enums</a><a href="05-vectors-and-collections.html">Vectors and collections &#8594;</a></nav>
 </main>
 <script src="book.js"></script>
