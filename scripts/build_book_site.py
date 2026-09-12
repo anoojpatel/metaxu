@@ -188,18 +188,20 @@ def convert(md: str) -> tuple[str, str]:
 
     while i < len(lines):
         line = lines[i]
-        fence = re.match(r"^```(\S*)\s*$", line)
+        # A fence opener is exactly three backticks plus an info string
+        # that may hold flags after a space ("metaxu error"); a fourth
+        # backtick (an ````-quoted run) is not an opener.
+        fence = re.match(r"^```([^`]*)$", line)
         if fence:
             flush_para(); close_list()
-            info = fence.group(1)
+            parts = fence.group(1).split()
+            info = parts[0] if parts else ""
+            extra = parts[1:]
             block: list[str] = []
             i += 1
             while i < len(lines) and not lines[i].startswith("```"):
                 block.append(lines[i]); i += 1
             code = html.escape("\n".join(block))
-            flags = re.match(r"^```(\S+)((?:\s+\S+)*)\s*$", line)
-            extra = (flags.group(2).split() if flags and flags.group(2)
-                     else [])
             if info == "metaxu" or info.startswith("metaxu"):
                 kind = ("error" if "error" in extra else
                         "norun" if "norun" in extra else "run")

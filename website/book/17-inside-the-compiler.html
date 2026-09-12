@@ -38,112 +38,57 @@ fn main() -&gt; int {
 <h2>Typecheck</h2>
 <p>Two checkers share this stage. Inference is SimpleSub-based: subtyping constraints flow through the program in both polarities, and a conflict is reported as the two requirements that collided. The borrow and mode checker of chapter 10 runs alongside it, walking the same tree and accumulating structured errors, each tagged with a kind such as <code>immutable-rebind</code> or <code>const-field-write</code>.</p>
 <p>Diagnostics carry a location and an excerpt. For a file the location starts with its path; a program handed to the pipeline as a string is <code>&lt;mem&gt;</code>. Misspell a function and the checker names its nearest neighbor:</p>
-<p><code></code>`metaxu error fn helper() -&gt; int { 3 }</p>
-<p>fn main() -&gt; int { helpr(); 0 }</p>
-<div class="fence"><span class="label">text</span><pre><code></code></pre></div>
-<p>&lt;mem&gt;:4:5: undefined function &#x27;helpr&#x27;; did you mean &#x27;helper&#x27;? helpr(); ^</p>
-<div class="fence"><span class="label">text</span><pre><code>
-A type conflict reads as the two facts that can&#x27;t both hold, with
-the caret on the value they collided over:
-</code></pre></div>
-<p>fn main() -&gt; int { let n = 1 + &quot;a&quot;; print(n); 0 }</p>
-<div class="fence"><span class="label">text</span><pre><code></code></pre></div>
-<p>&lt;mem&gt;:2:13: type check failed: one value is required to be Int and String let n = 1 + &quot;a&quot;; ^</p>
-<div class="fence"><span class="label">text</span><pre><code>
-Those two blocks are harness-pinned like every other rejection in
-this book: the exact location, message, and caret excerpt are what
-the compiler prints today, and the test suite fails if any of it
-drifts.
+<div class="fence error"><span class="label">metaxu · rejected</span><pre><code class="mx">fn helper() -&gt; int { 3 }
 
-## HIR and MIR
+fn main() -&gt; int {
+    helpr();
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>&lt;mem&gt;:4:5: undefined function &#x27;helpr&#x27;; did you mean &#x27;helper&#x27;?
+    helpr();
+    ^</code></pre></div>
+<p>A type conflict reads as the two facts that can&#x27;t both hold, with the caret on the value they collided over:</p>
+<div class="fence error"><span class="label">metaxu · rejected</span><pre><code class="mx">fn main() -&gt; int {
+    let n = 1 + &quot;a&quot;;
+    print(n);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>&lt;mem&gt;:2:13: type check failed: one value is required to be Int and String
+    let n = 1 + &quot;a&quot;;
+            ^</code></pre></div>
+<p>Those two blocks are harness-pinned like every other rejection in this book: the exact location, message, and caret excerpt are what the compiler prints today, and the test suite fails if any of it drifts.</p>
+<h2>HIR and MIR</h2>
+<p>The checked tree lowers to HIR, a smaller expression language with scoping resolved, and then to MIR, the shared instruction form every back end consumes. MIR is where effect handlers become explicit continuation plumbing and where the emitter uses effect classes (chapter 8) to decide which functions need coroutine machinery.</p>
+<h2>The interpreter is the spec</h2>
+<p><code>mir_interp</code> executes MIR directly, and its behavior is the definition of the language. When a question about semantics comes up, the answer is whatever the interpreter does, written down and pinned by a test. This is also where small decisions become law: the interpreter formats booleans as <code>1</code> and <code>0</code> because native code erases booleans to integers, and one formatting had to be the observable behavior of both engines. The strict heap of chapter 16 lives here too.</p>
+<h2>Native and Metal</h2>
+<p><code>codegen_llvm</code> emits LLVM IR from MIR, clang compiles it at <code>-O2</code>, and the result links against the C runtime in <code>src/metaxu/runtime/native/</code>. Chapter 14 covers the entry points and the measured cost. Tile kernels take the third exit: MIR to MSL, dispatched on Metal through the MLX shim of chapter 13.</p>
+<h2>The house rules</h2>
+<p>Three rules govern every change to this compiler.</p>
+<p>The interpreter is the spec. Back ends conform to it; it conforms to nothing but its tests. A disagreement between engines is by definition a back end bug or a spec change, never a coin flip.</p>
+<p>Native must match byte for byte. Stdout, exit codes, error messages, float formatting: the differential suite compares them all, and a mismatch fails the gate even when both outputs look plausible.</p>
+<p>Demotion over wrong code. When the LLVM back end meets a construct it can&#x27;t yet prove it compiles correctly, it demotes: the program is refused for native compilation with a reasoned placeholder naming the construct. A smaller language compiled right beats a bigger one compiled wrong, and the demotion list shrinks release by release.</p>
+<h2>The gates</h2>
+<p>The rules are enforced by machinery, not by review culture. The unit suite runs a couple of thousand tests, most of them small programs with pinned output on one engine or both. On top of it sit two gates driven by <code>scripts/run_examples.py</code>: every program in <code>examples/</code> must interpret to its pinned output, and every program the native back end claims must compile and match. A change lands when the suite and both gates are green, and not before.</p>
+<p>The book is part of the same machinery. <code>test_book_examples.py</code> extracts every <code>metaxu</code> fence from these chapters, runs it through the real pipeline, and compares stdout against the <code>output</code> fence byte for byte; <code>error</code> fences must be rejected with a diagnostic containing their pinned fragment. The harness also counts <code>norun</code> fences against a hard budget, so display-only examples stay the rare exception. Documentation that can&#x27;t drift from the implementation was the cheapest correctness tool this project bought.</p>
+<h2>Poking at the pipeline</h2>
+<p>The whole pipeline is a Python library, and every stage&#x27;s output is inspectable. <code>run_pipeline_ctx</code> runs a source string through the front end and hands back a context object holding each intermediate form:</p>
+<div class="fence"><span class="label">python</span><pre><code>from metaxu.compiler.pipeline import run_pipeline_ctx
 
-The checked tree lowers to HIR, a smaller expression language with
-scoping resolved, and then to MIR, the shared instruction form every
-back end consumes. MIR is where effect handlers become explicit
-continuation plumbing and where the emitter uses effect classes
-(chapter 8) to decide which functions need coroutine machinery.
-
-## The interpreter is the spec
-
-`mir_interp` executes MIR directly, and its behavior is the
-definition of the language. When a question about semantics comes
-up, the answer is whatever the interpreter does, written down and
-pinned by a test. This is also where small decisions become law: the
-interpreter formats booleans as `1` and `0` because native code
-erases booleans to integers, and one formatting had to be the
-observable behavior of both engines. The strict heap of chapter 16
-lives here too.
-
-## Native and Metal
-
-`codegen_llvm` emits LLVM IR from MIR, clang compiles it at `-O2`,
-and the result links against the C runtime in
-`src/metaxu/runtime/native/`. Chapter 14 covers the entry points and
-the measured cost. Tile kernels take the third exit: MIR to MSL,
-dispatched on Metal through the MLX shim of chapter 13.
-
-## The house rules
-
-Three rules govern every change to this compiler.
-
-The interpreter is the spec. Back ends conform to it; it conforms to
-nothing but its tests. A disagreement between engines is by
-definition a back end bug or a spec change, never a coin flip.
-
-Native must match byte for byte. Stdout, exit codes, error messages,
-float formatting: the differential suite compares them all, and a
-mismatch fails the gate even when both outputs look plausible.
-
-Demotion over wrong code. When the LLVM back end meets a construct
-it can&#x27;t yet prove it compiles correctly, it demotes: the program is
-refused for native compilation with a reasoned placeholder naming
-the construct. A smaller language compiled right beats a bigger one
-compiled wrong, and the demotion list shrinks release by release.
-
-## The gates
-
-The rules are enforced by machinery, not by review culture. The unit
-suite runs a couple of thousand tests, most of them small programs
-with pinned output on one engine or both. On top of it sit two
-gates driven by `scripts/run_examples.py`: every program in
-`examples/` must interpret to its pinned output, and every program
-the native back end claims must compile and match. A change lands
-when the suite and both gates are green, and not before.
-
-The book is part of the same machinery.
-`test_book_examples.py` extracts every `metaxu` fence from these
-chapters, runs it through the real pipeline, and compares stdout
-against the `output` fence byte for byte; `error` fences must be
-rejected with a diagnostic containing their pinned fragment. The
-harness also counts `norun` fences against a hard budget, so
-display-only examples stay the rare exception. Documentation that
-can&#x27;t drift from the implementation was the cheapest correctness
-tool this project bought.
-
-## Poking at the pipeline
-
-The whole pipeline is a Python library, and every stage&#x27;s output is
-inspectable. `run_pipeline_ctx` runs a source string through the
-front end and hands back a context object holding each intermediate
-form:
-</code></pre></div>
-<p>from metaxu.compiler.pipeline import run_pipeline_ctx</p>
-<p>ctx = run_pipeline_ctx(&quot;&quot;&quot; fn main() -&gt; int { print(21 * 2); 0 } &quot;&quot;&quot;) print(ctx.mir.dump())</p>
-<div class="fence"><span class="label">text</span><pre><code></code></pre></div>
-<p>fn main() -&gt; int bb0: %0 = mul 21, 2 %1 = call print(%0) ret 0</p>
-<div class="fence"><span class="label">text</span><pre><code>
-The dump above is abridged, and this fence is display-only: the MIR&#x27;s
-exact shape shifts as the compiler does, and pinning it would turn
-every optimization into a book edit. The same context object exposes
-the parse tree, the typed tree, and the HIR; the test helpers the
-book harness uses (`interp_run` and friends in
-`test_codegen_llvm.py`) are thin wrappers over it.
-
-That&#x27;s the machine. Fourteen chapters of examples ran through it to
-get onto these pages, and they&#x27;ll run through it again the next time
-anyone touches the compiler. If one of them ever stops matching,
-the book breaks loudly, which is exactly the arrangement.
-</code></pre></div>
+ctx = run_pipeline_ctx(&quot;&quot;&quot;
+fn main() -&gt; int {
+    print(21 * 2);
+    0
+}
+&quot;&quot;&quot;)
+print(ctx.mir.dump())</code></pre></div>
+<div class="fence"><span class="label">text</span><pre><code>fn main() -&gt; int
+bb0:
+    %0 = mul 21, 2
+    %1 = call print(%0)
+    ret 0</code></pre></div>
+<p>The dump above is abridged, and this fence is display-only: the MIR&#x27;s exact shape shifts as the compiler does, and pinning it would turn every optimization into a book edit. The same context object exposes the parse tree, the typed tree, and the HIR; the test helpers the book harness uses (<code>interp_run</code> and friends in <code>test_codegen_llvm.py</code>) are thin wrappers over it.</p>
+<p>That&#x27;s the machine. Fourteen chapters of examples ran through it to get onto these pages, and they&#x27;ll run through it again the next time anyone touches the compiler. If one of them ever stops matching, the book breaks loudly, which is exactly the arrangement.</p>
 <nav class="pager"><a href="16-unsafe-and-ffi.html">&#8592; Unsafe and FFI</a><a href="index.html">Contents</a></nav>
 </main>
 <script src="book.js"></script>

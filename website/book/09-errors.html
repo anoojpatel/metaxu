@@ -105,61 +105,75 @@ fn main() -&gt; int {
 <li>violations of the strict simulated heap in <code>unsafe</code> code (chapter 16).</li>
 </ul>
 <p>What it can never catch: compile errors. A rejection happens before the program exists, so wrapping the offending code in <code>try</code> changes nothing:</p>
-<p><code></code>`metaxu error fn main() -&gt; int { let r = try { 1 + &quot;a&quot; } catch e { 0 }; print(r); 0 }</p>
-<div class="fence"><span class="label">text</span><pre><code></code></pre></div>
-<p>Int and String</p>
-<div class="fence"><span class="label">text</span><pre><code>
-The conflict is reported exactly as in chapter 6. `try` is a runtime
-construct; it has no opinion about programs that never start.
+<div class="fence error"><span class="label">metaxu · rejected</span><pre><code class="mx">fn main() -&gt; int {
+    let r = try {
+        1 + &quot;a&quot;
+    } catch e {
+        0
+    };
+    print(r);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>Int and String</code></pre></div>
+<p>The conflict is reported exactly as in chapter 6. <code>try</code> is a runtime construct; it has no opinion about programs that never start.</p>
+<h2>Option and Result</h2>
+<p>Not every absence deserves a raise. <code>Option</code> says &quot;maybe no value&quot; in the type, and <code>Result</code> says &quot;value or error&quot;, and both are ordinary enums you can match. <code>std.option</code> and <code>std.result</code> add the combinators so the matches don&#x27;t pile up.</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">from std.option import map, unwrap_or;
 
-## Option and Result
+fn main() -&gt; int {
+    let some = Some(20);
+    let doubled = map(some, fn(x) -&gt; x * 2 + 2);
+    print(unwrap_or(doubled, 0));
+    print(unwrap_or(None, 7));
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>42
+7</code></pre></div>
+<p><code>map</code> transforms the value if there is one and passes <code>None</code> through untouched; <code>unwrap_or</code> ends the chain with a default. Uniform call syntax (chapter 7) lets the same functions chain as methods. The working rule: use <code>Option</code> and <code>Result</code> when absence or failure is an expected answer the caller should handle, and raises when it&#x27;s a bug or a broken environment.</p>
+<h2>fail, throw, early_return</h2>
+<p>Chapter 8 built an exception out of a plain abort handler. <code>std.fail</code> is that construction, packaged: <code>fail(msg)</code> raises with your message, and <code>try</code> catches it like any builtin raise.</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">from std.fail import fail;
 
-Not every absence deserves a raise. `Option` says &quot;maybe no value&quot;
-in the type, and `Result` says &quot;value or error&quot;, and both are
-ordinary enums you can match. `std.option` and `std.result` add the
-combinators so the matches don&#x27;t pile up.
-</code></pre></div>
-<p>from std.option import map, unwrap_or;</p>
-<p>fn main() -&gt; int { let some = Some(20); let doubled = map(some, fn(x) -&gt; x * 2 + 2); print(unwrap_or(doubled, 0)); print(unwrap_or(None, 7)); 0 }</p>
-<div class="fence"><span class="label">text</span><pre><code></code></pre></div>
-<p>42 7</p>
-<div class="fence"><span class="label">text</span><pre><code>
-`map` transforms the value if there is one and passes `None` through
-untouched; `unwrap_or` ends the chain with a default. Uniform call
-syntax (chapter 7) lets the same functions chain as methods. The
-working rule: use `Option` and `Result` when absence or failure is an
-expected answer the caller should handle, and raises when it&#x27;s a bug
-or a broken environment.
+fn checked_div(a: int, b: int) -&gt; int {
+    if b == 0 {
+        fail(&quot;divide by zero&quot;);
+        0
+    } else {
+        a / b
+    }
+}
 
-## fail, throw, early_return
+fn main() -&gt; int {
+    print(checked_div(84, 2));
+    let r = try {
+        checked_div(1, 0)
+    } catch e {
+        print(e);
+        0 - 1
+    };
+    print(r);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>42
+divide by zero
+-1</code></pre></div>
+<p><code>std.throw</code> is the same idea carrying an arbitrary value instead of a message, with its own catching wrapper for typed payloads.</p>
+<p><code>std.early_return</code> aims the abort somewhere gentler: at the end of the current computation, not an error handler. <code>with_return</code> runs a block; <code>early_return(v)</code> anywhere inside finishes it with <code>v</code>.</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">from std.early_return import early_return, with_return;
 
-Chapter 8 built an exception out of a plain abort handler.
-`std.fail` is that construction, packaged: `fail(msg)` raises with
-your message, and `try` catches it like any builtin raise.
-</code></pre></div>
-<p>from std.fail import fail;</p>
-<p>fn checked_div(a: int, b: int) -&gt; int { if b == 0 { fail(&quot;divide by zero&quot;); 0 } else { a / b } }</p>
-<p>fn main() -&gt; int { print(checked_div(84, 2)); let r = try { checked_div(1, 0) } catch e { print(e); 0 - 1 }; print(r); 0 }</p>
-<div class="fence"><span class="label">text</span><pre><code></code></pre></div>
-<p>42 divide by zero -1</p>
-<div class="fence"><span class="label">text</span><pre><code>
-`std.throw` is the same idea carrying an arbitrary value instead of
-a message, with its own catching wrapper for typed payloads.
-
-`std.early_return` aims the abort somewhere gentler: at the end of
-the current computation, not an error handler. `with_return` runs a
-block; `early_return(v)` anywhere inside finishes it with `v`.
-</code></pre></div>
-<p>from std.early_return import early_return, with_return;</p>
-<p>fn main() -&gt; int { let r = with_return(fn() -&gt; int { print(&quot;searching&quot;); early_return(3); print(&quot;kept looking&quot;); 99 }); print(r); 0 }</p>
-<div class="fence"><span class="label">text</span><pre><code></code></pre></div>
-<p>searching 3</p>
-<div class="fence"><span class="label">text</span><pre><code>
-No error exists here; `&quot;kept looking&quot;` is skipped because the
-computation already has its answer. All three helpers are small
-handlers over the abort pattern; reading their source in `std/` is a
-good exercise after chapter 8.
-</code></pre></div>
+fn main() -&gt; int {
+    let r = with_return(fn() -&gt; int {
+        print(&quot;searching&quot;);
+        early_return(3);
+        print(&quot;kept looking&quot;);
+        99
+    });
+    print(r);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>searching
+3</code></pre></div>
+<p>No error exists here; <code>&quot;kept looking&quot;</code> is skipped because the computation already has its answer. All three helpers are small handlers over the abort pattern; reading their source in <code>std/</code> is a good exercise after chapter 8.</p>
 <nav class="pager"><a href="08-effects.html">&#8592; Effects</a><a href="10-modes-and-memory.html">Modes and memory &#8594;</a></nav>
 </main>
 <script src="book.js"></script>
