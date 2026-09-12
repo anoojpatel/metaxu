@@ -1,0 +1,165 @@
+<title>Errors · The Metaxu Book</title>
+<link rel="stylesheet" href="style.css">
+<header class="top">
+  <div class="inner">
+    <a class="brand" href="../index.html">Metaxu</a>
+    <nav class="topnav">
+      <a href="index.html">the book</a>
+      <a href="../roadmap.html">roadmap</a>
+      <a href="https://github.com/anoojpatel/metaxu">github &#8599;</a>
+    </nav>
+  </div>
+</header>
+<main>
+<h1>Errors</h1>
+<p>Metaxu splits errors into two worlds. Compile-time rejections, the kind chapters 6 and 10 pinned, stop the program from existing. Runtime raises happen while a program runs, and <code>try</code>/<code>catch</code> handles them. Underneath, a raise is chapter 8&#x27;s abort pattern with a name, which is why the rules here will feel like handler rules.</p>
+<h2>try is an expression</h2>
+<p><code>try { }</code> evaluates its block. If nothing raises, the block&#x27;s value is the result. If something raises, the rest of the block is abandoned and the <code>catch</code> arm&#x27;s value is the result instead, with the error bound to the name after <code>catch</code>.</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">fn main() -&gt; int {
+    let ok = try { 40 + 2 } catch e { 0 };
+    print(ok);
+
+    let @mut v = Vec.new();
+    v.push(1);
+    let bad = try {
+        print(&quot;reading&quot;);
+        let x = v[10];
+        print(&quot;never printed&quot;);
+        x
+    } catch e {
+        0 - 1
+    };
+    print(bad);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>42
+reading
+-1</code></pre></div>
+<p>The abort is real: <code>&quot;never printed&quot;</code> isn&#x27;t. Work before the raise happened; work after it never will.</p>
+<h2>What raises</h2>
+<p>The builtin operations raise on the failures they can&#x27;t answer: indexing out of bounds, popping an empty Vec, dispatching a method with no implementation (chapter 7). The error is a value; printing it shows the message.</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">fn main() -&gt; int {
+    let @mut v = Vec.new();
+    v.push(7);
+    print(v.pop());
+    let r = try {
+        v.pop()
+    } catch e {
+        print(e);
+        0
+    };
+    print(r);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>7
+pop: Vec is empty
+0</code></pre></div>
+<p>The first <code>pop</code> succeeds. The second finds nothing, raises, and the catch arm both inspects the error and supplies a stand-in. The message wording is part of the language: the native backend produces the same bytes.</p>
+<h2>Unhandled effects raise</h2>
+<p>Performing an operation with no handler in scope and no default is a runtime error too, and <code>try</code> catches it:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">effect Parser {
+    parse(s: string) -&gt; int
+}
+
+fn main() -&gt; int {
+    let r = try {
+        perform Parser.parse(&quot;42&quot;)
+    } catch e {
+        print(e);
+        0 - 1
+    };
+    print(r);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>No handler for effect &#x27;Parser&#x27;
+-1</code></pre></div>
+<p>This is the safety net under chapter 8&#x27;s contract: if no handler is there when the perform executes, the failure is loud, named, and catchable.</p>
+<h2>Handlers come first</h2>
+<p><code>try</code> only sees raises that nothing else claimed. If a handler for the effect is installed inside the <code>try</code>, the handler answers and the catch arm never runs:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">effect Parser { parse(s: string) -&gt; int }
+
+fn main() -&gt; int {
+    let r = try {
+        handle Parser with {
+            parse(s) -&gt; resume(s.len())
+        } in {
+            perform Parser.parse(&quot;hello&quot;)
+        }
+    } catch e {
+        print(&quot;caught&quot;);
+        0
+    };
+    print(r);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>5</code></pre></div>
+<p>Same perform as before, but this time a handler is nearer. Think of <code>try</code> as the outermost, least specific handler: it catches whatever falls all the way through.</p>
+<h2>Catchable and fatal</h2>
+<p>What <code>try</code> can catch, in one place:</p>
+<ul>
+<li>out-of-bounds indexing, and <code>pop</code> on an empty Vec (chapter 5);</li>
+<li>method dispatch with no implementation (chapter 7);</li>
+<li>a <code>perform</code> with no handler and no default (above);</li>
+<li>explicit raises from <code>std.fail</code> and <code>std.throw</code> (below);</li>
+<li>a contended cross-thread write (chapter 11);</li>
+<li>violations of the strict simulated heap in <code>unsafe</code> code (chapter 16).</li>
+</ul>
+<p>What it can never catch: compile errors. A rejection happens before the program exists, so wrapping the offending code in <code>try</code> changes nothing:</p>
+<p><code></code>`metaxu error fn main() -&gt; int { let r = try { 1 + &quot;a&quot; } catch e { 0 }; print(r); 0 }</p>
+<div class="fence"><span class="label">text</span><pre><code></code></pre></div>
+<p>Int and String</p>
+<div class="fence"><span class="label">text</span><pre><code>
+The conflict is reported exactly as in chapter 6. `try` is a runtime
+construct; it has no opinion about programs that never start.
+
+## Option and Result
+
+Not every absence deserves a raise. `Option` says &quot;maybe no value&quot;
+in the type, and `Result` says &quot;value or error&quot;, and both are
+ordinary enums you can match. `std.option` and `std.result` add the
+combinators so the matches don&#x27;t pile up.
+</code></pre></div>
+<p>from std.option import map, unwrap_or;</p>
+<p>fn main() -&gt; int { let some = Some(20); let doubled = map(some, fn(x) -&gt; x * 2 + 2); print(unwrap_or(doubled, 0)); print(unwrap_or(None, 7)); 0 }</p>
+<div class="fence"><span class="label">text</span><pre><code></code></pre></div>
+<p>42 7</p>
+<div class="fence"><span class="label">text</span><pre><code>
+`map` transforms the value if there is one and passes `None` through
+untouched; `unwrap_or` ends the chain with a default. Uniform call
+syntax (chapter 7) lets the same functions chain as methods. The
+working rule: use `Option` and `Result` when absence or failure is an
+expected answer the caller should handle, and raises when it&#x27;s a bug
+or a broken environment.
+
+## fail, throw, early_return
+
+Chapter 8 built an exception out of a plain abort handler.
+`std.fail` is that construction, packaged: `fail(msg)` raises with
+your message, and `try` catches it like any builtin raise.
+</code></pre></div>
+<p>from std.fail import fail;</p>
+<p>fn checked_div(a: int, b: int) -&gt; int { if b == 0 { fail(&quot;divide by zero&quot;); 0 } else { a / b } }</p>
+<p>fn main() -&gt; int { print(checked_div(84, 2)); let r = try { checked_div(1, 0) } catch e { print(e); 0 - 1 }; print(r); 0 }</p>
+<div class="fence"><span class="label">text</span><pre><code></code></pre></div>
+<p>42 divide by zero -1</p>
+<div class="fence"><span class="label">text</span><pre><code>
+`std.throw` is the same idea carrying an arbitrary value instead of
+a message, with its own catching wrapper for typed payloads.
+
+`std.early_return` aims the abort somewhere gentler: at the end of
+the current computation, not an error handler. `with_return` runs a
+block; `early_return(v)` anywhere inside finishes it with `v`.
+</code></pre></div>
+<p>from std.early_return import early_return, with_return;</p>
+<p>fn main() -&gt; int { let r = with_return(fn() -&gt; int { print(&quot;searching&quot;); early_return(3); print(&quot;kept looking&quot;); 99 }); print(r); 0 }</p>
+<div class="fence"><span class="label">text</span><pre><code></code></pre></div>
+<p>searching 3</p>
+<div class="fence"><span class="label">text</span><pre><code>
+No error exists here; `&quot;kept looking&quot;` is skipped because the
+computation already has its answer. All three helpers are small
+handlers over the abort pattern; reading their source in `std/` is a
+good exercise after chapter 8.
+</code></pre></div>
+<nav class="pager"><a href="08-effects.html">&#8592; Effects</a><a href="10-modes-and-memory.html">Modes and memory &#8594;</a></nav>
+</main>
+<script src="book.js"></script>

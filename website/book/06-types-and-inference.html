@@ -1,0 +1,167 @@
+<title>Types and inference · The Metaxu Book</title>
+<link rel="stylesheet" href="style.css">
+<header class="top">
+  <div class="inner">
+    <a class="brand" href="../index.html">Metaxu</a>
+    <nav class="topnav">
+      <a href="index.html">the book</a>
+      <a href="../roadmap.html">roadmap</a>
+      <a href="https://github.com/anoojpatel/metaxu">github &#8599;</a>
+    </nav>
+  </div>
+</header>
+<main>
+<h1>Types and inference</h1>
+<p>Metaxu is statically typed, and most programs barely show it. You annotate function signatures; the checker works out everything else from how values flow. The engine is SimpleSub-style subtype inference: every expression contributes constraints, the solver connects them, and a program is rejected only when some value would have to be two incompatible things at once. That framing shapes the diagnostics, so this chapter spends most of its time on rejections. They are where the type system earns its keep.</p>
+<h2>What you never have to write</h2>
+<p><code>let</code> bindings carry no types. Neither do lambda parameters. The checker reads both off the uses.</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">fn main() -&gt; int {
+    let base = 40;
+    let bump = fn(x) -&gt; x + 2;
+    print(bump(base));
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>42</code></pre></div>
+<p><code>base</code> is an int because <code>40</code> is one. <code>bump</code> gets the type <code>fn(int) -&gt; int</code> because its body adds <code>2</code> to the parameter. The one place annotation is required is the signature of a named function: signatures are the contract between functions, and inference fills in the insides.</p>
+<h2>Inference flows through structures</h2>
+<p>An empty <code>Vec.new()</code> has an unknown element type. The first <code>push</code> pins it, and every later use is checked against that choice.</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">fn main() -&gt; int {
+    let @mut nums = Vec.new();
+    nums.push(20);
+    nums.push(22);
+    print(nums[0] + nums[1]);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>42</code></pre></div>
+<p>Generic structs work the same way. <code>Pair[T]</code> says nothing about <code>T</code>; each literal decides for itself.</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">struct Pair[T] { a: T, b: T }
+
+fn main() -&gt; int {
+    let ints = Pair { a: 20, b: 22 };
+    let words = Pair { a: &quot;me&quot;, b: &quot;taxu&quot; };
+    print(ints.a + ints.b);
+    print(words.a + words.b);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>42
+metaxu</code></pre></div>
+<p>One declaration, two instantiations, zero type arguments written: the checker infers <code>Pair[int]</code> and <code>Pair[string]</code> from the fields.</p>
+<h2>When values disagree</h2>
+<p>A conflict diagnostic names the two demands that clashed. Adding a string to an int asks one value to satisfy both:</p>
+<p><code></code>`metaxu error fn main() -&gt; int { print(1 + &quot;a&quot;); 0 }</p>
+<div class="fence"><span class="label">text</span><pre><code></code></pre></div>
+<p>one value is required to be Int and String</p>
+<div class="fence"><span class="label">text</span><pre><code>
+Chapter 1 showed this program and pinned only the headline; this is
+the sentence underneath. Notice it is not &quot;expected int, found
+string&quot;. The checker doesn&#x27;t privilege one side of the flow: both
+uses are real, they cannot both hold, and the message says so.
+
+A condition must be a bool. Testing an int directly is a conflict,
+not a truthiness coercion:
+</code></pre></div>
+<p>fn main() -&gt; int { let n = 3; let parity = if n { 1 } else { 0 }; print(parity); 0 }</p>
+<div class="fence"><span class="label">text</span><pre><code></code></pre></div>
+<p>Bool and Int</p>
+<div class="fence"><span class="label">text</span><pre><code>
+Both arms of an `if` expression produce the same value, so they must
+agree. Disagreeing arms are the same conflict in different clothes:
+</code></pre></div>
+<p>fn main() -&gt; int { let label = if 1 &lt; 2 { &quot;small&quot; } else { 0 }; print(label); 0 }</p>
+<div class="fence"><span class="label">text</span><pre><code></code></pre></div>
+<p>Int and String</p>
+<div class="fence"><span class="label">text</span><pre><code>
+The value in conflict is the result of the `if` itself: one arm
+demands String, the other Int, and `label` can&#x27;t be both.
+
+## Declared types are enforced
+
+Inference never overrides an annotation you wrote. A parameter
+declared `int` is an int at every call site, and an argument that
+disagrees is rejected there:
+</code></pre></div>
+<p>fn half(n: int) -&gt; int { n / 2 }</p>
+<p>fn main() -&gt; int { print(half(&quot;ten&quot;)); 0 }</p>
+<div class="fence"><span class="label">text</span><pre><code></code></pre></div>
+<p>Int and String</p>
+<div class="fence"><span class="label">text</span><pre><code>
+Callers are checked against what you declared, not against what the
+body happens to tolerate.
+
+## Generics are checked at instantiation
+
+A generic struct&#x27;s concrete fields still mean what they say. A
+literal that fills one with the wrong type is caught even though the
+struct as a whole is generic:
+</code></pre></div>
+<p>struct Tagged[T] { tag: string, value: T }</p>
+<p>fn main() -&gt; int { let t = Tagged { tag: 7, value: true }; print(t.value); 0 }</p>
+<div class="fence"><span class="label">text</span><pre><code></code></pre></div>
+<p>type mismatch for field &#x27;tag&#x27;</p>
+<div class="fence"><span class="label">text</span><pre><code>
+Written type arguments are counted. `Box` takes one parameter, and
+handing it two is an arity error, not a silent truncation:
+</code></pre></div>
+<p>struct Box[T] { value: T }</p>
+<p>fn open(b: Box[int, string]) -&gt; int { 0 }</p>
+<p>fn main() -&gt; int { print(open(Box { value: 3 })); 0 }</p>
+<div class="fence"><span class="label">text</span><pre><code></code></pre></div>
+<p>type argument</p>
+<div class="fence"><span class="label">text</span><pre><code>
+And within one instantiation, a type parameter is one type. `Pair[T]`
+uses `T` for both fields, so a literal that supplies an int and a
+string demands two different answers for the same `T`:
+</code></pre></div>
+<p>struct Pair[T] { a: T, b: T }</p>
+<p>fn main() -&gt; int { let p = Pair { a: 1, b: &quot;two&quot; }; print(p.a); 0 }</p>
+<div class="fence"><span class="label">text</span><pre><code></code></pre></div>
+<p>conflicting instantiations of type parameter T</p>
+<div class="fence"><span class="label">text</span><pre><code>
+If the fields should vary independently, that&#x27;s a two-parameter
+struct, `Pair[A, B]`.
+
+## Bounds come from where clauses
+
+A generic function can require capabilities of its type parameter
+with a `where` clause. Chapter 7 covers traits; the inference-side
+story is that the bound is checked per instantiation, at each call:
+</code></pre></div>
+<p>trait Show { fn show(self) -&gt; string; }</p>
+<p>fn describe<a href="x: T">T</a> -&gt; string where T: Show { x.show() }</p>
+<p>fn main() -&gt; int { print(describe(3)); 0 }</p>
+<div class="fence"><span class="label">text</span><pre><code></code></pre></div>
+<p>missing <code>implement Show for Int</code></p>
+<div class="fence"><span class="label">text</span><pre><code>
+The call instantiates `T` to Int, the bound asks for `Show`, no such
+block exists, and the diagnostic names the exact block that would fix
+it. Without the where clause the same call would typecheck and fail
+at runtime instead; chapter 7 shows that variant and why you&#x27;d
+usually prefer this one.
+
+## Names must exist
+
+Not every rejection is a conflict. A name the checker never saw is
+caught in the same pass, before anything runs:
+</code></pre></div>
+<p>fn main() -&gt; int { let total = 40 + 2; print(totl); 0 }</p>
+<div class="fence"><span class="label">text</span><pre><code></code></pre></div>
+<p>undefined variable &#x27;totl&#x27;</p>
+<div class="fence"><span class="label">text</span><pre><code>
+Where a close spelling exists the diagnostic suggests it, the same
+way it does for misspelled function names.
+
+## Principal types, with a caveat
+
+SimpleSub&#x27;s design promise is principal types: every accepted program
+has one most general type, and inference finds it. Metaxu&#x27;s
+implementation treats that as a tracked goal rather than a guarantee.
+Guaranteed: accepted programs are sound at the inferred types, and
+disagreements surface as the conflicts shown above. Advisory: that
+the inferred type is always the most general one possible;
+`compiler_roadmap.md` tracks the gap. You&#x27;ll rarely notice it, and
+when you do, the fix is ordinary: write the annotation you meant, and
+the checker will hold everyone to it.
+</code></pre></div>
+<nav class="pager"><a href="05-vectors-and-collections.html">&#8592; Vectors and collections</a><a href="07-traits.html">Traits &#8594;</a></nav>
+</main>
+<script src="book.js"></script>

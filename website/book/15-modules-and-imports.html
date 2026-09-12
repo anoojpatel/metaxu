@@ -1,0 +1,147 @@
+<title>examples/app/main.mx (import head) · The Metaxu Book</title>
+<link rel="stylesheet" href="style.css">
+<header class="top">
+  <div class="inner">
+    <a class="brand" href="../index.html">Metaxu</a>
+    <nav class="topnav">
+      <a href="index.html">the book</a>
+      <a href="../roadmap.html">roadmap</a>
+      <a href="https://github.com/anoojpatel/metaxu">github &#8599;</a>
+    </nav>
+  </div>
+</header>
+<main>
+<h1>Modules and imports</h1>
+<p>A Metaxu program starts as one file with a <code>main</code>. It stops being one file the moment you want to reuse something, and the module system is deliberately small: files are modules, <code>module</code> blocks make modules inside a file, <code>export</code> says what leaves, and two import forms bring names in. There is no visibility ladder, no re-export algebra, no crate graph. What a module doesn&#x27;t export, you can&#x27;t touch.</p>
+<h2>Importing from the standard library</h2>
+<p>The form you&#x27;ll write most is <code>from</code>-import, which binds member names directly into your file:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">from std.stream import iota, sum;
+
+fn main() -&gt; int {
+    print(sum(iota(5)));
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>10</code></pre></div>
+<p><code>iota(5)</code> streams 0 through 4 and <code>sum</code> folds them; chapter 8 built both out of the <code>Emit</code> effect. Note that <code>from</code> is a reserved word because of this statement. You can&#x27;t name a variable <code>from</code>, and the parse error if you try is blunt.</p>
+<p>The other form is <code>import std.stream;</code>, which declares the dependency without binding any member names. Calls stay fully qualified. It earns its keep in multi-file programs, where it&#x27;s how one of your own files names another; for <code>std</code> modules it&#x27;s mostly documentation, because of what the next section shows.</p>
+<h2>Qualified paths need no import</h2>
+<p>A fully qualified path under <code>std</code> resolves with no import statement anywhere in the file. The module loads the first time the resolver walks the path:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">fn main() -&gt; int {
+    print(std.stream.sum(std.stream.iota(100)));
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>4950</code></pre></div>
+<p>This is why one-off uses of a library function don&#x27;t force an import header on a short script. Once you use a name more than twice, <code>from</code>-import it; the qualified spelling is for the reader who wants to know where a name came from without scrolling up.</p>
+<h2>Modules inside a file</h2>
+<p>A <code>module</code> block creates a named namespace anywhere in a file. Its <code>export</code> list is the entire public interface; everything else in the block is private to it.</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">module geometry {
+    export area, perimeter;
+
+    fn area(w: int, h: int) -&gt; int {
+        w * h
+    }
+
+    fn perimeter(w: int, h: int) -&gt; int {
+        2 * (w + h)
+    }
+
+    # not exported: only code inside this block can call it
+    fn shave(x: int) -&gt; int {
+        x - 1
+    }
+}
+
+fn main() -&gt; int {
+    print(geometry.area(3, 4));
+    print(geometry.perimeter(3, 4));
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>12
+14</code></pre></div>
+<p>The dotted call <code>geometry.area(3, 4)</code> works from <code>main</code> with no import, same as <code>std</code> paths: modules in the same file are already in scope under their own names. Top-level <code>let</code> bindings inside a module block are module constants; they export like functions and are immutable, with the same diagnostic chapter 2 pins for rebinding.</p>
+<h2>What visibility rejects</h2>
+<p>Pull <code>shave</code> out of <code>geometry</code> and the resolver stops you:</p>
+<div class="fence"><span class="label">text</span><pre><code>module geometry {
+    export area;
+
+    fn area(w: int, h: int) -&gt; int { w * h }
+    fn shave(x: int) -&gt; int { x - 1 }
+}
+
+from geometry import shave;
+
+fn main() -&gt; int {
+    print(shave(2));
+    0
+}</code></pre></div>
+<div class="fence"><span class="label">text</span><pre><code>ModuleError: &lt;mem&gt;:8:1: cannot import private name &#x27;shave&#x27; from module &#x27;geometry&#x27;</code></pre></div>
+<p>Calling <code>geometry.shave(2)</code> directly is rejected the same way, at the call site. One honesty note about the fences above: they are plain fences, not <code>error</code> fences. The book&#x27;s harness only pins compile rejections that arrive as <code>TypeCheckError</code> or <code>BorrowCheckError</code>, and this one is a <code>ModuleError</code>, a plain <code>CompileError</code> from the resolver. The diagnostic is quoted verbatim from running the exact program shown, but the harness doesn&#x27;t re-check it on every run the way it does the typed rejections.</p>
+<h2>Multi-file programs</h2>
+<p>A directory of <code>.mx</code> files is a set of modules named by their file stems. <code>examples/app/</code> in the repository is the small worked example the pipeline gate builds:</p>
+<div class="fence"><span class="label">text</span><pre><code>examples/app/
+    main.mx        # the entry point: owns fn main
+    geometry.mx    # exports area
+    util.mx        # exports clamp</code></pre></div>
+<p><code>main.mx</code> opens by naming what it needs. Sibling files import by module name; the standard library imports look exactly like they do in a single file:</p>
+<p><code></code>`metaxu norun</p>
+<h1>examples/app/main.mx (import head)</h1>
+<p>import geometry; from util import clamp; from std.stream import iota, sum;</p>
+<p>fn main() -&gt; int { print(geometry.area(clamp(sum(iota(10)), 1, 6), 2)); 0 }</p>
+<div class="fence"><span class="label">text</span><pre><code>
+This is the book&#x27;s one display-only fence in this chapter: the
+harness extracts single-source programs, and a multi-file layout has
+no single source to extract. The program itself runs through the
+example gate, which is where its behavior is pinned.
+
+Each file&#x27;s `export` works as in a `module` block, with one default
+worth knowing: a file with no `export` statement exports nothing, so
+a library file that forgets its exports is unusable rather than
+accidentally wide open.
+
+## Name precedence
+
+When a plain call could mean two things, the resolver prefers the
+nearest definition. Your own top-level `fn len` beats the builtin
+`len` in call position:
+</code></pre></div>
+<p>fn len(s: string) -&gt; int { 999 }</p>
+<p>fn main() -&gt; int { print(len(&quot;hello&quot;)); print(&quot;hello&quot;.len()); 0 }</p>
+<div class="fence"><span class="label">text</span><pre><code></code></pre></div>
+<p>999 5</p>
+<div class="fence"><span class="label">text</span><pre><code>
+The method spelling still reaches the builtin, because method
+dispatch resolves through the receiver (chapter 7&#x27;s UFCS rules), not
+through the plain-call namespace. The precedence order for a plain
+name is: local and file-level definitions, then imported names, then
+builtins. Shadowing a builtin is legal and silent, which is a reason
+to keep import lists short enough to read.
+
+## The `__` prefix is not yours
+
+Names beginning with two underscores belong to the compiler. The
+desugarer manufactures bindings like `__guard_scrut_at12` when it
+rewrites match guards, and the borrow checker deliberately skips
+`__`-prefixed names so those generated lowerings never trip a false
+positive. That bargain only holds if user code can&#x27;t claim the
+prefix, so declaring one is rejected up front:
+</code></pre></div>
+<p>fn main() -&gt; int { let __tmp = 1; print(__tmp); 0 }</p>
+<div class="fence"><span class="label">text</span><pre><code></code></pre></div>
+<p>ReservedNameError: &lt;mem&gt;:2:9: &#x27;__tmp&#x27;: names beginning with &#x27;__&#x27; are reserved for compiler-generated bindings</p>
+<div class="fence"><span class="label">text</span><pre><code>
+Same caveat as the visibility rejection above: `ReservedNameError` is
+a plain `CompileError`, so this is a quoted diagnostic in a plain
+fence rather than a harness-pinned `error` block.
+
+## Where this leaves you
+
+Modules here are a naming discipline, not a compilation-unit design.
+One file per concern, an `export` list you can read in one glance,
+`from`-imports for the names you use often, qualified paths for the
+ones you don&#x27;t. Chapter 12 tours what `std` itself exports; chapter
+17 shows where module resolution sits in the pipeline, which is
+early, right after the parser and before any type is inferred.
+</code></pre></div>
+<nav class="pager"><a href="14-compiling-to-native.html">&#8592; Compiling to native</a><a href="16-unsafe-and-ffi.html">Unsafe and FFI &#8594;</a></nav>
+</main>
+<script src="book.js"></script>

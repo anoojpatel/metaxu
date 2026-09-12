@@ -1,0 +1,75 @@
+<title>Compiling to native · The Metaxu Book</title>
+<link rel="stylesheet" href="style.css">
+<header class="top">
+  <div class="inner">
+    <a class="brand" href="../index.html">Metaxu</a>
+    <nav class="topnav">
+      <a href="index.html">the book</a>
+      <a href="../roadmap.html">roadmap</a>
+      <a href="https://github.com/anoojpatel/metaxu">github &#8599;</a>
+    </nav>
+  </div>
+</header>
+<main>
+<h1>Compiling to native</h1>
+<p>The interpreter defines what every Metaxu program means. The native backend&#x27;s job is to reproduce that meaning exactly: it lowers MIR to LLVM IR, hands the IR to clang at <code>-O2</code>, and links the C runtime in <code>src/metaxu/runtime/native/</code>. This chapter is about the contract between the two engines, what the backend refuses to guess at, and what the compiled code costs.</p>
+<h2>Two ways in</h2>
+<p>The example runner drives both engines over <code>examples/</code>:</p>
+<div class="fence"><span class="label">bash</span><pre><code>uv run python scripts/run_examples.py --stage run   # interpret
+uv run python scripts/run_examples.py               # full gate: also compile and diff</code></pre></div>
+<p>From Python, the entry points are direct:</p>
+<div class="fence"><span class="label">bash</span><pre><code>uv run python -c &quot;
+from metaxu.compiler.codegen_llvm import emit_llvm_from_source, llvm_run
+
+src = open(&#x27;examples/hello.mx&#x27;).read()
+ir = emit_llvm_from_source(src)   # LLVM IR, as text
+print(ir.splitlines()[0])
+llvm_run(src)                     # clang -O2, link the runtime, execute
+&quot;</code></pre></div>
+<p><code>emit_llvm_from_source</code> gives you the IR to read; <code>llvm_run</code> takes the program all the way to a process and runs it.</p>
+<h2>The differential contract</h2>
+<p>Native output must match the interpreter byte for byte: stdout, exit code, error messages, float formatting. Not &quot;equivalent&quot;. Identical. The differential tests compare the bytes, and every plain fence in this book runs under that regime.</p>
+<p>Float formatting is where such contracts usually die, so it&#x27;s pinned directly:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">fn main() -&gt; int {
+    print(6.0 * 2.0);
+    print(1.0 / 100000.0);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>12.0
+1e-05</code></pre></div>
+<p>Both engines format <code>12.0</code> with its trailing zero and flip to exponent form at the same magnitude. The formatter is one algorithm implemented twice and tested against itself.</p>
+<p>Error messages are under the same contract. A runtime raise carries the same text compiled as interpreted, which is why a book example can pin one:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">fn main() -&gt; int {
+    let @mut v = Vec.new();
+    try {
+        v.pop();
+        print(&quot;popped&quot;)
+    } catch e {
+        print(e)
+    };
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>pop: Vec is empty</code></pre></div>
+<h2>Demotion</h2>
+<p>The backend does not compile every program, and that is a feature. When the emitter cannot prove it can match the interpreter, it demotes the construct: what you get is a reasoned placeholder that names what it couldn&#x27;t prove, never code that runs and prints something almost right. Printing a whole <code>Vec</code> is the standing example. The interpreter has a repr for any element type; the native runtime doesn&#x27;t yet, so a native <code>print(v)</code> demotes honestly instead of diverging. Demotions shrink as the runtime grows, but the rule they enforce is permanent: the two engines never disagree silently.</p>
+<h2>Microbenchmarks against C</h2>
+<p>The suite in <code>benchmarks/</code> times five small kernels against hand-written C twins, both sides through the same clang at <code>-O2</code>:</p>
+<div class="tablewrap"><table>
+<tr><th>kernel</th><th>native / C</th></tr>
+<tr><td>fib</td><td>1.02x</td></tr>
+<tr><td>mandelbrot</td><td>1.00x</td></tr>
+<tr><td>orbit</td><td>1.03x</td></tr>
+<tr><td>nsieve</td><td>1.09x</td></tr>
+<tr><td>par_sum</td><td>1.06x</td></tr>
+</table></div>
+<p>Read those ratios as &quot;in the same neighborhood as the C twin&quot;, nothing finer. These are microbenchmarks, and microbenchmarks reward whoever wrote them: five tiny kernels that fit in cache, with C twins that are straightforward ports rather than expert-tuned C. A determined person could tilt either column. Nothing in the set exercises heavy allocation, large working sets, or the shape of a real program. The table exists to pin regressions and keep performance in view while the language grows; it&#x27;s a starting point for performance work, not a scoreboard against C.</p>
+<p>What makes the ratios meaningful at all is the methodology. Both columns get the same clang and flags, function alignment is pinned so code layout can&#x27;t masquerade as a result, the two binaries run in alternating order, each number is the median of 15 runs, and a run only counts after an output-equality gate: the twins must print the same bytes before anyone times them.</p>
+<p>Two costs the table doesn&#x27;t show. Bounds-checked <code>Vec</code> loops land around 1.3x to 1.7x of the unchecked C equivalent, because the backend does not elide bounds checks yet. And crossing a handler, a <code>perform</code> that suspends to a handler arm and resumes, costs about 280ns compiled. Ordinary calls, arithmetic, and runtime-bound effects like <code>Thread.spawn</code> don&#x27;t pay it; it&#x27;s the price of the general mechanism from chapter 8, paid only where you use it.</p>
+<h2>Sanitizers and leaks</h2>
+<p>The differential suite runs under AddressSanitizer, scoped to the compiled program and the C runtime: heap misuse in generated code fails CI. Leak checking is scoped more carefully, because the runtime leaks by design in one place. Immortal allocations, interned strings, module constants, and the effect tables live for the whole process and are never freed; freeing them at exit would be work the OS is about to do anyway. Those are suppressed by name. Everything else must be clean, so a missing free in a lowering shows up as a red build rather than a slow rumor.</p>
+<h2>The recursion budget</h2>
+<p>Deep recursion is bounded on purpose. Both engines count frames and raise <code>RecursionLimitExceeded</code> at 100000, instead of the interpreter dying of the host&#x27;s RecursionError while native code overflows the stack and takes a signal. One budget, one error, same wording, and because it&#x27;s an ordinary raise you can <code>try</code> around a deliberately deep call. Loops don&#x27;t pay anything for this; only call depth is counted.</p>
+<p>The next chapter leaves single files behind: modules, imports, and what <code>export</code> means across them.</p>
+<nav class="pager"><a href="13-gpu-tiles.html">&#8592; GPU tiles</a><a href="15-modules-and-imports.html">Modules and imports &#8594;</a></nav>
+</main>
+<script src="book.js"></script>
