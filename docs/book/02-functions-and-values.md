@@ -189,7 +189,9 @@ ordering.
 
 A lambda is written `fn(x: int) -> expr`, or with a block body and a
 declared return type, `fn(x: int) -> int { ... }`. There is no `|x|`
-form. Lambda types read the same way the expressions do:
+form for lambdas that take arguments; the one pipe spelling in the
+language is the zero-argument closure `|| { ... }` that `Thread.spawn`
+takes (chapter 11). Lambda types read the same way the expressions do:
 `fn(int) -> int` is a function from int to int, and a parameter of
 that type accepts named functions and lambdas alike. Lambdas capture
 the bindings around them.
