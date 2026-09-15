@@ -96,3 +96,25 @@ Invented, vet first:
 6. Syntax assumptions: `;` after statement-position match, list
    literals build Vecs, method call on a struct literal, Ok/Err as
    prelude constructors.
+
+## Chapter 18 (algebraic subtyping; written post-reset from the
+## checked-in inference sources, not from a pre-reset report)
+
+Machinery described from src/metaxu/simplesub.py, type_defs.py,
+compiler/frozen_constraint_emitter.py, simplesub_adapter.py,
+frozen_constraint_checker.py, infer_tables.py at the 7ddfa00 base;
+the v1 tree's emitter is larger, so re-check the class-constraint
+list and the "not wired" claims (constraints.py FD solver unused,
+Union/Intersection never constructed, generalize() unused) against
+the restored tree before trusting the prose.
+Invented pins, vet first:
+1. `apply(fn(s) -> s + "!")` against `fn(int) -> int` rejected with
+   fragment "Int and String" (parameter-position flow).
+2. `1 < "a"` rejected with fragment "Int and String" (operand
+   unification; operand order matters for the message).
+3. `let same = fn(x) -> x; same(1); same("a")` rejected with fragment
+   "Int and String" (let-bound lambdas monomorphic). If the v1 tree
+   generalizes let-bound lambdas, this example AND the surrounding
+   prose must change.
+4. Generic-fn bracket syntax `fn flip[T](p: Pair[T]) -> Pair[T]`
+   (same assumption as ch06's `describe[T]`); outputs 40 / yx.
