@@ -110,7 +110,7 @@ price: 3
 hello from Metaxu</code></pre></div>
 <p>Chapter 5 covers the rest of the string surface: length, indexing, ordering.</p>
 <h2>Functions are values</h2>
-<p>A lambda is written <code>fn(x: int) -&gt; expr</code>, or with a block body and a declared return type, <code>fn(x: int) -&gt; int { ... }</code>. There is no <code>|x|</code> form. Lambda types read the same way the expressions do: <code>fn(int) -&gt; int</code> is a function from int to int, and a parameter of that type accepts named functions and lambdas alike. Lambdas capture the bindings around them.</p>
+<p>A lambda is written <code>fn(x: int) -&gt; expr</code>, or with a block body and a declared return type, <code>fn(x: int) -&gt; int { ... }</code>. There is no <code>|x|</code> form for lambdas that take arguments; the one pipe spelling in the language is the zero-argument closure <code>|| { ... }</code> that <code>Thread.spawn</code> takes (chapter 11). Lambda types read the same way the expressions do: <code>fn(int) -&gt; int</code> is a function from int to int, and a parameter of that type accepts named functions and lambdas alike. Lambdas capture the bindings around them.</p>
 <div class="fence"><span class="label">metaxu</span><pre><code class="mx">fn apply_twice(f: fn(int) -&gt; int, x: int) -&gt; int {
     f(f(x))
 }
