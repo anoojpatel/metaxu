@@ -1,0 +1,200 @@
+<title>Metaxu Wordmark Specimens</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=EB+Garamond:wght@700&family=Cormorant+Garamond:ital,wght@0,700;1,700&family=Playfair+Display:ital,wght@1,700&family=Instrument+Serif:ital@0;1&family=DM+Serif+Display:ital@1&family=Spectral:ital,wght@1,600&family=Fraunces:opsz,wght,WONK@9..144,100..900,0..1&family=Marcellus&family=Space+Grotesk:wght@700&display=swap">
+<style>
+  :root {
+    --bg: #e7ebe6; --panel: #f2efe3; --line: #cbd4cc; --line2: #b2c0b6;
+    --fg: #24403c; --mut: #4c5f59; --dim: #67786f; --acc: #21756a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+    font-size: 15px; line-height: 1.6;
+    padding-inline: 24px; padding-block: 0 80px;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 900px; margin: 0 auto; }
+  header { border-bottom: 1px solid var(--line); padding-block: 28px 20px; margin-bottom: 8px; }
+  h1 { font-size: 24px; margin: 0 0 6px; letter-spacing: -.01em; }
+  .note { color: var(--mut); max-width: 62ch; margin: 0; }
+  .note code { font-family: ui-monospace, Menlo, monospace; font-size: .9em;
+    background: var(--panel); border: 1px solid var(--line); padding: 1px 5px; border-radius: 2px; }
+
+  .spec { display: grid; grid-template-columns: 240px 1fr; gap: 28px;
+    align-items: center; border-bottom: 1px solid var(--line); padding-block: 30px; }
+  .spec.current { background: var(--panel); margin-inline: -24px; padding-inline: 24px;
+    border-block: 1px solid var(--line2); }
+  .meta .name { font-weight: 700; font-size: 14px; }
+  .meta .cut { font-family: ui-monospace, Menlo, monospace; font-size: 11.5px;
+    color: var(--acc); letter-spacing: .04em; text-transform: uppercase; margin-top: 2px; }
+  .meta .why { color: var(--dim); font-size: 13px; margin-top: 8px; max-width: 34ch; }
+  .marks { min-width: 0; overflow-x: auto; }
+  .mark { font-size: clamp(38px, 7vw, 60px); line-height: 1.1;
+    letter-spacing: .08em; text-transform: uppercase; white-space: nowrap; }
+  .small { margin-top: 10px; display: flex; align-items: baseline; gap: 18px; }
+  .small .mk { font-size: 15px; letter-spacing: .08em; text-transform: uppercase; }
+  .small .nav { font-family: ui-monospace, Menlo, monospace; font-size: 12.5px;
+    color: var(--dim); letter-spacing: .04em; }
+
+  .f-ebg  { font-family: 'EB Garamond', Georgia, serif; font-weight: 700; }
+  .f-corm { font-family: 'Cormorant Garamond', Georgia, serif; font-weight: 700; }
+  .f-cormi{ font-family: 'Cormorant Garamond', Georgia, serif; font-weight: 700; font-style: italic; }
+  .f-play { font-family: 'Playfair Display', Georgia, serif; font-weight: 700; font-style: italic; }
+  .f-inst { font-family: 'Instrument Serif', Georgia, serif; font-weight: 400; }
+  .f-insti{ font-family: 'Instrument Serif', Georgia, serif; font-weight: 400; font-style: italic; }
+  .f-dmsi { font-family: 'DM Serif Display', Georgia, serif; font-weight: 400; font-style: italic; }
+  .f-spec { font-family: 'Spectral', Georgia, serif; font-weight: 600; font-style: italic; }
+  .f-frau { font-family: 'Fraunces', Georgia, serif; font-weight: 900;
+    font-variation-settings: "opsz" 144, "WONK" 1; }
+  .f-marc { font-family: 'Marcellus', Georgia, serif; font-weight: 400; }
+  .f-sg   { font-family: 'Space Grotesk', Helvetica, sans-serif; font-weight: 700; }
+
+  @media (max-width: 640px) {
+    .spec { grid-template-columns: 1fr; gap: 10px; }
+    .meta .why { max-width: none; }
+  }
+</style>
+
+<div class="wrap">
+<header>
+  <h1>Wordmark specimens</h1>
+  <p class="note">Ten cuts of METAXU on the site's own celadon and ink, at
+  hero size and at the 15px header size with <code>letter-spacing: .08em</code>
+  and uppercase, same as the live wordmark. The current EB Garamond sits
+  first on the eggshell strip. Fonts load from Google Fonts here; the
+  pick gets embedded as a data URI like the current faces.</p>
+</header>
+
+<div class="spec current">
+  <div class="meta">
+    <div class="name">EB Garamond</div>
+    <div class="cut">700 · current</div>
+    <div class="why">The baseline. Old-style, even color, quiet. Nothing oblique about it.</div>
+  </div>
+  <div class="marks">
+    <div class="mark f-ebg">Metaxu</div>
+    <div class="small"><span class="mk f-ebg">Metaxu</span><span class="nav">the book&ensp;roadmap&ensp;github &#8599;</span></div>
+  </div>
+</div>
+
+<div class="spec">
+  <div class="meta">
+    <div class="name">Cormorant Garamond</div>
+    <div class="cut">700</div>
+    <div class="why">Same Garamond bones, cut sharper: higher contrast, finer serifs, more blade.</div>
+  </div>
+  <div class="marks">
+    <div class="mark f-corm">Metaxu</div>
+    <div class="small"><span class="mk f-corm">Metaxu</span><span class="nav">the book&ensp;roadmap&ensp;github &#8599;</span></div>
+  </div>
+</div>
+
+<div class="spec">
+  <div class="meta">
+    <div class="name">Cormorant Garamond</div>
+    <div class="cut">700 italic</div>
+    <div class="why">The oblique reading of the same face. The X turns into a real gesture.</div>
+  </div>
+  <div class="marks">
+    <div class="mark f-cormi">Metaxu</div>
+    <div class="small"><span class="mk f-cormi">Metaxu</span><span class="nav">the book&ensp;roadmap&ensp;github &#8599;</span></div>
+  </div>
+</div>
+
+<div class="spec">
+  <div class="meta">
+    <div class="name">Playfair Display</div>
+    <div class="cut">700 italic</div>
+    <div class="why">Didone contrast, slanted. The most formal of the oblique cuts.</div>
+  </div>
+  <div class="marks">
+    <div class="mark f-play">Metaxu</div>
+    <div class="small"><span class="mk f-play">Metaxu</span><span class="nav">the book&ensp;roadmap&ensp;github &#8599;</span></div>
+  </div>
+</div>
+
+<div class="spec">
+  <div class="meta">
+    <div class="name">Instrument Serif</div>
+    <div class="cut">400</div>
+    <div class="why">Condensed display serif with a grotesque skeleton under the serifs; single weight, holds at both sizes.</div>
+  </div>
+  <div class="marks">
+    <div class="mark f-inst">Metaxu</div>
+    <div class="small"><span class="mk f-inst">Metaxu</span><span class="nav">the book&ensp;roadmap&ensp;github &#8599;</span></div>
+  </div>
+</div>
+
+<div class="spec">
+  <div class="meta">
+    <div class="name">Instrument Serif</div>
+    <div class="cut">400 italic</div>
+    <div class="why">The same face slanted; closest thing here to an oblique grotesk with serifs.</div>
+  </div>
+  <div class="marks">
+    <div class="mark f-insti">Metaxu</div>
+    <div class="small"><span class="mk f-insti">Metaxu</span><span class="nav">the book&ensp;roadmap&ensp;github &#8599;</span></div>
+  </div>
+</div>
+
+<div class="spec">
+  <div class="meta">
+    <div class="name">DM Serif Display</div>
+    <div class="cut">400 italic</div>
+    <div class="why">Rounder didone, softer slant. Friendlier than Playfair at the same job.</div>
+  </div>
+  <div class="marks">
+    <div class="mark f-dmsi">Metaxu</div>
+    <div class="small"><span class="mk f-dmsi">Metaxu</span><span class="nav">the book&ensp;roadmap&ensp;github &#8599;</span></div>
+  </div>
+</div>
+
+<div class="spec">
+  <div class="meta">
+    <div class="name">Spectral</div>
+    <div class="cut">600 italic</div>
+    <div class="why">Angular, screen-first serif; the italic is sharp rather than calligraphic.</div>
+  </div>
+  <div class="marks">
+    <div class="mark f-spec">Metaxu</div>
+    <div class="small"><span class="mk f-spec">Metaxu</span><span class="nav">the book&ensp;roadmap&ensp;github &#8599;</span></div>
+  </div>
+</div>
+
+<div class="spec">
+  <div class="meta">
+    <div class="name">Fraunces</div>
+    <div class="cut">900 · opsz 144 · wonk on</div>
+    <div class="why">The grotesk-serif hybrid: heavy, flared, slightly wonky terminals. Most personality per letter.</div>
+  </div>
+  <div class="marks">
+    <div class="mark f-frau">Metaxu</div>
+    <div class="small"><span class="mk f-frau">Metaxu</span><span class="nav">the book&ensp;roadmap&ensp;github &#8599;</span></div>
+  </div>
+</div>
+
+<div class="spec">
+  <div class="meta">
+    <div class="name">Marcellus</div>
+    <div class="cut">400</div>
+    <div class="why">Inscriptional flare serifs, halfway to a grotesque. Single weight, all caps native.</div>
+  </div>
+  <div class="marks">
+    <div class="mark f-marc">Metaxu</div>
+    <div class="small"><span class="mk f-marc">Metaxu</span><span class="nav">the book&ensp;roadmap&ensp;github &#8599;</span></div>
+  </div>
+</div>
+
+<div class="spec">
+  <div class="meta">
+    <div class="name">Space Grotesk</div>
+    <div class="cut">700</div>
+    <div class="why">The pure grotesk reference point, no serifs at all, for calibrating how far from Garamond you want to go.</div>
+  </div>
+  <div class="marks">
+    <div class="mark f-sg">Metaxu</div>
+    <div class="small"><span class="mk f-sg">Metaxu</span><span class="nav">the book&ensp;roadmap&ensp;github &#8599;</span></div>
+  </div>
+</div>
+
+</div>

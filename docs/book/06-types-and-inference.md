@@ -264,4 +264,6 @@ disagreements surface as the conflicts shown above. Advisory: that
 the inferred type is always the most general one possible;
 `compiler_roadmap.md` tracks the gap. You'll rarely notice it, and
 when you do, the fix is ordinary: write the annotation you meant, and
-the checker will hold everyone to it.
+the checker will hold everyone to it. Chapter 18 opens the machinery
+behind all of this: the flow graph, polarity, the class-constraint
+algebra, and exactly where the principal-types gap lives.

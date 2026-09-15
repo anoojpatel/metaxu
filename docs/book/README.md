@@ -42,6 +42,9 @@ language changes, the book breaks loudly.
     the strict simulated heap, the native boundary.
 17. [Inside the compiler](17-inside-the-compiler.md) — the pipeline
     stage by stage, the house rules, how to poke at it.
+18. [Algebraic subtyping](18-algebraic-subtyping.md) — how inference
+    decides: flows, polarity, the class-constraint algebra, the
+    solver, and what is built versus sketched.
 
 ## How the examples work
 
