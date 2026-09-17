@@ -550,6 +550,17 @@ def _type_display(t: Any) -> str | None:
         base = _type_display(getattr(t, "base_type", None)) or "?"
         size = _type_display(getattr(t, "size", None)) or "?"
         return f"vector[{base}, {size}]"
+    # A function type written as a parameter type (`f: fn(int) -> int`).
+    # The str() fallback rendered it as "((TypeReferenceat 0x..) -> ...)",
+    # which dropped the declared shape on the floor: the constraint emitter
+    # could not tie a lambda argument's parameters to the declared ones, so
+    # `apply(fn(s) -> s + "!")` compiled and died at run time. Declared
+    # effects (`performs`) travel elsewhere and are not part of the display.
+    if isinstance(t, fast.FunctionType):
+        params = ", ".join(_type_display(p) or "?"
+                           for p in getattr(t, "param_types", None) or [])
+        ret = _safe_type_display(getattr(t, "return_type", None)) or "()"
+        return f"fn({params}) -> {ret}"
     name = getattr(t, "name", None)
     if isinstance(name, str):
         return name

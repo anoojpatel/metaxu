@@ -74,13 +74,30 @@ fn main() -> int {
 ```
 
 `f`'s parameter is a negative position, so `20` reaches the lambda's
-`s` through the call edge inside `apply`, and `s * 2` is an Int. One
-honest limit belongs right here: change the body to `s + "!"` and the
-compile path accepts the program, because call edges are not merged
-by the conflict detector described next; the mismatch surfaces only
-when the interpreter tries to add an Int to a String. The biunifier
-sees the clash statically. Closing that gap on the compile path is
-tracked in `docs/type_inference_plan.md`.
+`s` through the call edge inside `apply`, and `s * 2` is an Int. The
+declared type `fn(int) -> int` is itself a small graph: a function
+shape whose parameter position carries Int and whose result position
+carries Int, unified with `f`. Change the body to `s + "!"` and the
+Int that `apply` will pass meets the String the body needs, on one
+variable, and the program is rejected at the string:
+
+```metaxu error
+fn apply(f: fn(int) -> int) -> int {
+    f(20)
+}
+
+fn main() -> int {
+    print(apply(fn(s) -> s + "!"));
+    0
+}
+```
+```output
+<mem>:6:30: type mismatch: one value is required to be Int and String
+```
+
+Should a value ever reach an operator at a type the checker did not
+see, the interpreter raises a catchable Metaxu error naming the
+operator and both operand types, never a host-language exception.
 
 ## The algebra of requirements
 
@@ -105,14 +122,21 @@ variables are merged.
 
 After the walk, the conflict detector takes the four mutually
 exclusive literal classes (Int, String, Bool, Float), unions variables
-along *unify* edges only, and reads the classes of each component
-together. Two different primitives on one component is the rejection
-chapter 6 pinned as "one value is required to be Int and String". Flow
-edges are deliberately not merged (they are directional, and every
-statement flows into its block), and neither are call edges; that is
-the source of the limit noted above. The diagnostic points at the
-last of the conflicting values in source order, the one that made the
-conflict apparent:
+along *unify* edges, and reads the classes of each component together.
+Two function types that land in one component are unified
+structurally, parameter with parameter and result with result. Call
+edges are then folded in: when a callee's component holds a function
+type, each argument joins the matching parameter and the call's result
+joins the return type, repeated until nothing new joins. That fold is
+what carried `apply`'s Int to the lambda's `s` above. It is skipped
+for one kind of callee: a named function with a bare parameter or type
+parameters (`fn same(x)`, `fn ident<T>`), which serves every call
+through one shared type and would be wrongly merged. Flow edges are
+deliberately not merged; they are directional, and every statement
+flows into its block. Two different primitives on one component is
+the rejection chapter 6 pinned as "one value is required to be Int and
+String". The diagnostic points at the last of the conflicting values
+in source order, the one that made the conflict apparent:
 
 ```metaxu error
 fn main() -> int {
@@ -215,9 +239,10 @@ fn main() -> int {
 yx
 ```
 
-## Where generalization stands
+## Generalization
 
-A lambda bound with `let` and used at two types compiles today:
+A lambda bound with `let` is generalized: each use gets its own copy
+of the lambda's type, so one binding serves two types:
 
 ```metaxu
 fn main() -> int {
@@ -232,20 +257,28 @@ fn main() -> int {
 a
 ```
 
-It compiles for a reason worth understanding, not because `same` was
-generalized. Each call connects to the lambda through a call edge, and
-call edges are not merged by the conflict detector, so Int and String
-never meet in one component. The lambda has a single type variable for
-its whole life; ask the biunifier for `same`'s principal type and it
-answers `Int ∨ String`, and for the lambda as a function,
-`(Int ∧ String) -> (Int ∨ String)`: one function that has absorbed
-both uses rather than two instantiations of a polymorphic one. That is
-the precise form of chapter 6's caveat on principal types. Named
-generic functions such as `flip<T>` above are instantiated per call
-by the emitter; `let`-bound lambdas are not, yet. The biunifier
-already has the machinery, levels with extrusion, `generalize` and
-`instantiate`, exercised at the engine level; putting it on the
-compile path is the first item in the inference plan.
+The mechanism fits the single-solve design. The walk of the lambda is
+*recorded*: the constraints it emits and the variables that belong to
+its subtree. A use of `same`, whether a call or a bare mention, replays
+the recording under a fresh substitution for those variables and
+connects the use to the copy. Ask the biunifier for the lambda's
+principal type and it answers `'a -> 'a`; before generalization it
+answered `(Int ∧ String) -> (Int ∨ String)`, one function that had
+absorbed both uses. Instances are registered as aliases of the
+original, so a `once` lambda called through two instances is still one
+callable called twice, and effects propagate against the one lambda
+that exists at run time.
+
+Two limits are deliberate. Only the lambda's own variables are
+generalized: a binding captured from outside has one type for every
+instance, so with `let k = 1` the lambda `fn(x) -> x + k` accepts Ints
+only, and `addk("a")` is rejected. And only immutable bindings are
+generalized (the value restriction): a `let mut` lambda can be
+reassigned, so it keeps one type across its uses. Named generic
+functions such as `flip<T>` above are instantiated per call by the
+emitter's signature checking, and a named function with a bare
+parameter serves every call through one shared type with its call
+edges left unfolded, as the previous section said.
 
 ## The biunifier
 
@@ -322,24 +355,31 @@ same pass, from the same walk.
 ## What is built, and what is only sketched
 
 On the compile path, load-bearing on every build: a fresh variable per
-node; flow, unify, and call edges; the class-constraint algebra with
-its conflict detector over unify components; the flat solver with an
-occurs check and single-step unfolding of recursive types; variance
-inferred for type parameters; effect and linearity propagation over
-the solved graph.
+node; flow, unify, and call edges; declared function types as shapes
+in the graph; the class-constraint algebra with its conflict detector
+over unify components, function types unified structurally and call
+edges folded in; generalization of `let`-bound lambdas by recording
+and replay; the flat solver with an occurs check and single-step
+unfolding of recursive types; variance inferred for type parameters;
+effect and linearity propagation over the solved graph.
 
 Built and tested at the engine level, advisory on the path: the
 biunifier, with extrusion, levels, generalization, instantiation,
-coalescence, and simplification into principal types.
+coalescence, and simplification into principal types. Its answers are
+exact on expression chains and coarse on statement-heavy functions,
+because it reads types through the flat solver's links and the flat
+solver fuses every statement of a function into one representative.
 
-Not built: generalization of `let`-bound lambdas on the compile path;
-merging of call edges into conflict detection (the `s + "!"` gap); a
-type-class solver with functional dependencies (present in the source,
-never called); union and intersection types in surface syntax; the
-older design document's nominal struct extension, structural width
-subtyping for records and variants, and interfaces. `Number`, `Ord`,
-and `Eq` are requirements a primitive can satisfy, not supertypes: Int
-and Float are distinct, and there is no numeric widening.
+Not built: conflict diagnostics that show where each of the two
+requirements came from (today only the last conflicting value is
+located); the biunifier as the compile-path decision maker, which
+first needs the statement-flow edges sharpened; a type-class solver
+with functional dependencies (present in the source, never called);
+union and intersection types in surface syntax; the older design
+document's nominal struct extension, structural width subtyping for
+records and variants, and interfaces. `Number`, `Ord`, and `Eq` are
+requirements a primitive can satisfy, not supertypes: Int and Float
+are distinct, and there is no numeric widening.
 
 If you want to see the machinery run, chapter 17 shows how to hold the
 pipeline open from Python; `ctx.tables.facade.principal_type_of(node)`

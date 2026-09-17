@@ -92,7 +92,15 @@ class SchemeRecorder:
         self.end_len = len(self.facade._constraints)
         self.end_id = _current_id()
 
-    def finish(self, fn_type: CompactType) -> Scheme:
+    def finish(self, fn_type: CompactType,
+               extra_generic: Iterable[int] = ()) -> Scheme:
+        """``extra_generic``: variable ids that belong to the lambda even
+        though they were allocated before the window. The pipeline
+        pre-allocates one variable per frozen node before the walk, so a
+        lambda's parameter and body variables are older than the window;
+        the emitter passes the ids of every node in the lambda's subtree.
+        A captured outer binding is never in that set, so it stays
+        shared across instances."""
         recorded = tuple(self.facade._constraints[self.start_len:self.end_len])
         seen: set[int] = set()
         _vars_in(fn_type, seen)
@@ -101,6 +109,7 @@ class SchemeRecorder:
                 _vars_in(op, seen)
         generic = frozenset(i for i in seen
                             if self.start_id < i <= self.end_id)
+        generic = generic | frozenset(extra_generic)
         return Scheme(fn_type=fn_type, generic_ids=generic,
                       constraints=recorded)
 
@@ -123,20 +132,30 @@ def instantiate(scheme: Scheme, facade: Any,
                     sigma[ty.id] = fresh
                 return fresh
             return ty
+        # Structured types are copied once per instance (memoized by id),
+        # so the instance's function type and every replayed mention of
+        # it are the same object.
+        done = sigma.get(ty.id)
+        if done is not None:
+            return done
         if ty.kind == "function":
-            return CompactType(
+            copy = CompactType(
                 id=next_id(), kind="function",
                 param_types=[sub(p) for p in (ty.param_types or [])],
                 return_type=(sub(ty.return_type)
                              if ty.return_type is not None else None),
                 linearity=ty.linearity)
+            sigma[ty.id] = copy
+            return copy
         if ty.kind in ("constructor", "recursive"):
-            return CompactType(
+            copy = CompactType(
                 id=next_id(), kind=ty.kind,
                 constructor=ty.constructor,
                 recursive_ref=ty.recursive_ref,
                 name=ty.name,
                 type_args=[sub(a) for a in (ty.type_args or [])])
+            sigma[ty.id] = copy
+            return copy
         return ty
 
     inst = sub(scheme.fn_type)

@@ -147,6 +147,12 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
     # name not present here is simply unchecked (zero false positives).
     struct_type_bindings: dict[str, str] = {}
 
+    # Let-generalized lambdas (docs/type_inference_plan.md, part 2), kept
+    # parallel to `scopes`: scheme_scopes[i] holds the schemes of names
+    # bound in scopes[i]. A name bound WITHOUT a scheme in an inner scope
+    # (a parameter, `let same = 5`) shadows an outer scheme.
+    scheme_scopes: list[dict[str, Any]] = [{}]
+
     def bind(name: Any, ty: Any) -> None:
         if isinstance(name, str):
             scopes[-1][name] = ty
@@ -157,6 +163,14 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
         for scope in reversed(scopes):
             if name in scope:
                 return scope[name]
+        return None
+
+    def lookup_scheme(name: Any) -> Any | None:
+        if not isinstance(name, str):
+            return None
+        for scope, schemes in zip(reversed(scopes), reversed(scheme_scopes)):
+            if name in scope:
+                return schemes.get(name)
         return None
 
     def _is_locally_bound(name: Any) -> bool:
@@ -946,6 +960,131 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
     def non_param_nodes(children: Any) -> list[Any]:
         return [child for child in children if getattr(child, "kind", None) != "Parameter"]
 
+    # ------------------------------------------------------------------
+    # Function types in the constraint graph (docs/type_inference_plan.md)
+    # ------------------------------------------------------------------
+
+    def _split_fn_args(s: str) -> list[str]:
+        """Split a parameter list on commas outside (), [] and <>."""
+        parts: list[str] = []
+        depth = 0
+        cur = ""
+        for ch in s:
+            if ch in "([<":
+                depth += 1
+            elif ch in ")]>":
+                depth -= 1
+            if ch == "," and depth == 0:
+                parts.append(cur)
+                cur = ""
+            else:
+                cur += ch
+        if cur.strip():
+            parts.append(cur)
+        return [p.strip() for p in parts]
+
+    def _parse_fn_display(display: Any) -> tuple[list[str], str] | None:
+        """`fn(int, string) -> int` -> (["int", "string"], "int"); None for
+        anything that is not a function-type display."""
+        if not isinstance(display, str):
+            return None
+        s = display.strip()
+        if not s.startswith("fn("):
+            return None
+        depth = 0
+        close = -1
+        for i in range(2, len(s)):
+            ch = s[i]
+            if ch in "([<":
+                depth += 1
+            elif ch in ")]>":
+                depth -= 1
+                if depth == 0:
+                    close = i
+                    break
+        if close < 0:
+            return None
+        rest = s[close + 1:].strip()
+        if not rest.startswith("->"):
+            return None
+        return _split_fn_args(s[3:close]), rest[2:].strip()
+
+    def _declared_fn_shell(display: str, node_id: int) -> Any | None:
+        """A function CompactType for a declared `fn(...) -> ...` parameter
+        type: fresh variables in every position, classed Int/String/Bool/
+        Float where the display says so, nested function types recursively,
+        everything else (structs, type parameters, unit) left free. Unifying
+        the parameter's variable with the shell is what lets the conflict
+        detector see through `apply(fn(s) -> s + "!")`."""
+        parsed = _parse_fn_display(display)
+        if parsed is None or CompactType is None:
+            return None
+        from metaxu.type_defs import next_id
+        params, ret = parsed
+
+        def leaf(d: str) -> Any:
+            nested = _declared_fn_shell(d, node_id)
+            if nested is not None:
+                return nested
+            v = CompactType.fresh_var()
+            c = _canon_type(d)
+            if c in _PRIMITIVE_SET:
+                simplesub.add_class_constraint(c, [v], node_id)
+            return v
+
+        return CompactType(id=next_id(), kind='function',
+                           param_types=[leaf(p) for p in params],
+                           return_type=leaf(ret), linearity="many")
+
+    def _subtree_var_ids(node: Any) -> set[int]:
+        """Ids of the type variables that belong to `node`'s subtree: the
+        variable pre-allocated for each node, plus the return variable of
+        any lambda type in it (a lambda node's own entry is its function
+        type, whose return variable is otherwise unreachable from `types`).
+        These are the ids a let-bound lambda generalizes over."""
+        acc: set[int] = set()
+
+        def scan(n: Any) -> None:
+            ty = types.get(n.node_id)
+            if ty is not None:
+                if getattr(ty, "kind", None) == "var":
+                    acc.add(ty.id)
+                elif getattr(ty, "kind", None) == "function":
+                    ret = getattr(ty, "return_type", None)
+                    if ret is not None and getattr(ret, "kind", None) == "var":
+                        acc.add(ret.id)
+            for c in getattr(n, "children", ()):
+                scan(c)
+
+        scan(node)
+        return acc
+
+    def _preallocate_lambda_types(root: Any) -> None:
+        """Give every LambdaExpression node its function type BEFORE the
+        walk. The pre-allocated per-node variable becomes the lambda's
+        return type; `types[lambda]` becomes `fn(params) -> ret`. Until
+        this, a parent that read the lambda's type before walking it (a
+        call passing the lambda, a `let` binding it) got the RETURN
+        variable and treated the lambda as if it were its own result."""
+        if CompactType is None:
+            return
+        from metaxu.type_defs import next_id
+
+        def scan(n: Any) -> None:
+            if getattr(n, "kind", None) == "LambdaExpression":
+                ret = types.get(n.node_id)
+                if ret is not None and getattr(ret, "kind", None) == "var":
+                    params = [types[c.node_id] for c in param_nodes(n.children)
+                              if types.get(c.node_id) is not None]
+                    types[n.node_id] = CompactType(
+                        id=next_id(), kind='function', param_types=params,
+                        return_type=ret,
+                        linearity=str(payload_dict(n).get("linearity") or "many"))
+            for c in getattr(n, "children", ()):
+                scan(c)
+
+        scan(root)
+
     def literal_class(value: Any) -> str | None:
         if isinstance(value, bool):
             return "Bool"
@@ -1186,12 +1325,14 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
 
     def push_scope() -> None:
         scopes.append({})
+        scheme_scopes.append({})
         gsb_saves.append({})
         stb_saves.append({})
         borrow_checker.enter_scope()
 
     def pop_scope() -> None:
         scopes.pop()
+        scheme_scopes.pop()
         borrow_checker.exit_scope()
         for name, prev in (gsb_saves.pop() if gsb_saves else {}).items():
             if prev is None:
@@ -1375,6 +1516,17 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
             # Parameter frozen payloads carry no type; the function payload's
             # aligned "param_types" list is the source for struct typing.
             _declared_ptypes = list(payload_dict(node).get("param_types") or [])
+            # Call-edge folding (conflict detector): a named function's
+            # call edges are folded only when its signature is fully
+            # declared and non-generic. A function with a bare parameter
+            # (`fn identity(x)`) or type parameters is used at many types
+            # through one shared type, and folding would wrongly merge
+            # those uses (docs/type_inference_plan.md, part 1).
+            if CompactType is not None and (
+                    (value.get("type_params") or [])
+                    or len(_declared_ptypes) != len(param_children)
+                    or any(not isinstance(pt, str) for pt in _declared_ptypes)):
+                simplesub.nonfoldable.add(fn_compact.id)
             for _pidx, (name, child) in enumerate(zip(params, param_children)):
                 child_ty = types.get(child.node_id)
                 if child_ty is not None:
@@ -1396,6 +1548,10 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
                                 stb_saves[-1].setdefault(
                                     name, struct_type_bindings.get(name))
                             struct_type_bindings[name] = _pt
+                        _shell = _declared_fn_shell(_pt, child.node_id) \
+                            if isinstance(_pt, str) else None
+                        if _shell is not None:
+                            simplesub.add_unify(child_ty, _shell)
 
             # Push the return type (not the function type) for return statements
             # Must do this BEFORE walking the body
@@ -1450,6 +1606,11 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
             enclosing_performs.pop()
             return None
         if kind == "LambdaExpression" and node_ty is not None:
+            # _preallocate_lambda_types made types[node] the function type;
+            # its return variable is the node's own type for body flows.
+            fn_compact = node_ty if getattr(node_ty, "kind", None) == "function" else None
+            if fn_compact is not None:
+                node_ty = fn_compact.return_type
             outer_bindings = {name: lookup(name) for name in payload_dict(node).get("captures", {})}
             push_scope()
             borrow_checker.enter_region()
@@ -1480,6 +1641,10 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
                                 stb_saves[-1].setdefault(
                                     name, struct_type_bindings.get(name))
                             struct_type_bindings[name] = _pt
+                        _shell = _declared_fn_shell(_pt, child.node_id) \
+                            if isinstance(_pt, str) else None
+                        if _shell is not None:
+                            simplesub.add_unify(child_ty, _shell)
             linearity = value.get("linearity") or "many"
             captures = value.get("captures", {}) or {}
             for captured_name, mode in captures.items():
@@ -1488,17 +1653,19 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
                     simplesub.add_capture(node_ty, str(captured_name), captured_ty, str(mode), node.node_id)
             if any(mode == "borrow_mut" for mode in captures.values()) and linearity == "many":
                 linearity = "separate"
-            # Construct CompactType function type for lambda
-            # Store in types dict for proper representation
+            # The lambda's CompactType function type (pre-allocated; built
+            # here only if the pre-pass could not run).
             if CompactType is not None:
                 from metaxu.type_defs import next_id
-                fn_compact = CompactType(
-                    id=next_id(),
-                    kind='function',
-                    param_types=param_tys,
-                    return_type=node_ty,
-                    linearity=str(linearity)
-                )
+                if fn_compact is None:
+                    fn_compact = CompactType(
+                        id=next_id(),
+                        kind='function',
+                        param_types=param_tys,
+                        return_type=node_ty,
+                        linearity=str(linearity)
+                    )
+                fn_compact.linearity = str(linearity)
                 types[node.node_id] = fn_compact
                 simplesub.function_types[node.node_id] = fn_compact
                 simplesub.add_function_type(fn_compact, param_tys, node_ty, str(linearity), node.node_id)
@@ -1531,17 +1698,34 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
                 simplesub.add_class_constraint("Callable", [node_ty], node.node_id)
             return None
         if kind == "LetBinding" and node_ty is not None:
+            var_name = payload_name(node)
+            let_payload = payload_dict(node)
+            uniqueness, locality, linearity = _split_mode(let_payload)
+            # Let-generalization, lambdas only (the value restriction) and
+            # only for immutable bindings: `let same = fn(x) -> x` records
+            # the constraints its walk emits, and every use of `same`
+            # instantiates them afresh (generalize.py). A `let mut` lambda
+            # can be reassigned, so it keeps one shared type.
+            _scheme = None
             for child in children:
                 child_ty = types.get(child.node_id)
                 if child_ty is not None:
                     simplesub.add_unify(node_ty, child_ty)
-                    walk(child)
+                    if (child.kind == "LambdaExpression" and len(children) == 1
+                            and uniqueness == "shared"
+                            and getattr(child_ty, "kind", None) == "function"):
+                        _generic = _subtree_var_ids(child)
+                        with simplesub.record_scheme() as _rec:
+                            walk(child)
+                        _scheme = _rec.finish(child_ty, extra_generic=_generic)
+                    else:
+                        walk(child)
             # Declare variable in borrow checker with its real modes
             # (defaults to shared/global for unannotated bindings).
-            var_name = payload_name(node)
-            let_payload = payload_dict(node)
-            uniqueness, locality, linearity = _split_mode(let_payload)
             if isinstance(var_name, str):
+                scheme_scopes[-1].pop(var_name, None)
+                if _scheme is not None:
+                    scheme_scopes[-1][var_name] = _scheme
                 borrow_checker.declare_variable(var_name, uniqueness, locality, node.node_id)
                 # A rebinding of the name is a fresh binding: it must not
                 # inherit @global-container gating from an earlier binding.
@@ -1601,6 +1785,9 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
         if kind == "Variable" and node_ty is not None:
             name = payload_name(node)
             binding_ty = lookup(name)
+            _scheme = lookup_scheme(name)
+            if _scheme is not None:
+                binding_ty = simplesub.instantiate(_scheme, node.node_id)
             if binding_ty is not None:
                 simplesub.add_unify(node_ty, binding_ty)
             elif isinstance(name, str):
@@ -1620,6 +1807,9 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
         if kind == "FunctionCall" and node_ty is not None:
             name = payload_name(node)
             callee_ty = lookup(name)
+            _scheme = lookup_scheme(name)
+            if _scheme is not None:
+                callee_ty = simplesub.instantiate(_scheme, node.node_id)
             arg_tys = [types.get(child.node_id) for child in children if types.get(child.node_id) is not None]
             if callee_ty is not None:
                 simplesub.add_class_constraint("Callable", [callee_ty, node_ty], node.node_id)
@@ -1919,6 +2109,7 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
                         borrow_checker.release_call_borrow(arg_var, mode)
 
     _collect_definitions(frozen_root)
+    _preallocate_lambda_types(frozen_root)
     walk(frozen_root)
     # Publish declared effect classes so the constraint checker can
     # distinguish stack-class effects (which do not suspend) from
