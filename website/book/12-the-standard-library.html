@@ -1,0 +1,218 @@
+<title>The standard library · The Metaxu Book</title>
+<link rel="stylesheet" href="style.css">
+<header class="top">
+  <div class="inner">
+    <a class="brand" href="../index.html">Metaxu</a>
+    <nav class="topnav">
+      <a href="index.html">the book</a>
+      <a href="../roadmap.html">roadmap</a>
+      <a href="https://github.com/anoojpatel/metaxu">github &#8599;</a>
+    </nav>
+  </div>
+</header>
+<main>
+<h1>The standard library</h1>
+<p><code>std/</code> is written in Metaxu, modeled on Ante&#x27;s stdlib (the closest relative language: algebraic effects plus ownership), and it doubles as the compiler&#x27;s toughest test suite; several silent-degradation bugs were found only by writing these modules. <code>import std.foo</code> resolves to <code>std/foo.mx</code>; <code>from std.foo import x</code> brings names into scope, and <code>import std.foo as f</code> gives you qualified calls. This chapter tours each module with running code.</p>
+<h2>std.prelude</h2>
+<p>The everyday names in one import. Only unambiguous names are re-exported; <code>map</code>, <code>filter</code> and <code>sum</code> exist in several modules and stay in them.</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">from std.prelude import unwrap_or, clamp, parse_int;
+
+fn main() -&gt; int {
+    print(clamp(99, 0, 10));
+    print(unwrap_or(parse_int(&quot;41&quot;), 0) + 1);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>10
+42</code></pre></div>
+<h2>std.option and std.result</h2>
+<p>Combinators over the builtin <code>Some</code>/<code>None</code> and <code>Ok</code>/<code>Err</code>: plain matches, no effects. Chapter 9 shows them chained; the basics:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">import std.option as opt;
+import std.result as res;
+
+fn main() -&gt; int {
+    let a = opt.map(Some(20), fn(x: int) -&gt; x * 2);
+    print(opt.unwrap_or(a, 0));
+    print(opt.unwrap_or(None, 7));
+    let r = res.map_err(Err(&quot;no&quot;), fn(m: string) -&gt; &quot;error: &quot; + m);
+    match r { Ok(v) =&gt; print(v), Err(e) =&gt; print(e) };
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>40
+7
+error: no</code></pre></div>
+<h2>std.fail, std.throw, std.early_return</h2>
+<p>Failure as effects: a computation performs <code>fail()</code> or <code>throw(e)</code>, a boundary handler (<code>try_opt</code>, <code>catch_</code>, <code>with_early_return</code>) decides what that means, and the abort semantics skip everything after the failing perform. Chapter 9 has the worked examples.</p>
+<h2>std.stream</h2>
+<p>A stream is a thunk performing the <code>Emit</code> effect once per element; consumers are handlers, transformers re-emit, so <code>sum(filter(map(iota(n), f), p))</code> chains lazily with no intermediate collections. Chapter 8 builds this module up from the effect system.</p>
+<h2>std.iter</h2>
+<p>The adapters <code>std.stream</code> defers because they emit tuples: <code>enumerate</code>, <code>zip</code>, <code>take_while</code>, <code>windows</code>, <code>chunks</code> and friends. They are ordinary stream transformers and compose with <code>std.stream</code>&#x27;s consumers.</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">from std.stream import iota, emit_vec, collect;
+from std.iter import zip;
+from std.vec import of3;
+
+fn main() -&gt; int {
+    let pairs = collect(zip(iota(10), emit_vec(of3(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;))));
+    for (n, s) in pairs {
+        print(s, n)
+    }
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>a 0
+b 1
+c 2</code></pre></div>
+<p>One documented caveat: <code>zip</code> realizes its second stream into a Vec before pulling the first, because single-shot delimited continuations cannot step two producers in lockstep. Pass the finite stream second.</p>
+<h2>std.vec</h2>
+<p>Eager combinators over the builtin <code>Vec</code>: Vec in, fresh Vec out, the argument never mutated. The lazy equivalents live in <code>std.stream</code>.</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">from std.vec import range_vec, map, filter, sum;
+
+fn main() -&gt; int {
+    let squares = map(range_vec(1, 6), fn(x: int) -&gt; x * x);
+    print(sum(squares));
+    let odds = filter(squares, fn(x: int) -&gt; x % 2 == 1);
+    print(len(odds));
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>55
+3</code></pre></div>
+<h2>std.sort</h2>
+<p>Stable merge sort, following <code>std.vec</code>&#x27;s contract. Comparators are a strict less-than predicate, not a three-way <code>cmp</code>; stability is what lets chained <code>sort_by_key</code> calls order by several keys.</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">from std.sort import sort, binary_search;
+from std.vec import of3;
+
+fn main() -&gt; int {
+    let s = sort(of3(31, 4, 15));
+    print(s[0], s[1], s[2]);
+    match binary_search(s, 15) {
+        Some(i) =&gt; print(&quot;found at&quot;, i),
+        None =&gt; print(&quot;absent&quot;)
+    };
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>4 15 31
+found at 1</code></pre></div>
+<h2>std.map</h2>
+<p>An association-list <code>Map</code>. Every operation is O(n), stated up front, and the API is shaped so a real hash map can replace the representation without changing callers. <code>put</code> overwrites, <code>get</code> answers an Option, and the map mutates in place.</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">import std.map as map;
+
+fn main() -&gt; int {
+    let @mut m = map.empty();
+    map.put(m, &quot;ada&quot;, 1815);
+    map.put(m, &quot;grace&quot;, 1906);
+    map.put(m, &quot;ada&quot;, 1816);
+    print(map.size(m));
+    match map.get(m, &quot;ada&quot;) { Some(y) =&gt; print(y), None =&gt; print(&quot;absent&quot;) };
+    print(map.get_or(m, &quot;alan&quot;, 0));
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>2
+1816
+0</code></pre></div>
+<h2>std.string</h2>
+<p>Helpers over builtin strings. Metaxu has no char type; <code>s[i]</code> yields a one-character string, and this module&#x27;s API is built on that.</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">from std.string import repeat, reverse, join;
+from std.vec import of3;
+
+fn main() -&gt; int {
+    print(repeat(&quot;ab&quot;, 3));
+    print(reverse(&quot;stressed&quot;));
+    print(join(of3(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;), &quot;, &quot;));
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>ababab
+desserts
+a, b, c</code></pre></div>
+<h2>std.parse</h2>
+<p>Text into values, with the library&#x27;s two standard answer shapes: <code>parse_int</code> answers an Option, <code>parse_int_or_fail</code> performs <code>Fail</code> so a multi-field parse aborts at the first bad field (chapter 9 shows that composition). Floats, radix prefixes and overflow detection are documented gaps, not silent misbehavior.</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">from std.parse import parse_int, trim, split_on;
+
+fn main() -&gt; int {
+    match parse_int(trim(&quot;  42 &quot;)) { Some(n) =&gt; print(n), None =&gt; print(&quot;bad&quot;) };
+    match parse_int(&quot;4x2&quot;) { Some(n) =&gt; print(n), None =&gt; print(&quot;bad&quot;) };
+    print(len(split_on(&quot;3,14,15&quot;, &quot;,&quot;)));
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>42
+bad
+3</code></pre></div>
+<h2>std.math</h2>
+<p>Constants are real module-level bindings, read as plain names. <code>sqrt</code>/<code>sin</code>/<code>cos</code> wrap the builtin methods; <code>abs</code>/<code>min</code>/<code>max</code>/<code>clamp</code> take unannotated parameters and work on ints and floats.</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">from std.math import pi, abs, sqrt, powi;
+
+fn main() -&gt; int {
+    print(pi);
+    print(abs(-7));
+    print(sqrt(9));
+    print(powi(2, 10));
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>3.141592653589793
+7
+3.0
+1024</code></pre></div>
+<h2>std.random</h2>
+<p>Randomness as an effect: <code>next()</code> has no default handler, so the source is always an explicit choice. <code>with_seed</code> installs a xorshift64 generator (same sequence on every backend); <code>with_sequence</code> scripts the draws outright. There is deliberately no real-entropy fallback: performing <code>Random.next</code> unhandled is a loud error, never a silently constant &quot;random&quot; number.</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">from std.random import Random, with_seed, next_below;
+
+fn main() -&gt; int {
+    with_seed(7, fn() -&gt; () {
+        print(next_below(100), next_below(100), next_below(100));
+        ()
+    });
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>91 76 57</code></pre></div>
+<h2>std.state</h2>
+<p>The classic State effect with the classic three runners: <code>eval_state</code> answers the result, <code>exec_state</code> the final state, <code>run_state</code> both. The state lives in a cell shared by the handler&#x27;s arms, which is how the runners read it back after the block completes.</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">from std.state import State, run_state, modify, increment;
+
+fn step() performs State -&gt; () {
+    increment(5);
+    modify(fn(s: int) -&gt; s * 2);
+    ()
+}
+
+fn main() -&gt; int {
+    let r = run_state(10, fn() -&gt; () { step() });
+    print(r.state);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>30</code></pre></div>
+<h2>std.log</h2>
+<p>The sink is a handler choice, not a global logger. Unhandled, the effect&#x27;s declared defaults print with level prefixes; <code>quietly</code> silences, <code>with_collected_logs</code> hands you the lines as a Vec, <code>with_min_level</code> filters by re-performing into the next enclosing handler, so filters and collectors compose.</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">from std.log import Log, log_info, log_warn, with_collected_logs;
+
+fn work() -&gt; () {
+    log_info(&quot;starting&quot;);
+    log_warn(&quot;low disk&quot;);
+    ()
+}
+
+fn main() -&gt; int {
+    work();                 # unhandled: the defaults print
+    let lines = with_collected_logs(fn() -&gt; () { work() });
+    print(&quot;collected&quot;, len(lines));
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>[info] starting
+[warn] low disk
+collected 2</code></pre></div>
+<h2>std.test</h2>
+<p>Assertions report through a <code>Report</code> effect instead of aborting, so a suite runs to the end and a runner tallies. Importing the module&#x27;s <code>assert_eq</code> shadows the aborting builtin of the same name on purpose (chapter 7&#x27;s plain-call precedence rule). The report&#x27;s failure count doubles as a process exit code.</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">from std.test import assert_eq, run_tests;
+
+fn main() -&gt; int {
+    let report = run_tests(&quot;suite&quot;, fn() -&gt; () {
+        assert_eq(1 + 1, 2, &quot;arithmetic&quot;);
+        assert_eq(len(&quot;abc&quot;), 3, &quot;len&quot;);
+        ()
+    });
+    print(report.total, &quot;run,&quot;, report.failed, &quot;failed&quot;);
+    report.failed
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>2 run, 0 failed</code></pre></div>
+<h2>std.sync and std.gpu</h2>
+<p><code>std.sync</code> is thread-safe sharing: <code>protect(v)</code> builds a <code>Protected</code> value the spawn checker recognizes as separate by construction, and <code>with_lock</code>/<code>read</code>/<code>write</code>/<code>update</code> are the access idioms. Chapter 11 covers it with the Thread and Mutex effects. <code>std.gpu</code> backs the <code>Tile</code> kernels and the <code>Gpu</code> effect; chapter 13 covers tiles, kernels, and the Metal path.</p>
+<p>A last practical note: a <code>std.*</code> name with no file under <code>std/</code> (<code>std.simd</code>, <code>std.matrix</code>) still imports; nothing is rewritten, and calls fall through to interpreter builtins or fail loudly at run time.</p>
+<nav class="pager"><a href="11-threads-and-sharing.html">&#8592; Threads and sharing</a><a href="13-gpu-tiles.html">GPU tiles &#8594;</a></nav>
+</main>
+<script src="book.js"></script>

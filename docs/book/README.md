@@ -36,6 +36,15 @@ language changes, the book breaks loudly.
     Metal.
 14. [Compiling to native](14-compiling-to-native.md) — clang, the
     differential contract, measured performance.
+15. [Modules and imports](15-modules-and-imports.md) — `import`,
+    `export`, visibility, multi-file programs, name precedence.
+16. [Unsafe and FFI](16-unsafe-and-ffi.md) — `unsafe`, extern C,
+    the strict simulated heap, the native boundary.
+17. [Inside the compiler](17-inside-the-compiler.md) — the pipeline
+    stage by stage, the house rules, how to poke at it.
+18. [Algebraic subtyping](18-algebraic-subtyping.md) — how inference
+    decides: flows, polarity, the class-constraint algebra, the
+    solver, and what is built versus sketched.
 
 ## How the examples work
 

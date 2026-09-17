@@ -52,6 +52,22 @@ class SimpleSubFacade:
         self.function_types: Dict[int, Any] = {}  # Store CompactType function types by node_id
         self._apply_solution = False  # Flag to control whether to apply SimpleSub's solution
         self._biunify_engine: Any = None  # Lazily-built Biunifier (see biunify())
+        # instance fn type id -> the generalized original (generalize.py);
+        # the checker counts calls and propagates effects on originals
+        self.aliases: Dict[int, Any] = {}
+        # when True, unification failures from the flat solver are appended
+        # to self.errors after solve() (off by default: the conflict
+        # detector reports those in user terms)
+        self.surface_solver_errors = False
+
+    # --- Let-generalization by constraint replay (generalize.py) ---
+    def record_scheme(self):
+        from .generalize import SchemeRecorder
+        return SchemeRecorder(self)
+
+    def instantiate(self, scheme: Any, use_node_id: int | None = None) -> Any:
+        from .generalize import instantiate
+        return instantiate(scheme, self, use_node_id)
 
     # --- Constraint emission API (scaffold) ---
     def add_unify(self, a: Any, b: Any, variance: str = "invariant") -> None:
@@ -311,7 +327,8 @@ class SimpleSubFacade:
         # Run frozen constraint checker for custom validations
         from .frozen_constraint_checker import check_constraints
 
-        self.errors, self.effect_info = check_constraints(self._constraints, self.function_types)
+        self.errors, self.effect_info = check_constraints(
+            self._constraints, self.function_types, self.aliases)
         self.errors = (list(self.errors) + self._detect_class_conflicts()
                        + list(self.advisories))
 
@@ -335,5 +352,7 @@ class SimpleSubFacade:
             # SimpleSub modifies CompactTypes in place (setting upper_bound/lower_bound)
             # This applies the solution to our types dict since CompactTypes are shared
             self._ss.solve_constraints()
+            if self.surface_solver_errors:
+                self.errors.extend(getattr(self._ss, "errors", []))
 
         return None

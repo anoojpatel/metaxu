@@ -831,6 +831,7 @@ class Parser:
                               | postfix_expression DOT IDENTIFIER
                               | postfix_expression DOT IDENTIFIER LPAREN argument_list_opt RPAREN
                               | postfix_expression DOUBLECOLON IDENTIFIER LPAREN argument_list_opt RPAREN
+                              | postfix_expression DOUBLECOLON IDENTIFIER
                               | postfix_expression LPAREN argument_list_opt RPAREN
                               | postfix_expression LBRACKET index_content RBRACKET
                               | postfix_expression LGENERIC type_list RGENERIC
@@ -856,7 +857,10 @@ class Parser:
                     p[0] = ast.MethodCall(base, p[3], args)
         elif p[2] == '::':
             base = p[1]
-            args = p[5] if p[5] else []
+            # Bare `Enum::Variant` (no parens) is the zero-argument form:
+            # payload-less variants construct and PATTERN-MATCH under
+            # their qualified name, same as `Enum::Variant()`.
+            args = (p[5] if p[5] else []) if len(p) == 7 else []
             if isinstance(base, ast.GenericInstance):
                 base = base.base
             parts = self._name_parts(base) or [str(base)]
@@ -1306,7 +1310,45 @@ class Parser:
 
     def p_match_expression(self, p):
         '''match_expression : MATCH expression LBRACE arm_list RBRACE'''
-        p[0] = ast.MatchExpression(p[2], p[4])
+        if any(len(arm) == 3 for arm in p[4]):
+            p[0] = self._desugar_guarded_match(p[2], p[4], p.lexpos(1))
+        else:
+            p[0] = ast.MatchExpression(p[2], p[4])
+
+    def _desugar_guarded_match(self, scrut, arms, pos):
+        """Match guards, desugared at parse time.
+
+        `p if g => b` becomes `p => if g { b } else { match s { <rest> } }`
+        with the remaining arms duplicated into the else.  The scrutinee
+        binds ONCE: when it isn't already a variable, the whole match is
+        wrapped in an immediately-called lambda taking the scrutinee, so
+        effects in it never run twice.  Guarded arms deliberately do not
+        count toward exhaustiveness (their inner rest-match must still
+        cover, or the checker rejects the program), which is exactly the
+        semantics guards need: a failing guard falls through."""
+        if isinstance(scrut, ast.Variable):
+            return self._guarded_arms_match(scrut.name, arms)
+        temp = f"__guard_scrut_at{pos}"
+        lam = self._make_lambda(
+            [ast.Parameter(temp)],
+            self._guarded_arms_match(temp, arms))
+        return self._make_call(lam, [scrut])
+
+    def _guarded_arms_match(self, scrut_name, arms):
+        cases = []
+        for i, arm in enumerate(arms):
+            if len(arm) == 3:
+                pat, guard, body = arm
+                rest = arms[i + 1:]
+                fallback = (self._guarded_arms_match(scrut_name, rest)
+                            if rest else
+                            ast.MatchExpression(
+                                ast.Variable(scrut_name), []))
+                cases.append((pat,
+                              ast.IfExpression(guard, body, fallback)))
+            else:
+                cases.append((arm[0], arm[1]))
+        return ast.MatchExpression(ast.Variable(scrut_name), cases)
 
     def p_arm_list(self, p):
         '''arm_list : arm
@@ -1324,8 +1366,14 @@ class Parser:
             p[0] = p[1] + [p[3]]
 
     def p_arm(self, p):
-        '''arm : expression arm_arrow arm_body'''
-        p[0] = (p[1], p[3])
+        '''arm : expression arm_arrow arm_body
+               | expression IF expression arm_arrow arm_body'''
+        if len(p) == 4:
+            p[0] = (p[1], p[3])
+        else:
+            # guarded arm: (pattern, guard, body); p_match_expression
+            # desugars these, p_handle_expression rejects them
+            p[0] = (p[1], p[3], p[5])
 
     def p_arm_arrow(self, p):
         '''arm_arrow : ARROW
@@ -1343,13 +1391,25 @@ class Parser:
         '''handle_expression : HANDLE expression WITH LBRACE arm_list RBRACE IN in_target
                              | HANDLE expression LBRACE arm_list RBRACE'''
         if len(p) == 9:
+            self._reject_guarded_arms(p[5])
             effect_name, type_args = self._effect_name_of(p[2])
             cases = [self._handle_case_of(pat, body) for pat, body in p[5]]
             handle = ast.HandleEffect(effect_name, cases, p[8])
             handle.type_args = type_args
             p[0] = handle
         else:
+            self._reject_guarded_arms(p[4])
             p[0] = ast.HandleBlock(p[2], p[4])
+
+    @staticmethod
+    def _reject_guarded_arms(arms):
+        """`pattern if cond =>` is a MATCH arm form; a handler arm names an
+        operation and its parameters, and has nothing to guard on."""
+        if any(len(arm) == 3 for arm in arms):
+            raise CompileError(
+                message="handler arms do not take guards (`op(x) if cond ->`); "
+                        "`pattern if cond =>` is a match arm form",
+                error_type="ParseError")
 
     def _handle_case_of(self, pattern, body):
         """Convert an arm pattern (parsed as a call expression) to a HandleCase."""

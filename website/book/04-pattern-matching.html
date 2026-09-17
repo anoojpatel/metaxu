@@ -1,0 +1,159 @@
+<title>Pattern matching · The Metaxu Book</title>
+<link rel="stylesheet" href="style.css">
+<header class="top">
+  <div class="inner">
+    <a class="brand" href="../index.html">Metaxu</a>
+    <nav class="topnav">
+      <a href="index.html">the book</a>
+      <a href="../roadmap.html">roadmap</a>
+      <a href="https://github.com/anoojpatel/metaxu">github &#8599;</a>
+    </nav>
+  </div>
+</header>
+<main>
+<h1>Pattern matching</h1>
+<p><code>match</code> takes a value apart. Each arm is a pattern, <code>=&gt;</code>, and an expression; the first pattern that fits chooses the arm, and whatever names the pattern binds are in scope on its right-hand side.</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">enum Command {
+    Move(dx: int, dy: int),
+    Say(text: string),
+    Quit
+}
+
+fn describe(c: Command) -&gt; string {
+    match c {
+        Move(dx, dy) =&gt; f&quot;move by {dx},{dy}&quot;,
+        Say(text) =&gt; &quot;say &quot; + text,
+        Quit =&gt; &quot;quit&quot;
+    }
+}
+
+fn main() -&gt; int {
+    print(describe(Move(3, -1)));
+    print(describe(Say(&quot;hello&quot;)));
+    print(describe(Quit));
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>move by 3,-1
+say hello
+quit</code></pre></div>
+<p>Arms are separated by commas. Variant patterns can also be qualified (<code>Command::Move(dx, dy)</code>) when the bare name is ambiguous or you just want the enum in view.</p>
+<h2>match is an expression</h2>
+<p>Like <code>if</code>/<code>else</code>, a <code>match</code> in value position produces the chosen arm&#x27;s value. This is the usual way to write a function that maps an enum to something:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">enum Coin { Penny, Nickel, Dime, Quarter }
+
+fn cents(c: Coin) -&gt; int {
+    match c {
+        Penny =&gt; 1,
+        Nickel =&gt; 5,
+        Dime =&gt; 10,
+        Quarter =&gt; 25
+    }
+}
+
+fn main() -&gt; int {
+    let pocket = cents(Quarter) + cents(Dime) + cents(Penny);
+    print(pocket);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>36</code></pre></div>
+<h2>Literals, binders, and the wildcard</h2>
+<p>A pattern can be a literal (matches that exact value), a bare name (a binder: matches anything and binds it), or <code>_</code> (matches anything, binds nothing). Arms are tried top to bottom, so specific cases go first:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">fn ordinal(n: int) -&gt; string {
+    match n {
+        1 =&gt; &quot;first&quot;,
+        2 =&gt; &quot;second&quot;,
+        3 =&gt; &quot;third&quot;,
+        other =&gt; other.to_string() + &quot;th&quot;
+    }
+}
+
+fn main() -&gt; int {
+    print(ordinal(1));
+    print(ordinal(3));
+    print(ordinal(9));
+    match 42 {
+        0 =&gt; print(&quot;zero&quot;),
+        _ =&gt; print(&quot;something else&quot;)
+    }
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>first
+third
+9th
+something else</code></pre></div>
+<p>There are no pattern guards (<code>Some(n) if n &gt; 2 =&gt;</code> doesn&#x27;t parse). Bind the value and put the <code>if</code> inside the arm instead.</p>
+<h2>Nested patterns</h2>
+<p>Patterns compose: a variant pattern&#x27;s arguments are themselves patterns, so one arm can reach arbitrarily deep. Tuples destructure the same way:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">fn depth_two(o: Option) -&gt; string {
+    match o {
+        Some(Some(n)) =&gt; f&quot;value {n}&quot;,
+        Some(None) =&gt; &quot;an empty inner&quot;,
+        None =&gt; &quot;nothing at all&quot;
+    }
+}
+
+fn main() -&gt; int {
+    print(depth_two(Some(Some(7))));
+    print(depth_two(Some(None)));
+    print(depth_two(None));
+    match (2, 5) {
+        (x, y) =&gt; print(x * y)
+    }
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>value 7
+an empty inner
+nothing at all
+10</code></pre></div>
+<h2>Exhaustiveness</h2>
+<p>A <code>match</code> must cover every shape its scrutinee can take, and the checker proves it at compile time. Miss a variant and the program doesn&#x27;t run; the diagnostic names what&#x27;s missing:</p>
+<div class="fence error"><span class="label">metaxu · rejected</span><pre><code class="mx">enum Color { Red, Green, Blue }
+
+fn main() -&gt; int {
+    let c = Red;
+    match c {
+        Red =&gt; print(&quot;red&quot;),
+        Green =&gt; print(&quot;green&quot;)
+    }
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>non-exhaustive match: missing variants Blue</code></pre></div>
+<p>The proof is per-variant and deliberately shallow. An arm covers its variant only when its subpatterns are irrefutable (binders or <code>_</code>), so <code>Some(1)</code> alone doesn&#x27;t cover <code>Some</code>:</p>
+<div class="fence error"><span class="label">metaxu · rejected</span><pre><code class="mx">fn pick(o: Option) -&gt; int {
+    match o {
+        Some(1) =&gt; 1,
+        None =&gt; 0
+    }
+}
+
+fn main() -&gt; int {
+    print(pick(Some(2)));
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>missing variants Some</code></pre></div>
+<p>Add <code>Some(n) =&gt; ...</code> after the literal arm and it compiles: the binder arm covers the variant, and the literal arm still wins for <code>1</code>. A final <code>_</code> or binder arm makes any match exhaustive, which is also the only way to match on ints or strings, since no list of literals can ever cover them.</p>
+<p><code>bool</code> counts as a two-variant enum here: match <code>true</code> without <code>false</code> and you get the same rejection.</p>
+<h2>if let and while let</h2>
+<p>When you only care about one shape, a full <code>match</code> is noise. <code>if let</code> runs its block when the pattern fits and binds its names there; <code>while let</code> repeats as long as the pattern keeps fitting:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">fn main() -&gt; int {
+    let found = Some(4);
+    if let Some(n) = found {
+        print(f&quot;got {n}&quot;);
+    }
+
+    let @mut countdown = Some(3);
+    while let Some(n) = countdown {
+        print(n);
+        countdown = if n &gt; 1 { Some(n - 1) } else { None };
+    }
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>got 4
+3
+2
+1</code></pre></div>
+<p>An else-less <code>if let</code> is a statement, unit-valued like any else-less <code>if</code>, so the block runs for its effects only.</p>
+<p>Patterns are how every Option-returning function in <code>std/</code> gets consumed, and <code>std/option.mx</code> wraps the recurring matches (<code>unwrap_or</code>, <code>map</code>, <code>is_some</code>) so you don&#x27;t write them twice. Chapter 9 tours those. Next, though: collections.</p>
+<nav class="pager"><a href="03-structs-and-enums.html">&#8592; Structs and enums</a><a href="05-vectors-and-collections.html">Vectors and collections &#8594;</a></nav>
+</main>
+<script src="book.js"></script>

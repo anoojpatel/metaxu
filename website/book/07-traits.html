@@ -1,0 +1,154 @@
+<title>Traits · The Metaxu Book</title>
+<link rel="stylesheet" href="style.css">
+<header class="top">
+  <div class="inner">
+    <a class="brand" href="../index.html">Metaxu</a>
+    <nav class="topnav">
+      <a href="index.html">the book</a>
+      <a href="../roadmap.html">roadmap</a>
+      <a href="https://github.com/anoojpatel/metaxu">github &#8599;</a>
+    </nav>
+  </div>
+</header>
+<main>
+<h1>Traits</h1>
+<p>A trait declares methods; an <code>implement</code> block provides them for one type. Calling a method picks the impl by the runtime type of the receiver, the same way the interpreter and the native backend both do it (they are pinned to agree).</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">trait Speak {
+    fn speak(self) -&gt; string
+}
+
+struct Dog { name: string }
+struct Cat { name: string }
+
+implement Speak for Dog {
+    fn speak(self) -&gt; string { self.name + &quot; says woof&quot; }
+}
+
+implement Speak for Cat {
+    fn speak(self) -&gt; string { self.name + &quot; says meow&quot; }
+}
+
+fn announce(animal) -&gt; string {
+    animal.speak()
+}
+
+fn main() -&gt; int {
+    print(announce(Dog { name: &quot;Rex&quot; }));
+    print(announce(Cat { name: &quot;Tom&quot; }));
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>Rex says woof
+Tom says meow</code></pre></div>
+<p><code>announce</code> doesn&#x27;t say what type it takes. It doesn&#x27;t have to: the <code>speak</code> call dispatches on what actually arrives. <code>self</code> is the receiver; methods can read its fields and take further arguments after it:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">trait Greet {
+    fn greet(self, other: string) -&gt; string
+}
+
+struct Dog { name: string }
+
+implement Greet for Dog {
+    fn greet(self, other: string) -&gt; string {
+        self.name + &quot; greets &quot; + other
+    }
+}
+
+fn main() -&gt; int {
+    print(Dog { name: &quot;Rex&quot; }.greet(&quot;Tom&quot;));
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>Rex greets Tom</code></pre></div>
+<h2>Inherent impls and static methods</h2>
+<p><code>implement Type { ... }</code> with no trait attaches methods directly. A method that neither declares nor uses <code>self</code> is static, called as <code>Type.method(...)</code>. The usual constructor idiom:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">struct Counter { count: int }
+
+implement Counter {
+    fn make(start: int) -&gt; Counter { Counter { count: start } }
+    fn value(self) -&gt; int { self.count }
+    fn bump(self) -&gt; Counter { Counter { count: self.count + 1 } }
+}
+
+fn main() -&gt; int {
+    let c = Counter.make(40);
+    print(c.bump().bump().value());
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>42</code></pre></div>
+<h2>Generic impls</h2>
+<p>An impl target can be a type application, with a <code>where</code> clause making the impl conditional. <code>Pair[T]</code> is showable when <code>T</code> is:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">struct Pair&lt;T&gt; { x: T, y: T }
+
+trait Show { fn show(self) -&gt; string }
+
+implement Show for Pair[T] where T: Show {
+    fn show(self) -&gt; string {
+        &quot;&lt;&quot; + self.x.show() + &quot;, &quot; + self.y.show() + &quot;&gt;&quot;
+    }
+}
+
+struct N { v: int }
+
+implement Show for N {
+    fn show(self) -&gt; string { self.v.to_string() }
+}
+
+fn main() -&gt; int {
+    let p = Pair&lt;N&gt; { x: N { v: 1 }, y: N { v: 2 } };
+    print(p.show());
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>&lt;1, 2&gt;</code></pre></div>
+<p>Where clauses over concrete types are enforced when impls load; conditional ones like the above are enforced per instantiation, at call sites the checker can resolve (chapter 6 shows the diagnostic).</p>
+<h2>Your impls beat the builtins</h2>
+<p>The runtime ships builtin methods with ordinary names: <code>to_string</code>, <code>len</code>, <code>push</code>, <code>sqrt</code>. Method dispatch resolves a user impl first, then the builtin, then a plain user function (UFCS). So implementing <code>to_string</code> for your type changes what your type prints as, without touching what ints do:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">trait Show { fn to_string(self) -&gt; string }
+
+struct Temp { celsius: int }
+
+implement Show for Temp {
+    fn to_string(self) -&gt; string { self.celsius.to_string() + &quot; deg C&quot; }
+}
+
+fn main() -&gt; int {
+    print(Temp { celsius: 21 }.to_string());
+    print((7).to_string());
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>21 deg C
+7</code></pre></div>
+<p>Plain call position has its own rule (<code>docs/name_precedence.md</code>): a user function beats a same-named builtin, while method position keeps meaning &quot;the receiver&#x27;s own operation&quot;. Both directions at once:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">fn len(x: int) -&gt; int { 99 }
+
+fn double(x: int) -&gt; int { x * 2 }
+
+fn main() -&gt; int {
+    print(len(5));          # plain call: your len wins
+    print(&quot;hello&quot;.len());   # method: still the string&#x27;s length
+    print(21.double());     # no impl or builtin named double: UFCS
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>99
+5
+42</code></pre></div>
+<p><code>std.test</code> uses the plain-call rule on purpose: importing its <code>assert_eq</code> upgrades every plain <code>assert_eq(...)</code> in your file from the aborting builtin to a tallying assertion.</p>
+<h2>When there is no impl</h2>
+<p>Method lookup that finds nothing is a runtime error, not a silent no-op, and the message names the receiver type and the impls that do exist. Like other builtin contract violations it can be caught (chapter 9):</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">trait Speak { fn speak(self) -&gt; string }
+
+struct Dog { name: string }
+struct Robot { id: int }
+
+implement Speak for Dog {
+    fn speak(self) -&gt; string { &quot;woof&quot; }
+}
+
+fn main() -&gt; int {
+    let r = try { Robot { id: 3 }.speak() } catch e { &quot;caught: &quot; + e };
+    print(r);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>caught: Trait method &#x27;speak&#x27; is not implemented for type &#x27;Robot&#x27; (implementations exist for: Dog)</code></pre></div>
+<h2>Coherence</h2>
+<p>One type gets one impl of a trait. A second <code>implement Speak for Dog</code>, or the same method twice in one block, is rejected while impls are being desugared, before anything type-checks or runs: the compiler raises a <code>CoherenceError</code> telling you the trait, the type, and that more than one implement block was found. Two types implementing the same trait, or one type implementing two traits that happen to share a method name, are both fine; dispatch keys on the (trait, type, method) triple, not on the name alone.</p>
+<nav class="pager"><a href="06-types-and-inference.html">&#8592; Types and inference</a><a href="08-effects.html">Effects &#8594;</a></nav>
+</main>
+<script src="book.js"></script>

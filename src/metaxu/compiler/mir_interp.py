@@ -104,6 +104,24 @@ def _tuple_field_arity(field_name: str) -> "int | None":
 # Runtime values
 # ---------------------------------------------------------------------------
 
+def mx_display(v):
+    """A value as the user-visible formatter receives it: booleans format
+    as their word (1/0) on BOTH engines. Native erases bools to i64, so
+    the interpreter formats the same way (print parity, codegen_llvm
+    module notes)."""
+    if v is True:
+        return 1
+    if v is False:
+        return 0
+    return v
+
+
+def mx_repr(v) -> str:
+    """repr for language values inside container reprs (Vec/struct/enum/
+    vector): same bool-as-word rule as mx_display."""
+    return repr(mx_display(v))
+
+
 class MxUnit:
     """Singleton unit value."""
     _instance: "MxUnit | None" = None
@@ -173,8 +191,8 @@ class MxStruct:
             # it must READ like a tuple: `(1, 2)`, not
             # `__tuple2 { _0of2=1, _1of2=2 }`.
             return "(" + ", ".join(
-                repr(self.fields[_tuple_field(i, n)]) for i in range(n)) + ")"
-        fields_str = ", ".join(f"{k}={v!r}" for k, v in self.fields.items())
+                mx_repr(self.fields[_tuple_field(i, n)]) for i in range(n)) + ")"
+        fields_str = ", ".join(f"{k}={mx_repr(v)}" for k, v in self.fields.items())
         return f"{self.name} {{ {fields_str} }}"
 
     @property
@@ -207,7 +225,7 @@ class MxVariant:
     def __repr__(self) -> str:
         if not self.fields:
             return f"{self.enum_name}::{self.tag}" if self.enum_name else self.tag
-        payload = ", ".join(repr(f) for f in self.fields)
+        payload = ", ".join(mx_repr(f) for f in self.fields)
         prefix = f"{self.enum_name}::" if self.enum_name else ""
         return f"{prefix}{self.tag}({payload})"
 
@@ -271,7 +289,7 @@ class MxVec:
         return isinstance(other, MxVec) and self.items == other.items
 
     def __repr__(self) -> str:
-        return f"Vec[{', '.join(repr(i) for i in self.items)}]"
+        return f"Vec[{', '.join(mx_repr(i) for i in self.items)}]"
 
 
 @dataclass(frozen=True)
@@ -290,7 +308,7 @@ class MxVector:
         return len(self.elements)
 
     def __repr__(self) -> str:
-        return f"vector[{', '.join(repr(e) for e in self.elements)}]"
+        return f"vector[{', '.join(mx_repr(e) for e in self.elements)}]"
 
 
 @dataclass(frozen=True)
@@ -1675,10 +1693,10 @@ class MirInterpreter:
     # ------------------------------------------------------------------
 
     def _register_builtins(self) -> None:
-        self._builtins["print"] = lambda *args: (print(*args), UNIT)[1]
-        self._builtins["println"] = lambda *args: (print(*args), UNIT)[1]
+        self._builtins["print"] = lambda *args: (print(*(mx_display(a) for a in args)), UNIT)[1]
+        self._builtins["println"] = lambda *args: (print(*(mx_display(a) for a in args)), UNIT)[1]
         self._builtins["assert_eq"] = _builtin_assert_eq
-        self._builtins["int_to_str"] = lambda x: str(x)
+        self._builtins["int_to_str"] = lambda x: str(mx_display(x))
         self._builtins["neg"] = lambda x: -x
         self._builtins["not"] = lambda x: not x
         # `~x`: bitwise complement on i64.  Python's `~` is already
@@ -1686,7 +1704,7 @@ class MirInterpreter:
         # equals the native `xor i64 %x, -1`.
         self._builtins["bnot"] = lambda x: _wrap_i64(~_bit_operand("~", x, "left"))
         # Builtin methods (receiver passed as first argument by HIR)
-        self._builtins["to_string"] = lambda x: "()" if x is UNIT else str(x)
+        self._builtins["to_string"] = lambda x: "()" if x is UNIT else str(mx_display(x))
         self._builtins["len"] = _builtin_len
         self._builtins["assert"] = _builtin_assert
         # --- Runtime library: Tile (docs/gpu_tiles.md Stage 0) --------------

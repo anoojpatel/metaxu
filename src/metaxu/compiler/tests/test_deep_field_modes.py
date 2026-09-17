@@ -207,3 +207,84 @@ fn main() {
 """
     with pytest.raises(BorrowCheckError, match="deep|@local field"):
         run_pipeline_from_source(src)
+
+
+# ---------------------------------------------------------------------------
+# Rule: a field declared @const cannot be assigned, through let bindings,
+# parameters, and nested paths alike (mut and plain fields stay writable)
+# ---------------------------------------------------------------------------
+
+def test_const_field_write_through_let_binding_rejected():
+    src = """
+struct P { @const name: string, age: int }
+
+fn main() -> int {
+    let mut p = P { name: "a", age: 1 };
+    p.name = "b";
+    0
+}
+"""
+    with pytest.raises(BorrowCheckError, match="cannot assign to @const field 'name' of P"):
+        run_pipeline_from_source(src)
+
+
+def test_const_field_write_through_parameter_rejected():
+    src = """
+struct P { @const name: string, age: int }
+
+fn rename(p: P) -> int {
+    p.name = "b";
+    0
+}
+
+fn main() -> int {
+    rename(P { name: "a", age: 1 })
+}
+"""
+    with pytest.raises(BorrowCheckError, match="cannot assign to @const field 'name' of P"):
+        run_pipeline_from_source(src)
+
+
+def test_const_field_write_through_nested_path_rejected():
+    src = """
+struct Inner { @const id: int, n: int }
+struct Outer { inner: Inner }
+
+fn main() -> int {
+    let mut o = Outer { inner: Inner { id: 1, n: 2 } };
+    o.inner.id = 9;
+    0
+}
+"""
+    with pytest.raises(BorrowCheckError, match="cannot assign to @const field 'id' of Inner"):
+        run_pipeline_from_source(src)
+
+
+def test_mut_and_plain_fields_stay_writable():
+    src = """
+struct P { @const name: string, @mut hits: int, age: int }
+
+fn main() -> int {
+    let mut p = P { name: "a", hits: 0, age: 1 };
+    p.hits = 5;
+    p.age = 2;
+    0
+}
+"""
+    run_pipeline_from_source(src)
+
+
+def test_const_check_follows_the_binding_not_the_name():
+    # P has a @const `name`; a Q-typed binding called `p` writes its own
+    # plain `name` freely (zero false positives from name collisions).
+    src = """
+struct P { @const name: string }
+struct Q { name: string }
+
+fn main() -> int {
+    let mut p = Q { name: "a" };
+    p.name = "b";
+    0
+}
+"""
+    run_pipeline_from_source(src)

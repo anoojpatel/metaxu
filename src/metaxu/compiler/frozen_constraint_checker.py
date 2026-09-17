@@ -14,7 +14,8 @@ class EffectInfo:
     suspends: set[Any] = field(default_factory=set)
 
 
-def check_constraints(constraints: Sequence[tuple], function_types: dict = None) -> tuple[list[str], EffectInfo]:
+def check_constraints(constraints: Sequence[tuple], function_types: dict = None,
+                      aliases: dict | None = None) -> tuple[list[str], EffectInfo]:
     errors: list[str] = []
     linearity_by_type: dict[Any, str] = {}
     call_counts: dict[Any, int] = {}
@@ -24,6 +25,15 @@ def check_constraints(constraints: Sequence[tuple], function_types: dict = None)
     effect_classes: dict[str, str] = {}  # effect_name -> "stack" | "suspend"
     if function_types is None:
         function_types = {}
+
+    def canon(ty: Any) -> Any:
+        # an instantiated copy of a generalized lambda stands for the
+        # original at runtime: count its calls and carry its effects
+        # against the original
+        key = getattr(ty, "id", None)
+        if aliases and key is not None and key in aliases:
+            return aliases[key]
+        return ty
 
     # Process all constraints
     for constraint in constraints:
@@ -56,6 +66,7 @@ def check_constraints(constraints: Sequence[tuple], function_types: dict = None)
             effect_classes[effect_name] = effect_class
         elif tag == "call":
             _, callee_ty, _arg_tys, result_ty, node_id = constraint
+            callee_ty = canon(callee_ty)
             call_counts[callee_ty] = call_counts.get(callee_ty, 0) + 1
             if linearity_by_type.get(callee_ty) == "once" and call_counts[callee_ty] > 1:
                 errors.append(f"Once callable invoked more than once at node {node_id}")

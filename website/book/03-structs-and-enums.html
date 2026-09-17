@@ -1,0 +1,185 @@
+<title>Structs and enums · The Metaxu Book</title>
+<link rel="stylesheet" href="style.css">
+<header class="top">
+  <div class="inner">
+    <a class="brand" href="../index.html">Metaxu</a>
+    <nav class="topnav">
+      <a href="index.html">the book</a>
+      <a href="../roadmap.html">roadmap</a>
+      <a href="https://github.com/anoojpatel/metaxu">github &#8599;</a>
+    </nav>
+  </div>
+</header>
+<main>
+<h1>Structs and enums</h1>
+<p>Metaxu has two ways to build a type: a struct holds all of its fields at once, an enum holds exactly one of its variants at a time. Between them and <code>match</code> (next chapter) you can model most data without ever reaching for a null.</p>
+<h2>Structs</h2>
+<p>A struct declares named, typed fields. Construction spells out every field; access is <code>value.field</code>:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">struct Point {
+    x: int,
+    y: int
+}
+
+fn manhattan(p: Point) -&gt; int {
+    let ax = if p.x &lt; 0 { 0 - p.x } else { p.x };
+    let ay = if p.y &lt; 0 { 0 - p.y } else { p.y };
+    ax + ay
+}
+
+fn main() -&gt; int {
+    let p = Point { x: 3, y: -4 };
+    print(p.x);
+    print(manhattan(p));
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>3
+7</code></pre></div>
+<p>Field order in the literal doesn&#x27;t matter; leaving a field out or giving it the wrong type does. The checker names the field:</p>
+<div class="fence error"><span class="label">metaxu · rejected</span><pre><code class="mx">struct Point { x: int, y: int }
+
+fn main() -&gt; int {
+    let p = Point { x: &quot;three&quot;, y: 4 };
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>type mismatch for field &#x27;x&#x27; of Point</code></pre></div>
+<h2>Mutating fields</h2>
+<p>Bind with <code>@mut</code> and assign through the name. Structs nest, and a field access chain reads or writes at any depth:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">struct Point { x: int, y: int }
+
+struct Segment {
+    head: Point,
+    tail: Point
+}
+
+fn main() -&gt; int {
+    let @mut s = Segment {
+        head: Point { x: 0, y: 0 },
+        tail: Point { x: 5, y: 5 }
+    };
+    s.tail.x = 10;
+    print(s.tail.x);
+    print(s.head.y);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>10
+0</code></pre></div>
+<h2>Field modes</h2>
+<p>A field can carry its own mode annotation, the same <code>@</code>-words that appear on bindings and parameters:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">struct Account {
+    @const id: int,
+    @mut balance: int
+}
+
+fn deposit(acct: @mut Account, amount: int) {
+    acct.balance = acct.balance + amount;
+}
+
+fn main() -&gt; int {
+    let @mut a = Account { id: 7, balance: 100 };
+    deposit(a, 50);
+    print(a.balance);
+    print(a.id);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>150
+7</code></pre></div>
+<p><code>@const</code> marks a field callers shouldn&#x27;t write, <code>@mut</code> one they may, and <code>@local</code> pins a field to the stack, which is what stops a heap-bound (<code>@global</code>) value from smuggling stack references out of their scope. The rules that enforce all this, including checking locality through nested fields, are chapter 10&#x27;s subject; for now it&#x27;s enough that the annotations live in the type, so every function that touches an <code>Account</code> sees the same contract.</p>
+<h2>Generic structs</h2>
+<p>Type parameters go in angle brackets. You rarely write them at the construction site; the field values pin them down:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">struct Pair&lt;T&gt; {
+    first: T,
+    second: T
+}
+
+fn main() -&gt; int {
+    let words = Pair { first: &quot;fore&quot;, second: &quot;aft&quot; };
+    let nums = Pair { first: 1, second: 2 };
+    print(words.first + words.second);
+    print(nums.first + nums.second);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>foreaft
+3</code></pre></div>
+<p>Each use instantiates its own <code>Pair</code>: <code>Pair&lt;string&gt;</code> and <code>Pair&lt;int&gt;</code> are unrelated types, and mixing them up is a compile error.</p>
+<h2>Tuples</h2>
+<p>When the pair doesn&#x27;t deserve a name, a tuple is a struct without one. Destructure it with <code>let</code> or match on it:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">fn divmod(a: int, b: int) -&gt; (int, int) {
+    (a / b, a % b)
+}
+
+fn main() -&gt; int {
+    let (q, r) = divmod(17, 5);
+    print(q);
+    print(r);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>3
+2</code></pre></div>
+<h2>Enums</h2>
+<p>An enum lists its variants. A variant can carry a payload of named, typed fields, or nothing. You construct one by calling the variant like a function (bare, or qualified as <code>Shape::Circle</code> when you want the enum name in view), and take it apart with <code>match</code>:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">enum Shape {
+    Circle(radius: int),
+    Rect(w: int, h: int),
+    Empty
+}
+
+fn area(s: Shape) -&gt; int {
+    match s {
+        Circle(r) =&gt; 3 * r * r,
+        Rect(w, h) =&gt; w * h,
+        Empty =&gt; 0
+    }
+}
+
+fn main() -&gt; int {
+    print(area(Shape::Circle(2)));
+    print(area(Rect(3, 4)));
+    print(area(Empty));
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>12
+12
+0</code></pre></div>
+<p>The payload is only reachable through a pattern. There&#x27;s no <code>s.radius</code>: a <code>Shape</code> might be a <code>Rect</code>, and the checker won&#x27;t let you assume otherwise.</p>
+<h2>Enums that carry other enums</h2>
+<p>Variants nest, and enums take type parameters just like structs. Both at once gives you recursive data:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">enum Tree&lt;T&gt; {
+    Leaf(value: T),
+    Node(left: Tree&lt;T&gt;, right: Tree&lt;T&gt;)
+}
+
+fn total(t: Tree&lt;int&gt;) -&gt; int {
+    match t {
+        Leaf(v) =&gt; v,
+        Node(l, r) =&gt; total(l) + total(r)
+    }
+}
+
+fn main() -&gt; int {
+    let t = Node(Leaf(1), Node(Leaf(2), Leaf(3)));
+    print(total(t));
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>6</code></pre></div>
+<h2>Option</h2>
+<p>The one-of-two-shapes pattern you&#x27;ll write most is &quot;a value, or nothing&quot;, so Metaxu builds it in: <code>Option</code> with variants <code>Some(x)</code> and <code>None</code>. It&#x27;s an ordinary enum, just predeclared; you could define your own in three lines, and everything in <code>std/option.mx</code> is written against it with plain <code>match</code>:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">fn find_first_even(a: int, b: int, c: int) -&gt; Option {
+    if a % 2 == 0 { return Some(a); }
+    if b % 2 == 0 { return Some(b); }
+    if c % 2 == 0 { return Some(c); }
+    None
+}
+
+fn main() -&gt; int {
+    match find_first_even(3, 5, 8) {
+        Some(n) =&gt; print(f&quot;found {n}&quot;),
+        None =&gt; print(&quot;none even&quot;)
+    }
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>found 8</code></pre></div>
+<p><code>Result</code> (variants <code>Ok</code>/<code>Err</code>) is predeclared the same way; chapter 9 covers both properly, along with <code>std.option</code> and <code>std.result</code>.</p>
+<p>Next: everything <code>match</code> can do.</p>
+<nav class="pager"><a href="02-functions-and-values.html">&#8592; Functions and values</a><a href="04-pattern-matching.html">Pattern matching &#8594;</a></nav>
+</main>
+<script src="book.js"></script>

@@ -1,0 +1,95 @@
+<title>Modes and memory · The Metaxu Book</title>
+<link rel="stylesheet" href="style.css">
+<header class="top">
+  <div class="inner">
+    <a class="brand" href="../index.html">Metaxu</a>
+    <nav class="topnav">
+      <a href="index.html">the book</a>
+      <a href="../roadmap.html">roadmap</a>
+      <a href="https://github.com/anoojpatel/metaxu">github &#8599;</a>
+    </nav>
+  </div>
+</header>
+<main>
+<h1>Modes and memory</h1>
+<p>Metaxu has no lifetimes and no garbage collector. Memory safety comes from modes: a small set of properties the checker attaches to bindings and propagates through your program. You annotate a mode when you want a guarantee; unannotated code gets permissive defaults and stays ordinary. The design follows Jane Street&#x27;s OxCaml work on modal types more than it follows Rust.</p>
+<p>Three axes, one idea each:</p>
+<ul>
+<li>locality: does this value stay inside its region (<code>@local</code>) or may it outlive it (<code>@global</code>)?</li>
+<li>mutability: is this access mutable (<code>@mut</code>) or read-only (<code>@const</code>)?</li>
+<li>linearity: how many times may this value be consumed (<code>once</code>, <code>separate</code>, <code>many</code>)?</li>
+</ul>
+<p>The axes are independent. A value can be local and mutable, global and const, any combination.</p>
+<h2>Locality</h2>
+<p>A <code>@local</code> binding belongs to the region (roughly, the function frame) that created it. The checker rejects any path that would let it escape. Returning one is the simplest escape:</p>
+<div class="fence error"><span class="label">metaxu · rejected</span><pre><code class="mx">fn leak() -&gt; int {
+    let @local x = 1;
+    x
+}
+
+fn main() -&gt; int {
+    print(leak());
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>Local variable &#x27;x&#x27; cannot escape its region</code></pre></div>
+<p>The native backend uses the same information for allocation: locals live on the stack, <code>@global</code> values get heap storage. The rule and the representation are one decision.</p>
+<p>When you do want a local value to cross outward, say so. <code>exclave e</code> evaluates <code>e</code> and hands a copy to the enclosing region. The escape is in the source, not smuggled through an alias:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">fn give() -&gt; int {
+    let @local x = 41;
+    exclave x + 1
+}
+
+fn main() -&gt; int {
+    print(give());
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>42</code></pre></div>
+<p>Unannotated bindings default to <code>@global</code> behavior and return freely. Annotating <code>@local</code> is a promise you&#x27;re asking the checker to hold you to, and stack allocation is what the promise buys.</p>
+<h2>Mutability and borrows</h2>
+<p><code>let</code> binds a name; <code>let mut</code> makes the name rebindable. The <code>@mut</code> mode is about the value: an exclusive claim on mutating it. Taking two exclusive borrows of one value is the classic aliasing bug, and the checker stops it:</p>
+<div class="fence error"><span class="label">metaxu · rejected</span><pre><code class="mx">fn main() -&gt; int {
+    let @mut x = 5;
+    let @mut r1 = @mut x;
+    let @mut r2 = @mut x;
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>Cannot borrow x as exclusive while borrowed</code></pre></div>
+<p>Shared reads don&#x27;t conflict with each other; an exclusive borrow conflicts with everything, including a live shared borrow. Struct fields carry modes too (<code>@mut value: int</code>, <code>@const name: string</code>, <code>@local temp: int</code> in a declaration), and the deep rules propagate locality through fields: a <code>@global</code> struct can&#x27;t hold a reference to <code>@local</code> data. The checker walks the whole shape, not just the top binding. A field declared <code>@const</code> rejects assignment, through let bindings, parameters, and nested paths alike:</p>
+<div class="fence error"><span class="label">metaxu · rejected</span><pre><code class="mx">struct P { @const name: string, @mut n: int }
+
+fn main() -&gt; int {
+    let @mut p = P { name: &quot;a&quot;, n: 1 };
+    p.name = &quot;b&quot;;
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>cannot assign to @const field &#x27;name&#x27; of P</code></pre></div>
+<p>The same discipline applies to plain bindings: <code>let</code> without <code>mut</code> is immutable, and so are parameters and module constants (chapter 2 pins the error).</p>
+<h2>Linearity</h2>
+<p>The third axis bounds consumption. <code>once</code> values must be consumed exactly once (a file handle, a continuation). <code>many</code> values can be used freely. Between them, <code>separate</code> is the interesting one: a value with no shared mutable identity, safe to hand to another thread.</p>
+<p>You rarely write these. Linearity mostly surfaces through inference, and the place you&#x27;ll meet it is threads.</p>
+<h2>Thread-safety is inferred</h2>
+<p>Metaxu never asks you to declare Send or Sync. Instead the checker looks at what a spawned closure captures. A <code>Vec</code> has identity semantics: two handles to it alias one buffer, so letting a second thread write through a captured handle is a race, and the checker names it:</p>
+<div class="fence error"><span class="label">metaxu · rejected</span><pre><code class="mx">extern type Thread[T];
+
+effect Thread = {
+    fn spawn[T](f: fn() -&gt; @global T) -&gt; @global Thread[T] with EFFECT_SPAWN
+    fn join[T](thread: @global Thread[T]) -&gt; @global T with EFFECT_JOIN
+}
+
+fn main() -&gt; int {
+    let @mut shared = Vec.new();
+    shared.push(1);
+    let t = perform Thread.spawn(|| {
+        shared.push(2);
+        0
+    });
+    perform Thread.join(t);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>captures AND WRITES &#x27;shared&#x27;, which has shared mutable identity</code></pre></div>
+<p>Read the message closely, because it states the model: reads are free. Crossing a value into another thread weakens access, it does not revoke it. Writes are what need a permission, and the sanctioned way to get one is <code>std.sync.protect</code>, which pairs the value with its own mutex so every write goes through a lock. Chapter 11 shows that in full, along with what happens if you take the <code>unsafe</code> route instead: the value is marked contended at spawn, and an unpermitted write raises the same error, with the same wording, in the interpreter and in native code.</p>
+<h2>What there isn&#x27;t</h2>
+<p>No lifetime parameters. No borrow-checker annotations on every function signature. No <code>Rc</code>/<code>RefCell</code> escape hatches, because the default mode already is shared-and-permissive; you opt into strictness where you want the machine to hold a line. The cost of this design is that some guarantees are dynamic where Rust&#x27;s are static. The contended-write check is the honest example: caught statically where provable, dynamically otherwise, one error either way.</p>
+<nav class="pager"><a href="09-errors.html">&#8592; Errors</a><a href="11-threads-and-sharing.html">Threads and sharing &#8594;</a></nav>
+</main>
+<script src="book.js"></script>

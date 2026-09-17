@@ -141,6 +141,11 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
     # var name -> struct type name. Used for deep ownership checks on later
     # field assignments (global containers cannot store locals).
     global_struct_bindings: dict[str, str] = {}
+    # Any-locality struct typing of bindings: var name -> struct type name,
+    # recorded from `let x = S { ... }` initializers and from parameters
+    # declared with a struct type. Drives @const field-write rejection; a
+    # name not present here is simply unchecked (zero false positives).
+    struct_type_bindings: dict[str, str] = {}
 
     def bind(name: Any, ty: Any) -> None:
         if isinstance(name, str):
@@ -1177,10 +1182,12 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
     # or overwrote, restored at scope exit (a shadow in an inner block must
     # not disable gating of the outer @global container afterwards).
     gsb_saves: list[dict[str, str | None]] = []
+    stb_saves: list[dict[str, str | None]] = []  # same, for struct_type_bindings
 
     def push_scope() -> None:
         scopes.append({})
         gsb_saves.append({})
+        stb_saves.append({})
         borrow_checker.enter_scope()
 
     def pop_scope() -> None:
@@ -1191,6 +1198,11 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
                 global_struct_bindings.pop(name, None)
             else:
                 global_struct_bindings[name] = prev
+        for name, prev in (stb_saves.pop() if stb_saves else {}).items():
+            if prev is None:
+                struct_type_bindings.pop(name, None)
+            else:
+                struct_type_bindings[name] = prev
 
     def walk(node: Any) -> None:
         node_ty = types.get(node.node_id)
@@ -1355,11 +1367,15 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
             # @global-container gating is per-function: bindings recorded in
             # one function must not poison same-named locals in another.
             saved_global_bindings = dict(global_struct_bindings)
+            saved_struct_typing = dict(struct_type_bindings)
             enclosing_performs.append(frozenset(str(e) for e in performs))
             borrow_checker.enter_region()
             function_region_stack.append(borrow_checker.current_region())
 
-            for name, child in zip(params, param_children):
+            # Parameter frozen payloads carry no type; the function payload's
+            # aligned "param_types" list is the source for struct typing.
+            _declared_ptypes = list(payload_dict(node).get("param_types") or [])
+            for _pidx, (name, child) in enumerate(zip(params, param_children)):
                 child_ty = types.get(child.node_id)
                 if child_ty is not None:
                     bind(name, child_ty)
@@ -1373,6 +1389,13 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
                     uniqueness, locality, _linearity = _split_mode(param_payload)
                     if isinstance(name, str):
                         borrow_checker.declare_variable(name, uniqueness, locality, child.node_id)
+                        _pt = (_declared_ptypes[_pidx]
+                               if _pidx < len(_declared_ptypes) else None)
+                        if isinstance(_pt, str) and _pt in struct_defs:
+                            if stb_saves:
+                                stb_saves[-1].setdefault(
+                                    name, struct_type_bindings.get(name))
+                            struct_type_bindings[name] = _pt
 
             # Push the return type (not the function type) for return statements
             # Must do this BEFORE walking the body
@@ -1422,6 +1445,8 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
             borrow_checker.exit_function_state(fn_state)
             global_struct_bindings.clear()
             global_struct_bindings.update(saved_global_bindings)
+            struct_type_bindings.clear()
+            struct_type_bindings.update(saved_struct_typing)
             enclosing_performs.pop()
             return None
         if kind == "LambdaExpression" and node_ty is not None:
@@ -1433,7 +1458,8 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
             params = value.get("params", [])
             param_children = param_nodes(children)
             param_tys: list[Any] = []
-            for name, child in zip(params, param_children):
+            _declared_ptypes = list(payload_dict(node).get("param_types") or [])
+            for _pidx, (name, child) in enumerate(zip(params, param_children)):
                 child_ty = types.get(child.node_id)
                 if child_ty is not None:
                     bind(name, child_ty)
@@ -1447,6 +1473,13 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
                     uniqueness, locality, _linearity = _split_mode(param_payload)
                     if isinstance(name, str):
                         borrow_checker.declare_variable(name, uniqueness, locality, child.node_id)
+                        _pt = (_declared_ptypes[_pidx]
+                               if _pidx < len(_declared_ptypes) else None)
+                        if isinstance(_pt, str) and _pt in struct_defs:
+                            if stb_saves:
+                                stb_saves[-1].setdefault(
+                                    name, struct_type_bindings.get(name))
+                            struct_type_bindings[name] = _pt
             linearity = value.get("linearity") or "many"
             captures = value.get("captures", {}) or {}
             for captured_name, mode in captures.items():
@@ -1517,6 +1550,16 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
                     gsb_saves[-1].setdefault(
                         var_name, global_struct_bindings.get(var_name))
                 global_struct_bindings.pop(var_name, None)
+                # Same shadow discipline for struct typing (any locality).
+                if stb_saves:
+                    stb_saves[-1].setdefault(
+                        var_name, struct_type_bindings.get(var_name))
+                struct_type_bindings.pop(var_name, None)
+                for child in children:
+                    if child.kind == "StructInstantiation":
+                        _sname = payload_name(child)
+                        if isinstance(_sname, str):
+                            struct_type_bindings[var_name] = _sname
                 # Deep ownership: an *explicitly* @global struct binding must
                 # not (transitively) contain @local fields nor store @local
                 # values in its initializer. Structs default to local
@@ -1701,6 +1744,31 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
             # locals). Dotted targets arrive stringified, e.g. "g.field".
             if isinstance(target_name, str) and "." in target_name:
                 base_name, _dot, field_path = target_name.partition(".")
+                # @const field writes: walk the dotted path through the
+                # declared struct types; the first @const segment is an
+                # error. Unknown bindings/fields are left alone.
+                _cur = struct_type_bindings.get(base_name)
+                for _seg in field_path.split("."):
+                    if _cur is None:
+                        break
+                    _fields = {
+                        f.get("name"): f
+                        for f in (struct_defs.get(_cur, {}).get("fields", []) or [])
+                        if isinstance(f, dict)}
+                    _f = _fields.get(_seg)
+                    if _f is None:
+                        break
+                    if "const" in (_f.get("mode") or []):
+                        borrow_checker.errors.append(BorrowError(
+                            message=(f"cannot assign to @const field '{_seg}' "
+                                     f"of {_cur} (binding '{base_name}')"),
+                            node_id=node.node_id,
+                            kind="const-field-write",
+                            variable=base_name,
+                        ))
+                        break
+                    _ft = _f.get("type")
+                    _cur = _ft if isinstance(_ft, str) and _ft in struct_defs else None
                 container_struct = global_struct_bindings.get(base_name)
                 if container_struct is not None:
                     for child in children:
@@ -1719,6 +1787,24 @@ def emit_constraints(frozen_root: Any, types: Dict[int, Any], simplesub: Any) ->
                                 kind="deep-locality",
                                 variable=value_name,
                             ))
+            if (isinstance(target_name, str) and "." not in target_name
+                    and not target_name.startswith("__")):
+                # Rebinding discipline: assignment needs a binding declared
+                # mutable (`let mut x` / `let @mut x` / a mut-mode param).
+                # Compiler-generated names (__ prefix) and names the
+                # checker never saw (captures resolved elsewhere) are left
+                # alone: never a false positive on generated lowerings.
+                _info = borrow_checker.variables.get(target_name)
+                if _info is not None and _info.mode == "shared":
+                    borrow_checker.errors.append(BorrowError(
+                        message=(
+                            f"cannot assign twice to immutable binding "
+                            f"'{target_name}'; declare it mutable "
+                            f"(`let mut {target_name} = ...`)"),
+                        node_id=node.node_id,
+                        kind="immutable-rebind",
+                        variable=target_name,
+                    ))
             binding_ty = lookup(target_name)
             # An assignment is a STATEMENT: its own type is Unit, NOT the
             # type of the variable it writes.  Unifying node_ty with
