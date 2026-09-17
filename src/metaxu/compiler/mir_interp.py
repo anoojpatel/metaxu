@@ -2258,8 +2258,20 @@ class MirInterpreter:
                 f"Metal.launch: expected a closure, got "
                 f"{_runtime_type_name(f)!r}")
         kfunc, vecs = self._introspect_launch_closure(f)
+        # Lowering choice (docs/simdgroup_plan.md): by default a kernel
+        # with an 8x8 f32/f16 dot takes the per-simdgroup lowering (the
+        # matrix units); METAXU_METAL_LOWERING=thread forces the
+        # per-thread one (bit-exact device results for such kernels),
+        # =simdgroup forces the other.
+        import os
+        lowering = os.environ.get("METAXU_METAL_LOWERING", "auto")
+        choice = {"auto": None, "thread": False, "simdgroup": True}
+        if lowering not in choice:
+            raise InterpError(
+                f"Metal.launch: METAXU_METAL_LOWERING={lowering!r} is not "
+                "one of auto, thread, simdgroup")
         try:
-            kern = _emit(kfunc)
+            kern = _emit(kfunc, simdgroup=choice[lowering])
         except MslError as e:
             raise InterpError(
                 f"Metal.launch: kernel {kfunc.name!r} is outside the MSL "

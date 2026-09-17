@@ -34,6 +34,10 @@ def main() -> int:
                     help="one per kernel buffer parameter, in order")
     ap.add_argument("-o", "--out", default=None,
                     help="harness path (default: harness_<kernel>.py)")
+    ap.add_argument("--lowering", choices=["auto", "thread", "simdgroup"],
+                    default="auto",
+                    help="auto (default): per-simdgroup when the kernel has "
+                         "an 8x8 f32/f16 dot, else per-thread; or force one")
     args = ap.parse_args()
 
     from metaxu.compiler.emit_msl import MslError, emit_msl_kernel
@@ -58,8 +62,10 @@ def main() -> int:
         name, _, csv = spec.partition("=")
         buffers[name] = [num(x) for x in csv.split(",") if x != ""]
 
+    choice = {"auto": None, "thread": False, "simdgroup": True}
     try:
-        kern = emit_msl_kernel(source, args.kernel)
+        kern = emit_msl_kernel(source, args.kernel,
+                               simdgroup=choice[args.lowering])
     except MslError as e:
         print(f"kernel not emittable: {e}", file=sys.stderr)
         return 1
@@ -99,7 +105,10 @@ def main() -> int:
     out_path = Path(args.out or f"harness_{args.kernel}.py")
     out_path.write_text(kern.mlx_harness(args.grid, buffers, expected))
     print(f"wrote {out_path}")
-    print(f"  kernel:  {kern.name}  (grid {args.grid})")
+    gx, tg = kern.grid(args.grid)
+    print(f"  kernel:  {kern.name}  (grid {args.grid}; "
+          f"{'per-simdgroup' if kern.simdgroup else 'per-thread'} lowering: "
+          f"{gx} threads, threadgroup {tg})")
     print(f"  buffers: {', '.join(kern.in_bufs)}  "
           f"(written: {', '.join(kern.out_bufs) or 'none'})")
     for b in kern.out_bufs:

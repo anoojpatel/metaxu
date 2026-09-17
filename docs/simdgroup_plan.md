@@ -178,3 +178,50 @@ Smallest honest first increment, in two steps:
    everything else still replicated. Device leg tolerance-compared as
    today; shim and interpreter untouched and still bit-exact with
    each other. Measure; expand op coverage only where the win shows.
+
+## Status: Option A, both increments, landed
+
+`emit_msl.py` has the second lowering. It is chosen automatically when
+a kernel contains an 8x8 f32 or f16 `Tile.dot`; `emit_msl_kernel(...,
+simdgroup=...)` and `METAXU_METAL_LOWERING=thread|simdgroup|auto` (read
+by the `run_metal` handler) force either way. What the per-simdgroup
+body does, exactly:
+
+* `pid` is `thread_position_in_grid.x / 32`, the simdgroup index; the
+  lane id is kept only for guards. Dispatch is `grid = 32 * n`,
+  `threadgroup = 32` (`MslKernel.grid`), in the mlx engine and the
+  generated Mac harness alike.
+* Scalars stay per-thread and replicated: every lane computes them
+  identically, `Tile.sum` reduces the published tile on every lane, so
+  the switch-machine's control flow is uniform and every lane reaches
+  every collective and every barrier.
+* Tiles are `threadgroup` arrays. Lane 0 does the elementwise work
+  (fills, loads, add/mul/scale, conversions, transposes, copies) and a
+  `threadgroup_barrier(mem_threadgroup)` publishes each written tile;
+  device stores are lane 0's too. Lanes 1 to 31 are idle for those ops
+  in this first increment; distributing them is the next step and
+  needs a shim that emulates lanes, which is why it was not folded in.
+* An eligible dot is the collective: `simdgroup_load` of both operands
+  from the threadgroup tiles, `simdgroup_multiply_accumulate` into a
+  zero-filled `simdgroup_float8x8` / `simdgroup_half8x8`,
+  `simdgroup_store` back to the result tile, then a barrier. Dots of
+  other shapes, and all int dots, keep the lane-0 loop.
+* The C++ shim compiles the same body: `threadgroup` is defined away,
+  `namespace metal` carries `mem_flags`, a no-op barrier, the 8x8
+  matrix type and the three collectives, emulated with the
+  interpreter's pinned order (round the product, then the accumulate).
+  The shim runs lane 0 of each instance, which in this lowering is all
+  the non-collective work. Interpreter and shim remain the bit-exact
+  pair; the mlx leg keeps its float tolerance, which is where the
+  device's fused multiply-accumulate lands.
+
+Pinned in `test_msl_emitter.py` (16x16 f32 and f16 matmuls through
+two 8x8 k-blocks, against the interpreter and against an independent
+Python ground truth; the whole kernel corpus forced through the new
+lowering; body and harness structure) and `test_metal_launch.py`
+(handler parity under the default, and under both overrides).
+
+Not done: lane-distributed elementwise loops, several simdgroups per
+threadgroup, threadgroup-memory tiling across instances (that is
+Option B territory), and measurement on a Mac, which the generated
+harness is for.

@@ -239,6 +239,13 @@ per-lane register budget, swizzle bank-conflict freedom.
   `simdgroup_matrix` dot, threadgroup-memory tiling, software
   pipelining where it pays on Apple.  Execution-model mapping (how
   per-pid instances meet simdgroups): `docs/simdgroup_plan.md`.
+  * **Landed (2a):** the per-simdgroup lowering in `emit_msl.py`: one
+    instance is one 32-lane simdgroup, tiles live in threadgroup
+    memory, and an 8x8 f32/f16 `Tile.dot` is `simdgroup_load` /
+    `simdgroup_multiply_accumulate` / `simdgroup_store`.  Chosen
+    automatically for kernels with such a dot; kernels and `std/gpu.mx`
+    unchanged; the shim emulates the collectives and stays bit-exact
+    (status section of `docs/simdgroup_plan.md`).
 - **Stage 3 — expert surface:** Gluon-style explicit layout
   annotations, the autotuner (the benchmark harness's paired-run
   methodology as a per-kernel search with a shape-keyed cache),

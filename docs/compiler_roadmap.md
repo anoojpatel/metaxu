@@ -65,8 +65,8 @@ This document tracks high-level goals, status, and pointers across the new Pytho
     subset; declaration-only placeholders elsewhere; structural validator
   - Type enforcement: TypeCheckError for struct-field literal mismatches
     and constraint-graph class conflicts (1 + "a", non-bool conditions)
-  - Example gates: 19/19 pipeline (2 negative fixtures rejected),
-    15/19 executing, pinned in pytest with golden outputs
+  - Example gates: 21/21 pipeline (2 negative fixtures rejected),
+    21/21 executing, pinned in pytest with golden outputs
 
 - Completed since (verification round)
   - Coherence checks: duplicate implement blocks for the same
@@ -254,10 +254,20 @@ shipped. Current queue, in rough priority order:)
 - **Incremental module compilation (§9)**: step 1 is per-module codegen
   units + signature hashing. Gated on the language rule that exported
   functions require type annotations (owner decision).
-- **Backend consumption of principal types**: the biunification engine
-  produces them (simplesub.py); the constraint emitter needs per-call-site
-  instantiation (it currently shares one type per function) and a
-  CompactType encoding for ∨/∧ before kinds can be seeded from types.
+- **Type inference, plan parts 3 and 4** (`docs/type_inference_plan.md`):
+  parts 1 and 2 landed (call edges folded into conflict detection,
+  declared function types in the graph, let-bound lambdas generalized
+  by constraint replay). Left: conflict diagnostics that locate both
+  requirements, and promoting the biunifier, which first needs the
+  statement-flow edges sharpened so it can stop reading the flat
+  solver's union-find pointers.
+- **Packages**: `mxpkg` and the resolver hook landed
+  (`docs/packages.md`); the `[replace]` table and anything registry-
+  shaped are open decisions.
+- **GPU Stage 2**: the per-simdgroup lowering with 8x8 matrix-unit
+  dots landed (`docs/simdgroup_plan.md`, status section). Next in the
+  public roadmap's order: lane-distributed elementwise work, half
+  device buffers, the `gpu` effect class, inferred layouts.
 - **Native coverage chase**: next measured root is `run_program`'s own
   return kinds in examples/app (see gap analysis § "What actually blocks
   native coverage").

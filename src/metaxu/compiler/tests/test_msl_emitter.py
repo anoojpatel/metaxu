@@ -563,3 +563,194 @@ def test_emit_metal_harness_script(tmp_path):
     p = subprocess.run([sys.executable, str(out)],
                        capture_output=True, text=True)
     assert p.returncode in (0, 2), p.stderr
+
+
+# ---------------------------------------------------------------------------
+# Per-simdgroup lowering (docs/simdgroup_plan.md, Option A): one instance is
+# one 32-lane simdgroup and 8x8 f32/f16 dots take the matrix units.  The
+# shim emulates the collectives in the pinned rounding order, so it stays
+# the bit-exact leg; the device leg keeps its float tolerance.
+# ---------------------------------------------------------------------------
+
+_FMM8 = """
+fn fmm8_kernel(pid: int, a: Vec, b: Vec, c: Vec) -> () {
+    let ti = pid / 2;
+    let tj = pid % 2;
+    let mut k = 0;
+    let mut r = Tile.to_f32(Tile.filled(8, 8, 0));
+    while k < 2 {
+        let ta = Tile.to_f32(
+            Tile.load_rows(a, (ti * 8) * 16 + k * 8, 16, 8, 8, 0.0));
+        let tb = Tile.to_f32(
+            Tile.load_rows(b, (k * 8) * 16 + tj * 8, 16, 8, 8, 0.0));
+        r = Tile.add(r, Tile.dot(ta, tb));
+        k = k + 1
+    };
+    Tile.store_rows(c, (ti * 8) * 16 + tj * 8, 16, r);
+    ()
+}
+"""
+
+_HMM8 = """
+fn hmm8_kernel(pid: int, a: Vec, b: Vec, c: Vec) -> () {
+    let ti = pid / 2;
+    let tj = pid % 2;
+    let mut k = 0;
+    let mut r = Tile.to_f16(Tile.filled(8, 8, 0));
+    while k < 2 {
+        let ta = Tile.to_f16(Tile.to_f32(
+            Tile.load_rows(a, (ti * 8) * 16 + k * 8, 16, 8, 8, 0.0)));
+        let tb = Tile.to_f16(Tile.to_f32(
+            Tile.load_rows(b, (k * 8) * 16 + tj * 8, 16, 8, 8, 0.0)));
+        r = Tile.add(r, Tile.dot(ta, tb));
+        k = k + 1
+    };
+    Tile.store_rows(c, (ti * 8) * 16 + tj * 8, 16, Tile.to_f32(r));
+    ()
+}
+"""
+
+
+def _random_16x16(seed: int):
+    import random
+    rng = random.Random(seed)
+    a = [_f32r(rng.uniform(-1, 1)) for _ in range(256)]
+    b = [_f32r(rng.uniform(-1, 1)) for _ in range(256)]
+    return {"a": a, "b": b, "c": [0.0] * 256}
+
+
+def _blocked_16x16(a, b, rnd):
+    """The kernels' blocked accumulation, computed here with explicit
+    per-op rounding: two 8-wide k-blocks, each a dot (round the product,
+    then the accumulate, k ascending), combined through Tile.add."""
+    expect = [0.0] * 256
+    for i in range(16):
+        for j in range(16):
+            r = 0.0
+            for kb in range(2):
+                acc = 0.0
+                for kk in range(8):
+                    gk = kb * 8 + kk
+                    acc = rnd(acc + rnd(a[i * 16 + gk] * b[gk * 16 + j]))
+                r = rnd(r + acc)
+            expect[i * 16 + j] = r
+    return expect
+
+
+def test_simdgroup_lowering_is_chosen_for_8x8_dots_only():
+    bufs = _random_16x16(1)
+    k8 = emit_msl_kernel(_driver(_FMM8, "fmm8_kernel", 4, bufs), "fmm8_kernel")
+    assert k8.simdgroup
+    small = {"a": [_f32r(i * 0.1) for i in range(16)],
+             "b": [1.0] * 16, "c": [0.0] * 16}
+    k2 = emit_msl_kernel(_driver(_FMM, "fmm_kernel", 4, small), "fmm_kernel")
+    assert not k2.simdgroup           # a 2x2 dot has no matrix-unit form
+    ki = emit_msl_kernel(_driver(_MM, "mm_kernel", 4, {
+        "a": [0] * 16, "b": [0] * 16, "c": [0] * 16}), "mm_kernel")
+    assert not ki.simdgroup           # int tiles never do
+    # forcing either way is honored
+    assert emit_msl_kernel(_driver(_FMM8, "fmm8_kernel", 4, bufs),
+                           "fmm8_kernel", simdgroup=False).simdgroup is False
+    assert emit_msl_kernel(_driver(_FMM, "fmm_kernel", 4, small),
+                           "fmm_kernel", simdgroup=True).simdgroup is True
+
+
+def test_simdgroup_body_structure():
+    bufs = _random_16x16(2)
+    k = emit_msl_kernel(_driver(_FMM8, "fmm8_kernel", 4, bufs), "fmm8_kernel")
+    body = k.body
+    # pid is the simdgroup index; lanes are replicated except where guarded
+    assert "(long)(thread_position_in_grid.x / 32)" in body
+    assert "const uint __lane = thread_position_in_grid.x % 32;" in body
+    assert "threadgroup float " in body
+    assert "if (__lane == 0) {" in body
+    assert "metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);" in body
+    # the collective for the 8x8 dot
+    assert "metal::simdgroup_float8x8 __A, __B;" in body
+    assert "metal::simdgroup_load(__A," in body
+    assert "metal::make_filled_simdgroup_matrix<float, 8, 8>(0.0f)" in body
+    assert "metal::simdgroup_multiply_accumulate(__C, __A, __B, __C);" in body
+    assert "metal::simdgroup_store(__C," in body
+    # no per-thread dot loop remains for it
+    assert "__acc +=" not in body
+    # grid arithmetic: 32 threads per instance, one simdgroup per group
+    assert k.grid(4) == (128, 32)
+    # the shim carries the emulation exactly when the lowering needs it
+    assert "namespace metal {" in k.cpp_wrapper()
+    assert "(unsigned)pid * 32u" in k.cpp_wrapper()
+    kt = emit_msl_kernel(_driver(_FMM8, "fmm8_kernel", 4, bufs), "fmm8_kernel",
+                         simdgroup=False)
+    assert "namespace metal" not in kt.cpp_wrapper()
+    assert kt.grid(4) == (4, 4)
+
+
+def test_simdgroup_harness_dispatches_32_threads_per_instance():
+    bufs = _random_16x16(3)
+    src = _driver(_FMM8, "fmm8_kernel", 4, bufs)
+    k = emit_msl_kernel(src, "fmm8_kernel")
+    h = k.mlx_harness(4, bufs, {"c": [0.0] * 256})
+    assert "GRID_X = 128" in h and "THREADGROUP_X = 32" in h
+    assert "grid=(GRID_X, 1, 1)" in h
+    assert "threadgroup=(THREADGROUP_X, 1, 1)" in h
+    assert "per-simdgroup" in h
+
+
+@needs_clangxx
+def test_f32_8x8_matmul_simdgroup_shim_matches_interp_and_ground_truth():
+    bufs = _random_16x16(7)
+    _differential(_FMM8, "fmm8_kernel", 4, bufs)   # auto: per-simdgroup
+    src = _driver(_FMM8, "fmm8_kernel", 4, bufs)
+    k = emit_msl_kernel(src, "fmm8_kernel")
+    assert k.simdgroup
+    assert _run_shim(k, 4, bufs) == _blocked_16x16(bufs["a"], bufs["b"], _f32r)
+    # both lowerings of the same kernel agree bit for bit on the shim
+    kt = emit_msl_kernel(src, "fmm8_kernel", simdgroup=False)
+    assert _run_shim(kt, 4, bufs) == _run_shim(k, 4, bufs)
+
+
+@needs_clangxx
+def test_f16_8x8_matmul_simdgroup_shim_matches_interp_and_ground_truth():
+    bufs = _random_16x16(11)
+    _differential(_HMM8, "hmm8_kernel", 4, bufs)
+    src = _driver(_HMM8, "hmm8_kernel", 4, bufs)
+    k = emit_msl_kernel(src, "hmm8_kernel")
+    assert k.simdgroup and k.uses_half
+    assert "metal::simdgroup_half8x8" in k.body
+    assert "typedef simdgroup_matrix8x8<half> simdgroup_half8x8;" in k.cpp_wrapper()
+    ah = [_f16r(x) for x in bufs["a"]]
+    bh = [_f16r(x) for x in bufs["b"]]
+    assert _run_shim(k, 4, bufs) == _blocked_16x16(ah, bh, _f16r)
+
+
+@needs_clangxx
+@pytest.mark.parametrize("kernel_src,kernel,bufs", [
+    (_MM, "mm_kernel", {"a": list(range(16)),
+                        "b": [1 if i % 5 == 0 else 0 for i in range(16)],
+                        "c": [0] * 16}),
+    (_TRANSPOSE, "tr_kernel", {"a": list(range(12)), "out": [0] * 12}),
+    (_RAGGED, "dbl_kernel", {"v": [i + 1 for i in range(10)]}),
+    (_FMM, "fmm_kernel", {"a": [_f32r(i * 0.1) for i in range(16)],
+                          "b": [1.0 if i % 5 == 0 else 0.0 for i in range(16)],
+                          "c": [0.0] * 16}),
+    (_HSCALE, "hscale_kernel", {"v": [_f32r((i + 1) * 0.7) for i in range(10)]}),
+])
+def test_forced_simdgroup_lowering_matches_interp_for_every_op(kernel_src, kernel, bufs):
+    # Every op has a per-simdgroup form (lane 0 behind a barrier, sums
+    # replicated); forcing the mode on the whole kernel corpus must keep
+    # the interpreter parity, including a Tile.sum steering a scalar.
+    src = _driver(kernel_src, kernel, 4 if "c" in bufs else 3 if "v" in bufs else 2, bufs)
+    grid = 4 if "c" in bufs else 3 if "v" in bufs else 2
+    _res, out = interp_run(src)
+    k = emit_msl_kernel(src, kernel, simdgroup=True)
+    assert k.simdgroup
+    toks = out.split()
+    vals, pos = {}, 0
+    for name in bufs:
+        conv = float if k.buf_types[name] == "float" else int
+        n = len(bufs[name])
+        vals[name] = [conv(x) for x in toks[pos:pos + n]]
+        pos += n
+    expect = []
+    for name in k.out_bufs:
+        expect += vals[name]
+    assert _run_shim(k, grid, bufs) == expect
