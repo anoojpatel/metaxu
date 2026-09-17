@@ -24,8 +24,10 @@ Two engines live in this module:
    let-polymorphism: ``enter_level``/``exit_level``, ``generalize`` and
    ``instantiate``.
 
-Scope, honestly stated: the pipeline's constraint stream never generalizes
-— every function is bound to a single monomorphic CompactType shared by
+Scope, honestly stated: the pipeline's constraint stream generalizes only
+``let``-bound lambdas, and does so by recording and replaying their
+constraints (``compiler/generalize.py``), not through this engine's
+levels — every named function is bound to a single CompactType shared by
 all of its call sites — so levels/extrusion/instantiation are exercised at
 the engine level only (see ``compiler/tests/test_biunification.py``). The
 pipeline exposes the Biunifier lazily through

@@ -2519,7 +2519,15 @@ def _eval_binop(op: str, lv: Any, rv: Any) -> Any:
     fn = _BINOPS.get(op)
     if fn is None:
         raise InterpError(f"Unknown binary operator: {op!r}")
-    return fn(lv, rv)
+    try:
+        return fn(lv, rv)
+    except TypeError:
+        # A checker gap (a value reached an operator at a type the
+        # checker never saw) must be a LOUD, catchable Metaxu error, not a
+        # host Python exception leaking out of the interpreter.
+        raise InterpError(
+            f"binary operator {op!r} cannot be applied to "
+            f"{_runtime_type_name(lv)} and {_runtime_type_name(rv)}") from None
 
 
 def _vec_elementwise(op: str, lv: Any, rv: Any) -> "MxVector":

@@ -2,9 +2,10 @@
 
 Same contract as the book harness: each case is a complete program run
 through the real pipeline; ``ok`` cases pin stdout, ``error`` cases pin
-a fragment of the diagnostic. Cases for behavior that is planned but
-not landed are marked xfail so the suite documents the target without
-going red; drop the marker as each lands.
+a fragment of the diagnostic. Parts 1 (call edges in conflict detection)
+and 2 (let-polymorphism for let-bound lambdas) have landed and are
+pinned below without markers; part 3 (two-location diagnostics) is
+still xfail so the suite documents the target without going red.
 """
 from __future__ import annotations
 
@@ -12,13 +13,10 @@ import pytest
 
 from metaxu.compiler.frozen_borrow_checker import (BorrowCheckError,
                                                    TypeCheckError)
+from metaxu.compiler.mir_interp import InterpError, _eval_binop
 from metaxu.compiler.pipeline import build_context_from_source
 from metaxu.compiler.tests.test_codegen_llvm import interp_run
 
-P1 = pytest.mark.xfail(reason="plan part 1: call edges in conflict "
-                       "detection", strict=False)
-P2 = pytest.mark.xfail(reason="plan part 2: let-polymorphism on the "
-                       "compile path", strict=False)
 P3 = pytest.mark.xfail(reason="plan part 3: two-location conflict "
                        "diagnostics", strict=False)
 
@@ -35,14 +33,13 @@ def run_error(src: str, fragment: str) -> None:
     assert fragment in str(ei.value), str(ei.value)
 
 
-def principal_types_of_calls(src: str, callee: str) -> list[str]:
-    """Principal types of every `callee(...)` call node, in source order."""
+def principal_types_of(src: str, kind: str) -> list[str]:
+    """Principal types of every node of `kind`, in source order."""
     ctx = build_context_from_source(src)
     out = []
 
     def walk(n):
-        if n.kind == "FunctionCall" and isinstance(n.value, dict) \
-                and n.value.get("name") == callee:
+        if n.kind == kind:
             out.append(ctx.tables.facade.principal_type_of(n.node_id))
         for c in n.children:
             walk(c)
@@ -53,33 +50,99 @@ def principal_types_of_calls(src: str, callee: str) -> list[str]:
 
 # --- part 1: call edges ------------------------------------------------
 
-@P1
-def test_lambda_argument_body_mismatch_is_rejected():
-    # `s` receives an Int through apply's call edge and the body needs a
-    # String; today this compiles and dies at run time
-    run_error("""
+APPLY = """
 fn apply(f: fn(int) -> int) -> int {
     f(20)
 }
+"""
 
+
+def test_lambda_argument_body_mismatch_is_rejected():
+    # `s` receives an Int through apply's declared parameter type and the
+    # body needs a String; reported at the string, the value that made
+    # the conflict apparent
+    run_error(APPLY + """
 fn main() -> int {
     print(apply(fn(s) -> s + "!"));
     0
 }
-""", "Int and String")
+""", "<mem>:7:30: type mismatch: one value is required to be Int and String")
 
 
 def test_lambda_argument_flows_through_call_edge():
-    run_ok("""
-fn apply(f: fn(int) -> int) -> int {
-    f(20)
-}
-
+    run_ok(APPLY + """
 fn main() -> int {
     print(apply(fn(s) -> s * 2));
     0
 }
 """, "40")
+
+
+def test_let_bound_lambda_passed_as_argument_is_checked():
+    run_error(APPLY + """
+fn main() -> int {
+    let shout = fn(s) -> s + "!";
+    print(apply(shout));
+    0
+}
+""", "Int and String")
+
+
+def test_let_bound_lambda_passed_as_argument_runs():
+    run_ok(APPLY + """
+fn main() -> int {
+    let twice = fn(s) -> s * 2;
+    print(apply(twice));
+    print(twice(4));
+    0
+}
+""", "40\n8")
+
+
+def test_let_bound_lambda_called_at_wrong_type_is_rejected():
+    run_error("""
+fn main() -> int {
+    let shout = fn(s) -> s + "!";
+    print(shout(1));
+    0
+}
+""", "Int and String")
+
+
+def test_nested_function_type_parameter():
+    run_ok("""
+fn run(g: fn(fn(int) -> int) -> int) -> int {
+    g(fn(n) -> n + 1)
+}
+
+fn main() -> int {
+    print(run(fn(h) -> h(41)));
+    0
+}
+""", "42")
+
+
+def test_declared_function_type_is_in_the_frozen_payload():
+    ctx = build_context_from_source(APPLY + "fn main() -> int { 0 }\n")
+    decls = {}
+
+    def walk(n):
+        if n.kind == "FunctionDeclaration":
+            decls[n.value["name"]] = n.value
+        for c in n.children:
+            walk(c)
+
+    walk(ctx.frozen_root)
+    assert decls["apply"]["param_types"] == ["fn(int) -> int"]
+
+
+def test_interpreter_never_leaks_a_host_type_error():
+    # the checker's backstop: a value reaching an operator at a type the
+    # checker did not see is a catchable Metaxu error, not a Python one
+    with pytest.raises(InterpError) as ei:
+        _eval_binop("+", 1, "a")
+    assert str(ei.value) == \
+        "binary operator '+' cannot be applied to Int and String"
 
 
 # --- part 2: let-polymorphism -------------------------------------------
@@ -94,30 +157,40 @@ fn main() -> int {
 """
 
 
-def test_let_identity_used_at_two_types_compiles_today():
-    # accepted because call edges are not merged, not because `same` is
-    # generalized (chapter 18 explains); part 1 must not break this, and
-    # part 2 is what keeps it compiling once part 1 lands
+def test_let_identity_used_at_two_types_compiles():
     run_ok(LET_IDENTITY, "1\na")
 
 
-def test_let_identity_is_monomorphic_today():
-    tys = principal_types_of_calls(LET_IDENTITY, "same")
-    assert tys == ["Int ∨ String", "Int ∨ String"]
+def test_let_identity_stays_polymorphic():
+    # Before generalization both uses flowed into the one lambda type and
+    # the biunifier rendered it `(Int ∧ String) -> (Int ∨ String)`; each
+    # use now talks to its own instance, so the lambda itself is the
+    # polymorphic `'a -> 'a`. (The call RESULTS are not pinned: the flat
+    # solver fuses every statement of `main` into one representative, so
+    # their principal types are the chain's, not the call's; sharpening
+    # those edges is plan part 4.)
+    assert principal_types_of(LET_IDENTITY, "LambdaExpression") == ["'a -> 'a"]
 
 
-@P2
-def test_let_identity_instantiates_per_use():
-    tys = principal_types_of_calls(LET_IDENTITY, "same")
-    assert tys == ["Int", "String"]
+def test_let_bound_lambda_is_generic_in_its_own_variables_only():
+    # the lambda's parameter and body are generalized; `k`, bound outside,
+    # is shared by every instance and stays Int
+    run_ok("""
+fn main() -> int {
+    let k = 1;
+    let addk = fn(x) -> x + k;
+    let pair = fn(a) -> a;
+    print(addk(2));
+    print(pair("s"));
+    print(pair(addk(3)));
+    0
+}
+""", "3\ns\n4")
 
 
-@P1
 def test_captured_outer_binding_stays_monomorphic():
     # k is Int and the lambda's parameter unifies with k through `+`, so
-    # a String argument must collide with or without generalization; it
-    # reaches the parameter through a call edge, so today it slips past
-    # the detector and dies at run time (same gap as the apply case)
+    # a String argument collides even though `addk` is generalized
     run_error("""
 fn main() -> int {
     let k = 1;
@@ -129,6 +202,41 @@ fn main() -> int {
 """, "Int and String")
 
 
+def test_mutable_lambda_binding_is_not_generalized():
+    # the value restriction: a `let mut` lambda can be reassigned, so it
+    # keeps one type across its uses
+    run_error("""
+fn main() -> int {
+    let mut same = fn(x) -> x;
+    print(same(1));
+    print(same("a"));
+    0
+}
+""", "Int and String")
+
+
+def test_shadowing_a_generalized_lambda_drops_its_scheme():
+    run_ok("""
+fn main() -> int {
+    let same = fn(x) -> x;
+    let same = 7;
+    print(same + 1);
+    0
+}
+""", "8")
+
+
+def test_once_lambda_instances_count_as_one_callable():
+    run_error("""
+fn main() -> int {
+    let @once same = fn(x) -> x;
+    print(same(1));
+    print(same("a"));
+    0
+}
+""", "once")
+
+
 def test_named_generic_function_is_polymorphic():
     run_ok("""
 fn ident<T>(x: T) -> T {
@@ -138,6 +246,22 @@ fn ident<T>(x: T) -> T {
 fn main() -> int {
     print(ident(1));
     print(ident("a"));
+    0
+}
+""", "1\na")
+
+
+def test_named_function_with_bare_parameter_is_polymorphic():
+    # a named function with an undeclared parameter keeps one shared type
+    # (its call edges are not folded), exactly as before part 1
+    run_ok("""
+fn same(x) {
+    x
+}
+
+fn main() -> int {
+    print(same(1));
+    print(same("a"));
     0
 }
 """, "1\na")

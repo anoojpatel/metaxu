@@ -55,6 +55,10 @@ class SimpleSubFacade:
         # instance fn type id -> the generalized original (generalize.py);
         # the checker counts calls and propagates effects on originals
         self.aliases: Dict[int, Any] = {}
+        # ids of function types whose call edges the conflict detector must
+        # NOT fold: named functions with a bare parameter or type parameters
+        # (used at many types through one shared type; see the emitter)
+        self.nonfoldable: set[int] = set()
         # when True, unification failures from the flat solver are appended
         # to self.errors after solve() (off by default: the conflict
         # detector reports those in user terms)
@@ -175,11 +179,23 @@ class SimpleSubFacade:
         contradictory literal classes (e.g. `1 + \"a\"` unifies an Int-classed
         var with a String-classed var).
 
+        Two function types in one component are unified STRUCTURALLY
+        (parameter-wise and result-wise), and `call` edges are folded in:
+        for `call(callee, args, result)` whose callee's component holds a
+        function type, each argument joins the matching parameter and the
+        result joins the return type. That is how a lambda argument's
+        parameter meets the Int the callee will pass it
+        (docs/type_inference_plan.md, part 1). Callees in `nonfoldable`
+        (named functions with bare or generic parameters) are skipped:
+        their one shared type serves every use.
+
         Subtype edges are deliberately NOT merged: they are directional
         (every statement's type flows into its block's type), and merging
         them would conflate unrelated values.
         """
         parent: dict[int, int] = {}
+        fn_rep: dict[int, Any] = {}   # component root -> a function type in it
+        seen_pairs: set[tuple[int, int]] = set()
 
         def find(x: int) -> int:
             while parent.setdefault(x, x) != x:
@@ -187,17 +203,48 @@ class SimpleSubFacade:
                 x = parent[x]
             return x
 
-        def union(a: int, b: int) -> None:
-            ra, rb = find(a), find(b)
-            if ra != rb:
-                parent[ra] = rb
-
         def key(ty: Any) -> int | None:
             tid = getattr(ty, "id", None)
             return tid if isinstance(tid, int) else None
 
+        def is_fn(ty: Any) -> bool:
+            return getattr(ty, "kind", None) == "function"
+
+        def merge(a: Any, b: Any) -> None:
+            stack = [(a, b)]
+            while stack:
+                x, y = stack.pop()
+                kx, ky = key(x), key(y)
+                if kx is None or ky is None:
+                    continue
+                rx, ry = find(kx), find(ky)
+                fx = fn_rep.get(rx) or (x if is_fn(x) else None)
+                fy = fn_rep.get(ry) or (y if is_fn(y) else None)
+                if rx != ry:
+                    parent[rx] = ry
+                    fn_rep.pop(rx, None)
+                root = find(ry)
+                for f in (fx, fy):
+                    if f is not None:
+                        fn_rep.setdefault(root, f)
+                rep = fn_rep.get(root)
+                for f in (fx, fy, x if is_fn(x) else None,
+                          y if is_fn(y) else None):
+                    if f is None or rep is None or f is rep:
+                        continue
+                    pair = (min(f.id, rep.id), max(f.id, rep.id))
+                    if pair in seen_pairs:
+                        continue
+                    seen_pairs.add(pair)
+                    fp, rp = f.param_types or [], rep.param_types or []
+                    if len(fp) == len(rp):
+                        stack.extend(zip(fp, rp))
+                        if f.return_type is not None and rep.return_type is not None:
+                            stack.append((f.return_type, rep.return_type))
+
         classes: dict[int, set[str]] = {}
         nodes: dict[int, int] = {}
+        calls: list[tuple] = []
         for c in self._constraints:
             if c[0] == "class" and c[1] in self._LITERAL_CLASSES:
                 _, cls, args, node_id = c
@@ -208,9 +255,34 @@ class SimpleSubFacade:
                         if isinstance(node_id, int):
                             nodes.setdefault(k, node_id)
             elif c[0] == "unify":
-                ka, kb = key(c[1]), key(c[2])
-                if ka is not None and kb is not None:
-                    union(ka, kb)
+                merge(c[1], c[2])
+            elif c[0] == "call":
+                calls.append(c)
+
+        # Fold call edges to a fixpoint: folding one call can reveal the
+        # function type behind another call's callee.
+        pending = list(range(len(calls)))
+        while pending:
+            still: list[int] = []
+            for idx in pending:
+                _, callee, arg_tys, result, _node_id = calls[idx]
+                kc = key(callee)
+                f = callee if is_fn(callee) else (
+                    fn_rep.get(find(kc)) if kc is not None else None)
+                if f is None:
+                    still.append(idx)
+                    continue
+                if f.id in self.nonfoldable:
+                    continue
+                params = f.param_types or []
+                if len(params) == len(arg_tys):
+                    for a, p in zip(arg_tys, params):
+                        merge(a, p)
+                    if f.return_type is not None and result is not None:
+                        merge(result, f.return_type)
+            if len(still) == len(pending):
+                break
+            pending = still
 
         merged: dict[int, set[str]] = {}
         rep_node: dict[int, int] = {}
@@ -270,6 +342,16 @@ class SimpleSubFacade:
         def is_ct(x: Any) -> bool:
             return isinstance(x, CompactType)
 
+        # The engine reads types through `find()`, i.e. through the flat
+        # solver's union-find pointers. Those pointers fuse every statement
+        # of a function into one representative (the flat solver unifies
+        # along flow edges too), which is the over-approximation described
+        # above and the reason principal types are exact on expression
+        # chains only. Decoupling the engine from the pointers is not a
+        # local change: without them, every `a <: b`/`b <: a` pair and
+        # every "statement flows into its block" edge becomes a cycle the
+        # coalescer renders as a μ-type, so it belongs with the edge
+        # sharpening of docs/type_inference_plan.md, part 4.
         eng = Biunifier()
         for c in self._constraints:
             tag = c[0] if c else None
