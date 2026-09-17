@@ -1,0 +1,7 @@
+# Listed under [package] public in geom's mx.toml, so `geom.shapes`
+# is importable from outside the package.
+export { name };
+
+fn name(w: int, h: int) -> string {
+    if w == h { "square" } else { "rectangle" }
+}

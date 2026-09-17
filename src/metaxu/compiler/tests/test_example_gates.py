@@ -34,6 +34,7 @@ NEGATIVE = {
 # Files that must EXECUTE (entry found and runs without error).
 MUST_RUN = [
     "examples/app/main.mx",
+    "examples/pkg_app/main.mx",
     "examples/01_modes_and_references.mx",
     "examples/02_effects_and_handlers.mx",
     "examples/03_modules_and_imports.mx",
@@ -57,10 +58,13 @@ def all_targets() -> list[str]:
     # examples/app/ is a multi-file application: only its ENTRY file is a
     # target (its sibling modules are reached through imports, and compiling
     # one on its own would just be the same code with no main).
+    # examples/pkg_app/ is the same with dependencies resolved from its
+    # mx.lock (docs/packages.md).
     return sorted(
         os.path.relpath(p, REPO_ROOT)
         for p in glob.glob(os.path.join(REPO_ROOT, "examples", "*.mx"))
         + glob.glob(os.path.join(REPO_ROOT, "examples", "app", "main.mx"))
+        + glob.glob(os.path.join(REPO_ROOT, "examples", "pkg_app", "main.mx"))
         + glob.glob(os.path.join(REPO_ROOT, "test_*.mx"))
     )
 
@@ -97,6 +101,14 @@ def test_pipeline_gate(rel_path):
 @pytest.mark.parametrize("rel_path", MUST_RUN)
 def test_run_gate(rel_path):
     execute(rel_path)  # must not raise
+
+
+def test_package_example_output():
+    """examples/pkg_app: `import geom;` is geom's facade, `geom.shapes` is
+    a public module of it, `util` is geom's own dependency reached through
+    the flat lock; the comments in the files promise these values."""
+    _, prints = execute("examples/pkg_app/main.mx")
+    assert prints == ["12", "square", "50", "rectangle of area 10"]
 
 
 def test_effects_example_output():

@@ -43,6 +43,30 @@ from .hir import BUILTIN_CALL_PREFIX, BUILTIN_FUNCTION_NAMES
 # the placeholder fall through to interpreter builtins or fail loudly at
 # run time — documented examples importing those keep compiling.
 STD_ROOT = "std"
+MANIFEST_NAME = "mx.toml"
+LOCK_NAME = "mx.lock"
+
+
+def _discover_package_roots(start_dir: str) -> tuple[dict[str, str], str | None]:
+    """Find the nearest `mx.lock` at or above `start_dir` and return the
+    dependency table it describes (name -> root directory) with the
+    project root, or ({}, None) when there is no lock. Only the lock is
+    consulted: `mx.toml` says what a project wants, `mx.lock` says what
+    `mxpkg sync` put on disk, and the compiler builds from the latter."""
+    d = os.path.abspath(start_dir)
+    while True:
+        if os.path.isfile(os.path.join(d, LOCK_NAME)):
+            from pathlib import Path
+            from metaxu.packages import PackageError, package_roots
+            try:
+                roots = package_roots(Path(d))
+            except PackageError as e:
+                raise _module_error(f"cannot read {os.path.join(d, LOCK_NAME)}: {e}")
+            return {name: str(root) for name, root in roots.items()}, d
+        parent = os.path.dirname(d)
+        if parent == d:
+            return {}, None
+        d = parent
 
 
 def _stdlib_dir() -> str | None:
@@ -107,6 +131,11 @@ class ModuleInfo:
     # names re-exported via `public import` / `public from ... import`
     reexports: dict = field(default_factory=dict)   # name -> same binding shape
     imports: list = field(default_factory=list)      # raw Import/FromImport nodes
+    # Packages (docs/packages.md): the dependency this module was loaded
+    # from (None for the project's own files and std), and the directory
+    # of its file.
+    package: str | None = None
+    dir: str | None = None
 
     def declares(self, name: str) -> bool:
         return (name in self.functions or name in self.types
@@ -142,6 +171,15 @@ class ModuleResolver:
                 self.root_dir = d
         self.registry: dict[str, ModuleInfo] = {}
         self.entry_path: str | None = None
+        # Packages: name -> root directory of each locked dependency, read
+        # from the nearest mx.lock above the root file (docs/packages.md);
+        # empty when there is none. The compiler reads the lock, never the
+        # manifest, and never fetches.
+        self.package_roots: dict[str, str] = {}
+        self.project_root: str | None = None
+        if self.root_dir is not None:
+            self.package_roots, self.project_root = _discover_package_roots(self.root_dir)
+        self._package_public: dict[str, set[str]] = {}
         self.import_edges: list[tuple[str, str]] = []
         self.loaded_files: dict[str, str] = {}   # abs file path -> module path
         # from-import checks deferred until every module (and its own
@@ -302,10 +340,85 @@ class ModuleResolver:
             parts = base + parts
         return ".".join(parts)
 
+    def _qualify_for_package(self, importer: ModuleInfo, path: str) -> str:
+        """Inside a dependency, a bare import names a sibling of the
+        package: `import shapes;` in geom's `src/lib.mx` means
+        `geom.shapes`, never the project's own `shapes.mx`. Std, the
+        package itself, and other locked dependencies keep their names."""
+        head = path.split(".", 1)[0]
+        if (importer.package and head != STD_ROOT and head != importer.package
+                and head not in self.package_roots):
+            return f"{importer.package}.{path}"
+        return path
+
+    def _public_modules(self, package: str) -> set[str]:
+        """The dotted module paths a package exposes besides its facade:
+        `[package] public = [...]` in its mx.toml. Closed by default."""
+        cached = self._package_public.get(package)
+        if cached is None:
+            cached = set()
+            root = self.package_roots.get(package)
+            if root is not None:
+                from metaxu.packages import MANIFEST, PackageError, read_manifest
+                from pathlib import Path
+                if os.path.isfile(os.path.join(root, MANIFEST)):
+                    try:
+                        cached = set(read_manifest(Path(root)).public)
+                    except PackageError as e:
+                        raise _module_error(
+                            f"cannot read the manifest of package '{package}': {e}")
+            self._package_public[package] = cached
+        return cached
+
+    def _load_package_module(self, path: str, package: str,
+                             importer: ModuleInfo, node: Any = None) -> ModuleInfo:
+        """Load `path` (whose head is the dependency `package`) from the
+        package's `src/`: the bare name is `src/lib.mx`, the facade;
+        `package.a.b` is `src/a/b.mx`, importable from outside the package
+        only when the package lists `a.b` as public."""
+        pkg_root = self.package_roots[package]
+        rel_parts = path.split(".")[1:]
+        if not rel_parts:
+            candidate = os.path.join(pkg_root, "src", "lib.mx")
+            if not os.path.isfile(candidate):
+                raise _module_error(
+                    f"package '{package}' has no facade (imported from module "
+                    f"'{importer.path}')",
+                    notes=[f"looked for {candidate}",
+                           "a package's `import name;` means its src/lib.mx"],
+                    node=node)
+        else:
+            candidate = os.path.join(pkg_root, "src", *rel_parts) + ".mx"
+            sub = ".".join(rel_parts)
+            if importer.package != package and sub not in self._public_modules(package):
+                raise _module_error(
+                    f"module '{path}' is not public in package '{package}' "
+                    f"(imported from module '{importer.path}')",
+                    notes=[f"a package exposes src/lib.mx and the modules "
+                           f"listed under [package] public in its {MANIFEST_NAME}",
+                           f"import the facade (`import {package};`) or ask the "
+                           f"package to list \"{sub}\" as public"],
+                    node=node)
+            if not os.path.isfile(candidate):
+                raise _module_error(
+                    f"module '{path}' not found in package '{package}' "
+                    f"(imported from module '{importer.path}')",
+                    notes=[f"looked for {candidate}"], node=node)
+        info = self._load_module_file(os.path.abspath(candidate), path)
+        if info.package is None:
+            info.package = package
+            info.dir = os.path.dirname(os.path.abspath(candidate))
+        return info
+
     def _load_module(self, path: str, importer: ModuleInfo,
                      node: Any = None) -> ModuleInfo:
         """Ensure `path` is present in the registry, loading it from a file
-        if necessary."""
+        if necessary. Resolution order for a path whose head is `p`
+        (docs/packages.md): std is reserved; a module declared in-file;
+        a sibling file `p.mx` next to the root file; a locked dependency
+        named `p`. A head that is both a sibling file and a dependency is
+        ambiguous and rejected rather than resolved by precedence."""
+        path = self._qualify_for_package(importer, path)
         info = self.registry.get(path)
         if info is not None and (info.external or info.nodes):
             return info
@@ -322,6 +435,21 @@ class ModuleResolver:
             info = self._info(path)
             info.external = True
             return info
+        if root in self.package_roots:
+            sibling = None
+            if self.root_dir is not None and importer.package is None:
+                sibling = os.path.join(self.root_dir, *path.split(".")) + ".mx"
+            if sibling is not None and os.path.isfile(sibling):
+                raise _module_error(
+                    f"ambiguous module '{path}': both a sibling file and the "
+                    f"dependency '{root}' provide it (imported from module "
+                    f"'{importer.path}')",
+                    notes=[f"sibling file: {sibling}",
+                           f"dependency root: {self.package_roots[root]}",
+                           "rename the file or the dependency; a name is never "
+                           "resolved by precedence"],
+                    node=node)
+            return self._load_package_module(path, root, importer, node=node)
         if self.root_dir is None:
             raise _module_error(
                 f"cannot resolve import of module '{path}' from module "
@@ -331,13 +459,17 @@ class ModuleResolver:
         rel = os.path.join(*path.split(".")) + ".mx"
         candidate = os.path.join(self.root_dir, rel)
         if not os.path.isfile(candidate):
+            notes = [f"looked for {candidate}",
+                     f"module paths resolve relative to the root file's "
+                     f"directory: {self.root_dir}"]
+            if self.project_root is not None:
+                notes.append(
+                    f"'{root}' is not a locked dependency either "
+                    f"({os.path.join(self.project_root, 'mx.lock')} lists: "
+                    + (", ".join(sorted(self.package_roots)) or "nothing") + ")")
             raise _module_error(
                 f"module '{path}' not found (imported from module "
-                f"'{importer.path}')",
-                notes=[f"looked for {candidate}",
-                       f"module paths resolve relative to the root file's "
-                       f"directory: {self.root_dir}"],
-                node=node)
+                f"'{importer.path}')", notes=notes, node=node)
         return self._load_module_file(os.path.abspath(candidate), path)
 
     def _load_module_file(self, candidate: str, path: str) -> ModuleInfo:

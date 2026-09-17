@@ -1,0 +1,5 @@
+export { clamp };
+
+fn clamp(x: int, lo: int, hi: int) -> int {
+    if x < lo { lo } else { if x > hi { hi } else { x } }
+}

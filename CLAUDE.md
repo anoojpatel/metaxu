@@ -9,7 +9,7 @@ with algebraic effects, mode-based memory management (`@local`/`@global`,
 ```bash
 uv sync --all-groups                      # one-time setup
 uv run python -m pytest src/metaxu/compiler/tests -q   # full suite
-uv run python scripts/run_examples.py                  # pipeline gate (19 files)
+uv run python scripts/run_examples.py                  # pipeline gate (21 files)
 uv run python scripts/run_examples.py --stage run      # execution gate
 uv run python scripts/run_examples.py --stage parse    # parse-only
 ```
@@ -121,7 +121,7 @@ phase-by-phase plan.
   silent no-op fallback. Do not add lenient fallbacks to make a test pass.
 - New compiler behavior needs a regression test in
   `src/metaxu/compiler/tests/`, and the example gates must stay green
-  (19/19 pipeline AND 19/19 run; do not regress either).
+  (21/21 pipeline AND 21/21 run; do not regress either).
 - Native lowering claims need differential tests (native stdout/exit ==
   interpreter) and, for memory claims, ASan runs scoped to the documented
   contract (full leak-check where frees are claimed; detect_leaks=0 where

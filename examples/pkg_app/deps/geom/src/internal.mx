@@ -1,0 +1,6 @@
+# Not public: reachable from geom's own files only.
+export { twice };
+
+fn twice(n: int) -> int {
+    n * 2
+}

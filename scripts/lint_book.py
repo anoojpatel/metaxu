@@ -24,7 +24,7 @@ import sys
 from pathlib import Path
 
 BOOK = Path(__file__).resolve().parent.parent / "docs" / "book"
-ALLOWED_INFO = {"metaxu", "output", "bash", "python", "text", ""}
+ALLOWED_INFO = {"metaxu", "output", "bash", "python", "text", "toml", ""}
 ALLOWED_FLAGS = {"error", "norun"}
 
 
