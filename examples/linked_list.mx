@@ -141,7 +141,8 @@ fn main() {
     # Get mutable reference to second node's data (requires exclusive access)
     let mut_value = get_mut(list, 1);  # Some(&mut 2)
     if let Some(value) = mut_value {
-        value = 42;  # Modify through mutable reference
+        let mut updated = value;
+        updated = 42;  # a fresh mutable binding; the binder itself is immutable
     }
     
     # Take ownership of second node (removes it from list)

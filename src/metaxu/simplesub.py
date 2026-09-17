@@ -113,6 +113,10 @@ class TypeInferencer:
         self.next_var_id = 0
         self.variance_inferencer = VarianceInferencer()
         self._biunifier: Optional['Biunifier'] = None
+        # unification failures from the last solve_constraints(); the
+        # facade surfaces them on request (a failed constraint never
+        # aborts the solve, so callers read this list afterwards)
+        self.errors: List[str] = []
         
     def to_compact_type(self, ty: Type) -> CompactType:
         """Convert Type to CompactType"""
@@ -357,6 +361,7 @@ class TypeInferencer:
         # Optional: debug unify errors without breaking tests
         # if errors:
         #     print("Type inference warnings:", errors)
+        self.errors = errors
         return solution
 
     def finalize_type_definition(self, type_def: TypeConstructor):

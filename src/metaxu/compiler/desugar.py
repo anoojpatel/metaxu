@@ -19,6 +19,7 @@ from typing import Callable, Any
 from dataclasses import dataclass
 
 import metaxu.metaxu_ast as fast
+from metaxu.compiler.frozen_borrow_checker import BorrowError, TypeCheckError
 
 
 @dataclass(slots=True)
@@ -193,11 +194,13 @@ def is_reserved_name(name: str) -> bool:
     return isinstance(name, str) and name.startswith(RESERVED_NAME_PREFIX)
 
 
-class CoherenceError(Exception):
+class CoherenceError(TypeCheckError):
     """Two distinct implement blocks define the same (trait, type, method).
 
-    `location` is the source position of the offending method (None when the
-    node carries none); when known, the message carries the standard
+    A typed diagnostic (kind "type-coherence") so it travels the same
+    structured channel as every other compile rejection; `location` is
+    the source position of the offending method (None when the node
+    carries none); when known, the message carries the standard
     `file:line:column` prefix and an excerpt with a caret.
     """
 
@@ -209,7 +212,10 @@ class CoherenceError(Exception):
             excerpt = source_excerpt(location)
             if excerpt:
                 message = f"{message}\n{excerpt}"
-        super().__init__(message)
+        self.errors = [BorrowError(message=message, node_id=-1,
+                                   kind="type-coherence", variable="",
+                                   location=location)]
+        Exception.__init__(self, message)
 
 
 def node_location(node: Any) -> Any:

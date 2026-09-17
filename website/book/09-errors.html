@@ -1,0 +1,167 @@
+<title>Errors · The Metaxu Book</title>
+<link rel="stylesheet" href="style.css">
+<header class="top">
+  <div class="inner">
+    <a class="brand" href="../index.html">Metaxu</a>
+    <nav class="topnav">
+      <a href="index.html">the book</a>
+      <a href="../roadmap.html">roadmap</a>
+      <a href="https://github.com/anoojpatel/metaxu">github &#8599;</a>
+    </nav>
+  </div>
+</header>
+<main>
+<h1>Errors</h1>
+<p>Metaxu splits errors into three stories. Compile-time errors (types, borrows, undefined names) stop the build; chapters 6 and 10 cover them. Runtime failures can be contained with <code>try</code>/<code>catch</code>. And for errors that are part of a function&#x27;s contract, the library gives you <code>Option</code>, <code>Result</code>, and three effects built on handlers.</p>
+<h2>try/catch</h2>
+<p><code>try { body } catch e { handler }</code> is an expression. If the body completes, its value is the result and the catch never runs. If a runtime failure occurs anywhere in the body&#x27;s dynamic extent, including inside functions it calls, the rest of the body is abandoned and the handler&#x27;s value is the result instead:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">fn main() -&gt; int {
+    let fine = try { 41 + 1 } catch e { 0 };
+    let broken = try {
+        let v = Vec.new();
+        v.push(10);
+        v[3]
+    } catch e {
+        print(&quot;caught: &quot; + e);
+        -1
+    };
+    print(fine);
+    print(broken);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>caught: index out of bounds: 3 (length 1)
+42
+-1</code></pre></div>
+<p><code>e</code> binds the failure&#x27;s message: the plain text as raised, with no file paths and no compiler context attached, so the same program catches the same string on every machine and both backends (<code>docs/try_catch.md</code> pins this byte for byte). Nesting behaves the way handlers do: the innermost try catches, and a failure raised inside a catch block propagates outward rather than being caught by its own try.</p>
+<h2>What raises, and what catch sees</h2>
+<p>The catchable failures are: builtin contract violations (indexing out of bounds, <code>pop</code> on an empty Vec, <code>Tile.get</code> outside the tile&#x27;s shape, a shift count outside 0..63); a <code>perform</code> with no handler installed; a match that no pattern accepts at runtime; and a trait method call whose receiver type has no impl (chapter 7 catches one). The unhandled-<code>perform</code> case defines the division of labor between <code>try</code> and <code>handle</code>:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">effect Parser { parse(input: string) -&gt; int }
+
+fn main() -&gt; int {
+    let r = try {
+        perform Parser.parse(&quot;123&quot;)
+    } catch e {
+        print(&quot;caught: &quot; + e);
+        0
+    };
+    print(r);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>caught: No handler for effect &#x27;Parser&#x27;
+0</code></pre></div>
+<p>Catching this failure is dynamic recovery, not a handler: the <code>try</code> does not discharge the effect statically, and it cannot resume the computation. When a handler is installed, it wins, and the try has nothing to catch:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">effect Ask { ask() -&gt; int }
+
+fn main() -&gt; int {
+    let v = handle Ask with {
+        ask() -&gt; resume(5)
+    } in {
+        try { perform Ask.ask() + 1 } catch e { -1 }
+    };
+    print(v);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>6</code></pre></div>
+<p>Not everything is catchable, on purpose. An <code>assert</code> failure, integer division by zero, and resuming a continuation twice are fatal on both backends. Recursion-budget exhaustion also passes through <code>catch</code>: a catch arm would run with the stack still at its ceiling. And compile-time errors are simply not runtime events; wrapping a type error in <code>try</code> does not turn it into one:</p>
+<div class="fence error"><span class="label">metaxu · rejected</span><pre><code class="mx">fn main() -&gt; int {
+    let r = try { 1 + &quot;a&quot; } catch e { 0 };
+    r
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>one value is required to be Int and String</code></pre></div>
+<h2>Option and Result</h2>
+<p>For failures a caller is expected to handle, don&#x27;t raise: return <code>Option</code> (<code>Some</code>/<code>None</code>) or <code>Result</code> (<code>Ok</code>/<code>Err</code>). Both are builtins; <code>std.option</code> and <code>std.result</code> add the combinators:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">import std.option as opt;
+import std.result as res;
+from std.parse import parse_int;
+
+fn half(n: int) {
+    if n % 2 == 0 { Some(n / 2) } else { None }
+}
+
+fn main() -&gt; int {
+    let a = opt.and_then(parse_int(&quot;84&quot;), fn(n: int) -&gt; half(n));
+    print(opt.unwrap_or(a, -1));
+
+    let r = opt.ok_or(parse_int(&quot;4x&quot;), &quot;not a number&quot;);
+    match r {
+        Ok(v) =&gt; print(v),
+        Err(e) =&gt; print(&quot;error: &quot; + e)
+    };
+    print(opt.unwrap_or(res.ok(r), 0));
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>42
+error: not a number
+0</code></pre></div>
+<p><code>parse_int</code> answers an Option, <code>and_then</code> chains the next fallible step, <code>ok_or</code> converts to a Result with an error of your choosing, and <code>res.ok</code> goes back. All of them are plain matches.</p>
+<h2>The effectful error story</h2>
+<p><code>std.fail</code>, <code>std.throw</code>, and <code>std.early_return</code> (designs ported from Ante&#x27;s stdlib) treat failure as an algebraic effect: the failing code performs an operation, and a handler at the boundary decides what failure means. These handlers abort rather than resume.</p>
+<p><code>Fail</code> carries no payload. <code>try_opt</code> runs a computation and answers an Option; a multi-step computation aborts at the first failure with no per-step matching:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">from std.fail import Fail, try_opt;
+from std.parse import parse_int_or_fail;
+
+fn sum_fields(a: string, b: string) performs Fail -&gt; int {
+    parse_int_or_fail(a) + parse_int_or_fail(b)
+}
+
+fn main() -&gt; int {
+    match try_opt(fn() -&gt; int { sum_fields(&quot;12&quot;, &quot;30&quot;) }) {
+        Some(v) =&gt; print(v),
+        None =&gt; print(&quot;malformed&quot;)
+    };
+    match try_opt(fn() -&gt; int { sum_fields(&quot;12&quot;, &quot;3O&quot;) }) {
+        Some(v) =&gt; print(v),
+        None =&gt; print(&quot;malformed&quot;)
+    };
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>42
+malformed</code></pre></div>
+<p><code>Throw</code> is <code>Fail</code> with an error value. <code>catch_</code> turns a throwing computation into a Result (the underscore is there because <code>catch</code> is a reserved word):</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">from std.throw import Throw, catch_, throw_if;
+
+fn withdraw(balance: int, amount: int) performs Throw -&gt; int {
+    throw_if(amount &gt; balance, &quot;insufficient funds&quot;);
+    balance - amount
+}
+
+fn main() -&gt; int {
+    match catch_(fn() -&gt; int { withdraw(100, 30) }) {
+        Ok(left) =&gt; print(&quot;left: &quot; + left.to_string()),
+        Err(e) =&gt; print(&quot;error: &quot; + e)
+    };
+    match catch_(fn() -&gt; int { withdraw(100, 300) }) {
+        Ok(left) =&gt; print(left),
+        Err(e) =&gt; print(&quot;error: &quot; + e)
+    };
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>left: 70
+error: insufficient funds</code></pre></div>
+<p><code>EarlyReturn</code> is the same mechanism used for control flow rather than failure: multi-level early exit without a dedicated statement.</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">from std.early_return import EarlyReturn, with_early_return, return_if;
+
+fn first_negative_index(v: Vec) -&gt; int {
+    with_early_return(fn() -&gt; int {
+        let @mut i = 0;
+        while i &lt; len(v) {
+            return_if(v[i] &lt; 0, i);
+            i = i + 1
+        }
+        -1
+    })
+}
+
+fn main() -&gt; int {
+    let @mut v = Vec.new();
+    v.push(5);
+    v.push(-3);
+    v.push(8);
+    print(first_negative_index(v));
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>1</code></pre></div>
+<p>Which to reach for: <code>Option</code>/<code>Result</code> when the caller should decide at every step; <code>Fail</code>/<code>Throw</code> when a whole computation shares one failure boundary; <code>try</code>/<code>catch</code> when the failure is a violated contract you didn&#x27;t plan for and you want the program to survive it anyway.</p>
+<nav class="pager"><a href="08-effects.html">&#8592; Effects</a><a href="10-modes-and-memory.html">Modes and memory &#8594;</a></nav>
+</main>
+<script src="book.js"></script>

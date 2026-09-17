@@ -1,7 +1,7 @@
 <title>Metaxu</title>
 <style>
 /* ============================================================
-   Metaxu — documentation as a landing page.
+   Metaxu: documentation as a landing page.
    Committed single theme: dimmed light blue-green, eggshell trim.
    ============================================================ */
 @font-face {
@@ -339,7 +339,7 @@ footer .wrap { display: flex; justify-content: space-between; gap: 24px; flex-wr
       <a href="#design">design</a>
       <a href="#code">code</a>
       <a href="#performance">performance</a>
-      <a href="https://github.com/anoojpatel/metaxu/tree/main/docs/book">book</a>
+      <a href="book/index.html">book</a>
       <a href="roadmap.html">roadmap</a>
       <a href="https://github.com/anoojpatel/metaxu">github &#8599;</a>
     </nav>
@@ -365,12 +365,12 @@ footer .wrap { display: flex; justify-content: space-between; gap: 24px; flex-wr
     it.</p>
     <div class="cta">
       <a class="primary" href="https://github.com/anoojpatel/metaxu">GitHub &#8599;</a>
-      <a href="https://github.com/anoojpatel/metaxu/tree/main/docs/book">Read the book</a>
+      <a href="book/index.html">Read the book</a>
     </div>
     <p class="statusline">
       one semantics, three backends: <b>interpreter &middot; LLVM native
-      &middot; Metal</b> &middot; native speed measured at
-      <b>1.00&ndash;1.09x C</b>
+      &middot; Metal</b> &middot; early microbenchmarks land
+      <b>near plain C</b>, asterisks included
     </p>
   </div>
 </section>
@@ -450,7 +450,7 @@ fn main() -> int {
 }</code></pre>
     </div>
     <p class="pinned"><b>//</b> <a
-    href="https://github.com/anoojpatel/metaxu/tree/main/docs/book">The
+    href="book/index.html">The
     Metaxu Book</a> documents the whole language, and every example in it
     runs as a test on every commit. Nothing on this page can quietly rot.</p>
   </div>
@@ -460,12 +460,13 @@ fn main() -> int {
 <section id="performance">
   <div class="wrap">
     <p class="eyebrow">// measured</p>
-    <h2>Performance against C</h2>
-    <p class="lede">Native performance is measured, not promised. Each
-    benchmark asserts output equality with its hand-written C twin before
-    any timing runs. Both sides use the same clang
+    <h2>Microbenchmarks against C</h2>
+    <p class="lede">Five small kernels, each with a hand-written C twin.
+    A Metaxu build asserts output equality with its twin before any
+    timing runs. Both sides use the same clang
     at <span class="mono">-O2</span> with function alignment pinned; runs
-    alternate order; the ratio is a median of 15 rounds.</p>
+    alternate order; the ratio is a median of 15 rounds. What a table
+    like this can and can't tell you is spelled out below it.</p>
 
     <div class="tablewrap">
       <table class="bench">
@@ -489,6 +490,16 @@ fn main() -> int {
     benchmark or test gate in the repository (benchmarks/suite, 2026-08-19,
     clang -O2, 15 rounds). Absolute times vary on a shared container; the
     paired, interleaved ratios are the stable signal.</p>
+    <p class="pinned"><b>// the asterisks.</b> These are microbenchmarks,
+    and microbenchmarks reward whoever wrote them. The kernels are tiny
+    and fit in cache. The C twins are straightforward ports, not code a
+    C expert spent a week tuning, and a determined person could tilt
+    either column. Nothing here exercises heavy allocation, large working
+    sets, or a real program's shape. We keep the table because it pins
+    regressions and keeps performance in view while the language grows,
+    not as a scoreboard against C. Read every ratio as "in the same
+    neighborhood," nothing finer. This is where performance work starts,
+    not where it ends.</p>
 
   </div>
 </section>
@@ -500,7 +511,7 @@ fn main() -> int {
     <span class="footmark">METAXU</span>
     <nav class="footlinks" aria-label="Footer">
       <a href="https://github.com/anoojpatel/metaxu">github.com/anoojpatel/metaxu</a>
-      <a href="https://github.com/anoojpatel/metaxu/tree/main/docs/book">the metaxu book</a>
+      <a href="book/index.html">the metaxu book</a>
       <a href="roadmap.html">roadmap</a>
     </nav>
     <p class="footnote">// a Python front end, an LLVM back end, an MSL emitter,
@@ -563,7 +574,7 @@ fn main() -> int {
       }
       grid.push(row);
     }
-    // the particle layer, drawn over the field — always bold
+    // the particle layer, drawn over the field, always bold
     for (var p = 0; p < P.length; p++) {
       var q = P[p];
       var px = Math.round(CX + (q.r * Math.cos(q.th)) / AX);

@@ -230,7 +230,9 @@ conflict detector, which is deliberately coarser and points at source
 locations well. Principal types on statement-heavy functions
 over-approximate. If you ask the pipeline what the principal type of an
 expression chain is you get a real answer; the language does not yet
-act on it.
+act on it. Chapter 18 opens that machinery: the flow graph, the
+class-constraint algebra, the flat solver that decides what compiles,
+and the biunifier that computes those principal types.
 
 Undefined names are part of the same compile-time contract. A name that
 resolves to nothing is an error, never a silently dropped expression:

@@ -1,0 +1,134 @@
+<title>Unsafe and FFI · The Metaxu Book</title>
+<link rel="stylesheet" href="style.css">
+<header class="top">
+  <div class="inner">
+    <a class="brand" href="../index.html">Metaxu</a>
+    <nav class="topnav">
+      <a href="index.html">the book</a>
+      <a href="../roadmap.html">roadmap</a>
+      <a href="https://github.com/anoojpatel/metaxu">github &#8599;</a>
+    </nav>
+  </div>
+</header>
+<main>
+<h1>Unsafe and FFI</h1>
+<p>Everything before this chapter is checked code: the type system, modes, and the borrow checker stand between you and a bad memory access. <code>unsafe</code> opens a door in that wall. Behind it are raw pointers, manual allocation, and the C boundary. What makes Metaxu&#x27;s version unusual is that the reference interpreter runs unsafe code on a strict simulated heap where every access is validated, so the classic undefined behaviors of C are defined, catchable errors here. You get the sharp tools and a machine that tells you the moment you slip.</p>
+<h2><code>unsafe</code> is a statement</h2>
+<p>The first thing to learn is grammatical. <code>unsafe { ... }</code> is a statement, not an expression. This does not parse:</p>
+<div class="fence"><span class="label">text</span><pre><code>let p = unsafe { malloc(2) };   # parse error: unsafe is a statement</code></pre></div>
+<p>Two idioms replace it. Use an unsafe block in statement position and do your printing or mutation inside it, or make a whole function body end in an unsafe block: the block&#x27;s tail expression becomes the function&#x27;s return value, exactly as a function body&#x27;s last expression always does.</p>
+<h2>The heap primitives</h2>
+<p>Four functions run the manual heap: <code>malloc(n)</code> allocates a block of <code>n</code> slots and returns a pointer, <code>ptr_write(p, i, v)</code> stores into slot <code>i</code>, <code>ptr_read(p, i)</code> loads from it, and <code>free(p)</code> releases the block. Here is the second idiom from above, a function that returns through its unsafe tail:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">fn boxed_sum() -&gt; int {
+    unsafe {
+        let p = malloc(2);
+        ptr_write(p, 0, 41);
+        ptr_write(p, 1, 1);
+        let total = ptr_read(p, 0) + ptr_read(p, 1);
+        free(p);
+        total
+    }
+}
+
+fn main() -&gt; int {
+    print(boxed_sum());
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>42</code></pre></div>
+<p>Nothing reclaims that block for you. Forget the <code>free</code> and the block leaks, in the interpreter and in native code alike. The discipline is yours again, which is the point of the keyword.</p>
+<h2>Strings have an address</h2>
+<p><code>s.as_ptr()</code> gives a pointer to a string&#x27;s bytes, and <code>memcpy(dst, src, n)</code> copies <code>n</code> slots between pointers. Copy a string&#x27;s bytes into a block you own and they&#x27;re just numbers:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">fn main() -&gt; int {
+    let s = &quot;hi&quot;;
+    unsafe {
+        let src = s.as_ptr();
+        let dst = malloc(2);
+        memcpy(dst, src, 2);
+        print(ptr_read(dst, 0));
+        print(ptr_read(dst, 1));
+        free(dst);
+    }
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>104
+105</code></pre></div>
+<p>104 and 105 are the ASCII codes for <code>h</code> and <code>i</code>. This is the shape of every FFI marshalling routine: get an address, copy across the boundary, work on the copy.</p>
+<h2>The heap is strict</h2>
+<p>On the simulated heap, a freed block doesn&#x27;t linger as garbage you might get away with reading. It&#x27;s gone, and the interpreter says so. Use-after-free and double free are runtime errors, and like the runtime errors of chapter 9 they&#x27;re catchable with <code>try</code>:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">fn main() -&gt; int {
+    unsafe {
+        let p = malloc(1);
+        ptr_write(p, 0, 7);
+        print(ptr_read(p, 0));
+        free(p);
+        try {
+            print(ptr_read(p, 0));
+        } catch e {
+            print(e);
+        };
+        try {
+            free(p);
+        } catch e {
+            print(e);
+        };
+    }
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>7
+ptr_read: use after free (&lt;*heap#1&gt;)
+free: double free (&lt;*heap#1&gt;)</code></pre></div>
+<p><code>&lt;*heap#1&gt;</code> is the pointer&#x27;s identity: the first heap block this program allocated. The message names the operation that went wrong and the block it went wrong on, which is more than a segfault ever told you.</p>
+<p>Out-of-bounds access is caught the same way. A block of two slots has slots 0 and 1, and slot 2 is a refusal, not a read of whatever lies next door:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">fn main() -&gt; int {
+    unsafe {
+        let p = malloc(2);
+        ptr_write(p, 0, 10);
+        ptr_write(p, 1, 20);
+        try {
+            print(ptr_read(p, 2));
+        } catch e {
+            print(e);
+        };
+        free(p);
+    }
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>ptr_read: out of bounds — [2, 3) outside allocation of 2 bytes (&lt;*heap#1+2&gt;)</code></pre></div>
+<p>The message spells out the byte range the read wanted, <code>[2, 3)</code>, the size of the block it fell outside, and the offending address as an offset from the block&#x27;s identity, <code>&lt;*heap#1+2&gt;</code>.</p>
+<h2>Read-only snapshots</h2>
+<p>The pointer <code>as_ptr</code> hands you is a snapshot, and it&#x27;s read-only. Strings are immutable values in Metaxu, and no pointer is allowed to launder that away:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">fn main() -&gt; int {
+    let s = &quot;hi&quot;;
+    unsafe {
+        let p = s.as_ptr();
+        try {
+            ptr_write(p, 0, 72);
+        } catch e {
+            print(e);
+        };
+    }
+    print(s);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>ptr_write: write through read-only pointer (&lt;*heap#1 const&gt;)
+hi</code></pre></div>
+<p>The final line is the proof: <code>s</code> still reads <code>hi</code>. To mutate the bytes, copy them into your own block first, as the <code>memcpy</code> example did. The snapshot rule is the mode system of chapter 10 reaching through the unsafe door: immutability survives taking an address.</p>
+<h2>The C boundary</h2>
+<p>Extern declarations bind Metaxu names to C symbols; you&#x27;ve already met one, the <code>extern type Thread[T]</code> that chapter 11 spawns through. The file API is the everyday example. <code>fopen</code> is C&#x27;s <code>fopen</code>, and it keeps C&#x27;s contract: a path that doesn&#x27;t exist gets you a null pointer, not an exception.</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">fn main() -&gt; int {
+    unsafe {
+        let f = fopen(&quot;definitely-not-here.txt&quot;, &quot;r&quot;);
+        if f == null {
+            print(&quot;fopen returned null&quot;);
+        };
+    }
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>fopen returned null</code></pre></div>
+<p><code>f == null</code> is the test, and <code>null</code> is a pointer value that exists only inside <code>unsafe</code>; nothing outside the block can hold one, so the check lives here at the boundary and doesn&#x27;t leak out. The pattern for wrapping any C function is the same as wrapping <code>fopen</code>: call it inside <code>unsafe</code>, check its sentinel values at the edge, and hand back an <code>Option</code> or a <code>Result</code> so callers outside the block never see a pointer.</p>
+<h2>The native boundary</h2>
+<p>One question hangs over a simulated heap: what happens when the same program compiles to native code, where <code>malloc</code> is the real allocator? The differential contract from chapter 14 answers it. The native runtime implements the same checked discipline as the interpreter, tracking block identity and liveness, so the pinned messages in this chapter are the program&#x27;s behavior on both engines, byte for byte. The checks cost a bounds compare per access, and they are the language&#x27;s definition, not a debug mode.</p>
+<p>That&#x27;s the trade this chapter runs on. You give up the checker&#x27;s static guarantees inside an <code>unsafe</code> block; you do not give up having semantics. Undefined behavior isn&#x27;t a performance feature Metaxu forgot, it&#x27;s one it declined.</p>
+<nav class="pager"><a href="15-modules-and-imports.html">&#8592; Modules and imports</a><a href="17-inside-the-compiler.html">Inside the compiler &#8594;</a></nav>
+</main>
+<script src="book.js"></script>

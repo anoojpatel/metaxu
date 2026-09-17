@@ -91,9 +91,25 @@ fields carry modes too (`@mut value: int`, `@const name: string`,
 `@local temp: int` in a declaration), and the deep rules propagate
 locality through fields: a `@global` struct can't hold a reference to
 `@local` data. The checker walks the whole shape, not just the top
-binding. (Write-protection of `@const` fields is declared but not yet
-enforced by the checker; the gap analysis tracks it. This book doesn't
-pretend otherwise.)
+binding. A field declared `@const` rejects assignment, through let
+bindings, parameters, and nested paths alike:
+
+```metaxu error
+struct P { @const name: string, @mut n: int }
+
+fn main() -> int {
+    let @mut p = P { name: "a", n: 1 };
+    p.name = "b";
+    0
+}
+```
+```output
+cannot assign to @const field 'name' of P
+```
+
+The same discipline applies to plain bindings: `let` without `mut` is
+immutable, and so are parameters and module constants (chapter 2 pins
+the error).
 
 ## Linearity
 

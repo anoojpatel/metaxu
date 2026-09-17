@@ -1,0 +1,163 @@
+<title>Effects · The Metaxu Book</title>
+<link rel="stylesheet" href="style.css">
+<header class="top">
+  <div class="inner">
+    <a class="brand" href="../index.html">Metaxu</a>
+    <nav class="topnav">
+      <a href="index.html">the book</a>
+      <a href="../roadmap.html">roadmap</a>
+      <a href="https://github.com/anoojpatel/metaxu">github &#8599;</a>
+    </nav>
+  </div>
+</header>
+<main>
+<h1>Effects</h1>
+<p>An effect is an operation a function can perform without saying how it gets done. The caller decides that, by installing a handler. Metaxu uses this one mechanism for things other languages build separately: exceptions, generators, mutable state, threads, GPU launches. All of them are effects with different handlers.</p>
+<h2>Declaring and performing</h2>
+<p><code>effect</code> declares a named set of operations. <code>perform</code> invokes one.</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">effect Say {
+    say(msg: string) -&gt; Unit
+}
+
+fn greet() performs Say {
+    perform Say.say(&quot;hello&quot;);
+    perform Say.say(&quot;goodbye&quot;)
+}
+
+fn main() -&gt; int {
+    handle Say with {
+        say(msg) -&gt; {
+            print(msg);
+            resume(())
+        }
+    } in {
+        greet()
+    };
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>hello
+goodbye</code></pre></div>
+<p>The <code>performs Say</code> clause on <code>greet</code> says the function needs a <code>Say</code> handler somewhere above it. Inside the handler arm, <code>resume(v)</code> continues the suspended computation, delivering <code>v</code> as the value of the <code>perform</code> expression. The continuation is delimited and single-shot: it runs from the perform site to the end of the handled block, and you can call it once.</p>
+<h2>Handlers that answer</h2>
+<p>Operations return values. Whatever you pass to <code>resume</code> is what the <code>perform</code> expression evaluates to.</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">effect Ask {
+    ask() -&gt; int
+}
+
+fn add_two_answers() -&gt; int performs Ask {
+    perform Ask.ask() + perform Ask.ask()
+}
+
+fn main() -&gt; int {
+    let total = handle Ask with {
+        ask() -&gt; resume(21)
+    } in {
+        add_two_answers()
+    };
+    print(total);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>42</code></pre></div>
+<h2>Handlers that abort</h2>
+<p>An arm doesn&#x27;t have to resume. If it returns without calling <code>resume</code>, the rest of the handled block is torn down and the arm&#x27;s value becomes the value of the whole <code>handle</code> expression. That&#x27;s an exception, built from nothing but a handler.</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">effect Bail {
+    bail(code: int) -&gt; Unit
+}
+
+fn work() -&gt; int performs Bail {
+    print(&quot;before&quot;);
+    perform Bail.bail(3);
+    print(&quot;after&quot;);    # never runs
+    99
+}
+
+fn main() -&gt; int {
+    let r = handle Bail with {
+        bail(code) -&gt; code
+    } in {
+        work()
+    };
+    print(r);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>before
+3</code></pre></div>
+<p><code>std.throw</code>, <code>std.fail</code>, and <code>std.early_return</code> are this pattern with names; chapter 9 uses them.</p>
+<h2>State without mutation</h2>
+<p>The classic demonstration: <code>get</code> and <code>set</code> as operations, interpreted by handlers. This is <code>std.state</code>&#x27;s design in miniature.</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">effect Counter {
+    get() -&gt; int
+    bump() -&gt; Unit
+}
+
+fn count_to_three() performs Counter {
+    perform Counter.bump();
+    perform Counter.bump();
+    perform Counter.bump();
+    print(perform Counter.get())
+}
+
+fn main() -&gt; int {
+    let @mut cell = Vec.new();
+    cell.push(0);
+    handle Counter with {
+        get() -&gt; resume(cell[0])
+        bump() -&gt; {
+            cell[0] = cell[0] + 1;
+            resume(())
+        }
+    } in {
+        count_to_three()
+    };
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>3</code></pre></div>
+<p>The handler closes over <code>cell</code>, so state lives in the handler, not the code performing the operations. Swap the handler and the same <code>count_to_three</code> logs every bump, or counts down, or feeds a test.</p>
+<h2>Default implementations</h2>
+<p>An operation can carry a default. Performing it with no handler in scope runs the default; installing a handler overrides it. This is how <code>std.gpu</code> ships a launch that works everywhere:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">fn run_twice(f: fn(int) -&gt; ()) -&gt; () {
+    f(0);
+    f(1);
+    ()
+}
+
+effect Job {
+    submit(f: fn(int) -&gt; ()) -&gt; () = run_twice(f)
+}
+
+fn main() -&gt; int {
+    # no handler: the default runs the job twice, inline
+    perform Job.submit(fn(i: int) -&gt; print(i));
+    # a handler can virtualize the same perform completely
+    handle Job with {
+        submit(f) -&gt; {
+            print(&quot;intercepted&quot;);
+            resume(())
+        }
+    } in {
+        perform Job.submit(fn(i: int) -&gt; print(i * 100))
+    };
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>0
+1
+intercepted</code></pre></div>
+<p>In <code>std.gpu</code>, <code>Gpu.launch(n, f)</code> defaults to a sequential CPU loop in pid order. The Metal handler intercepts the same operation and sends the kernel to a GPU. Kernel code doesn&#x27;t change; chapter 13 shows it.</p>
+<h2>Streams are effects</h2>
+<p><code>std.stream</code> builds iteration from a single <code>Emit</code> effect, following Ante&#x27;s stdlib. A stream is a thunk that performs <code>emit</code> once per element. Consumers are handlers around calling it. Transformers are handlers that re-emit.</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">from std.stream import iota, map, filter, sum;
+
+fn main() -&gt; int {
+    let total = sum(filter(map(iota(200000), fn(x: int) -&gt; x * 2),
+                           fn(x: int) -&gt; x &gt; 5));
+    print(total);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>39999799994</code></pre></div>
+<p>No intermediate collections exist here. Each element flows from <code>iota</code> through <code>map</code>&#x27;s handler, <code>filter</code>&#x27;s handler, into <code>sum</code>&#x27;s accumulator, one at a time, by suspending and resuming. <code>for_</code> in the same module adds <code>break_</code>/<code>continue_</code> as abort-style operations of a <code>Loop</code> effect, which is all a for loop is.</p>
+<h2>Effect classes</h2>
+<p>Every effect belongs to a class that bounds what its handlers may do. A <code>stack</code> effect&#x27;s handlers finish or abort on the spot; a <code>suspend</code> effect&#x27;s handlers may hold the continuation across a suspension (this is what threads and schedulers need). The emitter checks the class, and the native backend uses it to decide when a function needs the coroutine machinery. You&#x27;ll mostly never write the class; the checker infers the need.</p>
+<p>Some effects map straight onto the runtime instead of user handlers: <code>Thread.spawn</code> and <code>Mutex.lock</code> are declared <code>with EFFECT_SPAWN</code>, <code>with EFFECT_MUTEX_LOCK</code>, and so on, binding them to pthreads natively and to real OS threads in the interpreter. Chapter 11 is about those. A handler can still interpose on them, which is how tests virtualize spawning.</p>
+<nav class="pager"><a href="07-traits.html">&#8592; Traits</a><a href="09-errors.html">Errors &#8594;</a></nav>
+</main>
+<script src="book.js"></script>

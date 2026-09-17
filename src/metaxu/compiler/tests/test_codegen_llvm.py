@@ -193,7 +193,7 @@ from metaxu.compiler.hir import HIRBuilder
 from metaxu.compiler.llvm_run import LlvmRunError, compile_and_run
 from metaxu.compiler.lower_hir_to_mir import lower_hir_to_mir
 from metaxu.compiler.mir import MirBlock, MirFunc
-from metaxu.compiler.mir_interp import UNIT, MirInterpreter
+from metaxu.compiler.mir_interp import UNIT, MirInterpreter, mx_display
 from metaxu.compiler.pipeline import build_context_from_source, run_pipeline_ctx
 
 REPO_ROOT = Path(__file__).parent.parent.parent.parent.parent
@@ -254,7 +254,7 @@ def interp_run(source: str, entry: str = "main"):
     out: list[str] = []
 
     def _print(*args):
-        out.append(" ".join(str(a) for a in args))
+        out.append(" ".join(str(mx_display(a)) for a in args))
         return UNIT
 
     interp.register_builtin("print", _print)
@@ -4417,15 +4417,18 @@ fn main() -> int {
     assert re.search(r"load i64, ptr @mx_g_BASE", ir)
 
 
-def test_local_shadow_of_module_constant_demotes():
-    # Assignment creates a flow-sensitive local shadow in the interpreter
-    # (reads before it see the global): no static storage class matches.
-    ir = llvm_from_source("""
+def test_assignment_to_module_constant_is_rejected():
+    # A module-level `let` is an immutable binding like any other: the
+    # rebinding discipline refuses the write before any storage-class
+    # question (the old flow-sensitive-shadow demotion) can arise.
+    from metaxu.compiler.frozen_borrow_checker import BorrowCheckError
+    with pytest.raises(BorrowCheckError) as ei:
+        llvm_from_source("""
 let BASE = 7;
 fn f() -> int { BASE = 2; BASE }
 fn main() -> int { print(f()); print(BASE); 0 }
 """)
-    assert "shadows the global flow-sensitively" in ir
+    assert "cannot assign twice to immutable binding 'BASE'" in str(ei.value)
 
 
 def test_zip_comprehension_emits_two_word_thunk_and_zip_map():
@@ -8077,3 +8080,62 @@ def test_memory_attr_fallback_for_older_clangs(tmp_path, monkeypatch):
     written = (tmp_path / "prog.ll").read_text()
     assert lr._MEMORY_ATTR not in written
     assert "cold noreturn" in written  # ancient syntax, kept everywhere
+
+
+@needs_clang
+def test_bool_print_parity_native_matches_interp(tmp_path):
+    # Booleans format as their word (1/0) on BOTH engines: native erases
+    # bools to i64, and the interpreter's mx_display matches it, closing
+    # the divergence the book surfaced (print(true) was "True" vs "1").
+    src = """
+fn main() -> int {
+    print(true);
+    print(false);
+    print(1 < 2);
+    print((3 > 2).to_string() + "!");
+    0
+}
+"""
+    _res, out = interp_run(src)
+    assert out.splitlines() == ["1", "0", "1", "1!"]
+    assert_native_matches_interp(src, tmp_path)
+    # container reprs format bools the same way (interp-only: native
+    # print of a whole Vec demotes honestly rather than diverging)
+    _res, out = interp_run("""
+fn main() -> int {
+    let @mut v = Vec.new();
+    v.push(true);
+    v.push(false);
+    print(v);
+    0
+}
+""")
+    assert out.splitlines() == ["Vec[1, 0]"]
+
+
+@needs_clang
+def test_bare_qualified_variant_construct_and_match(tmp_path):
+    # `Shape::Dot` with no parens is the zero-argument qualified variant
+    # form, in construction and in pattern position alike.
+    src = """
+enum Shape {
+    Dot,
+    Circle(int)
+}
+
+fn name(s: Shape) -> string {
+    match s {
+        Shape::Dot => "dot"
+        Shape::Circle(r) => r.to_string()
+    }
+}
+
+fn main() -> int {
+    print(name(Shape::Dot));
+    print(name(Shape::Circle(7)));
+    0
+}
+"""
+    _res, out = interp_run(src)
+    assert out.splitlines() == ["dot", "7"]
+    assert_native_matches_interp(src, tmp_path)

@@ -78,9 +78,15 @@ fn main() -> int {
 """
 
 
-def test_plain_param_rebinding_stays_local_to_callee():
-    result, _ = run_main(PLAIN_REBIND_SRC)
-    assert result == 5
+def test_plain_rebinding_is_now_rejected():
+    # Rebinding discipline: a plain parameter is an immutable binding, so
+    # `p = Point{...}` inside `clobber` is refused at compile time (the
+    # old value-semantics question never arises).
+    from metaxu.compiler.frozen_borrow_checker import BorrowCheckError
+    from metaxu.compiler.pipeline import run_pipeline_ctx
+    with pytest.raises(BorrowCheckError) as ei:
+        run_pipeline_ctx(build_context_from_source(PLAIN_REBIND_SRC))
+    assert "cannot assign twice to immutable binding 'p'" in str(ei.value)
 
 
 PLAIN_FIELD_SET_SRC = """
@@ -156,11 +162,6 @@ fn main() -> int {
 @needs_clang
 def test_native_plain_param_value_semantics_matches_interp(tmp_path):
     native_matches_interp(PLAIN_FIELD_SET_SRC, tmp_path)
-
-
-@needs_clang
-def test_native_plain_rebinding_matches_interp(tmp_path):
-    assert native_matches_interp(PLAIN_REBIND_SRC, tmp_path) == 5
 
 
 @needs_clang

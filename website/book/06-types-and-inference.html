@@ -1,0 +1,142 @@
+<title>Types and inference · The Metaxu Book</title>
+<link rel="stylesheet" href="style.css">
+<header class="top">
+  <div class="inner">
+    <a class="brand" href="../index.html">Metaxu</a>
+    <nav class="topnav">
+      <a href="index.html">the book</a>
+      <a href="../roadmap.html">roadmap</a>
+      <a href="https://github.com/anoojpatel/metaxu">github &#8599;</a>
+    </nav>
+  </div>
+</header>
+<main>
+<h1>Types and inference</h1>
+<p>Metaxu&#x27;s checker is built on SimpleSub, an inference algorithm in the algebraic-subtyping family. The practical consequence: you write types on <code>fn</code> signatures when you want a checked boundary, and almost nowhere else. <code>let</code> bindings never need annotations, lambda parameters usually don&#x27;t, and whole stdlib modules (<code>std/option.mx</code>, <code>std/sort.mx</code>) leave most parameters bare.</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">fn largest(a: int, b: int) -&gt; int {
+    if a &gt; b { a } else { b }
+}
+
+fn main() -&gt; int {
+    let x = 40;
+    let name = &quot;answer&quot;;
+    let bigger = largest(x + 2, 2);
+    print(name + &quot;: &quot; + bigger.to_string());
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>answer: 42</code></pre></div>
+<p><code>x</code> is an int because <code>40</code> is, and because <code>largest</code> demands one. Nothing about that needed saying twice.</p>
+<h2>How the checker decides</h2>
+<p>Every expression starts as an inference variable. Uses add constraints: a literal classes its variable as Int or String or Bool or Float, an operator ties its operands together, a call ties arguments to parameters, both arms of an <code>if</code> flow into the same result. The checker then looks for a variable that has been forced into two classes at once. That is a compile error, reported at the value that made the conflict apparent:</p>
+<div class="fence error"><span class="label">metaxu · rejected</span><pre><code class="mx">fn main() -&gt; int {
+    let n = 1 + &quot;a&quot;;
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>one value is required to be Int and String</code></pre></div>
+<p>A condition must be a bool. There is no truthiness:</p>
+<div class="fence error"><span class="label">metaxu · rejected</span><pre><code class="mx">fn main() -&gt; int {
+    if 1 { print(&quot;yes&quot;) } else { print(&quot;no&quot;) };
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>one value is required to be Bool and Int</code></pre></div>
+<p>And an <code>if</code> used as a value must produce one type, whichever arm runs:</p>
+<div class="fence error"><span class="label">metaxu · rejected</span><pre><code class="mx">fn main() -&gt; int {
+    let x = if true { 1 } else { &quot;one&quot; };
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>one value is required to be Int and String</code></pre></div>
+<p>Annotations you do write are enforced the same way. Declaring <code>fn add(a: int, b: int)</code> turns every call site into a checked boundary:</p>
+<div class="fence error"><span class="label">metaxu · rejected</span><pre><code class="mx">fn add(a: int, b: int) -&gt; int { a + b }
+
+fn main() -&gt; int {
+    let x = add(1, &quot;two&quot;);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>call of add: argument has type String, expected Int</code></pre></div>
+<h2>Generics</h2>
+<p>Type declarations introduce parameters with angle brackets; uses apply them with angle brackets or square brackets (<code>Pair&lt;int&gt;</code> and <code>Pair[int]</code> mean the same thing). A generic function gets a fresh instantiation at every call site, so one program can use it at several types:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">fn identity&lt;T&gt;(x: T) -&gt; T { x }
+
+struct Pair&lt;T&gt; { x: T, y: T }
+
+fn main() -&gt; int {
+    let n = identity(41);
+    let s = identity(&quot;forty-one&quot;);
+    let ints = Pair&lt;int&gt; { x: 3, y: 4 };
+    let words = Pair { x: &quot;left&quot;, y: &quot;right&quot; };
+    print(s);
+    print(n + 1);
+    print(ints.x + ints.y);
+    print(words.x);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>forty-one
+42
+7
+left</code></pre></div>
+<p><code>Pair { x: &quot;left&quot;, y: &quot;right&quot; }</code> shows inference at work on a struct: no type arguments, <code>T</code> comes from the fields.</p>
+<p>Explicit instantiations are checked, not trusted. Naming the type argument and then contradicting it is an error:</p>
+<div class="fence error"><span class="label">metaxu · rejected</span><pre><code class="mx">struct Pair&lt;T&gt; { x: T, y: T }
+
+fn main() -&gt; int {
+    let p = Pair&lt;int&gt; { x: 1, y: &quot;nope&quot; };
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>field &#x27;y&#x27; of Pair</code></pre></div>
+<p>So is passing the wrong number of type arguments:</p>
+<div class="fence error"><span class="label">metaxu · rejected</span><pre><code class="mx">fn identity&lt;T&gt;(x: T) -&gt; T { x }
+
+fn main() -&gt; int {
+    let i = identity&lt;int, string&gt;(1);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>wrong number of type arguments for identity</code></pre></div>
+<p>When you write no type arguments at all, the arguments themselves must agree on what <code>T</code> is:</p>
+<div class="fence error"><span class="label">metaxu · rejected</span><pre><code class="mx">fn first&lt;T&gt;(a: T, b: T) -&gt; T { a }
+
+fn main() -&gt; int {
+    let x = first(1, &quot;s&quot;);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>conflicting instantiations of type parameter T</code></pre></div>
+<h2>Trait bounds</h2>
+<p>A <code>where</code> clause (or the inline form <code>fn f&lt;T: Show&gt;</code>) restricts a type parameter to types with an impl. Chapter 7 covers traits themselves; what matters here is that bounds are checked at the call site, whenever the instantiation is statically known:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">trait Show { fn show(self) -&gt; string }
+
+struct Point { x: int, y: int }
+
+implement Show for Point {
+    fn show(self) -&gt; string {
+        &quot;(&quot; + self.x.to_string() + &quot;, &quot; + self.y.to_string() + &quot;)&quot;
+    }
+}
+
+fn describe&lt;T&gt;(x: T) -&gt; string where T: Show { x.show() }
+
+fn main() -&gt; int {
+    print(describe(Point { x: 1, y: 2 }));
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>(1, 2)</code></pre></div>
+<p>Violating a bound names the missing impl, which is also the fix:</p>
+<div class="fence error"><span class="label">metaxu · rejected</span><pre><code class="mx">trait Show { fn show(self) -&gt; string }
+
+fn describe&lt;T&gt;(x: T) -&gt; string where T: Show { x.show() }
+
+fn main() -&gt; int {
+    print(describe(1));
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>missing `implement Show for Int`</code></pre></div>
+<h2>What stays permissive, and the honest status</h2>
+<p>Instantiation checking fires where types are statically known. A value whose type the checker cannot determine (say, the result of another generic call it could not resolve) passes through unchecked rather than producing a false positive; runtime dispatch still enforces it. Unannotated parameters are checked by how they&#x27;re used, not by a declaration they don&#x27;t have. The design bias is stated in the compiler docs and worth repeating: a clear error where the checker is sure, permissiveness where it is not, and never a silently wrong answer.</p>
+<p>One more status note. A full biunification engine with principal-type coalescing (union and intersection types, the SimpleSub simplification passes) exists in the compiler (<code>simplesub.py</code>), but its results are advisory: nothing in HIR or codegen consumes them yet, and the hard diagnostics you saw above all come from the constraint-graph conflict detector, which is deliberately coarser and points at source locations well. Principal types on statement-heavy functions over-approximate. If you ask the pipeline what the principal type of an expression chain is you get a real answer; the language does not yet act on it. Chapter 18 opens that machinery: the flow graph, the class-constraint algebra, the flat solver that decides what compiles, and the biunifier that computes those principal types.</p>
+<p>Undefined names are part of the same compile-time contract. A name that resolves to nothing is an error, never a silently dropped expression:</p>
+<div class="fence error"><span class="label">metaxu · rejected</span><pre><code class="mx">fn main() -&gt; int {
+    print(total);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>undefined variable &#x27;total&#x27;</code></pre></div>
+<nav class="pager"><a href="05-vectors-and-collections.html">&#8592; Vectors and collections</a><a href="07-traits.html">Traits &#8594;</a></nav>
+</main>
+<script src="book.js"></script>

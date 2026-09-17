@@ -279,7 +279,13 @@ def test_every_production_is_reachable():
 #: 164 -> 162: removing the bare `spawn(e)` expression form (the keyword
 #: and its production are gone; threads go through the Thread effect)
 #: removed the two conflicts its production contributed.
-_EXPECTED_SHIFT_REDUCE_CONFLICTS = 162
+#:
+#: 162 -> 163: bare `Enum::Variant` (the zero-argument qualified variant
+#: form, usable in construction AND pattern position) shares a prefix
+#: with the call form `Enum::Variant(args)`; on LPAREN the parser must
+#: SHIFT into the call reading, which is exactly the maximal-munch
+#: resolution this test requires.
+_EXPECTED_SHIFT_REDUCE_CONFLICTS = 163
 
 
 def _grammar_build_warnings() -> list[str]:

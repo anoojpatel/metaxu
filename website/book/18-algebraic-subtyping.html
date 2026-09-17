@@ -1,0 +1,145 @@
+<title>Algebraic subtyping · The Metaxu Book</title>
+<link rel="stylesheet" href="style.css">
+<header class="top">
+  <div class="inner">
+    <a class="brand" href="../index.html">Metaxu</a>
+    <nav class="topnav">
+      <a href="index.html">the book</a>
+      <a href="../roadmap.html">roadmap</a>
+      <a href="https://github.com/anoojpatel/metaxu">github &#8599;</a>
+    </nav>
+  </div>
+</header>
+<main>
+<h1>Algebraic subtyping</h1>
+<p>Chapter 6 showed what the checker says. This chapter is how it decides. Metaxu&#x27;s inference descends from Dolan&#x27;s algebraic subtyping and Parreaux&#x27;s SimpleSub, the simplified algorithm for it: types are not guessed and compared, they are collected as flows between the places a value is produced and the places it is consumed, and a program is rejected when some single value would have to be two incompatible things. Two engines implement that idea in the compiler, and this chapter is precise about which one does what. The <em>flat solver</em> is on the compile path: it decides what compiles. The <em>biunifier</em> is a full SimpleSub engine that computes principal types on request; it is advisory today, and the last sections say exactly what that means.</p>
+<h2>Every expression is a type variable</h2>
+<p>The checker does not work on source text. It works on the frozen syntax tree, and the first thing it does is hand every node in that tree its own fresh type variable. A literal, a <code>let</code>, an <code>if</code>, a call, a whole block: each gets one. Nothing is known about any of them yet; knowledge arrives as constraints.</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">fn pick(flag: bool) -&gt; int {
+    if flag { 40 } else { 2 }
+}
+
+fn main() -&gt; int {
+    print(pick(true) + pick(false));
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>42</code></pre></div>
+<p>Walk <code>pick</code> the way the checker does. <code>40</code> and <code>2</code> are variables that each carry the requirement Int. Both arms flow into the <code>if</code> node; the <code>if</code> is the function body&#x27;s tail, so it flows into the function&#x27;s return type; the return type is declared <code>int</code>. Four variables, three flows, one declared anchor, and everything resolves.</p>
+<h2>Flows have a direction</h2>
+<p>Two kinds of edge come out of the walk. A <em>flow</em>, written <code>a &lt;: b</code>, says a value produced at <code>a</code> is consumed at <code>b</code>: each child expression flows into the expression that contains it, a block&#x27;s tail flows into the block, a returned expression flows into its function&#x27;s return type. A <em>unify</em> edge says two variables must be the same type, with no direction: a variable use and its binding, the two sides of <code>+</code>, an assignment&#x27;s target and its value, the arms of an <code>if</code> with each other. A third kind, the <em>call</em> edge, connects a callee&#x27;s type to the argument and result types at one call site.</p>
+<p>Direction is what makes this subtyping rather than plain unification. Positions that produce values are <em>positive</em>; positions that consume them are <em>negative</em>. A function&#x27;s return type is positive and its parameters are negative, and going under a parameter flips the sign of everything inside it. When a function is handed a function, the argument flows <em>into</em> the lambda&#x27;s parameter:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">fn apply(f: fn(int) -&gt; int) -&gt; int {
+    f(20)
+}
+
+fn main() -&gt; int {
+    print(apply(fn(s) -&gt; s * 2));
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>40</code></pre></div>
+<p><code>f</code>&#x27;s parameter is a negative position, so <code>20</code> reaches the lambda&#x27;s <code>s</code> through the call edge inside <code>apply</code>, and <code>s * 2</code> is an Int. One honest limit belongs right here: change the body to <code>s + &quot;!&quot;</code> and the compile path accepts the program, because call edges are not merged by the conflict detector described next; the mismatch surfaces only when the interpreter tries to add an Int to a String. The biunifier sees the clash statically. Closing that gap on the compile path is tracked in <code>docs/type_inference_plan.md</code>.</p>
+<h2>The algebra of requirements</h2>
+<p>Alongside the edges, the walk attaches <em>class constraints</em> to variables. These are the algebra in algebraic subtyping: not types, but requirements a type must satisfy, and they compose by set union as variables are merged.</p>
+<ul>
+<li>A literal contributes its primitive: Int, Float, String, Bool, or Unit.</li>
+<li><code>+ - * / %</code> require Number of their result; <code>&lt; &lt;= &gt; &gt;=</code> require Ord of their operands; <code>== !=</code> require Eq. Every comparison&#x27;s result is Bool. The bitwise operators require Int of everything they touch.</li>
+<li>The condition of an <code>if</code> or <code>while</code> must be Bool. A <code>while</code> is Unit.</li>
+<li>A struct literal carries Struct and <code>Struct:Name</code>; each field carries <code>Field:name</code>; reading <code>x.f</code> requires HasField of <code>x</code>.</li>
+<li>Parameters carry Param plus any declared mode, as <code>Mode:once</code> and the like; lambdas and named functions carry Callable; calls carry CallLinearity; borrows, moves, and <code>exclave</code> each leave their own mark for the mode checker.</li>
+<li>A function with a <code>performs</code> clause carries Effectful.</li>
+</ul>
+<p>After the walk, the conflict detector takes the four mutually exclusive literal classes (Int, String, Bool, Float), unions variables along <em>unify</em> edges only, and reads the classes of each component together. Two different primitives on one component is the rejection chapter 6 pinned as &quot;one value is required to be Int and String&quot;. Flow edges are deliberately not merged (they are directional, and every statement flows into its block), and neither are call edges; that is the source of the limit noted above. The diagnostic points at the last of the conflicting values in source order, the one that made the conflict apparent:</p>
+<div class="fence error"><span class="label">metaxu · rejected</span><pre><code class="mx">fn main() -&gt; int {
+    let small = 1 &lt; &quot;a&quot;;
+    print(small);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>Int and String</code></pre></div>
+<p>The two operands are unified, <code>1</code> brings Int, <code>&quot;a&quot;</code> brings String, and the merged variable cannot be both. Ord never even gets consulted; the primitive clash is found first.</p>
+<h2>The flat solver</h2>
+<p>The solver on the compile path is a unifier that records a bound. A type variable holds a pair of bounds, lower and upper; when a variable is unified with anything, that thing becomes its upper bound, and finding a variable&#x27;s representative means following upper bounds to the end, compressing the path as it goes. The bound <em>is</em> the union-find link. Beyond variables the cases are structural: primitives unify when their names match; constructors when their names and arities match and their arguments unify under the composed variance; function types with parameters contravariant and results covariant; effect types when their operation sets match. An occurs check refuses to build an infinite type.</p>
+<p>Variance composes by a small table: invariant absorbs everything, equal signs give covariant, different signs give contravariant. Type constructors carry a variance per parameter; unless the definition&#x27;s analysis recorded one, the default is invariant, which is why a <code>Vec[int]</code> is exactly a <code>Vec[int]</code> and not a subtype of anything wider.</p>
+<p>A failed constraint does not stop the solve. It is recorded and the walk continues, so one mistake cannot hide the others behind it.</p>
+<p>Recursive types are handled by unfolding, once, per constraint: the recursive occurrence is replaced by one copy of its definition with fresh parameters, which is enough to check any single use without looping.</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">enum Chain {
+    End,
+    Link(int, Chain)
+}
+
+fn total(c: Chain) -&gt; int {
+    match c {
+        Chain::End =&gt; 0
+        Chain::Link(v, rest) =&gt; v + total(rest)
+    }
+}
+
+fn main() -&gt; int {
+    print(total(Chain::Link(20, Chain::Link(22, Chain::End))));
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>42</code></pre></div>
+<h2>Variance is inferred, never written</h2>
+<p>A type parameter&#x27;s variance comes from where it appears. The checker records every position a parameter occupies in its definition as positive, negative, or neutral: only positive positions makes it covariant, only negative makes it contravariant, both or neither makes it invariant. There is no annotation syntax for this. Older design notes sketch <code>+T</code> and <code>-T</code>; the parser does not accept them, and you do not need them.</p>
+<p>Declarations introduce parameters in angle brackets and applications supply them in square brackets: <code>struct Pair&lt;T&gt;</code> declares, <code>Pair[int]</code> applies. Generic functions instantiate per call, with the parameter unified against whatever flows in:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">struct Pair&lt;T&gt; { a: T, b: T }
+
+fn flip&lt;T&gt;(p: Pair[T]) -&gt; Pair[T] {
+    Pair { a: p.b, b: p.a }
+}
+
+fn main() -&gt; int {
+    let f = flip(Pair { a: 1, b: 41 });
+    print(f.a - f.b);
+    let w = flip(Pair { a: &quot;x&quot;, b: &quot;y&quot; });
+    print(w.a + w.b);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>40
+yx</code></pre></div>
+<h2>Where generalization stands</h2>
+<p>A lambda bound with <code>let</code> and used at two types compiles today:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">fn main() -&gt; int {
+    let same = fn(x) -&gt; x;
+    print(same(1));
+    print(same(&quot;a&quot;));
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>1
+a</code></pre></div>
+<p>It compiles for a reason worth understanding, not because <code>same</code> was generalized. Each call connects to the lambda through a call edge, and call edges are not merged by the conflict detector, so Int and String never meet in one component. The lambda has a single type variable for its whole life; ask the biunifier for <code>same</code>&#x27;s principal type and it answers <code>Int ∨ String</code>, and for the lambda as a function, <code>(Int ∧ String) -&gt; (Int ∨ String)</code>: one function that has absorbed both uses rather than two instantiations of a polymorphic one. That is the precise form of chapter 6&#x27;s caveat on principal types. Named generic functions such as <code>flip&lt;T&gt;</code> above are instantiated per call by the emitter; <code>let</code>-bound lambdas are not, yet. The biunifier already has the machinery, levels with extrusion, <code>generalize</code> and <code>instantiate</code>, exercised at the engine level; putting it on the compile path is the first item in the inference plan.</p>
+<h2>The biunifier</h2>
+<p>The second engine is the SimpleSub algorithm proper. <code>constrain(a, b)</code> records <code>a &lt;: b</code> by decomposing structurally, keeps <em>lists</em> of lower and upper bounds per variable in side tables (never touching the flat solver&#x27;s union-find link), propagates each new bound against the bounds already present, and terminates on cyclic constraint graphs through a processed-pair cache. A variable constrained against a type from an inner scope is <em>extruded</em>: copied down to the outer level with fresh variables linked back, so nothing leaks. Coalescing then turns the solved graph into a principal type: positive variables union with their lower bounds, negative ones intersect with their upper bounds, re-entering a variable yields a <code>μ</code> binder, and the paper&#x27;s simplification passes remove polar-only variables and flatten.</p>
+<p>Everything the compile path emits is fed to it: unify edges as both directions, flow edges as one, the literal classes as bounds, and call edges as <code>callee &lt;: (args) -&gt; result</code>. Its primitive lattice is flat (no <code>Int &lt;: Float</code>), so it reports exactly the primitive clashes the flat solver would, plus the ones that hide behind call edges. Querying it never changes what compiles; the tests pin that the MIR of a program is byte-identical whether or not its principal types were asked for.</p>
+<h2>Effects and linearity ride the same graph</h2>
+<p>The flow graph carries more than types. When a function declares <code>performs Ask</code>, the effect name is attached to its function type. A call propagates the callee&#x27;s effects to the call&#x27;s result; a flow edge propagates them from the producing side to the consuming side; a function whose return type carries an effect carries it too. A function type that ends up with a suspend-class effect on it is marked as one that may suspend, and that mark is what later stages use to decide which functions need a continuation frame. The propagation is why the checker knows <code>doubled</code> suspends even though it never performs anything itself:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">effect Ask {
+    ask() -&gt; int
+}
+
+fn answer() -&gt; int performs Ask {
+    perform Ask.ask()
+}
+
+fn doubled() -&gt; int performs Ask {
+    answer() * 2
+}
+
+fn main() -&gt; int {
+    let n = handle Ask with {
+        ask() -&gt; resume(21)
+    } in {
+        doubled()
+    };
+    print(n);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>42</code></pre></div>
+<p>Linearity travels the same way. Every function type carries <code>once</code>, <code>separate</code>, or <code>many</code>. A lambda that captures something mutably is forced to at least <code>separate</code>; a lambda declared <code>many</code> with a mutable capture is rejected; a <code>once</code> callable invoked twice is rejected. Chapter 10 is where those rules are stated from the user&#x27;s side; here they are just more requirements on the same variables, checked in the same pass, from the same walk.</p>
+<h2>What is built, and what is only sketched</h2>
+<p>On the compile path, load-bearing on every build: a fresh variable per node; flow, unify, and call edges; the class-constraint algebra with its conflict detector over unify components; the flat solver with an occurs check and single-step unfolding of recursive types; variance inferred for type parameters; effect and linearity propagation over the solved graph.</p>
+<p>Built and tested at the engine level, advisory on the path: the biunifier, with extrusion, levels, generalization, instantiation, coalescence, and simplification into principal types.</p>
+<p>Not built: generalization of <code>let</code>-bound lambdas on the compile path; merging of call edges into conflict detection (the <code>s + &quot;!&quot;</code> gap); a type-class solver with functional dependencies (present in the source, never called); union and intersection types in surface syntax; the older design document&#x27;s nominal struct extension, structural width subtyping for records and variants, and interfaces. <code>Number</code>, <code>Ord</code>, and <code>Eq</code> are requirements a primitive can satisfy, not supertypes: Int and Float are distinct, and there is no numeric widening.</p>
+<p>If you want to see the machinery run, chapter 17 shows how to hold the pipeline open from Python; <code>ctx.tables.facade.principal_type_of(node)</code> is the biunifier&#x27;s answer for any node, and the tables it builds are the variables and constraints this chapter described.</p>
+<nav class="pager"><a href="17-inside-the-compiler.html">&#8592; Inside the compiler</a><a href="index.html">Contents</a></nav>
+</main>
+<script src="book.js"></script>

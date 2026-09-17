@@ -1,0 +1,193 @@
+<title>Vectors and collections · The Metaxu Book</title>
+<link rel="stylesheet" href="style.css">
+<header class="top">
+  <div class="inner">
+    <a class="brand" href="../index.html">Metaxu</a>
+    <nav class="topnav">
+      <a href="index.html">the book</a>
+      <a href="../roadmap.html">roadmap</a>
+      <a href="https://github.com/anoojpatel/metaxu">github &#8599;</a>
+    </nav>
+  </div>
+</header>
+<main>
+<h1>Vectors and collections</h1>
+<p>Metaxu has two vector types with two different characters. <code>Vec</code> is the growable heap collection: push, pop, index, one identity shared by everyone holding it. <code>vector[T, N]</code> is a fixed-size value: its length is part of its type, it copies on assignment, and arithmetic on it is elementwise. This chapter covers both, plus strings.</p>
+<h2>Vec</h2>
+<p><code>Vec.new()</code> makes an empty vector; a literal <code>[a, b, c]</code> makes a full one. <code>push</code> appends, <code>pop</code> removes and returns the last element, <code>len</code> answers the count, and <code>v[i]</code> indexes from zero, for reading or writing:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">fn main() -&gt; int {
+    let @mut v = Vec.new();
+    v.push(10);
+    v.push(20);
+    v.push(30);
+    print(v.len());
+    print(v[1]);
+    v[1] = 25;
+    print(v[1]);
+    print(v.pop());
+    print(v.len());
+    let primes = [2, 3, 5, 7];
+    print(primes[3]);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>3
+20
+25
+30
+2
+7</code></pre></div>
+<p><code>len(v)</code> and <code>v.len()</code> are the same call; <code>std/</code> uses the function form, most examples the method form.</p>
+<h2>Vec has identity</h2>
+<p>Assigning a <code>Vec</code> to another name or passing it to a function hands over the same vector, not a copy. That&#x27;s the point: a helper that pushes into its argument is how you build things.</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">fn extend_with_squares(target: Vec, upto: int) {
+    let @mut i = 0;
+    while i &lt; upto {
+        target.push(i * i);
+        i = i + 1
+    }
+}
+
+fn main() -&gt; int {
+    let @mut v = Vec.new();
+    let same = v;
+    extend_with_squares(v, 4);
+    print(same.len());
+    print(same[3]);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>4
+9</code></pre></div>
+<p>Both <code>same</code> and the callee saw <code>v</code> itself change. Contrast with structs, which chapter 2 showed pass as copies unless the parameter says <code>@mut</code>.</p>
+<h2>Out of bounds is a failure you can catch</h2>
+<p>Indexing past the end doesn&#x27;t read garbage and doesn&#x27;t kill the process behind your back. It&#x27;s a runtime failure, and <code>try</code>/<code>catch</code> (chapter 9 has the full story) turns it into a value:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">fn main() -&gt; int {
+    let v = [1, 2];
+    let got = try {
+        v[10]
+    } catch e {
+        print(&quot;caught: &quot; + e);
+        -1
+    };
+    print(got);
+    let @mut empty = Vec.new();
+    let popped = try { empty.pop() } catch e { 0 };
+    print(popped);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>caught: index out of bounds: 10 (length 2)
+-1
+0</code></pre></div>
+<h2>Iterating</h2>
+<p><code>for</code> walks a <code>Vec</code>, or an integer range <code>a..b</code> (end exclusive). When you need the index too, use the <code>while i &lt; len(v)</code> loop, the idiom all of <code>std/vec.mx</code> is written with; <code>extend_with_squares</code> above is one:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">fn main() -&gt; int {
+    let names = [&quot;ada&quot;, &quot;grace&quot;, &quot;edsger&quot;];
+    for name in names {
+        print(name);
+    }
+    for k in 0..3 {
+        print(k * 10);
+    }
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>ada
+grace
+edsger
+0
+10
+20</code></pre></div>
+<p>There is no slice syntax; <code>std.sort</code> builds its halves with an explicit copy loop for the same reason you would.</p>
+<h2>std.vec and std.sort</h2>
+<p>The combinators live in the library, not the language. <code>import std.vec</code> gives map, filter, sum, reverse and friends, eager and Vec-in, fresh-Vec-out; <code>std.sort</code> adds a stable merge sort driven by a strict less-than predicate:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">import std.vec
+import std.sort
+
+fn main() -&gt; int {
+    let v = std.vec.range_vec(1, 6);
+    print(std.vec.sum(v));
+    let evens = std.vec.filter(v, fn(x) -&gt; x % 2 == 0);
+    print(evens.len());
+    let sorted = std.sort.sort_desc([3, 1, 4, 1, 5]);
+    print(sorted[0]);
+    print(sorted[4]);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>15
+2
+5
+1</code></pre></div>
+<h2>Fixed vectors: vector[T, N]</h2>
+<p>A <code>vector[T, N]</code> holds exactly <code>N</code> elements of <code>T</code>. Construct it with values, with nothing (zero-initialized), or with a comprehension. Arithmetic is elementwise, and the operands&#x27; sizes must agree:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">fn main() -&gt; int {
+    let a = vector[int, 4](1, 2, 3, 4);
+    let b = vector[int, 4](10, 20, 30, 40);
+    let c = a + b;
+    print(c.to_string());
+    print((a * a).to_string());
+    let z = vector[int, 3]();
+    print(z[0]);
+    let sq = vector[float, 4](x * 0.5 for x in 0..4);
+    print(sq.to_string());
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>vector[11, 22, 33, 44]
+vector[1, 4, 9, 16]
+0
+vector[0.0, 0.5, 1.0, 1.5]</code></pre></div>
+<p>Because <code>N</code> is in the type, the native backend compiles these to real SIMD when it can prove the size, which is why they exist as a separate type instead of a small <code>Vec</code>.</p>
+<h2>Fixed vectors are values</h2>
+<p>Unlike <code>Vec</code>, a <code>vector[T, N]</code> copies on assignment. Writing through one name never surprises another:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">fn main() -&gt; int {
+    let @mut a = vector[int, 3](1, 2, 3);
+    let @mut b = a;
+    b[0] = 99;
+    print(a[0]);
+    print(b[0]);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>1
+99</code></pre></div>
+<p>One line to remember: <code>Vec</code> shares, <code>vector</code> copies.</p>
+<h2>Strings</h2>
+<p>Strings concatenate with <code>+</code>, compare with <code>==</code> and order with <code>&lt;</code>, and index to one-character strings; there&#x27;s no separate char type. <code>len</code> counts characters:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">fn main() -&gt; int {
+    let s = &quot;metaxu&quot;;
+    print(len(s));
+    print(s[2]);
+    print(s + &quot;!&quot;);
+    if &quot;abc&quot; &lt; &quot;abd&quot; {
+        print(&quot;abc sorts first&quot;);
+    }
+    let @mut spelled = &quot;&quot;;
+    let @mut i = len(s);
+    while i &gt; 0 {
+        spelled = spelled + s[i - 1];
+        i = i - 1
+    }
+    print(spelled);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>6
+t
+metaxu!
+abc sorts first
+uxatem</code></pre></div>
+<p><code>std.string</code> packages the loops you&#x27;d otherwise rewrite: <code>starts_with</code>, <code>count_char</code>, <code>repeat</code>, <code>join</code> over a <code>Vec</code> of parts, and more:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">import std.string
+
+fn main() -&gt; int {
+    print(std.string.repeat(&quot;ab&quot;, 3));
+    if std.string.starts_with(&quot;metaxu&quot;, &quot;meta&quot;) {
+        print(&quot;has the prefix&quot;);
+    }
+    print(std.string.join([&quot;a&quot;, &quot;b&quot;, &quot;c&quot;], &quot;, &quot;));
+    print(std.string.count_char(&quot;banana&quot;, &quot;a&quot;));
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>ababab
+has the prefix
+a, b, c
+3</code></pre></div>
+<p>That&#x27;s the eager story. <code>std.stream</code> and <code>std.iter</code> do the lazy version, pipelines built from the <code>Emit</code> effect, and they belong to chapter 8, after effects themselves. Next, though: the types you never had to write in any of these examples, and where they came from.</p>
+<nav class="pager"><a href="04-pattern-matching.html">&#8592; Pattern matching</a><a href="06-types-and-inference.html">Types and inference &#8594;</a></nav>
+</main>
+<script src="book.js"></script>

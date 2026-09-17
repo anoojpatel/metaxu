@@ -1,0 +1,177 @@
+<title>Functions and values · The Metaxu Book</title>
+<link rel="stylesheet" href="style.css">
+<header class="top">
+  <div class="inner">
+    <a class="brand" href="../index.html">Metaxu</a>
+    <nav class="topnav">
+      <a href="index.html">the book</a>
+      <a href="../roadmap.html">roadmap</a>
+      <a href="https://github.com/anoojpatel/metaxu">github &#8599;</a>
+    </nav>
+  </div>
+</header>
+<main>
+<h1>Functions and values</h1>
+<p>A Metaxu program is a set of <code>fn</code> declarations. Each parameter carries a type, the return type follows <code>-&gt;</code>, and the body&#x27;s last expression is what the function returns.</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">fn add(a: int, b: int) -&gt; int {
+    a + b
+}
+
+fn shout(word: string) {
+    print(word + &quot;!&quot;);
+}
+
+fn main() -&gt; int {
+    print(add(19, 23));
+    shout(&quot;hey&quot;);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>42
+hey!</code></pre></div>
+<p><code>shout</code> has no <code>-&gt;</code> clause, so it returns unit. Statements end with <code>;</code>; the trailing expression of a block doesn&#x27;t, and dropping the semicolon is what makes it the block&#x27;s value. Put one after it and the block becomes unit.</p>
+<p><code>return</code> exists for leaving early:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">fn classify(n: int) -&gt; string {
+    if n &lt; 0 {
+        return &quot;negative&quot;;
+    }
+    if n == 0 {
+        return &quot;zero&quot;;
+    }
+    &quot;positive&quot;
+}
+
+fn main() -&gt; int {
+    print(classify(-5));
+    print(classify(0));
+    print(classify(9));
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>negative
+zero
+positive</code></pre></div>
+<p>Those two else-less <code>if</code>s are statements: an <code>if</code> without an <code>else</code> is always unit-valued. The arm runs for its effects (here, the <code>return</code>), but its value is discarded.</p>
+<h2>let, @mut, and shadowing</h2>
+<p><code>let</code> binds a name. Add <code>@mut</code> when you intend to reassign the binding or mutate through it; that&#x27;s the convention everywhere in <code>std/</code>, and the mode system (chapter 10) is where it grows teeth. <code>mut</code> without the <code>@</code> is accepted as the same annotation. A second <code>let</code> with the same name shadows the first, which is how you &quot;change&quot; a value you&#x27;d rather keep immutable:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">fn main() -&gt; int {
+    let @mut total = 0;
+    total = total + 10;
+    total = total + 5;
+    print(total);
+
+    let x = 100;
+    let x = x + 1;   # a new binding, shadowing the old one
+    print(x);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>15
+101</code></pre></div>
+<p>Type annotations on <code>let</code> are optional; inference (chapter 6) fills them in. When you want one, it goes after the name: <code>let y: float = 1.5;</code>.</p>
+<h2>if and else as expressions</h2>
+<p>With both arms present, <code>if</code>/<code>else</code> is an expression, and each arm&#x27;s value is the block&#x27;s last expression:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">fn main() -&gt; int {
+    let n = 7;
+    let size = if n &gt; 10 { &quot;big&quot; } else { &quot;small&quot; };
+    print(size);
+
+    if n &lt; 0 {
+        print(&quot;neg&quot;);
+    } else if n == 0 {
+        print(&quot;zero&quot;);
+    } else {
+        print(&quot;pos&quot;);
+    }
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>small
+pos</code></pre></div>
+<p>Braces are mandatory, and there is no freestanding <code>{ ... }</code> expression: blocks get their value from being function bodies or <code>if</code>/<code>else</code>/<code>match</code> arms.</p>
+<h2>while</h2>
+<p><code>while</code> repeats a block. The condition must be <code>bool</code>; the checker rejects a bare integer there, the same way it rejects <code>1 + &quot;a&quot;</code>:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">fn main() -&gt; int {
+    let @mut i = 0;
+    let @mut sum = 0;
+    while i &lt; 5 {
+        sum = sum + i;
+        i = i + 1
+    }
+    print(sum);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>10</code></pre></div>
+<p>(<code>for x in ...</code> also exists; chapter 5 covers it alongside the collections you&#x27;d iterate.)</p>
+<h2>Numbers, strings, and to_string</h2>
+<p><code>int</code> and <code>float</code> are distinct types with the usual operators. <code>/</code> on ints is integer division; <code>%</code> is remainder. Strings compare with <code>==</code> and order lexicographically with <code>&lt;</code>. <code>+</code> concatenates strings, and only strings: gluing a number on takes <code>.to_string()</code>, or an f-string, which interpolates any expression between braces:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">fn main() -&gt; int {
+    print(7 / 2);
+    print(7 % 2);
+    print(2.5 + 0.5);
+    print(&quot;score: &quot; + (7 * 6).to_string());
+    let name = &quot;Metaxu&quot;;
+    let n = 5;
+    print(f&quot;hello {name}, {n} squared is {n * n}&quot;);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>3
+1
+3.0
+score: 42
+hello Metaxu, 5 squared is 25</code></pre></div>
+<p>Comparisons (<code>==</code>, <code>!=</code>, <code>&lt;</code>, <code>&lt;=</code>, <code>&gt;</code>, <code>&gt;=</code>) produce <code>bool</code>, and <code>&amp;&amp;</code>, <code>||</code>, <code>!</code> combine them; you&#x27;ve seen them in every condition so far.</p>
+<h2>Functions as values</h2>
+<p><code>fn</code> without a name is a lambda. The body is either a single expression after <code>-&gt;</code>, or a braced block; parameter types may be omitted and inferred. Lambdas close over the bindings around them, and a function type is written <code>fn(int) -&gt; int</code>:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">fn apply_twice(f: fn(int) -&gt; int, v: int) -&gt; int {
+    f(f(v))
+}
+
+fn main() -&gt; int {
+    let square = fn(x: int) -&gt; x * x;
+    print(square(6));
+
+    let offset = 10;
+    let shifted = fn(x) -&gt; x + offset;   # captures offset
+    print(shifted(5));
+
+    let clamped = fn(x: int) {
+        if x &gt; 100 { 100 } else { x }
+    };
+    print(apply_twice(clamped, 7));
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>36
+15
+7</code></pre></div>
+<p>There is no <code>|x| ...</code> form; <code>fn(x) -&gt; ...</code> is the lambda syntax. <code>std/sort.mx</code> is written entirely in this style: <code>sort_by(v, fn(a, b) -&gt; a &lt; b)</code>.</p>
+<h2>What a call does to its arguments</h2>
+<p>An unmarked parameter gives the function its own view of the value; writes to it don&#x27;t reach the caller. Mark the parameter <code>@mut</code> and they do:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">struct Box { value: int }
+
+fn keeps(b: Box) {
+    b.value = 99;
+}
+
+fn bumps(b: @mut Box, by: int) {
+    b.value = b.value + by;
+}
+
+fn main() -&gt; int {
+    let @mut bx = Box { value: 1 };
+    keeps(bx);
+    print(bx.value);
+    bumps(bx, 41);
+    print(bx.value);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>1
+42</code></pre></div>
+<p>Nothing extra is written at the call site; the parameter&#x27;s mode is the contract, and the borrow checker holds both sides to it. (<code>Vec</code> behaves differently, on purpose. Chapter 5.)</p>
+<h2>Names must exist</h2>
+<p>An undefined name is a compile error, not a runtime one. The checker resolves every variable and callee before anything runs:</p>
+<div class="fence error"><span class="label">metaxu · rejected</span><pre><code class="mx">fn main() -&gt; int {
+    let total = subtotal + tax;
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>undefined variable &#x27;subtotal&#x27;</code></pre></div>
+<p>Next: putting values together into your own types.</p>
+<nav class="pager"><a href="01-getting-started.html">&#8592; Getting started</a><a href="03-structs-and-enums.html">Structs and enums &#8594;</a></nav>
+</main>
+<script src="book.js"></script>
