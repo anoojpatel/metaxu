@@ -1,0 +1,11 @@
+version = 1
+
+[[package]]
+name = "geom"
+source = "path+deps/geom"
+hash = "sha256:626013fffbbdb0e268c9b61fbe34d2d37ced1e72da29141b23bab3589c33475d"
+
+[[package]]
+name = "util"
+source = "path+deps/util"
+hash = "sha256:edd308f57cc009399b1917e2927b661c78d30ee27f599969deab4e2c50084c33"

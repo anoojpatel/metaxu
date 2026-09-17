@@ -37,7 +37,8 @@ language changes, the book breaks loudly.
 14. [Compiling to native](14-compiling-to-native.md) — clang, the
     differential contract, measured performance.
 15. [Modules and imports](15-modules-and-imports.md) — `import`,
-    `export`, visibility, multi-file programs, name precedence.
+    `export`, visibility, multi-file programs, name precedence,
+    packages and the lockfile.
 16. [Unsafe and FFI](16-unsafe-and-ffi.md) — `unsafe`, extern C,
     the strict simulated heap, the native boundary.
 17. [Inside the compiler](17-inside-the-compiler.md) — the pipeline

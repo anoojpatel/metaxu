@@ -120,6 +120,27 @@ def test_path_dependencies_are_used_in_place(tmp_path):
     assert package_roots(proj) == {"util": lib.resolve()}
 
 
+def test_transitive_path_dependency_is_locked_relative_to_the_project(tmp_path):
+    # geom lives under the project (deps/geom) and names util as `../util`,
+    # i.e. deps/util: that spelling is relative to geom, and the lock must
+    # record it relative to the project, which is the only base the
+    # compiler has when it reads the lock
+    proj = make_project(tmp_path, 'geom = { path = "deps/geom" }\n')
+    for name, deps in (("geom", 'util = { path = "../util" }\n'), ("util", "")):
+        d = proj / "deps" / name
+        (d / "src").mkdir(parents=True)
+        (d / "mx.toml").write_text(
+            f'[package]\nname = "{name}"\nversion = "0.1.0"\n\n[dependencies]\n{deps}')
+        (d / "src" / "lib.mx").write_text("export { f };\nfn f() -> int { 1 }\n")
+
+    locked = sync(proj)
+
+    assert locked["util"].source == "path+deps/util"
+    assert package_roots(proj) == {"geom": (proj / "deps" / "geom").resolve(),
+                                   "util": (proj / "deps" / "util").resolve()}
+    assert check(proj) == []
+
+
 def test_std_cannot_be_a_dependency(tmp_path):
     proj = make_project(tmp_path, 'std = { path = "../std" }\n')
     with pytest.raises(PackageError, match="reserved"):

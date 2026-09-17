@@ -1,0 +1,15 @@
+# The facade of the geom package: what `import geom;` means.
+export { area, describe };
+
+import shapes;
+from internal import twice;
+import util;
+
+fn area(w: int, h: int) -> int {
+    w * h
+}
+
+fn describe(w: int, h: int) -> string {
+    let a = util.clamp(area(w, h), 0, 100);
+    shapes.name(w, h) + " of area " + twice(a / 2).to_string()
+}

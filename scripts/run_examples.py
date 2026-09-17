@@ -22,9 +22,12 @@ sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
 def default_targets() -> list[str]:
     # examples/app/ is a multi-file application: only its ENTRY file is a
     # target, the sibling modules are reached through its imports.
+    # examples/pkg_app/ is the same with DEPENDENCIES: its mx.lock names
+    # two packages under deps/ and the resolver loads them from there.
     return (
         sorted(glob.glob(os.path.join(REPO_ROOT, "examples", "*.mx")))
         + sorted(glob.glob(os.path.join(REPO_ROOT, "examples", "app", "main.mx")))
+        + sorted(glob.glob(os.path.join(REPO_ROOT, "examples", "pkg_app", "main.mx")))
         + sorted(glob.glob(os.path.join(REPO_ROOT, "test_*.mx")))
     )
 

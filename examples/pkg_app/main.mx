@@ -1,0 +1,18 @@
+# A project with dependencies (docs/packages.md, book chapter 15).
+#
+# mx.toml names the dependencies, mx.lock pins what `mxpkg sync` put on
+# disk, and the compiler resolves `import geom;` from the lock: the
+# package's src/lib.mx. `geom.shapes` is importable because geom lists
+# it as public; `util` is geom's own dependency, and the lock is one
+# flat table, so it means the same package here.
+import geom;
+from geom.shapes import name;
+import util;
+
+fn main() -> int {
+    print(geom.area(3, 4));
+    print(name(2, 2));
+    print(util.clamp(geom.area(9, 9), 0, 50));
+    print(geom.describe(2, 5));
+    0
+}

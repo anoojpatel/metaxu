@@ -134,6 +134,21 @@ the lock format.
 
 ## Status
 
-The tool and its tests exist and run against local git repositories.
-The resolver hook (step 3 above, plus the ambiguity check) lands on
-the v1 compiler tree, where module resolution lives.
+Built and pinned:
+
+- The tool (`mxpkg add/sync/check/tree/paths`), tested against local
+  git repositories (`test_packages.py`).
+- The resolver hook (`compiler/module_loader.py`). The resolver finds
+  the nearest `mx.lock` at or above the root file, reads the
+  name-to-root table from it, and resolves an import whose head is a
+  locked dependency from that package's `src/`: the bare name is
+  `src/lib.mx`, `name.a.b` is `src/a/b.mx` and must be listed under
+  `[package] public` when imported from outside the package. A head
+  that is both a sibling file and a dependency is rejected as
+  ambiguous. Inside a dependency, a bare import is qualified with the
+  package name (`import shapes;` in geom means `geom.shapes`), so a
+  package's files never collide with the project's. Pinned in
+  `test_package_resolution.py` (path dependencies, no git needed) and
+  by the example gate's `examples/pkg_app/`.
+
+Not built: everything under "What this does not do, yet".

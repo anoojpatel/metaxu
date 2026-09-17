@@ -99,7 +99,7 @@ fn main() -&gt; int {
     print(geometry.area(clamp(sum(iota(10)), 1, 6), 2));
     0
 }</code></pre></div>
-<p>This is the book&#x27;s one display-only fence in this chapter: the harness extracts single-source programs, and a multi-file layout has no single source to extract. The program itself runs through the example gate, which is where its behavior is pinned.</p>
+<p>This is a display-only fence (the packages section below has the other one): the harness extracts single-source programs, and a multi-file layout has no single source to extract. The program itself runs through the example gate, which is where its behavior is pinned.</p>
 <p>Each file&#x27;s <code>export</code> works as in a <code>module</code> block, with one default worth knowing: a file with no <code>export</code> statement exports nothing, so a library file that forgets its exports is unusable rather than accidentally wide open.</p>
 <h2>Name precedence</h2>
 <p>When a plain call could mean two things, the resolver prefers the nearest definition. Your own top-level <code>fn len</code> beats the builtin <code>len</code> in call position:</p>
@@ -129,8 +129,78 @@ fn main() -&gt; int {
   1 | fn __helper() -&gt; int {
     | ^</code></pre></div>
 <p>The rule is about <em>functions</em>: a <code>let __tmp = 1;</code> is accepted today, because a local binding cannot be mistaken for a compiler symbol. Don&#x27;t lean on that; the prefix is reserved in spirit everywhere. Same caveat as the visibility rejection above: <code>ReservedNameError</code> is a plain <code>CompileError</code>, so this is a quoted diagnostic in a plain fence rather than a harness-pinned <code>error</code> block.</p>
+<h2>Packages: code from another repository</h2>
+<p>Everything above is one project. Code that lives elsewhere comes in as a <em>package</em>, and the design is deliberately small (<code>docs/packages.md</code> has the whole of it). The compiler never touches the network. A separate tool, <code>mxpkg</code>, fetches dependencies before a build and leaves files on disk; a build with a complete <code>mx_modules/</code> directory works offline. Dependencies are pinned, never ranged: a git URL plus a revision, or a local path. Two requesters that disagree on a revision are an error naming both, for a person to settle.</p>
+<p>A project declares what it wants in <code>mx.toml</code>:</p>
+<div class="fence"><span class="label">toml</span><pre><code>[package]
+name = &quot;pkg_app&quot;
+version = &quot;0.1.0&quot;
+
+[dependencies]
+geom = { path = &quot;deps/geom&quot; }</code></pre></div>
+<p><code>mxpkg sync</code> resolves that transitively, fetches whatever the lock lacks (git dependencies are vendored into <code>mx_modules/&lt;name&gt;/</code> with their <code>.git</code> removed; path dependencies are used in place), and writes <code>mx.lock</code>, which records each package&#x27;s source and a hash of its tree. The compiler reads the lock, never the manifest. This is the lock of <code>examples/pkg_app/</code> in the repository, whose <code>geom</code> package itself depends on a <code>util</code> package:</p>
+<div class="fence"><span class="label">toml</span><pre><code>version = 1
+
+[[package]]
+name = &quot;geom&quot;
+source = &quot;path+deps/geom&quot;
+hash = &quot;sha256:626013fffbbdb0e268c9b61fbe34d2d37ced1e72da29141b23bab3589c33475d&quot;
+
+[[package]]
+name = &quot;util&quot;
+source = &quot;path+deps/util&quot;
+hash = &quot;sha256:edd308f57cc009399b1917e2927b661c78d30ee27f599969deab4e2c50084c33&quot;</code></pre></div>
+<p>The lock is flat: one root per name, so a name means the same package everywhere in one build, and <code>util</code> is reachable from the application even though only <code>geom</code> asked for it. <code>mxpkg tree</code> shows who asked:</p>
+<div class="fence"><span class="label">text</span><pre><code>pkg_app 0.1.0
+  geom path+deps/geom
+    util path+../util</code></pre></div>
+<p>A package is a directory with a manifest and a <code>src/</code>. Its <code>src/lib.mx</code> is the facade, what <code>import geom;</code> means; every other file under <code>src/</code> is private to the package unless the manifest lists it under <code>[package] public</code>:</p>
+<div class="fence"><span class="label">text</span><pre><code>examples/pkg_app/
+    mx.toml
+    mx.lock
+    main.mx
+    deps/geom/
+        mx.toml            # public = [&quot;shapes&quot;], depends on util
+        src/lib.mx         # `import geom;`
+        src/shapes.mx      # `import geom.shapes;` (public)
+        src/internal.mx    # geom&#x27;s own files only
+    deps/util/
+        mx.toml
+        src/lib.mx         # `import util;`</code></pre></div>
+<p>The entry file imports a package exactly like a module, because to the resolver it is one. This is the example&#x27;s <code>main.mx</code>, and the example gate runs it:</p>
+<div class="fence"><span class="label">metaxu · display only</span><pre><code class="mx">import geom;
+from geom.shapes import name;
+import util;
+
+fn main() -&gt; int {
+    print(geom.area(3, 4));
+    print(name(2, 2));
+    print(util.clamp(geom.area(9, 9), 0, 50));
+    print(geom.describe(2, 5));
+    0
+}</code></pre></div>
+<p>It prints <code>12</code>, <code>square</code>, <code>50</code>, and <code>rectangle of area 10</code>. Inside <code>geom</code>, <code>lib.mx</code> says <code>import shapes;</code> and <code>from internal import twice;</code>; those bare names are qualified with the package name by the resolver, so they mean <code>geom.shapes</code> and <code>geom.internal</code> even if the application has a <code>shapes.mx</code> of its own.</p>
+<p>Resolution of an import whose head is <code>p</code> goes: <code>std</code> is reserved; a module declared in the file; a sibling file <code>p.mx</code> next to the root file; a locked dependency named <code>p</code>. A head that is both a sibling file and a dependency is not resolved by precedence, it is rejected. The three rejections a package can produce, quoted from running them against the example:</p>
+<div class="fence"><span class="label">text</span><pre><code>ModuleError: module &#x27;geom.internal&#x27; is not public in package &#x27;geom&#x27; (imported from module &#x27;main&#x27;)
+
+Notes:
+  - a package exposes src/lib.mx and the modules listed under [package] public in its mx.toml
+  - import the facade (`import geom;`) or ask the package to list &quot;internal&quot; as public</code></pre></div>
+<div class="fence"><span class="label">text</span><pre><code>ModuleError: ambiguous module &#x27;geom&#x27;: both a sibling file and the dependency &#x27;geom&#x27; provide it (imported from module &#x27;main&#x27;)
+
+Notes:
+  - sibling file: examples/pkg_app/geom.mx
+  - dependency root: examples/pkg_app/deps/geom
+  - rename the file or the dependency; a name is never resolved by precedence</code></pre></div>
+<div class="fence"><span class="label">text</span><pre><code>ModuleError: module &#x27;nothing&#x27; not found (imported from module &#x27;main&#x27;)
+
+Notes:
+  - looked for examples/pkg_app/nothing.mx
+  - module paths resolve relative to the root file&#x27;s directory: examples/pkg_app
+  - &#x27;nothing&#x27; is not a locked dependency either (examples/pkg_app/mx.lock lists: geom, util)</code></pre></div>
+<p><code>mxpkg check</code> recomputes the tree hashes and exits nonzero on drift, which is what a CI job should run; a hand edit inside <code>mx_modules/</code> is caught. There is no registry, no version-range solver, no build scripts, and no binary artifacts; each of those is a separate decision for later, and none is needed to share a library between two repositories today.</p>
 <h2>Where this leaves you</h2>
-<p>Modules here are a naming discipline, not a compilation-unit design. One file per concern, an <code>export</code> list you can read in one glance, <code>from</code>-imports for the names you use often, qualified paths for the ones you don&#x27;t. Chapter 12 tours what <code>std</code> itself exports; chapter 17 shows where module resolution sits in the pipeline, which is early, right after the parser and before any type is inferred.</p>
+<p>Modules here are a naming discipline, not a compilation-unit design. One file per concern, an <code>export</code> list you can read in one glance, <code>from</code>-imports for the names you use often, qualified paths for the ones you don&#x27;t, and a lockfile when the code comes from somewhere else. Chapter 12 tours what <code>std</code> itself exports; chapter 17 shows where module resolution sits in the pipeline, which is early, right after the parser and before any type is inferred.</p>
 <nav class="pager"><a href="14-compiling-to-native.html">&#8592; Compiling to native</a><a href="16-unsafe-and-ffi.html">Unsafe and FFI &#8594;</a></nav>
 </main>
 <script src="book.js"></script>

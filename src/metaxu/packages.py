@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -183,24 +184,32 @@ def sync(project: Path, log=lambda s: None) -> dict[str, Locked]:
     manifest = read_manifest(project)
     old = read_lock(project)
     locked: dict[str, Locked] = {}
-    requested: dict[str, tuple[Dep, str]] = {}   # name -> (dep, requester)
+    requested: dict[str, tuple[Dep, str, Path]] = {}   # name -> (dep, requester, root)
     queue: list[tuple[Dep, Path, str]] = [
         (d, project, manifest.name) for d in manifest.deps.values()]
     while queue:
         dep, req_root, requester = queue.pop(0)
         if dep.name == "std":
             raise PackageError(f"{requester}: 'std' is reserved and cannot be a dependency")
+        root = dep_root(project, dep, req_root)
         prior = requested.get(dep.name)
         if prior is not None:
-            if prior[0].source != dep.source or prior[0].rev != dep.rev:
+            prior_dep, prior_requester, prior_root = prior
+            same = ((prior_dep.git == dep.git and prior_dep.rev == dep.rev)
+                    if (dep.git or prior_dep.git) else prior_root == root)
+            if not same:
                 raise PackageError(
                     f"conflicting requirements for '{dep.name}': "
-                    f"{prior[1]} wants {prior[0].source}@{prior[0].rev}, "
+                    f"{prior_requester} wants {prior_dep.source}@{prior_dep.rev}, "
                     f"{requester} wants {dep.source}@{dep.rev}; "
                     "pin one revision in the root manifest")
             continue
-        requested[dep.name] = (dep, requester)
-        root = dep_root(project, dep, req_root)
+        requested[dep.name] = (dep, requester, root)
+        # A path dependency's manifest spelling is relative to whoever
+        # requested it (geom's `../util`); the lock records it relative
+        # to the PROJECT, which is the only base the compiler has.
+        source = dep.source if dep.git else (
+            "path+" + Path(os.path.relpath(root, project)).as_posix())
         if dep.git:
             have = old.get(dep.name)
             fresh = (have is None or have.source != dep.source
@@ -211,13 +220,13 @@ def sync(project: Path, log=lambda s: None) -> dict[str, Locked]:
                 commit = fetch_git(dep, root)
             else:
                 commit = have.commit
-            locked[dep.name] = Locked(dep.name, dep.source, tree_hash(root),
+            locked[dep.name] = Locked(dep.name, source, tree_hash(root),
                                       rev=dep.rev, commit=commit)
         else:
             if not root.is_dir():
                 raise PackageError(f"{requester}: path dependency '{dep.name}' "
                                    f"not found at {root}")
-            locked[dep.name] = Locked(dep.name, dep.source, tree_hash(root))
+            locked[dep.name] = Locked(dep.name, source, tree_hash(root))
         if (root / MANIFEST).is_file():
             sub = read_manifest(root)
             for d in sub.deps.values():
@@ -240,9 +249,8 @@ def check(project: Path) -> list[str]:
     manifest = read_manifest(project)
     problems: list[str] = []
     for name, entry in locked.items():
-        dep = manifest.deps.get(name)
-        if dep is not None and dep.path:
-            root = (project / dep.path).resolve()
+        if entry.source.startswith("path+"):
+            root = (project / entry.source[len("path+"):]).resolve()
         else:
             root = project / VENDOR / name
         if not root.is_dir():

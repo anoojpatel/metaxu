@@ -164,10 +164,10 @@ fn main() -> int {
 }
 ```
 
-This is the book's one display-only fence in this chapter: the
-harness extracts single-source programs, and a multi-file layout has
-no single source to extract. The program itself runs through the
-example gate, which is where its behavior is pinned.
+This is a display-only fence (the packages section below has the
+other one): the harness extracts single-source programs, and a
+multi-file layout has no single source to extract. The program itself
+runs through the example gate, which is where its behavior is pinned.
 
 Each file's `export` works as in a `module` block, with one default
 worth knowing: a file with no `export` statement exports nothing, so
@@ -239,11 +239,150 @@ caveat as the visibility rejection above: `ReservedNameError` is a
 plain `CompileError`, so this is a quoted diagnostic in a plain fence
 rather than a harness-pinned `error` block.
 
+## Packages: code from another repository
+
+Everything above is one project. Code that lives elsewhere comes in
+as a *package*, and the design is deliberately small
+(`docs/packages.md` has the whole of it). The compiler never touches
+the network. A separate tool, `mxpkg`, fetches dependencies before a
+build and leaves files on disk; a build with a complete `mx_modules/`
+directory works offline. Dependencies are pinned, never ranged: a git
+URL plus a revision, or a local path. Two requesters that disagree on
+a revision are an error naming both, for a person to settle.
+
+A project declares what it wants in `mx.toml`:
+
+```toml
+[package]
+name = "pkg_app"
+version = "0.1.0"
+
+[dependencies]
+geom = { path = "deps/geom" }
+```
+
+`mxpkg sync` resolves that transitively, fetches whatever the lock
+lacks (git dependencies are vendored into `mx_modules/<name>/` with
+their `.git` removed; path dependencies are used in place), and writes
+`mx.lock`, which records each package's source and a hash of its
+tree. The compiler reads the lock, never the manifest. This is the
+lock of `examples/pkg_app/` in the repository, whose `geom` package
+itself depends on a `util` package:
+
+```toml
+version = 1
+
+[[package]]
+name = "geom"
+source = "path+deps/geom"
+hash = "sha256:626013fffbbdb0e268c9b61fbe34d2d37ced1e72da29141b23bab3589c33475d"
+
+[[package]]
+name = "util"
+source = "path+deps/util"
+hash = "sha256:edd308f57cc009399b1917e2927b661c78d30ee27f599969deab4e2c50084c33"
+```
+
+The lock is flat: one root per name, so a name means the same package
+everywhere in one build, and `util` is reachable from the application
+even though only `geom` asked for it. `mxpkg tree` shows who asked:
+
+```text
+pkg_app 0.1.0
+  geom path+deps/geom
+    util path+../util
+```
+
+A package is a directory with a manifest and a `src/`. Its
+`src/lib.mx` is the facade, what `import geom;` means; every other
+file under `src/` is private to the package unless the manifest lists
+it under `[package] public`:
+
+```text
+examples/pkg_app/
+    mx.toml
+    mx.lock
+    main.mx
+    deps/geom/
+        mx.toml            # public = ["shapes"], depends on util
+        src/lib.mx         # `import geom;`
+        src/shapes.mx      # `import geom.shapes;` (public)
+        src/internal.mx    # geom's own files only
+    deps/util/
+        mx.toml
+        src/lib.mx         # `import util;`
+```
+
+The entry file imports a package exactly like a module, because to the
+resolver it is one. This is the example's `main.mx`, and the example
+gate runs it:
+
+```metaxu norun
+import geom;
+from geom.shapes import name;
+import util;
+
+fn main() -> int {
+    print(geom.area(3, 4));
+    print(name(2, 2));
+    print(util.clamp(geom.area(9, 9), 0, 50));
+    print(geom.describe(2, 5));
+    0
+}
+```
+
+It prints `12`, `square`, `50`, and `rectangle of area 10`. Inside
+`geom`, `lib.mx` says `import shapes;` and `from internal import
+twice;`; those bare names are qualified with the package name by the
+resolver, so they mean `geom.shapes` and `geom.internal` even if the
+application has a `shapes.mx` of its own.
+
+Resolution of an import whose head is `p` goes: `std` is reserved; a
+module declared in the file; a sibling file `p.mx` next to the root
+file; a locked dependency named `p`. A head that is both a sibling
+file and a dependency is not resolved by precedence, it is rejected.
+The three rejections a package can produce, quoted from running them
+against the example:
+
+```text
+ModuleError: module 'geom.internal' is not public in package 'geom' (imported from module 'main')
+
+Notes:
+  - a package exposes src/lib.mx and the modules listed under [package] public in its mx.toml
+  - import the facade (`import geom;`) or ask the package to list "internal" as public
+```
+
+```text
+ModuleError: ambiguous module 'geom': both a sibling file and the dependency 'geom' provide it (imported from module 'main')
+
+Notes:
+  - sibling file: examples/pkg_app/geom.mx
+  - dependency root: examples/pkg_app/deps/geom
+  - rename the file or the dependency; a name is never resolved by precedence
+```
+
+```text
+ModuleError: module 'nothing' not found (imported from module 'main')
+
+Notes:
+  - looked for examples/pkg_app/nothing.mx
+  - module paths resolve relative to the root file's directory: examples/pkg_app
+  - 'nothing' is not a locked dependency either (examples/pkg_app/mx.lock lists: geom, util)
+```
+
+`mxpkg check` recomputes the tree hashes and exits nonzero on drift,
+which is what a CI job should run; a hand edit inside `mx_modules/` is
+caught. There is no registry, no version-range solver, no build
+scripts, and no binary artifacts; each of those is a separate decision
+for later, and none is needed to share a library between two
+repositories today.
+
 ## Where this leaves you
 
 Modules here are a naming discipline, not a compilation-unit design.
 One file per concern, an `export` list you can read in one glance,
 `from`-imports for the names you use often, qualified paths for the
-ones you don't. Chapter 12 tours what `std` itself exports; chapter
-17 shows where module resolution sits in the pipeline, which is
-early, right after the parser and before any type is inferred.
+ones you don't, and a lockfile when the code comes from somewhere
+else. Chapter 12 tours what `std` itself exports; chapter 17 shows
+where module resolution sits in the pipeline, which is early, right
+after the parser and before any type is inferred.
