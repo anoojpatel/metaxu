@@ -145,7 +145,51 @@ fn main() -&gt; int {
 <div class="fence"><span class="label">bash</span><pre><code>uv run python scripts/emit_metal_harness.py kernels.mx mm_kernel \
     --grid 4 --buf a=0,1,2,3 --buf out=0,0,0,0 -o harness_mm.py
 python3 harness_mm.py    # on a Mac with mlx installed</code></pre></div>
-<p>What exists today is Stage 1 of <code>docs/gpu_tiles.md</code>: one launch instance is one device thread, tiles live in thread-private registers. Inferred layouts, <code>simdgroup_matrix</code> dot, and threadgroup-memory tiling are Stage 2 (<code>docs/simdgroup_plan.md</code>).</p>
+<h2>Matrix units</h2>
+<p>A kernel whose <code>Tile.dot</code> multiplies 8x8 f32 or f16 tiles gets a second lowering, chosen automatically: one launch instance becomes one 32-lane simdgroup instead of one thread, its tiles live in threadgroup memory, and the dot is the collective <code>simdgroup_load</code>, <code>simdgroup_multiply_accumulate</code>, <code>simdgroup_store</code> on a <code>simdgroup_float8x8</code>, which is what Apple&#x27;s matrix units execute. The kernel and the <code>Gpu.launch</code> idiom do not change; <code>pid</code> still names the instance, and every instance still computes its own output block. The 16x16 matmul below runs each of its four blocks through two 8x8 dots, and the printed corner is the plain sum it should be:</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">from std.gpu import Gpu, run_grid, Metal, run_metal;
+
+fn block_kernel(pid: int, a: Vec, b: Vec, c: Vec) -&gt; () {
+    let ti = pid / 2;
+    let tj = pid % 2;
+    let mut k = 0;
+    let mut r = Tile.to_f32(Tile.filled(8, 8, 0));
+    while k &lt; 2 {
+        let ta = Tile.to_f32(
+            Tile.load_rows(a, (ti * 8) * 16 + k * 8, 16, 8, 8, 0.0));
+        let tb = Tile.to_f32(
+            Tile.load_rows(b, (k * 8) * 16 + tj * 8, 16, 8, 8, 0.0));
+        r = Tile.add(r, Tile.dot(ta, tb));
+        k = k + 1
+    };
+    Tile.store_rows(c, (ti * 8) * 16 + tj * 8, 16, r);
+    ()
+}
+
+fn main() -&gt; int {
+    let @mut a = Vec.new();
+    let @mut b = Vec.new();
+    let @mut c = Vec.new();
+    let mut i = 0;
+    while i &lt; 256 {
+        a.push(1.0);
+        b.push(if i % 17 == 0 { 2.0 } else { 0.0 });
+        c.push(0.0);
+        i = i + 1
+    };
+    handle Gpu with {
+        launch(n, f) -&gt; { run_metal(n, f); resume(()) }
+    } in {
+        perform Gpu.launch(4, fn(pid: int) -&gt; block_kernel(pid, a, b, c));
+        ()
+    };
+    print(c[0]);
+    print(c[255]);
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>2.0
+2.0</code></pre></div>
+<p>The shim leg stays bit-exact: it emulates each collective as the whole-tile operation the interpreter defines, in the same rounding order. The device&#x27;s matrix unit fuses the multiply and the add, so on a Mac the float tolerance the harness already applies is where that difference lands; a kernel that needs bit-exact device results can force the per-thread lowering with <code>METAXU_METAL_LOWERING=thread</code>. Elementwise work in the simdgroup lowering is done by one lane behind a barrier for now; distributing it across the lanes, inferred layouts, and threadgroup-memory tiling across instances are the rest of Stage 2 (<code>docs/simdgroup_plan.md</code>).</p>
 <nav class="pager"><a href="12-the-standard-library.html">&#8592; The standard library</a><a href="14-compiling-to-native.html">Compiling to native &#8594;</a></nav>
 </main>
 <script src="book.js"></script>

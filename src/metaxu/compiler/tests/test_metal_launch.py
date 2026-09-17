@@ -260,3 +260,87 @@ fn main() -> int {
     result, out = interp_run(src)
     assert result == 0
     assert out.splitlines() == [_CONTENDED_WRITE_MSG, "1"]
+
+
+# ---------------------------------------------------------------------------
+# Per-simdgroup lowering through the handler (docs/simdgroup_plan.md)
+# ---------------------------------------------------------------------------
+
+def _mm8_program(metal: bool) -> str:
+    launch = ("""
+    handle Gpu with {
+        launch(n, f) -> { run_metal(n, f); resume(()) }
+    } in {
+        perform Gpu.launch(4, fn(pid: int) -> fmm8(pid, a, b, c));
+        ()
+    };""" if metal else """
+    perform Gpu.launch(4, fn(pid: int) -> fmm8(pid, a, b, c));""")
+    return """
+from std.gpu import Gpu, run_grid, Metal, run_metal;
+
+fn fmm8(pid: int, a: Vec, b: Vec, c: Vec) -> () {
+    let ti = pid / 2;
+    let tj = pid % 2;
+    let mut k = 0;
+    let mut r = Tile.to_f32(Tile.filled(8, 8, 0));
+    while k < 2 {
+        let ta = Tile.to_f32(
+            Tile.load_rows(a, (ti * 8) * 16 + k * 8, 16, 8, 8, 0.0));
+        let tb = Tile.to_f32(
+            Tile.load_rows(b, (k * 8) * 16 + tj * 8, 16, 8, 8, 0.0));
+        r = Tile.add(r, Tile.dot(ta, tb));
+        k = k + 1
+    };
+    Tile.store_rows(c, (ti * 8) * 16 + tj * 8, 16, r);
+    ()
+}
+
+fn main() -> int {
+    let @mut a = Vec.new();
+    let @mut b = Vec.new();
+    let @mut c = Vec.new();
+    let mut i = 0;
+    while i < 256 {
+        a.push(Tile.sum(Tile.to_f32(Tile.filled(1, 1, i % 7))) * 0.25);
+        b.push(if i % 17 == 0 { 1.0 } else { 0.5 });
+        c.push(0.0);
+        i = i + 1
+    };
+""" + launch + """
+    let mut j = 0;
+    while j < 256 { print(c[j]); j = j + 1 };
+    0
+}
+"""
+
+
+@needs_clangxx
+def test_metal_handler_matches_cpu_handler_f32_8x8_simdgroup(monkeypatch):
+    # An 8x8 f32 dot selects the per-simdgroup lowering by default; the
+    # handler must still reproduce the CPU reference byte for byte (the
+    # shim emulates the collectives in the pinned rounding order).
+    monkeypatch.delenv("METAXU_METAL_LOWERING", raising=False)
+    _res, cpu = interp_run(_mm8_program(metal=False))
+    _res, metal = interp_run(_mm8_program(metal=True))
+    assert metal == cpu
+    assert len(metal.splitlines()) == 256
+
+
+@needs_clangxx
+@pytest.mark.parametrize("lowering", ["thread", "simdgroup"])
+def test_metal_lowering_override_keeps_parity(monkeypatch, lowering):
+    monkeypatch.setenv("METAXU_METAL_LOWERING", lowering)
+    _res, cpu = interp_run(_mm8_program(metal=False))
+    _res, metal = interp_run(_mm8_program(metal=True))
+    assert metal == cpu
+
+
+def test_metal_lowering_override_rejects_unknown_values(monkeypatch):
+    monkeypatch.setenv("METAXU_METAL_LOWERING", "fast")
+    src = _catch_program(
+        "fn k(pid: int, v: Vec) -> () {\n"
+        "    Tile.store_clipped(v, pid, Tile.filled(1, 1, 7));\n"
+        "    ()\n}",
+        "run_metal(1, fn(pid: int) -> k(pid, v))")
+    _res, out = interp_run(src)
+    assert "METAXU_METAL_LOWERING='fast' is not one of auto, thread, simdgroup" in out

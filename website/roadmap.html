@@ -362,8 +362,9 @@ footer .wrap { display: flex; justify-content: space-between; gap: 24px; flex-wr
         <div class="tag mono">done</div>
         <div class="body"><b>The compiler runs programs.</b> Parser, modules,
         type inference with hard conflict detection, and a strict interpreter
-        that defines the semantics. 19 example programs run with pinned
-        output; two negative fixtures must be rejected.</div>
+        that defines the semantics. 21 example programs run with pinned
+        output, one of them a project with locked dependencies; two
+        negative fixtures must be rejected.</div>
       </div>
       <div class="stage">
         <div class="tag mono">done</div>
@@ -422,6 +423,16 @@ footer .wrap { display: flex; justify-content: space-between; gap: 24px; flex-wr
         shim elsewhere. Anything outside the contract is an error, never a
         silent CPU fallback.</div>
       </div>
+      <div class="stage">
+        <div class="tag mono">done</div>
+        <div class="body"><b>Matrix units.</b> A kernel with an 8x8 f32 or
+        f16 dot gets a second lowering: one launch instance is one 32-lane
+        simdgroup, tiles live in threadgroup memory, and the dot is
+        <code>simdgroup_multiply_accumulate</code> on
+        <code>simdgroup_float8x8</code>. Kernels and the reference
+        interpreter did not change; the shim emulates the collectives and
+        stays bit-exact.</div>
+      </div>
     </div>
   </div>
 </section>
@@ -433,11 +444,11 @@ footer .wrap { display: flex; justify-content: space-between; gap: 24px; flex-wr
     <div class="stages">
       <div class="stage">
         <div class="tag mono">1</div>
-        <div class="body"><b>Matrix units.</b> One launch instance becomes
-        one 32-thread simdgroup so 8x8 dot products can use
-        <code>simdgroup_float8x8</code>. Kernels and the reference
-        interpreter don't change; the plan is
-        <span class="mono">docs/simdgroup_plan.md</span>.</div>
+        <div class="body"><b>All lanes at work.</b> In the simdgroup
+        lowering only the dot uses the 32 lanes; loads, elementwise ops
+        and stores run on one lane behind a barrier. Distributing them
+        needs the shim to emulate lanes, then measurement on a Mac
+        (<span class="mono">docs/simdgroup_plan.md</span>).</div>
       </div>
       <div class="stage">
         <div class="tag mono">2</div>

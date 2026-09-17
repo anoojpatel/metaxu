@@ -183,10 +183,13 @@ def _run_mlx(kern: MslKernel, grid_n: int,
         output_names=output_names,
         source=kern.body,
     )
+    # per-simdgroup lowering: 32 threads per instance, one simdgroup per
+    # threadgroup (MslKernel.grid does the arithmetic for both modes)
+    gx, tg = kern.grid(grid_n)
     outs = kernel(
         inputs=inputs,
-        grid=(grid_n, 1, 1),
-        threadgroup=(min(max(grid_n, 1), 32), 1, 1),
+        grid=(gx, 1, 1),
+        threadgroup=(tg, 1, 1),
         output_shapes=output_shapes,
         output_dtypes=output_dtypes,
         init_value=0,

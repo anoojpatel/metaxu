@@ -70,6 +70,28 @@ read-after-write within one launch are outside the contract (they would
 be racy on any real GPU; the sequential CPU reference would hide that).
 The mask merge is what makes `store_clipped`'s partial writes correct
 under MLX's const-input model.
+
+Two lowerings (docs/simdgroup_plan.md, Option A):
+
+  * **per-thread** (the original): one launch instance is one device
+    thread; tiles are thread-private stack arrays; every op is a loop
+    in that one thread.
+  * **per-simdgroup**: one launch instance is one 32-thread simdgroup.
+    `pid` is the simdgroup index (`thread_position_in_grid.x / 32`),
+    tiles live in threadgroup memory, scalars stay replicated on every
+    lane (control flow is uniform by construction: no scalar depends on
+    a lane), lane 0 performs the elementwise work behind a
+    `threadgroup_barrier`, and an 8x8 f32/f16 `Tile.dot` becomes the
+    collective `simdgroup_load` / `simdgroup_multiply_accumulate` /
+    `simdgroup_store` on `simdgroup_float8x8` / `simdgroup_half8x8`,
+    which is what the matrix units execute.  The mode is chosen
+    automatically when the kernel contains an eligible dot (the
+    `simdgroup` argument forces either way); `std/gpu.mx` and kernels
+    do not change.  The C++ shim emulates the collectives with the
+    interpreter's pinned rounding order (round the product, then the
+    accumulate), so shim and interpreter stay the bit-exact pair;
+    the device's matrix unit fuses, which the existing float tolerance
+    on the mlx leg already covers.
 """
 from __future__ import annotations
 
@@ -87,6 +109,13 @@ _INT_BINOPS = {"+": "+", "-": "-", "*": "*", "/": "/", "%": "%",
 _TILE_OPS = {"filled", "arange", "load_or", "store_clipped", "load_rows",
              "store_rows", "add", "mul", "scale", "dot", "sum",
              "transpose", "rows", "cols", "to_f32", "to_f16"}
+
+#: One simdgroup is 32 lanes on every Apple GPU Metal runs on; the
+#: per-simdgroup lowering dispatches `grid = 32 * n`, `threadgroup = 32`.
+SIMD_WIDTH = 32
+_BARRIER = "metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);"
+_SG_MATRIX = {"float": "metal::simdgroup_float8x8",
+              "half": "metal::simdgroup_half8x8"}
 
 
 class MslError(Exception):
@@ -113,9 +142,73 @@ class MslKernel:
     buf_types: Dict[str, str]    # buffer -> "long" | "float"
     body: str                    # references <b>_in / <b>_out / <b>_wm / lens
     uses_half: bool = False      # body declares f16 (`half`) values
+    simdgroup: bool = False      # per-simdgroup lowering (module docstring)
 
     def _bt(self, b: str) -> str:
         return self.buf_types.get(b, "long")
+
+    def grid(self, n: int) -> Tuple[int, int]:
+        """(grid.x, threadgroup.x) for `n` launch instances."""
+        if self.simdgroup:
+            return SIMD_WIDTH * n, SIMD_WIDTH
+        return n, min(max(n, 1), SIMD_WIDTH)
+
+    def _simdgroup_shim(self) -> List[str]:
+        """The C++ emulation of the Metal collectives the per-simdgroup
+        body uses.  The shim runs ONE lane per instance (lane 0), so
+        barriers are no-ops and every collective is its whole-tile
+        semantics — the interpreter's pinned semantics — evaluated in
+        the pinned rounding order."""
+        half_alias = (["typedef simdgroup_matrix8x8<half> simdgroup_half8x8;"]
+                      if self.uses_half else [])
+        return [
+            "// per-simdgroup lowering: the shim emulates the collectives",
+            "// (one lane per instance; barriers are no-ops)",
+            "typedef unsigned uint;",
+            "#define threadgroup",
+            "namespace metal {",
+            "struct mem_flags { enum flags { mem_threadgroup = 1 }; };",
+            "static inline void threadgroup_barrier(int) {}",
+            "template <typename T> struct simdgroup_matrix8x8 { T m[64]; };",
+            "typedef simdgroup_matrix8x8<float> simdgroup_float8x8;",
+            *half_alias,
+            "template <typename T, int C, int R>",
+            "static inline simdgroup_matrix8x8<T> "
+            "make_filled_simdgroup_matrix(T v) {",
+            "    static_assert(C == 8 && R == 8, \"8x8 only\");",
+            "    simdgroup_matrix8x8<T> s;",
+            "    for (int i = 0; i < 64; i++) s.m[i] = v;",
+            "    return s;",
+            "}",
+            "template <typename T>",
+            "static inline void simdgroup_load(simdgroup_matrix8x8<T>& d,"
+            " const T* src, unsigned long stride) {",
+            "    for (int r = 0; r < 8; r++) for (int c = 0; c < 8; c++)"
+            " d.m[r * 8 + c] = src[r * stride + c];",
+            "}",
+            "template <typename T>",
+            "static inline void simdgroup_store(const simdgroup_matrix8x8<T>& s,"
+            " T* dst, unsigned long stride) {",
+            "    for (int r = 0; r < 8; r++) for (int c = 0; c < 8; c++)"
+            " dst[r * stride + c] = s.m[r * 8 + c];",
+            "}",
+            "template <typename T>",
+            "static inline void simdgroup_multiply_accumulate("
+            "simdgroup_matrix8x8<T>& d, const simdgroup_matrix8x8<T>& a,"
+            " const simdgroup_matrix8x8<T>& b,"
+            " const simdgroup_matrix8x8<T>& c) {",
+            "    simdgroup_matrix8x8<T> out;",
+            "    for (int r = 0; r < 8; r++) for (int col = 0; col < 8; col++) {",
+            "        T acc = c.m[r * 8 + col];",
+            "        // pinned order: round the product, then the accumulate",
+            "        for (int k = 0; k < 8; k++)"
+            " acc = (T)(acc + (T)(a.m[r * 8 + k] * b.m[k * 8 + col]));",
+            "        out.m[r * 8 + col] = acc;",
+            "    }",
+            "    d = out;",
+            "}",
+            "}  // namespace metal",
+        ]
 
     def cpp_wrapper(self) -> str:
         """A C++ translation unit that runs the body sequentially over the
@@ -146,6 +239,7 @@ class MslKernel:
             ] if self.uses_half else []),
             "struct uint3 { unsigned x, y, z; };",
             "static_assert(sizeof(long) == 8, \"long must be 64-bit\");",
+            *(self._simdgroup_shim() if self.simdgroup else []),
             f"static void kernel_body({', '.join(params)}) {{",
             self.body,
             "}",
@@ -188,9 +282,14 @@ class MslKernel:
                 f"    std::vector<{t}> out_{b}(lens[{i}], 0);",
                 f"    std::vector<long> wm_{b}(lens[{i}], 0);",
             ]
+        # per-simdgroup: the shim runs lane 0 of each simdgroup
+        # (thread_position_in_grid.x = 32 * pid), which does all the
+        # non-collective work in that lowering.
+        first = (f"(unsigned)pid * {SIMD_WIDTH}u" if self.simdgroup
+                 else "(unsigned)pid")
         lines += [
             "    for (int pid = 0; pid < grid_n; pid++) {",
-            "        uint3 tpg{(unsigned)pid, 0, 0};",
+            f"        uint3 tpg{{{first}, 0, 0}};",
             "        kernel_body(tpg"
             + "".join(f", buf_{b}.data()" for b in self.in_bufs)
             + "".join(f", out_{b}.data(), wm_{b}.data()"
@@ -235,10 +334,15 @@ class MslKernel:
         for b in self.out_bufs:
             output_names += [f"{b}_out", f"{b}_wm"]
         lens = [len(buffers[b]) for b in self.in_bufs]
+        gx, tg = self.grid(grid_n)
+        lowering = ("per-simdgroup: one instance is one 32-lane simdgroup, "
+                    "8x8 dots on the matrix units" if self.simdgroup
+                    else "per-thread: one instance is one device thread")
         lines = [
             "#!/usr/bin/env python3",
             f'"""Self-checking Metal harness for kernel {self.name!r},',
             "generated by metaxu emit_msl (docs/gpu_tiles.md Stage 1c).",
+            f"Lowering: {lowering}.",
             "Run on a Mac with mlx installed:  python3 <this file>",
             "Exit 0 = Metal output matches the interpreter reference.",
             '"""',
@@ -262,6 +366,8 @@ class MslKernel:
             ")",
             "",
             f"GRID_N = {grid_n}",
+            f"GRID_X = {gx}  # threads dispatched",
+            f"THREADGROUP_X = {tg}",
             f"LENS = {lens!r}",
             "FLOAT_TOL = 1e-5  # Metal is fast-math; CPU shim is bit-exact",
         ]
@@ -290,8 +396,8 @@ class MslKernel:
         lines += [
             "outs = kernel(",
             "    inputs=inputs,",
-            "    grid=(GRID_N, 1, 1),",
-            "    threadgroup=(min(GRID_N, 32), 1, 1),",
+            "    grid=(GRID_X, 1, 1),",
+            "    threadgroup=(THREADGROUP_X, 1, 1),",
             "    output_shapes=output_shapes,",
             "    output_dtypes=output_dtypes,",
             "    init_value=0,",
@@ -337,12 +443,15 @@ class MslKernel:
 # Emission
 # ---------------------------------------------------------------------------
 
-def emit_msl_kernel(source: str, kernel_name: str) -> MslKernel:
+def emit_msl_kernel(source: str, kernel_name: str,
+                    simdgroup: Optional[bool] = None) -> MslKernel:
     """Compile ``kernel_name`` from metaxu ``source`` into an MslKernel.
 
     Runs the same strict front end as every backend (build context ->
     type/borrow gate -> HIR -> monomorphize -> MIR) and translates the
-    kernel's MIR.  Raises MslError for anything outside the subset."""
+    kernel's MIR.  Raises MslError for anything outside the subset.
+    ``simdgroup``: None chooses the per-simdgroup lowering exactly when
+    the kernel has an 8x8 f32/f16 dot; True/False force it."""
     from .hir import HIRBuilder
     from .lower_hir_to_mir import lower_hir_to_mir
     from .monomorphize import collect_signatures, monomorphize_hir
@@ -358,10 +467,10 @@ def emit_msl_kernel(source: str, kernel_name: str) -> MslKernel:
         near = sorted(f.name for f in funcs if kernel_name in f.name)
         raise MslError(f"kernel {kernel_name!r} not found in the module"
                        + (f" (near: {', '.join(near)})" if near else ""))
-    return _emit(matches[0])
+    return _emit(matches[0], simdgroup=simdgroup)
 
 
-def _emit(f: MirFunc) -> MslKernel:
+def _emit(f: MirFunc, simdgroup: Optional[bool] = None) -> MslKernel:
     if not f.blocks or not f.blocks[0].ops \
             or f.blocks[0].ops[0][0] != "params":
         raise MslError(f"kernel {f.name!r} has no parameter list")
@@ -677,15 +786,46 @@ def _emit(f: MirFunc) -> MslKernel:
                 "which is outside kernels — wrap it directly: "
                 "Tile.to_f32(Tile.load_rows(...))")
 
+    # Which dots the matrix units can take: 8x8 by 8x8, f32 or f16.
+    def sg_eligible(op: tuple) -> bool:
+        _, dst, rhs, args = op
+        if rhs[0] != "call" or len(rhs) < 2 or str(rhs[1]) != "Tile.dot":
+            return False
+        return (shapes.get(args[0]) == (8, 8) and shapes.get(args[1]) == (8, 8)
+                and ek_of(dst) in _SG_MATRIX)
+
+    has_sg_dot = any(sg_eligible(op) for b in f.blocks for op in b.ops
+                     if op[0] == "let")
+    sg = has_sg_dot if simdgroup is None else bool(simdgroup)
+
     # Pass 2: emit the switch-machine body.
     L: List[str] = []
-    L.append(f"const long {pid} = (long)thread_position_in_grid.x;")
+    if sg:
+        L.append(f"const long {pid} = (long)(thread_position_in_grid.x "
+                 f"/ {SIMD_WIDTH});")
+        L.append(f"const uint __lane = thread_position_in_grid.x "
+                 f"% {SIMD_WIDTH};")
+    else:
+        L.append(f"const long {pid} = (long)thread_position_in_grid.x;")
+    tile_decls = []
     for name, ty in sorted(decls.items()):
         if "[" not in ty:
             L.append(f"{ty} {name} = 0;")
         else:  # long[N] / float[N]
             base, n = ty[:-1].split("[")
-            L.append(f"{base} {name}[{n}] = {{0}};")
+            if sg:
+                # threadgroup storage cannot carry an initializer: lane 0
+                # zeroes the tiles below, before the first barrier.
+                L.append(f"threadgroup {base} {name}[{n}];")
+                tile_decls.append((name, int(n)))
+            else:
+                L.append(f"{base} {name}[{n}] = {{0}};")
+    if sg:
+        L.append("if (__lane == 0) {")
+        for name, n in tile_decls:
+            L.append(f"  for (int __i = 0; __i < {n}; __i++) {name}[__i] = 0;")
+        L.append("}")
+        L.append(_BARRIER)
     L.append("int __bb = 0;")
     L.append("bool __run = true;")
     L.append("while (__run) { switch (__bb) {")
@@ -693,6 +833,17 @@ def _emit(f: MirFunc) -> MslKernel:
     def loop(dst: str, n: int, expr: str) -> List[str]:
         return [f"for (int __i = 0; __i < {n}; __i++) "
                 f"{dst}[__i] = {expr};"]
+
+    def lane0(mark: int, barrier: bool) -> None:
+        """Per-simdgroup: the statements emitted since ``mark`` write a
+        threadgroup tile (or the device output), so lane 0 alone runs
+        them; a barrier publishes a written tile to the other lanes."""
+        if not sg or len(L) == mark:
+            return
+        L.insert(mark, "if (__lane == 0) {")
+        L.append("}")
+        if barrier:
+            L.append(_BARRIER)
 
     def emit_masked_load(dst: str, top: str, largs: tuple) -> None:
         """Emit load_or/load_rows into ``dst`` (also the fused-float
@@ -739,13 +890,35 @@ def _emit(f: MirFunc) -> MslKernel:
             elif rk == "copy":
                 if dst in shapes:
                     r, c = shapes[dst]
+                    mark = len(L)
                     L += loop(dst, r * c, f"{args[0]}[__i]")
+                    lane0(mark, barrier=True)
                 else:
                     L.append(f"{dst} = {args[0]};")
             else:  # Tile.*
                 top = str(rhs[1])[len("Tile."):]
                 if dst in f64loads:
                     # a fused float load: emitted at its to_f32 below
+                    continue
+                mark = len(L)
+                if sg and sg_eligible(op):
+                    # The collective: every lane of the simdgroup loads
+                    # its fragment of A and B from the threadgroup tiles,
+                    # the matrix unit multiplies, and the result lands
+                    # back in the threadgroup tile for the next op.
+                    m = _SG_MATRIX[ek_of(dst)]
+                    zero = "0.0f" if ek_of(dst) == "float" else "(half)0"
+                    L.append("{")
+                    L.append(f"  {m} __A, __B;")
+                    L.append(f"  metal::simdgroup_load(__A, {args[0]}, 8);")
+                    L.append(f"  metal::simdgroup_load(__B, {args[1]}, 8);")
+                    L.append(f"  {m} __C = metal::make_filled_simdgroup_matrix"
+                             f"<{ek_of(dst)}, 8, 8>({zero});")
+                    L.append("  metal::simdgroup_multiply_accumulate"
+                             "(__C, __A, __B, __C);")
+                    L.append(f"  metal::simdgroup_store(__C, {dst}, 8);")
+                    L.append("}")
+                    L.append(_BARRIER)
                     continue
                 if top == "filled":
                     r, c = shapes[dst]
@@ -850,12 +1023,23 @@ def _emit(f: MirFunc) -> MslKernel:
                              f"{dst}[__c * {r} + __r] = "
                              f"{args[0]}[__r * {c} + __c];")
                 elif top == "sum":
+                    # A scalar every lane must hold identically (it may
+                    # steer control flow): all lanes reduce the published
+                    # tile; no guard, no barrier.
                     r, c = shapes[args[0]]
                     L.append(f"{dst} = 0;")
                     L.append(f"for (int __i = 0; __i < {r * c}; __i++) "
                              f"{dst} += {args[0]}[__i];")
                 elif top in ("rows", "cols"):
                     L.append(f"{dst} = {consts[dst]};")
+                if top in ("store_clipped", "store_rows"):
+                    # device writes: lane 0 only (the trailing `dst = 0`
+                    # unit is a replicated scalar and stays outside)
+                    unit = L.pop()
+                    lane0(mark, barrier=False)
+                    L.append(unit)
+                elif top not in ("sum", "rows", "cols"):
+                    lane0(mark, barrier=True)
         t = b.term
         if t[0] == "br":
             L.append(f"__bb = {t[1]};")
@@ -871,4 +1055,5 @@ def _emit(f: MirFunc) -> MslKernel:
                      buf_types={b: buf_types.get(b, "long") for b in bufs},
                      body="\n".join(L),
                      uses_half=any(d.startswith("half")
-                                   for d in decls.values()))
+                                   for d in decls.values()),
+                     simdgroup=sg)
