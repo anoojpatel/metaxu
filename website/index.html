@@ -473,7 +473,12 @@ footer .wrap { display: flex; justify-content: space-between; gap: 24px; flex-wr
     lot of the language, but you meet them one at a time, and unannotated
     code stays ordinary code. <a href="book/index.html">The book</a> covers
     the whole language in eighteen chapters, and every example in it runs as
-    a test, so the text and the compiler cannot drift apart.</p>
+    a test, so the text and the compiler cannot drift apart. The compiler
+    is the other teaching tool. It is a Python library, and one call runs a
+    program through it and hands back every stage for inspection: the parse
+    tree, the typed tree, the HIR, the MIR and the LLVM IR it lowers to
+    (<a href="book/17-inside-the-compiler.html">chapter 17</a> walks
+    through them).</p>
     <p>The end of that road is a compiler written in Metaxu. When the
     language can express its own parser, checker and lowering, the Python
     compiler becomes stage zero: it builds the Metaxu compiler once, and
