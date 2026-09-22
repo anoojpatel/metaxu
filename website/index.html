@@ -464,10 +464,15 @@ footer .wrap { display: flex; justify-content: space-between; gap: 24px; flex-wr
     value in a spawned closure and write to it without a lock, and the
     compiler rejects the program where it can prove the race; the runtime
     rejects it where it cannot, with the same message.</p>
-    <p><b>3. The interpreter is the spec.</b> A strict reference interpreter
-    defines what every program means. The native backend must match it byte
-    for byte: stdout, exit code, error messages, float formatting. A backend
-    that differs fails a differential test before it reaches a user.</p>
+    <p><b>3. Algebraic subtyping and a functional surface bridge high level
+    and low level.</b> Inference is SimpleSub-style algebraic subtyping: you
+    annotate function signatures and almost nothing else, and the checker
+    infers the rest, generics included, from how values flow. The language
+    reads like a functional one: expressions, immutable bindings by default,
+    pattern matching, functions as values. The same programs compile to
+    native code with stack allocation by default, SIMD for fixed-size vectors
+    and a small C runtime, because modes give the compiler the ownership facts
+    a functional surface usually hides.</p>
   </div>
 </section>
 
