@@ -581,7 +581,7 @@ defects in shipped code, both fixed at the source.
 
 ## Headline findings
 
-- 18 of 19 example programs (`examples/*.mx` + root `test_*.mx`) fail at the
+- 18 of 19 example programs (`examples/*.mx` + `tests/fixtures/test_*.mx`) fail at the
   parser. Only `hello.mx` compiles. The grammar accepts a different language
   than the docs describe (effects require `=` and `fn` prefixes, modes are
   postfix, `@local`/`@global`/`@const` cannot lex because those words are
@@ -632,7 +632,7 @@ after adversarial review)
 
 ## v1 acceptance criteria
 
-- Every `examples/*.mx` and root `test_*.mx` parses; each either runs
+- Every `examples/*.mx` and `tests/fixtures/test_*.mx` parses; each either runs
   end-to-end under the MIR interpreter with correct semantics or fails with a
   meaningful, documented diagnostic (e.g. `test_type_error.mx` must fail
   type checking — that is its purpose).

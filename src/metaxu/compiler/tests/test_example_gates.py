@@ -2,8 +2,9 @@
 
 `scripts/run_examples.py` is the merge gate, but living outside pytest it
 can silently drift. This file pins the exact same facts:
-- all example/root .mx files compile through the full pipeline (with the
-  two negative fixtures REJECTED with the right diagnostic class), and
+- all examples/*.mx files and the tests/fixtures/test_*.mx files compile
+  through the full pipeline (with the two negative fixtures REJECTED with
+  the right diagnostic class), and
 - the files known to execute keep executing (with printed output pinned
   for the ones whose docs promise specific values).
 """
@@ -25,6 +26,7 @@ from metaxu.compiler.lower_hir_to_mir import lower_hir_to_mir
 from metaxu.compiler.mir_interp import MirInterpreter, UNIT
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
+FIXTURES = "src/metaxu/compiler/tests/fixtures"
 
 NEGATIVE = {
     "test_borrow_check.mx": BorrowCheckError,
@@ -47,10 +49,10 @@ MUST_RUN = [
     "examples/hello.mx",
     "examples/linked_list.mx",
     "examples/ownership.mx",
-    "test_locality_heap.mx",
-    "test_locality_local.mx",
-    "test_locality_ref.mx",
-    "test_operations.mx",
+    f"{FIXTURES}/test_locality_heap.mx",
+    f"{FIXTURES}/test_locality_local.mx",
+    f"{FIXTURES}/test_locality_ref.mx",
+    f"{FIXTURES}/test_operations.mx",
 ]
 
 
@@ -65,7 +67,7 @@ def all_targets() -> list[str]:
         for p in glob.glob(os.path.join(REPO_ROOT, "examples", "*.mx"))
         + glob.glob(os.path.join(REPO_ROOT, "examples", "app", "main.mx"))
         + glob.glob(os.path.join(REPO_ROOT, "examples", "pkg_app", "main.mx"))
-        + glob.glob(os.path.join(REPO_ROOT, "test_*.mx"))
+        + glob.glob(os.path.join(REPO_ROOT, FIXTURES, "test_*.mx"))
     )
 
 

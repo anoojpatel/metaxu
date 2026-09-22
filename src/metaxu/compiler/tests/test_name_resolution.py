@@ -451,7 +451,8 @@ class TestNoFalsePositives:
 
 def _corpus() -> list[str]:
     return (sorted(glob.glob(os.path.join(REPO_ROOT, "examples", "*.mx")))
-            + sorted(glob.glob(os.path.join(REPO_ROOT, "test_*.mx")))
+            + sorted(glob.glob(os.path.join(os.path.dirname(__file__),
+                                            "fixtures", "test_*.mx")))
             + sorted(glob.glob(os.path.join(REPO_ROOT, "std", "*.mx"))))
 
 
@@ -470,9 +471,10 @@ class TestCorpus:
         """A guard on the guard: if the corpus shrinks, the parametrization
         above silently checks less."""
         examples = glob.glob(os.path.join(REPO_ROOT, "examples", "*.mx"))
-        roots = glob.glob(os.path.join(REPO_ROOT, "test_*.mx"))
+        fixtures = glob.glob(os.path.join(os.path.dirname(__file__),
+                                          "fixtures", "test_*.mx"))
         stdlib = glob.glob(os.path.join(REPO_ROOT, "std", "*.mx"))
-        assert len(examples) + len(roots) == 19   # the pipeline/run gates
+        assert len(examples) + len(fixtures) == 19   # the pipeline/run gates
         assert len(stdlib) >= 17                  # std/*.mx
 
 

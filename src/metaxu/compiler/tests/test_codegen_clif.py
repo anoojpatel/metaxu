@@ -531,7 +531,7 @@ _REJECTED = {"test_borrow_check.mx", "test_type_error.mx"}
 
 def _example_files():
     files = sorted((REPO_ROOT / "examples").glob("*.mx"))
-    files += sorted(REPO_ROOT.glob("test_*.mx"))
+    files += sorted((Path(__file__).parent / "fixtures").glob("test_*.mx"))
     return [f for f in files if f.name not in _REJECTED]
 
 

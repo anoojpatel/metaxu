@@ -3,7 +3,8 @@
 Usage:
     uv run python scripts/run_examples.py [--stage parse|pipeline] [paths...]
 
-With no paths, runs all examples/*.mx and repo-root test_*.mx files.
+With no paths, runs all examples/*.mx files plus the test_*.mx fixtures in
+src/metaxu/compiler/tests/fixtures/.
 Exit code is the number of failing files (0 = all pass), so this can gate CI
 and merges.
 """
@@ -17,6 +18,7 @@ import traceback
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
+FIXTURES = os.path.join(REPO_ROOT, "src", "metaxu", "compiler", "tests", "fixtures")
 
 
 def default_targets() -> list[str]:
@@ -28,7 +30,7 @@ def default_targets() -> list[str]:
         sorted(glob.glob(os.path.join(REPO_ROOT, "examples", "*.mx")))
         + sorted(glob.glob(os.path.join(REPO_ROOT, "examples", "app", "main.mx")))
         + sorted(glob.glob(os.path.join(REPO_ROOT, "examples", "pkg_app", "main.mx")))
-        + sorted(glob.glob(os.path.join(REPO_ROOT, "test_*.mx")))
+        + sorted(glob.glob(os.path.join(FIXTURES, "test_*.mx")))
     )
 
 

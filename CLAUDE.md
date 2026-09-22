@@ -16,9 +16,10 @@ uv run python scripts/run_examples.py --stage parse    # parse-only
 
 The example gates are also pinned inside pytest
 (`src/metaxu/compiler/tests/test_example_gates.py`), including golden
-outputs for examples whose docs promise specific values. Two root-level
-files are negative fixtures: `test_borrow_check.mx` must be rejected with a
-borrow diagnostic and `test_type_error.mx` with a type diagnostic.
+outputs for examples whose docs promise specific values. The gate corpus
+is `examples/*.mx` plus `src/metaxu/compiler/tests/fixtures/test_*.mx`;
+two of the fixtures are negative: `test_borrow_check.mx` must be rejected
+with a borrow diagnostic and `test_type_error.mx` with a type diagnostic.
 
 ## Pipeline shape
 

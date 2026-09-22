@@ -6,7 +6,8 @@
 <p style="text-align: center;">
 A systems language with algebraic effects, mode-based memory safety,
 and tile-level GPU kernels <br>
-[<a href="docs/book/README.md">The Metaxu Book</a>] &middot;
+[<a href="https://metaxulang.org">metaxulang.org</a>] &middot;
+[<a href="https://metaxulang.org/book/">The Metaxu Book</a>] &middot;
 [<a href="docs/index.md">Documentation</a>]
 </p>
 </div>
@@ -166,18 +167,61 @@ uv run python scripts/emit_metal_harness.py kernels.mx my_kernel \
     --grid 4 --buf a=1,2,3,4 --buf out=0,0,0,0
 ```
 
-#### Helping LLMs
-We have a `llm-ctx.txt` file that contains some examples of how to use Metaxu with LLMs. It follows [llms.txt](https://llmstxt.org/) standards. Add it via `@docs` for IDEs or into relvant context manager protocols.
+### Using Metaxu with an LLM
+`llm-ctx.txt` follows the [llms.txt](https://llmstxt.org/) convention: a
+compact description of the language with examples. Point your editor's
+or agent's context at it.
 
 ## Development
 
-Conventions that keep this codebase honest (see `CLAUDE.md` for the
-full set):
+### Layout
 
-- Tests go through parsed source, never hand-built IR fixtures.
-- The interpreter is strict; no lenient fallbacks to make a test pass.
-- Native lowering claims need differential tests (native output ==
-  interpreter, byte for byte) and, for memory claims, ASan runs scoped
-  to the documented contract.
-- Benchmarks pin function alignment and rotate run order — unaligned
-  microbenchmarks measure linker luck, not your change.
+| path | contents |
+|---|---|
+| `src/metaxu/lexer.py`, `src/metaxu/parser.py` | the lexer and the PLY grammar |
+| `src/metaxu/compiler/` | the pipeline: module loading, desugaring, type inference, borrow checking, HIR, MIR, the interpreter, the LLVM and Metal emitters |
+| `src/metaxu/compiler/tests/` | the pytest suite; `fixtures/` holds `.mx` programs the tests read |
+| `std/` | the standard library, written in Metaxu |
+| `examples/` | example programs; the gates below run every one of them |
+| `runtime/native/` | the C runtime linked into native binaries |
+| `docs/` | design notes; `docs/book/` is the book |
+| `website/` | metaxulang.org |
+
+### Running the checks
+
+```bash
+uv run python -m pytest src/metaxu/compiler/tests -q   # the test suite
+uv run python scripts/run_examples.py                  # every example compiles
+uv run python scripts/run_examples.py --stage run      # every example runs
+```
+
+All three must pass before a change is merged.
+
+### How the pieces fit
+
+`src/metaxu/compiler/pipeline.py` is the entry point. A source file goes
+through the parser, module resolution, desugaring, type inference and
+borrow checking, then is lowered to HIR and MIR. From MIR there are three
+ways out: the interpreter (`mir_interp.py`), the LLVM emitter
+(`codegen_llvm.py`, compiled with clang), and the Metal emitter
+(`emit_msl.py`).
+
+The interpreter defines what a program means. The other backends are
+tested by running the same program both ways and comparing the output.
+
+### Rules for changes
+
+- Write tests as Metaxu source and run it through the pipeline. Do not
+  build HIR or MIR by hand in a test. Past bugs hid in the seams between
+  stages, and a hand-built fixture skips those seams.
+- When a program is wrong, reject it with a clear message. Do not add a
+  fallback that lets it run.
+- A compiler change comes with a regression test, and both example gates
+  stay green.
+- A change to native code generation needs a test that compares the
+  native program's output with the interpreter's.
+- Every example in the book runs as a test (`test_book_examples.py`). A
+  change that alters an example's output updates the book in the same
+  commit.
+- Every diagnostic carries a source location. Read
+  `docs/diagnostics_locations.md` before adding a new error.

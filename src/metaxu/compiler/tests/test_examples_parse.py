@@ -1,4 +1,4 @@
-"""Every example program and repo-root .mx test file must parse.
+"""Every example program and tests/fixtures .mx file must parse.
 
 Parsing is the hard requirement here: each file must go through the PLY
 front end without a ParseError.  As of the parser overhaul all of these
@@ -20,6 +20,7 @@ from metaxu.parser import Parser
 from metaxu.compiler.pipeline import run_pipeline_from_source
 
 REPO_ROOT = Path(__file__).parent.parent.parent.parent.parent
+FIXTURES = Path(__file__).parent / "fixtures"
 
 # Files whose full pipeline is known to fail (parse must still succeed).
 # Currently empty: all example files pass the full pipeline.
@@ -39,7 +40,7 @@ EXPECTED_PIPELINE_ERROR: dict[str, str] = {
 
 def _collect_mx_files():
     files = sorted((REPO_ROOT / "examples").glob("*.mx"))
-    files += sorted(REPO_ROOT.glob("test_*.mx"))
+    files += sorted(FIXTURES.glob("test_*.mx"))
     assert files, f"no .mx files found under {REPO_ROOT}"
     return files
 
