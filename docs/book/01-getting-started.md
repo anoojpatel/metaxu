@@ -27,12 +27,12 @@ fn main() -> int {
 hello, Metaxu
 ```
 
-(A bare `.mx` file of top-level statements also runs as a script —
-`examples/hello.mx` is one line of `print` — but everything in this
+(A bare `.mx` file of top-level statements also runs as a script:
+`examples/hello.mx` is one line of `print`. But everything in this
 book uses `main`, because that's what the native backend compiles.)
 
 Two things to notice already. Statements end with `;`, but the last
-expression of a block doesn't need one, and its value IS the block's
+expression of a block doesn't need one, and its value *is* the block's
 value: that final `0` is `main`'s return. And `+` concatenates strings
 when both sides are strings. There's no implicit conversion; gluing a
 number onto a string takes `.to_string()`, which chapter 2 covers.

@@ -9,43 +9,43 @@ language changes, the book breaks loudly.
 
 ## Contents
 
-1. [Getting started](01-getting-started.md) — install, run a program,
+1. [Getting started](01-getting-started.md): install, run a program,
    what the pipeline does with it.
-2. [Functions and values](02-functions-and-values.md) — `fn`, `let`,
+2. [Functions and values](02-functions-and-values.md): `fn`, `let`,
    mutability, blocks as expressions, control flow.
-3. [Structs and enums](03-structs-and-enums.md) — product and sum
+3. [Structs and enums](03-structs-and-enums.md): product and sum
    types, generics, construction and field access.
-4. [Pattern matching](04-pattern-matching.md) — `match`, binders,
+4. [Pattern matching](04-pattern-matching.md): `match`, binders,
    literals, exhaustiveness.
-5. [Vectors and collections](05-vectors-and-collections.md) — `Vec`,
+5. [Vectors and collections](05-vectors-and-collections.md): `Vec`,
    fixed-size `vector[T, N]`, strings, slicing.
-6. [Types and inference](06-types-and-inference.md) — what you never
+6. [Types and inference](06-types-and-inference.md): what you never
    have to write, what the checker rejects, and why.
-7. [Traits](07-traits.md) — `trait`, `implements`, dispatch on the
+7. [Traits](07-traits.md): `trait`, `implements`, dispatch on the
    runtime type.
-8. [Effects](08-effects.md) — `perform`, `handle`, `resume`; defaults;
+8. [Effects](08-effects.md): `perform`, `handle`, `resume`; defaults;
    streams and generators built from them.
-9. [Errors](09-errors.md) — `try`/`catch`, `std.option`, `std.result`.
-10. [Modes and memory](10-modes-and-memory.md) — locality, mutability,
+9. [Errors](09-errors.md): `try`/`catch`, `std.option`, `std.result`.
+10. [Modes and memory](10-modes-and-memory.md): locality, mutability,
     linearity; the borrow checker; no lifetimes anywhere.
-11. [Threads and sharing](11-threads-and-sharing.md) — `Thread` and
+11. [Threads and sharing](11-threads-and-sharing.md): `Thread` and
     `Mutex` effects, inferred thread-safety, `std.sync`.
-12. [The standard library](12-the-standard-library.md) — a tour of
+12. [The standard library](12-the-standard-library.md): a tour of
     `std/`, module by module.
-13. [GPU tiles](13-gpu-tiles.md) — `Tile`, kernels, the `Gpu` effect,
+13. [GPU tiles](13-gpu-tiles.md): `Tile`, kernels, the `Gpu` effect,
     Metal.
-14. [Compiling to native](14-compiling-to-native.md) — clang, the
+14. [Compiling to native](14-compiling-to-native.md): clang, the
     differential contract, measured performance.
-15. [Modules and imports](15-modules-and-imports.md) — `import`,
+15. [Modules and imports](15-modules-and-imports.md): `import`,
     `export`, visibility, multi-file programs, name precedence,
     packages and the lockfile.
-16. [Unsafe and FFI](16-unsafe-and-ffi.md) — `unsafe`, extern C,
+16. [Unsafe and FFI](16-unsafe-and-ffi.md): `unsafe`, extern C,
     the strict simulated heap, the native boundary.
-17. [Inside the compiler](17-inside-the-compiler.md) — the pipeline
+17. [Inside the compiler](17-inside-the-compiler.md): the pipeline
     stage by stage, the house rules, how to poke at it.
-18. [Algebraic subtyping](18-algebraic-subtyping.md) — how inference
-    decides: flows, polarity, the class-constraint algebra, the
-    solver, and what is built versus sketched.
+18. [Algebraic subtyping](18-algebraic-subtyping.md): how inference
+    decides (flows, polarity, the class-constraint algebra, the
+    solver) and what is built versus sketched.
 
 ## How the examples work
 

@@ -13,7 +13,7 @@ malformed in ways that make a green run meaningless:
   metaxu norun / output / bash / python / text
 - no tabs inside fences (the interpreter's excerpts assume spaces)
 - output fences are non-empty for run and error examples
-- prose contains no em-dashes (pinned program output may)
+- prose contains no em-dashes or en-dashes (pinned program output may)
 
     uv run python scripts/lint_book.py
 """
@@ -85,9 +85,8 @@ def lint(path: Path) -> list[str]:
                             "`fn main() -> int {`")
 
     for n, line in prose_lines:
-        if "—" in line and path.name not in ("README.md",
-                                                 "01-getting-started.md"):
-            problems.append(f"{n}: em-dash in prose")
+        if "—" in line or "–" in line:
+            problems.append(f"{n}: em-dash or en-dash in prose")
     return problems
 
 
