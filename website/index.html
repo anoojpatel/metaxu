@@ -146,6 +146,13 @@ a:focus-visible, button:focus-visible { outline: 2px solid var(--acc); outline-o
    star becomes when it hits the pointer */
 .heroviz pre s { text-decoration: none; color: var(--acc-dim); opacity: .75; }
 .heroviz pre em { font-style: normal; color: var(--dim); }
+.heroviz pre em b { font-weight: 700; color: var(--mut); }   /* a star's head */
+/* the rim of the wound: the band of glyphs just outside the cleared
+   zone smears, a blurred halo that follows the cut across the arms */
+.heroviz pre u {
+  text-decoration: none; color: var(--acc); opacity: .92;
+  filter: blur(.8px); text-shadow: 0 0 7px rgba(33, 117, 106, .65);
+}
 .heroviz pre strong {
   font-weight: 700; color: #1b5f56;
   text-shadow: 0 0 10px rgba(33, 117, 106, .55);
@@ -577,13 +584,13 @@ fn main() -> int {
     && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
   var mx = -1e3, my = -1e3;                  // pointer, in cell coords
   var speed = 1, targetSpeed = 1, phase = 1.7, lastT = null;
-  var STARS = [], FW = [], nextStar = 1500;   // the sky layer (see stepSky)
+  var STARS = [], FW = [], nextStar = 600;    // the sky layer (see stepSky)
   // The event horizon. `hole` eases 0..1 while the pointer sits in the
   // centre; the field cross-fades from the spiral into a Gargantua:
   // an empty shadow of radius HR, a thin photon ring around it, an
   // edge-on accretion disk streaming across (approaching side brighter)
   // and the lensed arcs over and under it.
-  var HR = 4.2, hole = 0, holeOn = false;
+  var HR = 3.2, hole = 0, holeOn = false;
   var spin = 0;                                // extra spin, winds up to a top speed
   // The pointer is a wound, not a light: it carves the arms open around
   // itself, and the material it displaces breaks away as debris that
@@ -633,7 +640,7 @@ fn main() -> int {
         var dx = (x - CX) * AX, dy = y - CY;
         var r = Math.sqrt(dx * dx + dy * dy);
         var th = Math.atan2(dy, dx);
-        var v = 0;
+        var v = 0, rim = false;
         if (r <= RMAX) {
           var gx = (x - wx) * AX, gy = y - wy;
           var d2 = gx * gx + gy * gy;
@@ -646,6 +653,8 @@ fn main() -> int {
           // the negative: the wound removes the arms around the pointer
           var wf = Math.exp(-d2 / 5) * wstr * (1 - hole);
           v = v0 * (1 - wf);
+          // the band just outside the cleared zone is the blurred rim
+          rim = wf > 0.06 && wf <= 0.35;
           // bright arm material the wound covers breaks away once, as
           // debris; when the wound moves on the cell may break again
           if (t > 0) {
@@ -666,10 +675,12 @@ fn main() -> int {
         if (hole > 0.01) v = v * (1 - hole) + horizonField(dx, dy, r, th) * hole;
         var i2 = Math.round(v * (RAMP.length - 1));
         if (i2 >= RAMP.length) i2 = RAMP.length - 1;
-        // the top of the ramp is EMPHASISED: the arm cores and the
-        // cursor knot carry visible weight, as bold (1) or italic (2)
-        // depending on where a slow diagonal wave has reached
-        row.push(i2 >= 10 ? [RAMP[i2], style(x, y, t)] : [RAMP[i2], 0]);
+        // the upper ramp is EMPHASISED: arm bodies and cores carry
+        // visible weight, as bold (1) or italic (2) depending on where a
+        // slow diagonal wave has reached; the wound's rim (6) wins
+        var em = i2 >= 8 ? style(x, y, t) : 0;
+        if (rim && i2 >= 3) em = 6;
+        row.push([RAMP[i2], em]);
       }
       grid.push(row);
     }
@@ -717,7 +728,9 @@ fn main() -> int {
         var kx = Math.round(st.x - sgn * k), ky = Math.round(st.y - slope * k);
         if (kx < 0 || kx >= W || ky < 0 || ky >= H) continue;
         var c0 = grid[ky][kx];
-        if (c0[1] === 0 && RAMP.indexOf(c0[0]) <= 2) grid[ky][kx] = [STAR_TAIL[k], 4];
+        if (c0[1] === 0 && RAMP.indexOf(c0[0]) <= 2) {
+          grid[ky][kx] = [STAR_TAIL[k], k === 0 ? 7 : 4];   // bold head
+        }
       }
     }
     // fireworks: five streamers, each a short trail that slows and
@@ -743,23 +756,22 @@ fn main() -> int {
       }
     }
     // emit as tagged runs (RAMP, star and firework chars need no HTML
-    // escaping): b bold, i italic, s shadow, em star, strong firework
-    var TAG = ['', 'b', 'i', 's', 'em', 'strong'];
+    // escaping): b bold, i italic, s shadow, em star tail, strong
+    // firework, u wound rim, em>b star head
+    var OPEN = ['', '<b>', '<i>', '<s>', '<em>', '<strong>', '<u>', '<em><b>'];
+    var CLOSE = ['', '</b>', '</i>', '</s>', '</em>', '</strong>', '</u>', '</b></em>'];
     var out = '';
     for (var y2 = 0; y2 < H; y2++) {
-      var row2 = grid[y2], run = '', em = 0;
+      var row2 = grid[y2], run = '', cur = 0;
       for (var x2 = 0; x2 < W; x2++) {
         var cell = row2[x2];
-        var ch = cell.length === 1 ? cell : cell[0];
-        var e = cell.length === 1 ? 0 : cell[1];
-        if (e !== em) {
-          out += em ? '<' + TAG[em] + '>' + run + '</' + TAG[em] + '>' : run;
-          run = ''; em = e;
+        if (cell[1] !== cur) {
+          out += OPEN[cur] + run + CLOSE[cur];
+          run = ''; cur = cell[1];
         }
-        run += ch;
+        run += cell[0];
       }
-      out += em ? '<' + TAG[em] + '>' + run + '</' + TAG[em] + '>' : run;
-      out += '\n';
+      out += OPEN[cur] + run + CLOSE[cur] + '\n';
     }
     el.innerHTML = out;
   }
@@ -803,9 +815,9 @@ fn main() -> int {
     FW.push({ x: x, y: y, born: t, streamers: streamers });
   }
   function stepSky(t, dt) {
-    if (t > nextStar && STARS.length < 2) {
+    if (t > nextStar && STARS.length < 5) {
       spawnStar(t);
-      nextStar = t + 2500 + Math.random() * 3500;
+      nextStar = t + 800 + Math.random() * 1500;
     }
     for (var i = STARS.length - 1; i >= 0; i--) {
       var st = STARS[i];
@@ -831,8 +843,8 @@ fn main() -> int {
     // pointer is well outside (hysteresis, so the edge doesn't flicker)
     var pdx = (mx - CX) * AX, pdy = my - CY;
     var pr = Math.sqrt(pdx * pdx + pdy * pdy);
-    if (pr < HR + 1.5) holeOn = true;
-    else if (pr > HR + 4.5) holeOn = false;
+    if (pr < HR + 1.2) holeOn = true;
+    else if (pr > HR + 4) holeOn = false;
     hole += ((holeOn ? 1 : 0) - hole) * 0.045;
     if (hole < 0.002) hole = 0;
     // the wound follows the pointer with a little lag and heals once
