@@ -5,11 +5,30 @@ backend, and a strict reference interpreter that defines what every
 program means. You need Python 3.11+, clang, and
 [uv](https://docs.astral.sh/uv/).
 
+The compiler is one command, `metaxuc`. Install it on your PATH
+straight from the repository:
+
+```bash
+uv tool install git+https://github.com/anoojpatel/metaxu
+```
+
+If the shell cannot find it afterwards, `uv tool update-shell` adds
+uv's tool directory to your PATH; open a new terminal and try again.
+`uvx --from git+https://github.com/anoojpatel/metaxu metaxuc ...` runs
+it once without installing.
+
+To work from a checkout instead, which is what the rest of this book
+assumes when it mentions `examples/` or the test suite:
+
 ```bash
 git clone https://github.com/anoojpatel/metaxu.git
 cd metaxu
 uv sync --all-groups
 ```
+
+Inside the checkout, `uv run metaxuc` is the same command running
+against the working tree, and `uv tool install -e .` puts that version
+on your PATH.
 
 ## The first program
 
@@ -42,9 +61,9 @@ number onto a string takes `.to_string()`, which chapter 2 covers.
 
 ## Running it
 
-Save the program as `hello.mx`. The `metaxuc` command installed by
-`uv sync` is the front door to the compiler; inside the repository,
-call it through `uv run`.
+Save the program as `hello.mx`. With `metaxuc` on your PATH, drop the
+`uv run` prefix from every command below; inside the checkout it runs
+the working tree's compiler.
 
 ```bash
 uv run metaxuc run hello.mx        # interpret it

@@ -133,8 +133,7 @@ layouts and `simdgroup_matrix`). See `docs/compiler_roadmap.md` and
 - clang (for the native backend)
 - uv (fast Python package installer)
 
-### Setup
-1. Install uv:
+### Install uv
 ```bash
 # On macOS
 brew install uv
@@ -143,34 +142,61 @@ brew install uv
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-2. Clone the repository:
+### Install `metaxuc` as a command
+
+`metaxuc` is the compiler's command-line front door. To have it on your
+PATH without a checkout:
+
+```bash
+uv tool install git+https://github.com/anoojpatel/metaxu
+metaxuc run hello.mx
+```
+
+uv puts the executable in its tool directory (`~/.local/bin` by default).
+If your shell cannot find `metaxuc` afterwards, run `uv tool update-shell`
+once and open a new terminal. `uv tool upgrade metaxu` picks up new
+commits. To try it without installing anything:
+
+```bash
+uvx --from git+https://github.com/anoojpatel/metaxu metaxuc run hello.mx
+```
+
+The four subcommands:
+
+```bash
+metaxuc run hello.mx                # interpret; exit code is main's return
+metaxuc build hello.mx              # native executable at ./hello (-o to choose)
+metaxuc check hello.mx              # type check and borrow check only
+metaxuc emit hello.mx --stage mir   # print a stage: ast, hir, mir, clif, llvm
+```
+
+### Work on the compiler
+
+Clone the repository and install its dependencies:
+
 ```bash
 git clone https://github.com/anoojpatel/metaxu.git
 cd metaxu
-```
-
-3. Install dependencies:
-```bash
 uv sync --all-groups
 ```
 
-4. Compile and run a program. `uv sync` installs `metaxuc`, the compiler's
-   command-line front door:
+Inside the checkout, `uv run metaxuc ...` runs the command against the
+working tree. To have the checkout's `metaxuc` on your PATH as well, install
+it in editable mode, so your edits are live without reinstalling:
+
 ```bash
-uv run metaxuc run hello.mx            # interpret; exit code is main's return
-uv run metaxuc build hello.mx          # native executable at ./hello (-o to choose)
-uv run metaxuc check hello.mx          # type check and borrow check only
-uv run metaxuc emit hello.mx --stage mir   # print a stage: ast, hir, mir, clif, llvm
+uv tool install -e .
 ```
 
-5. Run the gates:
+Run the gates before opening a pull request:
+
 ```bash
 uv run python -m pytest src/metaxu/compiler/tests -q   # full suite
 uv run python scripts/run_examples.py                  # pipeline gate
 uv run python scripts/run_examples.py --stage run      # execution gate
 ```
 
-6. Emit a Metal kernel harness for a Mac:
+To emit a Metal kernel harness for a Mac:
 ```bash
 uv run python scripts/emit_metal_harness.py kernels.mx my_kernel \
     --grid 4 --buf a=1,2,3,4 --buf out=0,0,0,0

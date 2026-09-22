@@ -13,9 +13,14 @@
 <main>
 <h1>Getting started</h1>
 <p>Metaxu is a systems language with a Python front end, an LLVM native backend, and a strict reference interpreter that defines what every program means. You need Python 3.11+, clang, and <a href="https://docs.astral.sh/uv/">uv</a>.</p>
+<p>The compiler is one command, <code>metaxuc</code>. Install it on your PATH straight from the repository:</p>
+<div class="fence"><span class="label">bash</span><pre><code>uv tool install git+https://github.com/anoojpatel/metaxu</code></pre></div>
+<p>If the shell cannot find it afterwards, <code>uv tool update-shell</code> adds uv&#x27;s tool directory to your PATH; open a new terminal and try again. <code>uvx --from git+https://github.com/anoojpatel/metaxu metaxuc ...</code> runs it once without installing.</p>
+<p>To work from a checkout instead, which is what the rest of this book assumes when it mentions <code>examples/</code> or the test suite:</p>
 <div class="fence"><span class="label">bash</span><pre><code>git clone https://github.com/anoojpatel/metaxu.git
 cd metaxu
 uv sync --all-groups</code></pre></div>
+<p>Inside the checkout, <code>uv run metaxuc</code> is the same command running against the working tree, and <code>uv tool install -e .</code> puts that version on your PATH.</p>
 <h2>The first program</h2>
 <p>A program declares <code>fn main() -&gt; int</code>. Its return value is the process exit code. <code>print</code> writes a line to stdout.</p>
 <div class="fence"><span class="label">metaxu</span><pre><code class="mx">fn main() -&gt; int {
@@ -27,7 +32,7 @@ uv sync --all-groups</code></pre></div>
 <p>(A bare <code>.mx</code> file of top-level statements also runs as a script: <code>examples/hello.mx</code> is one line of <code>print</code>, and the compiler makes those statements the body of <code>main</code>. A file gets one or the other; a top-level statement next to a declared <code>main</code> is a compile error, not something that silently runs first or not at all. Everything in this book uses <code>main</code>.)</p>
 <p>Two things to notice already. Statements end with <code>;</code>, but the last expression of a block doesn&#x27;t need one, and its value <em>is</em> the block&#x27;s value: that final <code>0</code> is <code>main</code>&#x27;s return. And <code>+</code> concatenates strings when both sides are strings. There&#x27;s no implicit conversion; gluing a number onto a string takes <code>.to_string()</code>, which chapter 2 covers.</p>
 <h2>Running it</h2>
-<p>Save the program as <code>hello.mx</code>. The <code>metaxuc</code> command installed by <code>uv sync</code> is the front door to the compiler; inside the repository, call it through <code>uv run</code>.</p>
+<p>Save the program as <code>hello.mx</code>. With <code>metaxuc</code> on your PATH, drop the <code>uv run</code> prefix from every command below; inside the checkout it runs the working tree&#x27;s compiler.</p>
 <div class="fence"><span class="label">bash</span><pre><code>uv run metaxuc run hello.mx        # interpret it
 uv run metaxuc build hello.mx      # compile it to ./hello
 ./hello</code></pre></div>

@@ -15,6 +15,11 @@ cd metaxu
 uv sync --all-groups
 ```
 
+`uv run metaxuc run file.mx` runs the working tree's compiler. If you
+want that `metaxuc` on your PATH while you work, `uv tool install -e .`
+installs it in editable mode, so edits in the checkout take effect
+without reinstalling.
+
 ## Before you open a pull request
 
 Run all three. A pull request is ready when they pass.

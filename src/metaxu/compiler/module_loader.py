@@ -75,16 +75,24 @@ def _stdlib_dir() -> str | None:
     Resolution order:
     1. the METAXU_STD_PATH environment variable, when set and a directory;
     2. the repo-layout default: the `std/` directory at the repository
-       root, located relative to this file (src/metaxu/compiler/ -> ../../../std).
-    Returns None when neither exists (std.* imports then all resolve to
+       root, located relative to this file (src/metaxu/compiler/ -> ../../../std);
+    3. the installed layout: `metaxu/std/` inside the package, which the
+       wheel build copies from the repository's `std/` (pyproject.toml,
+       [tool.hatch.build.targets.wheel.force-include]) so `uv tool install`
+       and `uvx` users get the standard library without a checkout.
+    Returns None when none exists (std.* imports then all resolve to
     the external placeholder, the pre-stdlib behavior).
     """
     env = os.environ.get("METAXU_STD_PATH")
     if env:
         return env if os.path.isdir(env) else None
     here = os.path.dirname(os.path.abspath(__file__))
-    cand = os.path.normpath(os.path.join(here, "..", "..", "..", "std"))
-    return cand if os.path.isdir(cand) else None
+    for cand in (os.path.join(here, "..", "..", "..", "std"),
+                 os.path.join(here, "..", "std")):
+        cand = os.path.normpath(cand)
+        if os.path.isdir(cand):
+            return cand
+    return None
 
 
 def _module_error(message: str, notes: list[str] | None = None,
