@@ -127,13 +127,13 @@ Notes:
 
 Calling `geometry.shave(2)` directly is rejected the same way, at the
 call site: "symbol 'shave' of module 'geometry' is private (referenced
-from module 'main' as 'geometry.shave')". One honesty note about the fences above: they are plain
-fences, not `error` fences. The book's harness only pins compile
-rejections that arrive as `TypeCheckError` or `BorrowCheckError`, and
-this one is a `ModuleError`, a plain `CompileError` from the resolver.
-The diagnostic is quoted verbatim from running the exact program
-shown, but the harness doesn't re-check it on every run the way it
-does the typed rejections.
+from module 'main' as 'geometry.shave')". One honesty note about the
+fences above: they are plain fences, not `error` fences. The book's
+harness only pins compile rejections that arrive as `TypeCheckError`
+or `BorrowCheckError`, and this one is a `ModuleError`, a plain
+`CompileError` from the resolver. The diagnostic is quoted verbatim
+from running the exact program shown, but the harness doesn't
+re-check it on every run the way it does the typed rejections.
 
 ## Multi-file programs
 
@@ -371,11 +371,11 @@ Notes:
 ```
 
 `mxpkg check` recomputes the tree hashes and exits nonzero on drift,
-which is what a CI job should run; a hand edit inside `mx_modules/` is
-caught. There is no registry, no version-range solver, no build
-scripts, and no binary artifacts; each of those is a separate decision
-for later, and none is needed to share a library between two
-repositories today.
+so it catches a hand edit inside `mx_modules/`; that is the command a
+CI job should run. There is no registry, no version-range solver, no
+build scripts, and no binary artifacts; each of those is a separate
+decision for later, and you need none of them to share a library
+between two repositories today.
 
 ## Where this leaves you
 

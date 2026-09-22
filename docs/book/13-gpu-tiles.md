@@ -226,14 +226,14 @@ fn main() -> int {
 
 The kernel didn't change; only the handler did. Two rules of the
 Metal contract matter. Kernels use the masked load/store forms,
-because device kernels can't raise (the strict forms are rejected
-with a message saying exactly that). And instances read buffers as
-they were at launch entry, writes mask-merged afterward:
-cross-instance read-after-write inside one launch is outside the
-contract, racy on a real GPU and hidden by the sequential reference.
-Everything outside the contract, a kernel outside the MSL subset, a
-non-canonical closure, a missing engine, is a loud catchable error,
-never a silent CPU fallback. For an actual Mac,
+because device kernels can't raise (use a strict form and the error
+message says exactly that). And instances read buffers as they were
+at launch entry, writes mask-merged afterward: cross-instance
+read-after-write inside one launch is outside the contract, racy on a
+real GPU and hidden by the sequential reference. Everything outside
+the contract, a kernel outside the MSL subset, a non-canonical
+closure, a missing engine, is a loud catchable error, never a silent
+CPU fallback. For an actual Mac,
 `scripts/emit_metal_harness.py` generates a self-checking harness
 that bakes in the interpreter's expected outputs and exits 0 only if
 the Metal results match:
