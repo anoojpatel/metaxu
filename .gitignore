@@ -173,3 +173,7 @@ cython_debug/
 
 # assembled static site (scripts/build_site.py)
 _site/
+
+# agent tooling stays local to each machine
+.claude/
+CLAUDE.md

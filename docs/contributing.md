@@ -1,117 +1,99 @@
 # Contributing to Metaxu
 
-Thank you for your interest in contributing to Metaxu! This document provides guidelines for contributing to the project.
+This page covers how to set up a working copy, what to run before you
+open a pull request, and the rules a change has to follow. The README's
+Development section has the repository layout.
 
-## Development Setup
+## Setup
 
-1. Install prerequisites:
-   - Python 3.11 or higher
-   - GCC compiler
-   - uv package manager
+You need Python 3.11 or newer, clang (the native backend compiles
+through it), and [uv](https://docs.astral.sh/uv/).
 
-2. Clone and setup:
 ```bash
-git clone https://github.com/yourusername/metaxu.git
+git clone https://github.com/anoojpatel/metaxu.git
 cd metaxu
-uv sync --all  # Install all dependencies including dev tools
+uv sync --all-groups
 ```
 
-## Development Workflow
+## Before you open a pull request
 
-### Running Tests
+Run all three. A pull request is ready when they pass.
+
 ```bash
-# Run all tests
-doit test
-
-# Run specific test suites
-doit test_python
-doit test_atomic_effects
-doit test_effect_runtime
+uv run python -m pytest src/metaxu/compiler/tests -q   # the test suite, about three minutes
+uv run python scripts/run_examples.py                  # every example program compiles
+uv run python scripts/run_examples.py --stage run      # every example program runs
 ```
 
-### Code Style
-- Use type hints for all Python code
-- Follow PEP 8 guidelines
-- Use beartype for runtime type checking
-- Keep functions focused and well-documented
+If you touched the book (`docs/book/`), also run the prose lint:
 
-### Making Changes
-1. Create a new branch for your changes
-2. Write tests for new functionality
-3. Ensure all tests pass
-4. Submit a pull request
-
-## Project Structure
-
+```bash
+uv run python scripts/lint_book.py
 ```
-metaxu/
-├── src/metaxu/           # Main source code
-│   ├── runtimes/        # Runtime implementations
-│   │   ├── c/          # C runtime
-│   │   │   ├── effects.c    # Effect system implementation
-│   │   │   ├── effects.h    # Effect system interface
-│   │   │   ├── values.c     # Value handling implementation
-│   │   │   └── values.h     # Value handling interface
-│   │   └── std/        # Standard library
-│   │       ├── prelude.mx   # Core language features
-│   │       └── effects/     # Effect implementations
-│   │           ├── state.mx    # State effects
-│   │           ├── thread.mx   # Threading effects
-│   │           ├── domain.mx   # Domain effects
-│   │           ├── sync.mx     # Synchronization effects
-│   │           ├── advanced.mx # Advanced effects
-│   │           └── concurrent.mx # Concurrency effects
-│   ├── metaxu_ast.py   # AST definitions
-│   ├── type_checker.py # Type checking
-│   ├── symbol_table.py # Symbol resolution
-│   ├── vm_to_c.py      # VM to C compilation
-│   ├── c_linker.py     # C linking utilities
-│   ├── unsafe_ast.py   # Unsafe operation AST
-│   └── extern_ast.py   # External binding AST
-├── tests/              # Test files
-│   ├── *.py           # Python test files
-│   ├── *.c            # C runtime tests
-│   └── *.mx           # Metaxu test files
-├── docs/               # Documentation
-│   ├── index.md       # Documentation home
-│   ├── effects/       # Effect system docs
-│   ├── type_system.md # Type system docs
-│   └── *.md           # Other documentation
-├── vscode-metaxu/     # VSCode extension
-│   ├── syntaxes/      # Syntax highlighting
-│   └── themes/        # Color themes
-├── outputs/           # Build outputs
-├── dodo.py           # Build automation
-├── pyproject.toml    # Project configuration
-└── README.md         # Project overview
-```
+
+The book's code examples are part of the test suite, so the first
+command already checks that they still print what the text says.
+
+## Writing a test
+
+Tests live in `src/metaxu/compiler/tests/`. A test is a Metaxu program
+as a string (or a file under `tests/fixtures/`) that goes through the
+whole pipeline, then an assertion about the result: the printed output,
+the returned value, or the error the compiler raised. `test_book_examples.py`
+and `test_example_gates.py` are short and show the shape.
+
+Do not construct HIR or MIR by hand in a test. The bugs this project has
+had were in the seams between stages, where a construct was silently
+turned into something weaker, and a hand-built fixture starts after the
+seam.
+
+A test for a compile error checks the error type and a fragment of the
+message. Every diagnostic carries a file, line and column, and
+`docs/diagnostics_locations.md` describes how that location travels from
+the parser to the message.
+
+## What a change has to satisfy
+
+- New compiler behavior comes with a regression test in the same
+  commit.
+- Both example gates stay at 21 of 21.
+- When a program is wrong, the compiler or the interpreter rejects it
+  with a message. Do not add a fallback that lets it run so a test
+  passes.
+- The interpreter (`mir_interp.py`) is the reference for what a program
+  means. A change to the LLVM backend needs a test that runs the program
+  natively and compares stdout and the exit code with the interpreter.
+- A change that alters what a book example prints updates the chapter in
+  the same commit.
+- The standard library in `std/` is written in Metaxu. Writing real code
+  there is the best stress test the compiler has, and several bugs were
+  only found that way, so extending `std/` is a welcome contribution.
 
 ## Documentation
 
-- Update relevant documentation when making changes
-- Add docstrings to new functions and classes
-- Update type annotations when modifying interfaces
+Design notes live in `docs/`. Each covers one area (type inference,
+modules, packages, GPU tiles, diagnostics) and says what is implemented
+and what is not. When a change moves one of those lines, update the
+note. `docs/v1_gap_analysis.md` is the summary of what works today.
 
-## Testing
+The book in `docs/book/` is the user-facing reference. Its prose is
+linted: no em or en dashes, and code fences must name a language the
+harness knows. `scripts/build_book_site.py` renders it into `website/book/`.
 
-- Write tests for new features
-- Update existing tests when changing behavior
-- Use pytest for Python tests
-- Test both success and failure cases
+## The website
 
-## Commit Messages
+`website/` holds metaxulang.org. The pages are static and deploy through
+`.github/workflows/pages.yml` on a push to `main` that touches the site
+or the book. `website/README.md` explains the build and the domain
+setup.
 
-Follow conventional commits format:
-- feat: New feature
-- fix: Bug fix
-- docs: Documentation changes
-- test: Test changes
-- refactor: Code refactoring
-- chore: Maintenance tasks
+## Branches and commits
 
-## Getting Help
+Work on a branch and open a pull request against `main`. Write the
+commit subject in the imperative and keep it under about 70 characters.
+Use the body to say why the change was made and what you checked,
+because the diff already shows what changed.
 
-- Check existing documentation
-- Look through related issues
-- Ask questions in discussions
-- Join our community chat (soonTM)
+## Questions
+
+Open an issue. There is no chat channel yet.
