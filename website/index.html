@@ -134,6 +134,15 @@ a:focus-visible, button:focus-visible { outline: 2px solid var(--acc); outline-o
    between bold and italic as a wave crosses the field */
 .heroviz pre b { font-weight: 700; font-style: normal; color: #1b5f56; }
 .heroviz pre i { font-weight: 400; font-style: italic; color: #1b5f56; }
+/* the textual layers behind and over the field: a dim offset shadow of
+   the arms, shooting stars crossing behind them, and the firework a
+   star becomes when it hits the pointer */
+.heroviz pre s { text-decoration: none; color: var(--acc-dim); opacity: .75; }
+.heroviz pre em { font-style: normal; color: var(--dim); }
+.heroviz pre strong {
+  font-weight: 700; color: #1b5f56;
+  text-shadow: 0 0 10px rgba(33, 117, 106, .55);
+}
 .vizcap {
   font-family: var(--mono); font-size: 11.5px; color: var(--dim);
   margin: 12px 0 34px; letter-spacing: .02em;
@@ -376,7 +385,7 @@ footer .wrap { display: flex; justify-content: space-between; gap: 24px; flex-wr
       <h1 class="wordmark">Metaxu</h1>
       <pre id="vortex" aria-hidden="true"> </pre>
     </figure>
-    <p class="vizcap">move the cursor to stir; left to right steers the spin</p>
+    <p class="vizcap">move the cursor to stir; left to right steers the spin; catch a shooting star</p>
     <p class="thesis">A systems language with algebraic effects, mode-based
     memory safety, and tile-level GPU kernels compiled to Metal.</p>
     <p class="subthesis">You write what should happen; <em>handlers</em>
@@ -560,6 +569,7 @@ fn main() -> int {
     && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
   var mx = -1e3, my = -1e3;                  // pointer, in cell coords
   var speed = 1, targetSpeed = 1, phase = 1.7, lastT = null;
+  var STARS = [], FW = [], nextStar = 1500;   // the sky layer (see stepSky)
 
   // Particles ride the same rotation: inner ones orbit faster, all
   // drift slowly inward and respawn at the rim.
@@ -579,7 +589,7 @@ fn main() -> int {
       for (var x = 0; x < W; x++) {
         var dx = (x - CX) * AX, dy = y - CY;
         var r = Math.sqrt(dx * dx + dy * dy);
-        if (r > RMAX) { row.push(' '); continue; }
+        if (r > RMAX) { row.push([' ', 0]); continue; }
         var th = Math.atan2(dy, dx);
         var gx = (x - mx) * AX, gy = y - my;
         var g = Math.exp(-(gx * gx + gy * gy) / 7);
@@ -598,6 +608,20 @@ fn main() -> int {
       }
       grid.push(row);
     }
+    // the shadow layer: every visible arm cell casts a dim echo two
+    // columns right and one row down, into cells the field left dark
+    for (var sy = 0; sy < H; sy++) {
+      for (var sx = 0; sx < W; sx++) {
+        var lvl = RAMP.indexOf(grid[sy][sx][0]);
+        if (lvl < 4) continue;
+        var tx = sx + 2, ty = sy + 1;
+        if (tx >= W || ty >= H) continue;
+        var under = grid[ty][tx];
+        if (under[1] === 0 && RAMP.indexOf(under[0]) <= 1) {
+          grid[ty][tx] = [lvl >= 9 ? ':' : '.', 3];
+        }
+      }
+    }
     // the particle layer, drawn over the field, always emphasised;
     // each particle flips bold/italic on its own twinkle phase
     for (var p = 0; p < P.length; p++) {
@@ -609,9 +633,44 @@ fn main() -> int {
       grid[py][px] = [tw > 0.3 ? '@' : tw > -0.4 ? '*' : '+',
                       Math.cos(t * 0.0007 + q.blink) > 0 ? 1 : 2];
     }
-    // emit as <b> / <i> runs (RAMP and particle chars need no HTML
-    // escaping)
-    var TAG = ['', 'b', 'i'];
+    // shooting stars: a bright head and a tail of six cells, drawn only
+    // where the field is dark so they pass BEHIND the arms
+    var STAR_TAIL = '*+--...';
+    for (var s = 0; s < STARS.length; s++) {
+      var st = STARS[s];
+      var sgn = st.vx > 0 ? 1 : -1, slope = st.vy / Math.abs(st.vx);
+      for (var k = 0; k < STAR_TAIL.length; k++) {
+        var kx = Math.round(st.x - sgn * k), ky = Math.round(st.y - slope * k);
+        if (kx < 0 || kx >= W || ky < 0 || ky >= H) continue;
+        var c0 = grid[ky][kx];
+        if (c0[1] === 0 && RAMP.indexOf(c0[0]) <= 2) grid[ky][kx] = [STAR_TAIL[k], 4];
+      }
+    }
+    // fireworks: five streamers, each a short trail that slows and
+    // droops, drawn over everything
+    for (var f = 0; f < FW.length; f++) {
+      var fw = FW[f], age = (t - fw.born) / 1000;
+      if (age < 0.12) {
+        var fx0 = Math.round(fw.x), fy0 = Math.round(fw.y);
+        if (fx0 >= 0 && fx0 < W && fy0 >= 0 && fy0 < H) grid[fy0][fx0] = ['@', 5];
+      }
+      var shift = age > 0.85 ? 2 : age > 0.55 ? 1 : 0;
+      for (var m = 0; m < fw.streamers.length; m++) {
+        var sm = fw.streamers[m];
+        for (var k2 = 0; k2 < 4; k2++) {
+          var tau = age - k2 * 0.08;
+          if (tau < 0) continue;
+          var dist = sm.sp * 0.35 * (1 - Math.exp(-tau / 0.35));
+          var fx = Math.round(fw.x + Math.cos(sm.a) * dist / AX);
+          var fy = Math.round(fw.y + Math.sin(sm.a) * dist + 4 * tau * tau);
+          if (fx < 0 || fx >= W || fy < 0 || fy >= H) continue;
+          grid[fy][fx] = ['*+:...'[Math.min(5, k2 + shift)], 5];
+        }
+      }
+    }
+    // emit as tagged runs (RAMP, star and firework chars need no HTML
+    // escaping): b bold, i italic, s shadow, em star, strong firework
+    var TAG = ['', 'b', 'i', 's', 'em', 'strong'];
     var out = '';
     for (var y2 = 0; y2 < H; y2++) {
       var row2 = grid[y2], run = '', em = 0;
@@ -651,9 +710,49 @@ fn main() -> int {
     mx = my = -1e3; targetSpeed = 1;
   });
 
+  // Shooting stars cross the background every few seconds; one whose
+  // head passes within two cells of the pointer bursts into a firework
+  // of five streamers (a small one, on purpose).
+  function spawnStar(t) {
+    var fromLeft = Math.random() < 0.5;
+    var ang = (fromLeft ? 0.38 : Math.PI - 0.38) + (Math.random() - 0.5) * 0.5;
+    var sp = 13 + Math.random() * 7;             // rows per second, visually
+    STARS.push({ x: fromLeft ? -1 : W, y: Math.random() * H * 0.55 - 1,
+                 vx: Math.cos(ang) * sp / AX, vy: Math.sin(ang) * sp });
+  }
+  function burst(x, y, t) {
+    var base = Math.random() * Math.PI * 2, streamers = [];
+    for (var k = 0; k < 5; k++) {
+      streamers.push({ a: base + k * Math.PI * 2 / 5 + (Math.random() - 0.5) * 0.5,
+                       sp: 9 + Math.random() * 5 });
+    }
+    FW.push({ x: x, y: y, born: t, streamers: streamers });
+  }
+  function stepSky(t, dt) {
+    if (t > nextStar && STARS.length < 2) {
+      spawnStar(t);
+      nextStar = t + 2500 + Math.random() * 3500;
+    }
+    for (var i = STARS.length - 1; i >= 0; i--) {
+      var st = STARS[i];
+      st.x += st.vx * dt / 1000; st.y += st.vy * dt / 1000;
+      var hx = (st.x - mx) * AX, hy = st.y - my;
+      if (hx * hx + hy * hy < 4) {               // within two rows of the pointer
+        burst(st.x, st.y, t);
+        STARS.splice(i, 1);
+      } else if (st.x < -8 || st.x > W + 8 || st.y > H + 2) {
+        STARS.splice(i, 1);
+      }
+    }
+    for (var j = FW.length - 1; j >= 0; j--) {
+      if (t - FW[j].born > 1100) FW.splice(j, 1);
+    }
+  }
+
   function tick(t) {
     if (lastT === null) lastT = t;
     var dt = Math.min(t - lastT, 64); lastT = t;
+    stepSky(t, dt);
     speed += (targetSpeed - speed) * 0.05;
     var w = speed * dt * 0.00028;              // much slower than before
     phase += w;
