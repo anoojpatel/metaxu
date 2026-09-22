@@ -129,6 +129,13 @@ a:focus-visible, button:focus-visible { outline: 2px solid var(--acc); outline-o
   white-space: pre; user-select: none; cursor: crosshair;
   color: var(--acc); text-shadow: 0 0 18px rgba(33, 117, 106, .18);
   font-feature-settings: "calt" 0, "liga" 0; /* raw glyphs, no joining */
+  transform-origin: 50% 50%; will-change: transform;
+  transition: text-shadow .7s ease;
+}
+/* the event horizon: pointer in the centre collapses the spiral into a
+   black hole; the glow deepens while it lasts */
+.heroviz pre.horizon {
+  text-shadow: 0 0 26px rgba(33, 117, 106, .5), 0 0 5px rgba(27, 95, 86, .45);
 }
 /* the emphasised cells (arm cores, cursor knot, particles) ripple
    between bold and italic as a wave crosses the field */
@@ -145,7 +152,8 @@ a:focus-visible, button:focus-visible { outline: 2px solid var(--acc); outline-o
 }
 .vizcap {
   font-family: var(--mono); font-size: 11.5px; color: var(--dim);
-  margin: 12px 0 34px; letter-spacing: .02em;
+  margin: 44px 0 34px; letter-spacing: .02em; /* room for the horizon to grow into */
+  position: relative; z-index: 3;
 }
 .thesis {
   font-size: 19.5px; line-height: 1.55; max-width: 34em;
@@ -385,7 +393,7 @@ footer .wrap { display: flex; justify-content: space-between; gap: 24px; flex-wr
       <h1 class="wordmark">Metaxu</h1>
       <pre id="vortex" aria-hidden="true"> </pre>
     </figure>
-    <p class="vizcap">move the cursor to stir; left to right steers the spin; catch a shooting star</p>
+    <p class="vizcap">move the cursor to stir; left to right steers the spin; catch a shooting star; hold the centre</p>
     <p class="thesis">A systems language with algebraic effects, mode-based
     memory safety, and tile-level GPU kernels compiled to Metal.</p>
     <p class="subthesis">You write what should happen; <em>handlers</em>
@@ -570,6 +578,27 @@ fn main() -> int {
   var mx = -1e3, my = -1e3;                  // pointer, in cell coords
   var speed = 1, targetSpeed = 1, phase = 1.7, lastT = null;
   var STARS = [], FW = [], nextStar = 1500;   // the sky layer (see stepSky)
+  // The event horizon. `hole` eases 0..1 while the pointer sits in the
+  // centre; the field cross-fades from the spiral into a Gargantua:
+  // an empty shadow of radius HR, a thin photon ring around it, an
+  // edge-on accretion disk streaming across (approaching side brighter)
+  // and the lensed arcs over and under it.
+  var HR = 4.2, hole = 0, holeOn = false;
+  function horizonField(dx, dy, r, th) {
+    if (r < HR) return 0;
+    var ring = Math.exp(-Math.pow(r - HR - 0.5, 2) / 0.22);
+    // the disk flares outward and is hottest just outside the ring
+    var band = Math.max(0, 1 - Math.abs(dy) / (1.7 + 0.09 * Math.abs(dx)));
+    var flow = 0.78 + 0.22 * Math.sin(5 * th + phase * 3 - r * 2.2);
+    var heat = 0.55 + 0.9 * Math.exp(-(r - HR) / 2.5);
+    var disk = Math.pow(band, 0.6) * flow * heat * Math.max(0, 1 - (r - HR) / 20);
+    // the lensed image of the far side, arcing over and under
+    var halo = 0.8 * Math.exp(-Math.pow(r - HR - 2.2, 2) / 0.9)
+               * Math.pow(Math.abs(Math.sin(th)), 0.7);
+    var v = Math.max(ring, disk, halo);
+    var doppler = 1 + 0.35 * (-dx / Math.max(r, 1));
+    return Math.min(1, v * doppler);
+  }
 
   // Particles ride the same rotation: inner ones orbit faster, all
   // drift slowly inward and respawn at the rim.
@@ -589,16 +618,22 @@ fn main() -> int {
       for (var x = 0; x < W; x++) {
         var dx = (x - CX) * AX, dy = y - CY;
         var r = Math.sqrt(dx * dx + dy * dy);
-        if (r > RMAX) { row.push([' ', 0]); continue; }
         var th = Math.atan2(dy, dx);
-        var gx = (x - mx) * AX, gy = y - my;
-        var g = Math.exp(-(gx * gx + gy * gy) / 7);
-        var edge = 1 - r / RMAX;             // arms die out at the rim
-        // four arms, low pitch; the gamma (< 1) is what makes each
-        // bright band WIDE instead of a thin ridge
-        var band = Math.sin(4 * th + r * 0.6 - phase - g * 2.2);
-        var v = Math.pow(Math.max(0, band), 0.5) * edge * breath
-                + g * 0.9;
+        var v = 0;
+        if (r <= RMAX) {
+          var gx = (x - mx) * AX, gy = y - my;
+          var g = Math.exp(-(gx * gx + gy * gy) / 7);
+          var edge = 1 - r / RMAX;           // arms die out at the rim
+          // four arms, low pitch; the gamma (< 1) is what makes each
+          // bright band WIDE instead of a thin ridge
+          var band = Math.sin(4 * th + r * 0.6 - phase - g * 2.2);
+          v = Math.pow(Math.max(0, band), 0.5) * edge * breath + g * 0.9;
+        } else if (hole < 0.01) {
+          row.push([' ', 0]); continue;
+        }
+        // the collapse: cross-fade into the black hole (its disk runs
+        // past the spiral's rim, out to the grid's edge)
+        if (hole > 0.01) v = v * (1 - hole) + horizonField(dx, dy, r, th) * hole;
         var i2 = Math.round(v * (RAMP.length - 1));
         if (i2 >= RAMP.length) i2 = RAMP.length - 1;
         // the top of the ramp is EMPHASISED: the arm cores and the
@@ -753,23 +788,44 @@ fn main() -> int {
     if (lastT === null) lastT = t;
     var dt = Math.min(t - lastT, 64); lastT = t;
     stepSky(t, dt);
+    // pointer in the centre opens the horizon; it closes again once the
+    // pointer is well outside (hysteresis, so the edge doesn't flicker)
+    var pdx = (mx - CX) * AX, pdy = my - CY;
+    var pr = Math.sqrt(pdx * pdx + pdy * pdy);
+    if (pr < HR + 1.5) holeOn = true;
+    else if (pr > HR + 4.5) holeOn = false;
+    hole += ((holeOn ? 1 : 0) - hole) * 0.045;
+    if (hole < 0.002) hole = 0;
     speed += (targetSpeed - speed) * 0.05;
-    var w = speed * dt * 0.00028;              // much slower than before
+    // the spin: slow by default, violent when the hole is open
+    var w = speed * dt * 0.00028 * (1 + hole * 6);
     phase += w;
     for (var p = 0; p < P.length; p++) {
       var q = P[p];
-      // inner particles orbit faster (flow-like), all drift inward
+      // inner particles orbit faster (flow-like), all drift inward;
+      // the hole pulls them in hard and swallows them at the horizon
       q.th += w * (1 + 9 / (1.5 + q.r));
-      q.r -= dt * 0.00028;
-      if (q.r < 1.2) {
+      q.r -= dt * 0.00028 * (1 + hole * 10);
+      if (q.r < (hole > 0.5 ? HR + 0.2 : 1.2)) {
         q.r = RMAX - 0.4;
         q.th = Math.random() * Math.PI * 2;
         q.blink = Math.random() * Math.PI * 2;
       }
     }
-    // the fade in and out: dips to a whisper, swells back (~18s cycle)
-    var breath = 0.52 + 0.38 * Math.sin(t * 0.00035);
+    // the fade in and out: dips to a whisper, swells back (~18s cycle);
+    // the hole burns at full brightness
+    var breath = (0.52 + 0.38 * Math.sin(t * 0.00035)) * (1 - hole) + 0.95 * hole;
     render(breath, t);
+    // growth and shake while the hole is open
+    if (hole > 0) {
+      var jx = (Math.random() - 0.5) * 3 * hole, jy = (Math.random() - 0.5) * 3 * hole;
+      el.style.transform = 'scale(' + (1 + 0.25 * hole).toFixed(3) + ') translate('
+                           + jx.toFixed(1) + 'px,' + jy.toFixed(1) + 'px)';
+    } else if (el.style.transform) {
+      el.style.transform = '';
+    }
+    var open = hole > 0.4;
+    if (open !== el.classList.contains('horizon')) el.classList.toggle('horizon', open);
     requestAnimationFrame(tick);
   }
   requestAnimationFrame(tick);
