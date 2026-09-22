@@ -182,6 +182,11 @@ a:focus-visible, button:focus-visible { outline: 2px solid var(--acc); outline-o
   letter-spacing: .02em; line-height: 1.9;
 }
 .statusline b { color: var(--mut); font-weight: 500; }
+.statusline a.fn {
+  color: var(--acc); text-decoration: none; font-weight: 700;
+  vertical-align: super; font-size: 11px; line-height: 0; padding: 0 1px;
+}
+.statusline a.fn:hover { text-decoration: underline; }
 @media (max-width: 640px) {
   .heroviz pre { font-size: 8px; }
   .wordmark { letter-spacing: .06em; }
@@ -189,10 +194,15 @@ a:focus-visible, button:focus-visible { outline: 2px solid var(--acc); outline-o
 
 /* ---------- sections ---------- */
 section { border-top: 1px solid var(--line); padding: 78px 0; }
+/* section subheader: a mono kicker above the serif h2, set like a
+   Metaxu comment (`#`, the language's comment marker) */
 .eyebrow {
-  font-family: var(--mono); font-weight: 500; font-size: 13px;
-  color: var(--acc); letter-spacing: .06em; margin: 0 0 14px;
+  font-family: var(--mono); font-weight: 700; font-size: 15px;
+  color: var(--mut); letter-spacing: .03em; margin: 0 0 12px;
+  padding-bottom: 8px; border-bottom: 1px solid var(--line2);
+  display: inline-block; min-width: 12ch;
 }
+.eyebrow b { color: var(--acc); font-weight: 700; margin-right: .35em; }
 h2 {
   font-family: var(--serif); font-size: clamp(30px, 3.6vw, 38px);
   font-weight: 700; letter-spacing: 0; line-height: 1.12;
@@ -235,6 +245,11 @@ p { max-width: 68ch; }
   font-size: 13.5px; line-height: 1.62; color: var(--fg);
   display: block; white-space: pre;
 }
+.exlede { color: var(--mut); max-width: 62ch; margin: 44px 0 18px; font-size: 15.5px; }
+.codeblock pre.diag { border-top: 1px solid var(--line); padding: 16px 24px; background: var(--panel2); }
+.codeblock pre.diag code { font-size: 12.5px; color: var(--mut); line-height: 1.55; }
+.pinned:target { color: var(--fg); }
+.pinned:target b { text-decoration: underline; }
 .tok-k { color: var(--acc); }
 .tok-t { color: #3e5c74; }
 .tok-s { color: #5c7a3f; }
@@ -381,6 +396,7 @@ footer .wrap { display: flex; justify-content: space-between; gap: 24px; flex-wr
     <a class="brand" href="#top">METAXU</a>
     <nav class="topnav" aria-label="Sections">
       <a href="#why">why</a>
+      <a href="#purpose">purpose</a>
       <a href="#design">design</a>
       <a href="#code">code</a>
       <a href="#performance">performance</a>
@@ -414,8 +430,8 @@ footer .wrap { display: flex; justify-content: space-between; gap: 24px; flex-wr
     </div>
     <p class="statusline">
       one semantics, three backends: <b>interpreter &middot; LLVM native
-      &middot; Metal</b> &middot; early microbenchmarks land
-      <b>near plain C</b>, asterisks included
+      &middot; Metal</b> &middot; reaching for <b>C-like performance</b><a
+      class="fn" href="#asterisks" title="the asterisks: what the microbenchmarks can and cannot tell you">*</a>
     </p>
   </div>
 </section>
@@ -423,7 +439,7 @@ footer .wrap { display: flex; justify-content: space-between; gap: 24px; flex-wr
 <!-- ================= code taste ================= -->
 <section id="why">
   <div class="wrap">
-    <p class="eyebrow">// why</p>
+    <p class="eyebrow"><b>#</b>why</p>
     <h2>A wall can carry a message</h2>
     <p>The name is Simone Weil&rsquo;s <em>metaxu</em>: the wall between two
     prison cells separates the prisoners, and it&rsquo;s also what they tap
@@ -445,9 +461,36 @@ footer .wrap { display: flex; justify-content: space-between; gap: 24px; flex-wr
   </div>
 </section>
 
+<section id="purpose">
+  <div class="wrap">
+    <p class="eyebrow"><b>#</b>why build it</p>
+    <h2>Built with simple tools, so that one day it can build itself</h2>
+    <p>A powerful language does not need a large organization behind it.
+    Metaxu&rsquo;s compiler is plain Python. The parser is a PLY grammar,
+    the checker is ordinary code over an immutable syntax tree, and the
+    native backend writes LLVM IR as text and hands it to clang. Anyone can
+    read each of those, and each stage writes out something you can look at.
+    Those tools were chosen because they are enough. With the mechanics this
+    small, the quality of the language comes down to its design, and a
+    design is something a few people can argue over and get right.</p>
+    <p>It should be easy to learn. Effects, modes and inference each carry a
+    lot of the language, but you meet them one at a time, and unannotated
+    code stays ordinary code. <a href="book/index.html">The book</a> covers
+    the whole language in eighteen chapters, and every example in it runs as
+    a test, so the text and the compiler cannot drift apart.</p>
+    <p>The end of that road is a compiler written in Metaxu. When the
+    language can express its own parser, checker and lowering, the Python
+    compiler becomes stage zero: it builds the Metaxu compiler once, and
+    from then on Metaxu lowers itself to LLVM IR. A systems language should
+    be able to write its own compiler, and that test already shapes the
+    design: every phase that exists in Python today is written with its
+    rewrite in Metaxu in mind.</p>
+  </div>
+</section>
+
 <section id="design">
   <div class="wrap">
-    <p class="eyebrow">// design</p>
+    <p class="eyebrow"><b>#</b>design</p>
     <h2>Three driving decisions</h2>
     <p><b>1. Effects are the machine model.</b> Threads, exceptions and
     async are not separate features. Each is an <em>effect</em>: a function
@@ -478,7 +521,7 @@ footer .wrap { display: flex; justify-content: space-between; gap: 24px; flex-wr
 
 <section id="code">
   <div class="wrap">
-    <p class="eyebrow">// what it looks like</p>
+    <p class="eyebrow"><b>#</b>what it looks like</p>
     <h2>Streams are effects; consumers are handlers</h2>
     <p class="lede">One mechanism carries exceptions, generators, threads,
     and GPU launches. Here it carries a stream: each element flows from
@@ -497,17 +540,139 @@ fn main() -> int {
     0
 }</code></pre>
     </div>
-    <p class="pinned"><b>//</b> <a
+    <p class="exlede">A handler that does not resume is an exception.
+    The arm's value becomes the value of the whole <span
+    class="mono">handle</span> block, and the rest of <span
+    class="mono">work</span> is torn down. Prints <span
+    class="mono">before</span>, then <span class="mono">3</span>.</p>
+    <div class="codeblock">
+      <header><span>bail.mx</span><span class="note">chapter 8: handlers that abort</span></header>
+      <pre><code class="mx">effect Bail {
+    bail(code: int) -> Unit
+}
+
+fn work() -> int performs Bail {
+    print("before");
+    perform Bail.bail(3);
+    print("after");    # never runs
+    99
+}
+
+fn main() -> int {
+    let r = handle Bail with {
+        bail(code) -> code
+    } in {
+        work()
+    };
+    print(r);
+    0
+}</code></pre>
+    </div>
+    <p class="exlede">Threads are an effect whose operations map to
+    runtime symbols. Four threads bump one counter behind <span
+    class="mono">protect</span>, and the result is 1000 on every run.
+    Nothing is annotated for sharing: the checker recognizes a
+    protected value as safe to capture.</p>
+    <div class="codeblock">
+      <header><span>counter.mx</span><span class="note">chapter 11: std.sync</span></header>
+      <pre><code class="mx">extern type Thread[T];
+
+effect Thread = {
+    fn spawn[T](f: fn() -> @global T) -> @global Thread[T] with EFFECT_SPAWN
+    fn join[T](thread: @global Thread[T]) -> @global T with EFFECT_JOIN
+}
+
+from std.sync import protect, update, read;
+
+fn main() -> int {
+    let p = protect(0);
+    let @mut handles = Vec.new();
+    let @mut i = 0;
+    while i < 4 {
+        let t = perform Thread.spawn(|| {
+            let @mut j = 0;
+            while j < 250 {
+                update(p, fn(n: int) -> n + 1);
+                j = j + 1
+            };
+            0
+        });
+        handles.push(t);
+        i = i + 1
+    };
+    let @mut k = 0;
+    while k < 4 {
+        perform Thread.join(handles[k]);
+        k = k + 1
+    };
+    print(read(p));
+    0
+}</code></pre>
+    </div>
+    <p class="exlede">Drop the lock and write to a plain <span
+    class="mono">Vec</span> from the spawned closure, and the program
+    does not compile. A <span class="mono">Vec</span> is one heap
+    object that every alias sees, so the checker names the race at the
+    spawn site and lists the three fixes.</p>
+    <div class="codeblock">
+      <header><span>race.mx</span><span class="note">chapter 11: what the checker rejects</span></header>
+      <pre><code class="mx">extern type Thread[T];
+
+effect Thread = {
+    fn spawn[T](f: fn() -> @global T) -> @global Thread[T] with EFFECT_SPAWN
+    fn join[T](thread: @global Thread[T]) -> @global T with EFFECT_JOIN
+}
+
+fn main() -> int {
+    let mut v = Vec.new();
+    v.push(0);
+    let t = perform Thread.spawn(|| { v[0] = v[0] + 1; 0 });
+    0
+}</code></pre>
+      <pre class="diag"><code>&lt;mem&gt;:11:34: borrow check failed: closure passed to spawn-mapped
+operation 'Thread.spawn' (with EFFECT_SPAWN) captures AND WRITES 'v',
+which has shared mutable identity (Vec): two threads mutating through
+one handle race (reads are free &mdash; contention weakens access, it does
+not revoke it); protect it (std.sync.protect), move it into exactly
+one thread (move(v)), or take responsibility with `unsafe { .. }`
+  11 |     let t = perform Thread.spawn(|| { v[0] = v[0] + 1; 0 });
+     |                                  ^~~~~~~~~~~~~~~~~~~~~~~~~</code></pre>
+    </div>
+    <p class="exlede">GPU kernels are written at the tile level, the
+    way Triton kernels are. A <span class="mono">Tile</span> is an
+    immutable value with its shape in its type, so a mismatched <span
+    class="mono">dot</span> is a compile error, and the interpreter,
+    the native runtime and the Metal path agree on every float, bit for
+    bit.</p>
+    <div class="codeblock">
+      <header><span>tiles.mx</span><span class="note">chapter 13: GPU tiles</span></header>
+      <pre><code class="mx">fn main() -> int {
+    let a = Tile.arange(2, 3);
+    print(a);
+    let b = Tile.transpose(a);
+    let c = Tile.dot(a, b);
+    print(c);
+    print(Tile.sum(c));
+    let z = Tile.filled(2, 2, 1.5);
+    print(Tile.sum(Tile.scale(z, 2.0)));
+    0
+}</code></pre>
+      <pre class="diag"><code>tile[2x3](0, 1, 2; 3, 4, 5)
+tile[2x2](5, 14; 14, 50)
+83
+12.0</code></pre>
+    </div>
+    <p class="pinned"><b>#</b> <a
     href="book/index.html">The
-    Metaxu Book</a> documents the whole language, and every example in it
-    runs as a test on every commit. Nothing on this page can quietly rot.</p>
+    Metaxu Book</a> documents the whole language, and every example in it,
+    these five included, runs as a test on every commit. Nothing on this
+    page can quietly rot.</p>
   </div>
 </section>
 
 <!-- ================= performance ================= -->
 <section id="performance">
   <div class="wrap">
-    <p class="eyebrow">// measured</p>
     <h2>Microbenchmarks against C</h2>
     <p class="lede">Five small kernels, each with a hand-written C twin.
     A Metaxu build asserts output equality with its twin before any
@@ -534,11 +699,11 @@ fn main() -> int {
         </tbody>
       </table>
     </div>
-    <p class="pinned"><b>//</b> every number on this page is from a pinned
+    <p class="pinned"><b>#</b> every number on this page is from a pinned
     benchmark or test gate in the repository (benchmarks/suite, 2026-08-19,
     clang -O2, 15 rounds). Absolute times vary on a shared container; the
     paired, interleaved ratios are the stable signal.</p>
-    <p class="pinned"><b>// the asterisks.</b> These are microbenchmarks,
+    <p class="pinned" id="asterisks"><b># the asterisks.</b> These are microbenchmarks,
     and microbenchmarks reward whoever wrote them. The kernels are tiny
     and fit in cache. The C twins are straightforward ports, not code a
     C expert spent a week tuning, and a determined person could tilt
@@ -562,7 +727,7 @@ fn main() -> int {
       <a href="book/index.html">the metaxu book</a>
       <a href="roadmap.html">roadmap</a>
     </nav>
-    <p class="footnote">// a Python front end, an LLVM back end, an MSL emitter,
+    <p class="footnote"># a Python front end, an LLVM back end, an MSL emitter,
     and one interpreter that all of them must agree with.</p>
   </div>
 </footer>

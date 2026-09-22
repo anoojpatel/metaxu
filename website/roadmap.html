@@ -152,9 +152,12 @@ a:focus-visible, button:focus-visible { outline: 2px solid var(--acc); outline-o
 /* ---------- sections ---------- */
 section { border-top: 1px solid var(--line); padding: 78px 0; }
 .eyebrow {
-  font-family: var(--mono); font-weight: 500; font-size: 13px;
-  color: var(--acc); letter-spacing: .06em; margin: 0 0 14px;
+  font-family: var(--mono); font-weight: 700; font-size: 15px;
+  color: var(--mut); letter-spacing: .03em; margin: 0 0 12px;
+  padding-bottom: 8px; border-bottom: 1px solid var(--line2);
+  display: inline-block; min-width: 12ch;
 }
+.eyebrow b { color: var(--acc); font-weight: 700; margin-right: .35em; }
 h2 {
   font-family: var(--serif); font-size: clamp(30px, 3.6vw, 38px);
   font-weight: 700; letter-spacing: 0; line-height: 1.12;
@@ -355,7 +358,7 @@ footer .wrap { display: flex; justify-content: space-between; gap: 24px; flex-wr
 
 <section id="done" style="border-top:none">
   <div class="wrap">
-    <p class="eyebrow">// roadmap</p>
+    <p class="eyebrow"><b>#</b>roadmap</p>
     <h2>Milestones</h2>
     <p class="lede">Done means merged, tested, and green on both example
     gates. The design records live in the repo:
@@ -377,9 +380,10 @@ footer .wrap { display: flex; justify-content: space-between; gap: 24px; flex-wr
         <div class="tag mono">done</div>
         <div class="body"><b>Programs compile to native code.</b> An LLVM
         backend whose output must match the interpreter byte for byte,
-        including error messages and float formatting. Small paired
-        microbenchmarks land near plain C; they exist to pin regressions
-        and keep performance in view, not to score points against C.</div>
+        including error messages and float formatting. It is reaching for
+        C-like performance: small paired microbenchmarks exist to pin
+        regressions and keep performance in view, not to score points
+        against C.</div>
       </div>
       <div class="stage">
         <div class="tag mono">done</div>
@@ -446,7 +450,7 @@ footer .wrap { display: flex; justify-content: space-between; gap: 24px; flex-wr
 
 <section id="next">
   <div class="wrap">
-    <p class="eyebrow">// next</p>
+    <p class="eyebrow"><b>#</b>next</p>
     <h2>In order</h2>
     <div class="stages">
       <div class="stage">
@@ -493,7 +497,7 @@ footer .wrap { display: flex; justify-content: space-between; gap: 24px; flex-wr
 
 <section id="components">
   <div class="wrap">
-    <p class="eyebrow">// components</p>
+    <p class="eyebrow"><b>#</b>components</p>
     <h2>What each part does</h2>
     <div class="stages">
       <div class="stage">
@@ -558,7 +562,7 @@ footer .wrap { display: flex; justify-content: space-between; gap: 24px; flex-wr
       <a href="https://github.com/anoojpatel/metaxu">github.com/anoojpatel/metaxu</a>
       <a href="https://github.com/anoojpatel/metaxu/tree/main/docs/book">the metaxu book</a>
     </nav>
-    <p class="footnote">// done means merged with tests and both example
+    <p class="footnote"># done means merged with tests and both example
     gates green.</p>
   </div>
 </footer>
