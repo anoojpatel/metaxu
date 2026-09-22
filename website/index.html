@@ -393,7 +393,7 @@ footer .wrap { display: flex; justify-content: space-between; gap: 24px; flex-wr
       <h1 class="wordmark">Metaxu</h1>
       <pre id="vortex" aria-hidden="true"> </pre>
     </figure>
-    <p class="vizcap">move the cursor to stir; left to right steers the spin; catch a shooting star; hold the centre</p>
+    <p class="vizcap">drag through the arms to break them; left to right steers the spin; catch a shooting star; hold the centre</p>
     <p class="thesis">A systems language with algebraic effects, mode-based
     memory safety, and tile-level GPU kernels compiled to Metal.</p>
     <p class="subthesis">You write what should happen; <em>handlers</em>
@@ -584,11 +584,25 @@ fn main() -> int {
   // edge-on accretion disk streaming across (approaching side brighter)
   // and the lensed arcs over and under it.
   var HR = 4.2, hole = 0, holeOn = false;
+  var spin = 0;                                // extra spin, winds up to a top speed
+  // The pointer is a wound, not a light: it carves the arms open around
+  // itself, and the material it displaces breaks away as debris that
+  // keeps the arms' angular velocity while drifting outward. The wound
+  // trails the pointer and heals about a second after it leaves.
+  var wx = -1e3, wy = -1e3, wstr = 0, wRate = 0;
+  var DEBRIS = [], consumed = {};
+  function spawnDebris(x, y) {
+    var dx = (x - CX) * AX, dy = y - CY, r = Math.sqrt(dx * dx + dy * dy);
+    DEBRIS.push({ r: r, th: Math.atan2(dy, dx),
+                  dth: wRate * (1 + 9 / (1.5 + r)),   // the arms' own rate here
+                  dr: 0.0025 + Math.random() * 0.003, age: 0 });
+  }
   function horizonField(dx, dy, r, th) {
     if (r < HR) return 0;
     var ring = Math.exp(-Math.pow(r - HR - 0.5, 2) / 0.22);
-    // the disk flares outward and is hottest just outside the ring
-    var band = Math.max(0, 1 - Math.abs(dy) / (1.7 + 0.09 * Math.abs(dx)));
+    // the disk is thickest at the ring and tapers to a thread at its tips
+    var half = (2.1 + 0.02 * Math.abs(dx)) * Math.max(0.12, 1 - (r - HR) / 15);
+    var band = Math.max(0, 1 - Math.abs(dy) / half);
     var flow = 0.78 + 0.22 * Math.sin(5 * th + phase * 3 - r * 2.2);
     var heat = 0.55 + 0.9 * Math.exp(-(r - HR) / 2.5);
     var disk = Math.pow(band, 0.6) * flow * heat * Math.max(0, 1 - (r - HR) / 20);
@@ -621,13 +635,29 @@ fn main() -> int {
         var th = Math.atan2(dy, dx);
         var v = 0;
         if (r <= RMAX) {
-          var gx = (x - mx) * AX, gy = y - my;
-          var g = Math.exp(-(gx * gx + gy * gy) / 7);
+          var gx = (x - wx) * AX, gy = y - wy;
+          var d2 = gx * gx + gy * gy;
+          var g = Math.exp(-d2 / 7) * wstr;    // the wound's reach
           var edge = 1 - r / RMAX;           // arms die out at the rim
           // four arms, low pitch; the gamma (< 1) is what makes each
           // bright band WIDE instead of a thin ridge
-          var band = Math.sin(4 * th + r * 0.6 - phase - g * 2.2);
-          v = Math.pow(Math.max(0, band), 0.5) * edge * breath + g * 0.9;
+          var band = Math.sin(4 * th + r * 0.6 - phase - g * 1.4);
+          var v0 = Math.pow(Math.max(0, band), 0.5) * edge * breath;
+          // the negative: the wound removes the arms around the pointer
+          var wf = Math.exp(-d2 / 5) * wstr * (1 - hole);
+          v = v0 * (1 - wf);
+          // bright arm material the wound covers breaks away once, as
+          // debris; when the wound moves on the cell may break again
+          if (t > 0) {
+            var key = y * W + x;
+            if (wf > 0.35 && v0 > 0.4) {
+              if (!consumed[key] && DEBRIS.length < 80) {
+                consumed[key] = 1; spawnDebris(x, y);
+              }
+            } else if (consumed[key]) {
+              delete consumed[key];
+            }
+          }
         } else if (hole < 0.01) {
           row.push([' ', 0]); continue;
         }
@@ -667,6 +697,15 @@ fn main() -> int {
       var tw = Math.sin(t * 0.0011 + q.blink);   // slow twinkle
       grid[py][px] = [tw > 0.3 ? '@' : tw > -0.4 ? '*' : '+',
                       Math.cos(t * 0.0007 + q.blink) > 0 ? 1 : 2];
+    }
+    // debris broken off the arms: young pieces bold, then italic, then
+    // a dim fleck, orbiting on with the momentum they left with
+    for (var d = 0; d < DEBRIS.length; d++) {
+      var db = DEBRIS[d];
+      var ex = Math.round(CX + (db.r * Math.cos(db.th)) / AX);
+      var ey = Math.round(CY + db.r * Math.sin(db.th));
+      if (ex < 0 || ex >= W || ey < 0 || ey >= H) continue;
+      grid[ey][ex] = db.age < 900 ? ['*', 1] : db.age < 1800 ? ['+', 2] : ['.', 0];
     }
     // shooting stars: a bright head and a tail of six cells, drawn only
     // where the field is dark so they pass BEHIND the arms
@@ -796,10 +835,31 @@ fn main() -> int {
     else if (pr > HR + 4.5) holeOn = false;
     hole += ((holeOn ? 1 : 0) - hole) * 0.045;
     if (hole < 0.002) hole = 0;
+    // the wound follows the pointer with a little lag and heals once
+    // the pointer is gone
+    if (mx > -100) {
+      if (wstr < 0.01) { wx = mx; wy = my; }
+      wx += (mx - wx) * 0.35; wy += (my - wy) * 0.35;
+      wstr += (1 - wstr) * 0.12;
+    } else {
+      wstr += (0 - wstr) * 0.04;
+      if (wstr < 0.005) wstr = 0;
+    }
     speed += (targetSpeed - speed) * 0.05;
-    // the spin: slow by default, violent when the hole is open
-    var w = speed * dt * 0.00028 * (1 + hole * 6);
+    // the spin: slow by default; with the hole open it winds up over a
+    // few seconds to a top speed seven times the resting rate
+    spin += ((holeOn ? 6 : 0) - spin) * 0.016;
+    var w = speed * dt * 0.00028 * (1 + spin);
+    wRate = w / Math.max(dt, 1);
     phase += w;
+    for (var dd = DEBRIS.length - 1; dd >= 0; dd--) {
+      var db = DEBRIS[dd];
+      db.th += db.dth * dt;                     // angular momentum kept
+      db.r += db.dr * dt;                       // slow outward drift
+      db.dr *= 1 - dt * 0.0009;
+      db.age += dt;
+      if (db.age > 2600 || db.r > RMAX + 1.5) DEBRIS.splice(dd, 1);
+    }
     for (var p = 0; p < P.length; p++) {
       var q = P[p];
       // inner particles orbit faster (flow-like), all drift inward;
