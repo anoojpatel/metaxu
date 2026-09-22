@@ -127,7 +127,11 @@ a:focus-visible, button:focus-visible { outline: 2px solid var(--acc); outline-o
   position: relative; z-index: 2;
   margin: 0; font-family: var(--mono); font-size: 13px; line-height: 1.02;
   letter-spacing: -.07em; /* negative gap: the columns crowd together */
-  white-space: pre; user-select: none; cursor: crosshair;
+  white-space: pre; user-select: none; -webkit-user-select: none;
+  -webkit-touch-callout: none; cursor: crosshair;
+  /* touch: a vertical swipe still scrolls the page; a horizontal drag,
+     a tap or a hold is ours (see the pointer handlers in the script) */
+  touch-action: pan-y;
   color: var(--acc); text-shadow: 0 0 18px rgba(33, 117, 106, .18);
   font-feature-settings: "calt" 0, "liga" 0; /* raw glyphs, no joining */
   transform-origin: 50% 50%; will-change: transform;
@@ -752,6 +756,7 @@ tile[2x2](5, 14; 14, 50)
   var reduced = window.matchMedia
     && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
   var mx = -1e3, my = -1e3;                  // pointer, in cell coords
+  var reach = 1, touching = false;           // a fingertip covers more cells than a cursor
   var speed = 1, targetSpeed = 1, phase = 1.7, lastT = null;
   var STARS = [], FW = [], nextStar = 600;    // the sky layer (see stepSky)
   // The event horizon. `hole` eases 0..1 while the pointer sits in the
@@ -813,14 +818,14 @@ tile[2x2](5, 14; 14, 50)
         if (r <= RMAX) {
           var gx = (x - wx) * AX, gy = y - wy;
           var d2 = gx * gx + gy * gy;
-          var g = Math.exp(-d2 / 7) * wstr;    // the wound's reach
+          var g = Math.exp(-d2 / (7 * reach)) * wstr;    // the wound's reach
           var edge = 1 - r / RMAX;           // arms die out at the rim
           // four arms, low pitch; the gamma (< 1) is what makes each
           // bright band WIDE instead of a thin ridge
           var band = Math.sin(4 * th + r * 0.6 - phase - g * 1.4);
           var v0 = Math.pow(Math.max(0, band), 0.5) * edge * breath;
           // the negative: the wound removes the arms around the pointer
-          var wf = Math.exp(-d2 / 5) * wstr * (1 - hole);
+          var wf = Math.exp(-d2 / (5 * reach)) * wstr * (1 - hole);
           v = v0 * (1 - wf);
           // the band just outside the cleared zone is the blurred rim
           rim = wf > 0.06 && wf <= 0.35;
@@ -954,16 +959,45 @@ tile[2x2](5, 14; 14, 50)
 
   if (reduced) { render(0.9, 0); return; }
 
-  el.addEventListener('pointermove', function (e) {
+  // Pointer handling. A mouse drives everything by hovering and clears
+  // it by leaving. A finger (or pen) is different: the CSS touch-action
+  // on the <pre> leaves vertical swipes to the page, so a touch reaches
+  // us only as a tap, a hold or a sideways drag. While it is down it is
+  // the pointer; lifting it, or the browser claiming the gesture for a
+  // scroll (which arrives as pointercancel), clears it, so the wound
+  // heals and the horizon closes. A tap also bursts a firework where it
+  // lands, so a touch always does something visible. A fingertip covers
+  // more cells than a cursor, so the wound, the catch radius for stars
+  // and the centre that opens the horizon all grow by FINGER.
+  var FINGER = 1.8;
+  function place(e) {
     var b = el.getBoundingClientRect();
     mx = (e.clientX - b.left) / b.width * W;
     my = (e.clientY - b.top) / b.height * H;
+    reach = e.pointerType === 'mouse' ? 1 : FINGER;
     // horizontal position steers the spin: left = backward, right = fast
     targetSpeed = 0.3 + ((e.clientX - b.left) / b.width - 0.5) * 3;
+  }
+  function clear() { mx = my = -1e3; targetSpeed = 1; }
+  function release(e) {
+    if (e.pointerType === 'mouse') return;
+    touching = false; clear();
+  }
+  el.addEventListener('pointermove', function (e) {
+    if (e.pointerType === 'mouse' || touching) place(e);
   });
-  el.addEventListener('pointerleave', function () {
-    mx = my = -1e3; targetSpeed = 1;
+  el.addEventListener('pointerdown', function (e) {
+    if (e.pointerType === 'mouse') return;
+    touching = true; place(e);
+    burst(mx, my, performance.now());
   });
+  el.addEventListener('pointerup', release);
+  el.addEventListener('pointercancel', release);
+  el.addEventListener('pointerleave', function (e) {
+    if (e.pointerType === 'mouse') clear();
+  });
+  // a long press must not open the context menu over the art
+  el.addEventListener('contextmenu', function (e) { e.preventDefault(); });
 
   // Shooting stars cross the background every few seconds; one whose
   // head passes within two cells of the pointer bursts into a firework
@@ -992,7 +1026,7 @@ tile[2x2](5, 14; 14, 50)
       var st = STARS[i];
       st.x += st.vx * dt / 1000; st.y += st.vy * dt / 1000;
       var hx = (st.x - mx) * AX, hy = st.y - my;
-      if (hx * hx + hy * hy < 4) {               // within two rows of the pointer
+      if (hx * hx + hy * hy < 4 * reach) {       // within two rows of the pointer
         burst(st.x, st.y, t);
         STARS.splice(i, 1);
       } else if (st.x < -8 || st.x > W + 8 || st.y > H + 2) {
@@ -1012,7 +1046,7 @@ tile[2x2](5, 14; 14, 50)
     // pointer is well outside (hysteresis, so the edge doesn't flicker)
     var pdx = (mx - CX) * AX, pdy = my - CY;
     var pr = Math.sqrt(pdx * pdx + pdy * pdy);
-    if (pr < HR + 1.2) holeOn = true;
+    if (pr < HR + 1.2 * reach) holeOn = true;
     else if (pr > HR + 4) holeOn = false;
     hole += ((holeOn ? 1 : 0) - hole) * 0.045;
     if (hole < 0.002) hole = 0;
