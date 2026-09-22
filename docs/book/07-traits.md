@@ -207,11 +207,11 @@ caught: Trait method 'speak' is not implemented for type 'Robot' (implementation
 
 ## Coherence
 
-One type gets one impl of a trait. A second
-`implement Speak for Dog`, or the same method twice in one block, is
-rejected while impls are being desugared, before anything type-checks
-or runs: the compiler raises a `CoherenceError` telling you the trait,
-the type, and that more than one implement block was found. Two types
-implementing the same trait, or one type implementing two traits that
-happen to share a method name, are both fine; dispatch keys on the
-(trait, type, method) triple, not on the name alone.
+One type gets one impl of a trait. The compiler rejects a second
+`implement Speak for Dog`, or the same method twice in one block, while
+it desugars impls, before anything type-checks or runs: it raises a
+`CoherenceError` telling you the trait, the type, and that more than
+one implement block was found. Two types implementing the same trait,
+or one type implementing two traits that happen to share a method
+name, are both fine; dispatch keys on the (trait, type, method)
+triple, not on the name alone.
