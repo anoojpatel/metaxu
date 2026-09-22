@@ -216,10 +216,11 @@ Instantiation checking fires where types are statically known.
 A value whose type the checker cannot determine (say, the result of
 another generic call it could not resolve) passes through unchecked
 rather than producing a false positive; runtime dispatch still enforces
-it. Unannotated parameters are checked by how they're used, not by a
-declaration they don't have. The design bias is stated in the compiler
-docs and worth repeating: a clear error where the checker is sure,
-permissiveness where it is not, and never a silently wrong answer.
+it. The checker judges an unannotated parameter by how it's used, not
+by a declaration it doesn't have. The design bias is stated in the
+compiler docs and worth repeating: a clear error where the checker is
+sure, permissiveness where it is not, and never a silently wrong
+answer.
 
 One more status note. A full biunification engine with
 principal-type coalescing (union and intersection types, the SimpleSub

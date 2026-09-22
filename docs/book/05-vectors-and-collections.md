@@ -214,8 +214,6 @@ fn main() -> int {
 99
 ```
 
-One line to remember: `Vec` shares, `vector` copies.
-
 ## Strings
 
 Strings concatenate with `+`, compare with `==` and order with `<`,
