@@ -48,13 +48,14 @@ programs should assert the same kinds of facts.
 
 ## What the checker rejects
 
-Whether a value may cross into another thread is inferred, never
-declared. There is no `Send`, no `Sync`, no marker trait, no bound on
-any signature. The compiler knows structurally which values have shared
-mutable identity: ints, floats, strings, and structs of them copy
-freely; a `Vec` is one heap object that every alias sees, so two
-threads writing through one handle race. Capture such a value in a
-spawned closure and write to it, and the spawn site is rejected:
+The compiler infers whether a value may cross into another thread. You
+never declare it. There is no `Send`, no `Sync`, no marker trait, no
+bound on any signature. The compiler knows structurally which values
+have shared mutable identity: ints, floats, strings, and structs of
+them copy freely; a `Vec` is one heap object that every alias sees, so
+two threads writing through one handle race. Capture such a value in a
+spawned closure and write to it, and the checker rejects the spawn
+site:
 
 ```metaxu error
 extern type Thread[T];
@@ -83,11 +84,12 @@ doesn't revoke it. And the check follows aliases the way locality does
 (chapter 10): `let w = v` inherits `v`'s sharedness, and the diagnostic
 shows the provenance chain.
 
-Two more spawn rules are enforced regardless of `unsafe`, because they
-aren't things careful discipline can promise away: no `@local` captures
-(the spawning frame may return while the child still runs, leaving the
-capture dangling) and no captures of live `&mut` borrows (an exclusive
-borrow shared with another thread breaks exclusivity by construction).
+The checker enforces two more spawn rules regardless of `unsafe`,
+because they aren't things careful discipline can promise away: no
+`@local` captures (the spawning frame may return while the child still
+runs, leaving the capture dangling) and no captures of live `&mut`
+borrows (an exclusive borrow shared with another thread breaks
+exclusivity by construction).
 
 ## std.sync: the blessed surface
 

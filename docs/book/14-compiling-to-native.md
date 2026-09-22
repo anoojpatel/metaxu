@@ -32,15 +32,15 @@ into codegen that the strict front end rejected.
 ## The differential contract
 
 The native backend's output must match the interpreter byte for byte:
-stdout, exit codes, error messages, and float formatting. Not "close
-enough". Identical. The test suite enforces this with differential
-assertions that run every program both ways and compare.
+stdout, exit codes, error messages, and float formatting. The test
+suite enforces this with differential assertions that run every
+program both ways and compare.
 
-Float formatting is where such contracts usually leak, so it's worth
-seeing what's pinned. The interpreter prints floats as Python reprs
-(shortest round-trip form), and native `print` routes through a C
-implementation of the same algorithm, because an early tile test
-caught native `%g` printing `12` where the interpreter printed `12.0`:
+Float formatting is where such contracts usually leak. The interpreter
+prints floats as Python reprs (shortest round-trip form), and native
+`print` routes through a C implementation of the same algorithm,
+because an early tile test caught native `%g` printing `12` where the
+interpreter printed `12.0`:
 
 ```metaxu
 fn main() -> int {
@@ -157,8 +157,3 @@ after. Overrunning it is `RecursionLimitExceeded`: a fatal runtime
 error that `try` does not catch, or a `CompileError` when a
 compile-time phase recurses too deep. You get a Metaxu-named
 diagnostic either way, never a raw host traceback.
-
-That's the shape of the native story: one strict interpreter that
-defines the semantics, one backend proven equal to it byte for byte,
-honest placeholders where proof runs out, and numbers that come with
-their methodology attached.
