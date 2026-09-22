@@ -545,8 +545,9 @@ fn main() -> int {
 (function () {
   var el = document.getElementById('vortex');
   if (!el) return;
-  var W = 72, H = 30, AX = 0.50;             // cell aspect: width/height
-                                             // (tightened tracking, see CSS)
+  var W = 72, H = 30, AX = 0.52;             // cell aspect: width/height
+  // measured in Chromium at 13px Hasklig with the CSS tracking and
+  // line-height above: 6.89px by 13.25px, so the sampled disc is round
   var RAMP = ' `.,:;-=+*xX#%@';
   var CX = W / 2 - 0.5, CY = H / 2 - 0.5;
   var RMAX = Math.min(CX * AX, CY) + 0.5;
