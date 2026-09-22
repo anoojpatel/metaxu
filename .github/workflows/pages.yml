@@ -1,0 +1,52 @@
+name: Deploy metaxulang.org
+
+# Publishes website/ (landing page, roadmap, the book) to GitHub Pages
+# under the custom domain.  scripts/build_site.py rebuilds the book
+# from docs/book and wraps the artifact-style pages in a document
+# shell; see website/README.md for the one-time repository settings
+# and the DNS records.
+
+on:
+  push:
+    branches: [main, v1-compiler]
+    paths:
+      - "website/**"
+      - "docs/book/**"
+      - "scripts/build_site.py"
+      - "scripts/build_book_site.py"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Assemble the site
+        run: python scripts/build_site.py --out _site
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
