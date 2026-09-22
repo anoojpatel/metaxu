@@ -14,7 +14,7 @@
 <h1>Algebraic subtyping</h1>
 <p>Chapter 6 showed what the checker says. This chapter is how it decides. Metaxu&#x27;s inference descends from Dolan&#x27;s algebraic subtyping and Parreaux&#x27;s SimpleSub, the simplified algorithm for it: types are not guessed and compared, they are collected as flows between the places a value is produced and the places it is consumed, and a program is rejected when some single value would have to be two incompatible things. Two engines implement that idea in the compiler, and this chapter is precise about which one does what. The <em>flat solver</em> is on the compile path: it decides what compiles. The <em>biunifier</em> is a full SimpleSub engine that computes principal types on request; it is advisory today, and the last sections say exactly what that means.</p>
 <h2>Every expression is a type variable</h2>
-<p>The checker does not work on source text. It works on the frozen syntax tree, and the first thing it does is hand every node in that tree its own fresh type variable. A literal, a <code>let</code>, an <code>if</code>, a call, a whole block: each gets one. Nothing is known about any of them yet; knowledge arrives as constraints.</p>
+<p>The checker works on the frozen syntax tree, and the first thing it does is hand every node in that tree its own fresh type variable. A literal, a <code>let</code>, an <code>if</code>, a call, a whole block: each gets one. Nothing is known about any of them yet; knowledge arrives as constraints.</p>
 <div class="fence"><span class="label">metaxu</span><pre><code class="mx">fn pick(flag: bool) -&gt; int {
     if flag { 40 } else { 2 }
 }

@@ -210,10 +210,11 @@ fopen returned null
 
 `f == null` is the test, and `null` is a pointer value that exists
 only inside `unsafe`; nothing outside the block can hold one, so the
-check lives here at the boundary and doesn't leak out. The pattern for wrapping any C function is the same as wrapping
-`fopen`: call it inside `unsafe`, check its sentinel values at the
-edge, and hand back an `Option` or a `Result` so callers outside the
-block never see a pointer.
+check lives here at the boundary and doesn't leak out. The pattern
+for wrapping any C function is the same as wrapping `fopen`: call it
+inside `unsafe`, check its sentinel values at the edge, and hand back
+an `Option` or a `Result` so callers outside the block never see a
+pointer.
 
 ## The native boundary
 

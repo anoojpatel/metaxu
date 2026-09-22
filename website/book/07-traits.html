@@ -148,7 +148,7 @@ fn main() -&gt; int {
 }</code></pre></div>
 <div class="fence output"><span class="label">output</span><pre><code>caught: Trait method &#x27;speak&#x27; is not implemented for type &#x27;Robot&#x27; (implementations exist for: Dog)</code></pre></div>
 <h2>Coherence</h2>
-<p>One type gets one impl of a trait. A second <code>implement Speak for Dog</code>, or the same method twice in one block, is rejected while impls are being desugared, before anything type-checks or runs: the compiler raises a <code>CoherenceError</code> telling you the trait, the type, and that more than one implement block was found. Two types implementing the same trait, or one type implementing two traits that happen to share a method name, are both fine; dispatch keys on the (trait, type, method) triple, not on the name alone.</p>
+<p>One type gets one impl of a trait. The compiler rejects a second <code>implement Speak for Dog</code>, or the same method twice in one block, while it desugars impls, before anything type-checks or runs: it raises a <code>CoherenceError</code> telling you the trait, the type, and that more than one implement block was found. Two types implementing the same trait, or one type implementing two traits that happen to share a method name, are both fine; dispatch keys on the (trait, type, method) triple, not on the name alone.</p>
 <nav class="pager"><a href="06-types-and-inference.html">&#8592; Types and inference</a><a href="08-effects.html">Effects &#8594;</a></nav>
 </main>
 <script src="book.js"></script>

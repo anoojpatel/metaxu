@@ -14,11 +14,11 @@ advisory today, and the last sections say exactly what that means.
 
 ## Every expression is a type variable
 
-The checker does not work on source text. It works on the frozen
-syntax tree, and the first thing it does is hand every node in that
-tree its own fresh type variable. A literal, a `let`, an `if`, a call,
-a whole block: each gets one. Nothing is known about any of them yet;
-knowledge arrives as constraints.
+The checker works on the frozen syntax tree, and the first thing it
+does is hand every node in that tree its own fresh type variable. A
+literal, a `let`, an `if`, a call, a whole block: each gets one.
+Nothing is known about any of them yet; knowledge arrives as
+constraints.
 
 ```metaxu
 fn pick(flag: bool) -> int {

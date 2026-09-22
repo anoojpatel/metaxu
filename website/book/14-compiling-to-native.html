@@ -26,8 +26,8 @@ EOF</code></pre></div>
 uv run python scripts/run_examples.py --stage run   # execution gate</code></pre></div>
 <p><code>emit_llvm_from_source</code> raises the same <code>TypeCheckError</code> and <code>BorrowCheckError</code> diagnostics as the interpreter path; nothing gets into codegen that the strict front end rejected.</p>
 <h2>The differential contract</h2>
-<p>The native backend&#x27;s output must match the interpreter byte for byte: stdout, exit codes, error messages, and float formatting. Not &quot;close enough&quot;. Identical. The test suite enforces this with differential assertions that run every program both ways and compare.</p>
-<p>Float formatting is where such contracts usually leak, so it&#x27;s worth seeing what&#x27;s pinned. The interpreter prints floats as Python reprs (shortest round-trip form), and native <code>print</code> routes through a C implementation of the same algorithm, because an early tile test caught native <code>%g</code> printing <code>12</code> where the interpreter printed <code>12.0</code>:</p>
+<p>The native backend&#x27;s output must match the interpreter byte for byte: stdout, exit codes, error messages, and float formatting. The test suite enforces this with differential assertions that run every program both ways and compare.</p>
+<p>Float formatting is where such contracts usually leak. The interpreter prints floats as Python reprs (shortest round-trip form), and native <code>print</code> routes through a C implementation of the same algorithm, because an early tile test caught native <code>%g</code> printing <code>12</code> where the interpreter printed <code>12.0</code>:</p>
 <div class="fence"><span class="label">metaxu</span><pre><code class="mx">fn main() -&gt; int {
     print(12.0);
     print(0.1);
@@ -68,7 +68,6 @@ uv run python scripts/run_examples.py --stage run   # execution gate</code></pre
 <p>ASan runs are scoped to that documented contract. Where frees are claimed, tests run under <code>-fsanitize=address</code> with full leak checking. Where leak-by-design applies (thread programs and their immortal handles), they run with <code>detect_leaks=0</code>, checking for corruption but not for the leaks the contract already admits. Thread programs also run under <code>-fsanitize=thread</code>; the mutex-protected paths are TSan-clean, and TSan non-vacuity was verified by deleting the locks and watching it report.</p>
 <h2>The recursion budget</h2>
 <p>One divergence between host and language is papered over deliberately. A Metaxu frame costs about 4 Python frames in the interpreter (up to ~24 for effect-and-closure-heavy code), so deep recursion would hit Python&#x27;s own <code>RecursionError</code> at an arbitrary, host-dependent depth. Instead, every entry point (the interpreter and the compile-time phases both) installs a 100k-frame budget and restores the host limit after. Overrunning it is <code>RecursionLimitExceeded</code>: a fatal runtime error that <code>try</code> does not catch, or a <code>CompileError</code> when a compile-time phase recurses too deep. You get a Metaxu-named diagnostic either way, never a raw host traceback.</p>
-<p>That&#x27;s the shape of the native story: one strict interpreter that defines the semantics, one backend proven equal to it byte for byte, honest placeholders where proof runs out, and numbers that come with their methodology attached.</p>
 <nav class="pager"><a href="13-gpu-tiles.html">&#8592; GPU tiles</a><a href="15-modules-and-imports.html">Modules and imports &#8594;</a></nav>
 </main>
 <script src="book.js"></script>

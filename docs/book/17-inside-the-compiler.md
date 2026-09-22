@@ -144,11 +144,9 @@ dispatched on Metal through the MLX shim of chapter 13.
 
 ## The house rules
 
-Three rules govern every change to this compiler.
-
 The interpreter is the spec. Back ends conform to it; it conforms to
 nothing but its tests. A disagreement between engines is by
-definition a back end bug or a spec change, never a coin flip.
+definition a back end bug or a spec change.
 
 Native must match byte for byte. Stdout, exit codes, error messages,
 float formatting: the differential suite compares them all, and a
@@ -168,7 +166,7 @@ with pinned output on one engine or both. On top of it sit two
 gates driven by `scripts/run_examples.py`: every program in
 `examples/` must interpret to its pinned output, and every program
 the native back end claims must compile and match. A change lands
-when the suite and both gates are green, and not before.
+when the suite and both gates are green.
 
 The book is part of the same machinery.
 `test_book_examples.py` extracts every `metaxu` fence from these

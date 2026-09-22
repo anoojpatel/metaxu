@@ -15,24 +15,24 @@
 <p>This is the language documentation: every part of Metaxu, explained with programs that run. It is written in the same discipline as the compiler itself. Each <code>```metaxu</code> block in these pages is extracted by <code>test_book_examples.py</code> and executed through the real pipeline on every test run, and its printed output is pinned. If the language changes, the book breaks loudly.</p>
 <h2>Contents</h2>
 <ol>
-<li><a href="01-getting-started.html">Getting started</a> — install, run a program, what the pipeline does with it.</li>
-<li><a href="02-functions-and-values.html">Functions and values</a> — <code>fn</code>, <code>let</code>, mutability, blocks as expressions, control flow.</li>
-<li><a href="03-structs-and-enums.html">Structs and enums</a> — product and sum types, generics, construction and field access.</li>
-<li><a href="04-pattern-matching.html">Pattern matching</a> — <code>match</code>, binders, literals, exhaustiveness.</li>
-<li><a href="05-vectors-and-collections.html">Vectors and collections</a> — <code>Vec</code>, fixed-size <code>vector[T, N]</code>, strings, slicing.</li>
-<li><a href="06-types-and-inference.html">Types and inference</a> — what you never have to write, what the checker rejects, and why.</li>
-<li><a href="07-traits.html">Traits</a> — <code>trait</code>, <code>implements</code>, dispatch on the runtime type.</li>
-<li><a href="08-effects.html">Effects</a> — <code>perform</code>, <code>handle</code>, <code>resume</code>; defaults; streams and generators built from them.</li>
-<li><a href="09-errors.html">Errors</a> — <code>try</code>/<code>catch</code>, <code>std.option</code>, <code>std.result</code>.</li>
-<li><a href="10-modes-and-memory.html">Modes and memory</a> — locality, mutability, linearity; the borrow checker; no lifetimes anywhere.</li>
-<li><a href="11-threads-and-sharing.html">Threads and sharing</a> — <code>Thread</code> and <code>Mutex</code> effects, inferred thread-safety, <code>std.sync</code>.</li>
-<li><a href="12-the-standard-library.html">The standard library</a> — a tour of <code>std/</code>, module by module.</li>
-<li><a href="13-gpu-tiles.html">GPU tiles</a> — <code>Tile</code>, kernels, the <code>Gpu</code> effect, Metal.</li>
-<li><a href="14-compiling-to-native.html">Compiling to native</a> — clang, the differential contract, measured performance.</li>
-<li><a href="15-modules-and-imports.html">Modules and imports</a> — <code>import</code>, <code>export</code>, visibility, multi-file programs, name precedence, packages and the lockfile.</li>
-<li><a href="16-unsafe-and-ffi.html">Unsafe and FFI</a> — <code>unsafe</code>, extern C, the strict simulated heap, the native boundary.</li>
-<li><a href="17-inside-the-compiler.html">Inside the compiler</a> — the pipeline stage by stage, the house rules, how to poke at it.</li>
-<li><a href="18-algebraic-subtyping.html">Algebraic subtyping</a> — how inference decides: flows, polarity, the class-constraint algebra, the solver, and what is built versus sketched.</li>
+<li><a href="01-getting-started.html">Getting started</a>: install, run a program, what the pipeline does with it.</li>
+<li><a href="02-functions-and-values.html">Functions and values</a>: <code>fn</code>, <code>let</code>, mutability, blocks as expressions, control flow.</li>
+<li><a href="03-structs-and-enums.html">Structs and enums</a>: product and sum types, generics, construction and field access.</li>
+<li><a href="04-pattern-matching.html">Pattern matching</a>: <code>match</code>, binders, literals, exhaustiveness.</li>
+<li><a href="05-vectors-and-collections.html">Vectors and collections</a>: <code>Vec</code>, fixed-size <code>vector[T, N]</code>, strings, slicing.</li>
+<li><a href="06-types-and-inference.html">Types and inference</a>: what you never have to write, what the checker rejects, and why.</li>
+<li><a href="07-traits.html">Traits</a>: <code>trait</code>, <code>implements</code>, dispatch on the runtime type.</li>
+<li><a href="08-effects.html">Effects</a>: <code>perform</code>, <code>handle</code>, <code>resume</code>; defaults; streams and generators built from them.</li>
+<li><a href="09-errors.html">Errors</a>: <code>try</code>/<code>catch</code>, <code>std.option</code>, <code>std.result</code>.</li>
+<li><a href="10-modes-and-memory.html">Modes and memory</a>: locality, mutability, linearity; the borrow checker; no lifetimes anywhere.</li>
+<li><a href="11-threads-and-sharing.html">Threads and sharing</a>: <code>Thread</code> and <code>Mutex</code> effects, inferred thread-safety, <code>std.sync</code>.</li>
+<li><a href="12-the-standard-library.html">The standard library</a>: a tour of <code>std/</code>, module by module.</li>
+<li><a href="13-gpu-tiles.html">GPU tiles</a>: <code>Tile</code>, kernels, the <code>Gpu</code> effect, Metal.</li>
+<li><a href="14-compiling-to-native.html">Compiling to native</a>: clang, the differential contract, measured performance.</li>
+<li><a href="15-modules-and-imports.html">Modules and imports</a>: <code>import</code>, <code>export</code>, visibility, multi-file programs, name precedence, packages and the lockfile.</li>
+<li><a href="16-unsafe-and-ffi.html">Unsafe and FFI</a>: <code>unsafe</code>, extern C, the strict simulated heap, the native boundary.</li>
+<li><a href="17-inside-the-compiler.html">Inside the compiler</a>: the pipeline stage by stage, the house rules, how to poke at it.</li>
+<li><a href="18-algebraic-subtyping.html">Algebraic subtyping</a>: how inference decides (flows, polarity, the class-constraint algebra, the solver) and what is built versus sketched.</li>
 </ol>
 <h2>How the examples work</h2>
 <p>A plain <code>metaxu</code> fence is a complete program. The <code>output</code> fence after it is the program&#x27;s exact stdout; the test harness runs the program and compares byte for byte.</p>

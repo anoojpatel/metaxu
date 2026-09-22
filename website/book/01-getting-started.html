@@ -24,8 +24,8 @@ uv sync --all-groups</code></pre></div>
     0
 }</code></pre></div>
 <div class="fence output"><span class="label">output</span><pre><code>hello, Metaxu</code></pre></div>
-<p>(A bare <code>.mx</code> file of top-level statements also runs as a script — <code>examples/hello.mx</code> is one line of <code>print</code> — but everything in this book uses <code>main</code>, because that&#x27;s what the native backend compiles.)</p>
-<p>Two things to notice already. Statements end with <code>;</code>, but the last expression of a block doesn&#x27;t need one, and its value IS the block&#x27;s value: that final <code>0</code> is <code>main</code>&#x27;s return. And <code>+</code> concatenates strings when both sides are strings. There&#x27;s no implicit conversion; gluing a number onto a string takes <code>.to_string()</code>, which chapter 2 covers.</p>
+<p>(A bare <code>.mx</code> file of top-level statements also runs as a script: <code>examples/hello.mx</code> is one line of <code>print</code>. But everything in this book uses <code>main</code>, because that&#x27;s what the native backend compiles.)</p>
+<p>Two things to notice already. Statements end with <code>;</code>, but the last expression of a block doesn&#x27;t need one, and its value <em>is</em> the block&#x27;s value: that final <code>0</code> is <code>main</code>&#x27;s return. And <code>+</code> concatenates strings when both sides are strings. There&#x27;s no implicit conversion; gluing a number onto a string takes <code>.to_string()</code>, which chapter 2 covers.</p>
 <h2>Running it</h2>
 <p>Two engines run the same program. The example runner drives both; drop your file in <code>examples/</code> or point the pipeline at it from Python:</p>
 <div class="fence"><span class="label">bash</span><pre><code>uv run python scripts/run_examples.py --stage run   # interpret examples/
