@@ -448,28 +448,26 @@ footer .wrap { display: flex; justify-content: space-between; gap: 24px; flex-wr
 <section id="design">
   <div class="wrap">
     <p class="eyebrow">// design</p>
-    <h2>Three decisions shape everything</h2>
-    <p><b>Effects are the machine model.</b> Most languages weld their
-    concurrency in: threads are threads, exceptions are exceptions, async
-    needs its own keywords. Here they&rsquo;re all one thing, an
-    <em>effect</em>: an operation a function performs without saying how
-    it&rsquo;s done. A handler upstream decides that. It&rsquo;s why the same
-    kernel function runs on a sequential CPU loop under a test and on a Metal
-    GPU in production, unchanged.</p>
-    <p><b>Modes replace lifetimes.</b> Memory safety without a garbage
-    collector usually means lifetime annotations. Metaxu instead tracks a few
-    small properties of each value: local to its region or free to escape,
-    mutable or shared, consumable once or many times. The checker infers and
-    propagates them; you annotate to demand a guarantee, not to satisfy the
-    compiler. Thread-safety follows the same rule. Nothing is declared
-    <span class="mono">Send</span>: capture a shared value in a spawned
-    closure and unsynchronized writes to it become errors, caught statically
-    where provable and at run time otherwise, with one wording either way.</p>
-    <p><b>The interpreter is the spec.</b> A strict reference interpreter
-    defines what every program means, and each backend must reproduce it byte
-    for byte: stdout, exit codes, error messages, float formatting. A backend
-    that gets something subtly wrong fails a differential test before it
-    reaches a user.</p>
+    <h2>Three driving decisions</h2>
+    <p><b>1. Effects are the machine model.</b> Threads, exceptions and
+    async are not separate features. Each is an <em>effect</em>: a function
+    performs an operation, such as spawn or read, and a handler somewhere up
+    the call stack decides how that operation runs. That is why one kernel
+    function runs as a sequential CPU loop under a test and on a Metal GPU in
+    production, with no change to the kernel.</p>
+    <p><b>2. Modes replace lifetimes.</b> There is no garbage collector and
+    there are no lifetime annotations. The checker tracks three properties of
+    every value: whether it may leave its region, whether it may be mutated,
+    and how many times it may be consumed. It infers them from use; you write
+    an annotation only to demand a guarantee. Thread safety follows the same
+    rule. Nothing is marked <span class="mono">Send</span>. Capture a shared
+    value in a spawned closure and write to it without a lock, and the
+    compiler rejects the program where it can prove the race; the runtime
+    rejects it where it cannot, with the same message.</p>
+    <p><b>3. The interpreter is the spec.</b> A strict reference interpreter
+    defines what every program means. The native backend must match it byte
+    for byte: stdout, exit code, error messages, float formatting. A backend
+    that differs fails a differential test before it reaches a user.</p>
   </div>
 </section>
 
