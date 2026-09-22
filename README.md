@@ -154,14 +154,23 @@ cd metaxu
 uv sync --all-groups
 ```
 
-4. Run the gates:
+4. Compile and run a program. `uv sync` installs `metaxuc`, the compiler's
+   command-line front door:
+```bash
+uv run metaxuc run hello.mx            # interpret; exit code is main's return
+uv run metaxuc build hello.mx          # native executable at ./hello (-o to choose)
+uv run metaxuc check hello.mx          # type check and borrow check only
+uv run metaxuc emit hello.mx --stage mir   # print a stage: ast, hir, mir, clif, llvm
+```
+
+5. Run the gates:
 ```bash
 uv run python -m pytest src/metaxu/compiler/tests -q   # full suite
 uv run python scripts/run_examples.py                  # pipeline gate
 uv run python scripts/run_examples.py --stage run      # execution gate
 ```
 
-5. Emit a Metal kernel harness for a Mac:
+6. Emit a Metal kernel harness for a Mac:
 ```bash
 uv run python scripts/emit_metal_harness.py kernels.mx my_kernel \
     --grid 4 --buf a=1,2,3,4 --buf out=0,0,0,0

@@ -47,7 +47,9 @@ source -> Parser (PLY, src/metaxu/parser.py; shared instance via
 `compiler/pipeline.py` is the entry point: `run_pipeline_from_source`
 raises `BorrowCheckError` / `TypeCheckError` in strict mode;
 `emit_llvm_from_source` + `llvm_run.compile_and_run` produce and execute
-native binaries. The interpreter provides delimited single-shot effect
+native binaries. `compiler/cli.py` is the `metaxuc` console script
+(`run` / `build` / `check` / `emit`) over the same functions; it must
+never grow a code path the library entry points do not have. The interpreter provides delimited single-shot effect
 continuations, trait dispatch on runtime types, Vec/vector runtime, a
 bounds-checked simulated C heap for FFI, and strict name resolution. The
 LLVM backend mirrors it with mode-based memory (stack default, @global

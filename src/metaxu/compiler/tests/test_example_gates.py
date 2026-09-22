@@ -105,6 +105,14 @@ def test_run_gate(rel_path):
     execute(rel_path)  # must not raise
 
 
+def test_script_file_runs_its_top_level_statements():
+    """examples/hello.mx has no `fn main`: its one top-level `print` IS the
+    program. Before HIRBuilder synthesized main from the top-level
+    statements, this file compiled to an empty main and printed nothing."""
+    _result, prints = execute("examples/hello.mx")
+    assert prints == ["Hello from Metaxu!"]
+
+
 def test_package_example_output():
     """examples/pkg_app: `import geom;` is geom's facade, `geom.shapes` is
     a public module of it, `util` is geom's own dependency reached through

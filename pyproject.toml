@@ -12,6 +12,7 @@ dependencies = [
 
 [project.scripts]
 metaxu = "metaxu.metaxu:main"
+metaxuc = "metaxu.compiler.cli:main"
 
 [dependency-groups]
 dev = [

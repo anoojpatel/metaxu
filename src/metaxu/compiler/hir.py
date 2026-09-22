@@ -384,6 +384,16 @@ _DECLARATION_NODES: tuple[type, ...] = (
 #: `_convert_pattern` raise instead of silently degrading to a wildcard —
 #: which would make the arm match EVERYTHING (the seam that made
 #: `match list { [] -> ..., [x, ...xs] -> ... }` always take its first arm).
+# Top-level statement kinds that are NOT the body of a script file: every
+# "declaration -> unit" kind above, plus module constants (compiled into
+# __module_init by build()), comptime functions (rejected by build()) and
+# type aliases. Anything else at the top level of the entry file is code
+# that must run; see HIRBuilder._script_statements.
+SCRIPT_EXCLUDED_KINDS: frozenset[str] = frozenset(
+    {k for k, (_status, desc) in AST_NODE_TRIAGE.items()
+     if desc.startswith("declaration -> unit")}
+    | {"LetStatement", "ComptimeFunction", "TypeAlias"})
+
 PATTERN_TRIAGE: dict[str, tuple[str, str]] = {
     "WildcardPattern": (LOWERED, "`_`"),
     "VariablePattern": (LOWERED, "a binding"),
@@ -819,6 +829,30 @@ class HIRBuilder:
                     params=dparams, dict_params=[], ret_ty="Unknown",
                     where_cls=[], body=body_he))
 
+        # Script files. A file whose top level holds executable statements
+        # and declares no `main` runs those statements as main's body
+        # (chapter 1: examples/hello.mx is one line of `print`). Before this
+        # existed the fallback below synthesized an EMPTY main for such a
+        # file, so `print("hi")` compiled, ran and printed nothing. Top-level
+        # statements next to a declared `main` are refused rather than
+        # dropped: there is no order in which both could run.
+        script_stmts = self._script_statements(root)
+        if script_stmts:
+            first = script_stmts[0]
+            first_frozen = self._orig_to_frozen.get(id(first), root)
+            if any(f.sym == "main" for f in funcs):
+                raise UnsupportedConstruct(
+                    f"top-level statement at "
+                    f"{self._span_text(first_frozen.span, first)} in a file "
+                    "that also declares `fn main`: a file runs EITHER its "
+                    "top-level statements as a script OR `main`, never both; "
+                    "move the statement into main",
+                    location=self._loc(first_frozen.span, first))
+            body_hexpr = self._from_orig_expr(script_stmts, first_frozen)
+            assert body_hexpr is not None  # a non-empty list never lowers to None
+            funcs.append(HFun(sym="main", params=[], dict_params=[],
+                              ret_ty="Unit", where_cls=[], body=body_hexpr))
+
         # Fallback: if no functions found, produce a default wrapper
         if not funcs:
             ty = self.t.apply_tyenv(self.t.types.get(root.node_id, "Unit"))  # type: ignore[union-attr]
@@ -836,6 +870,35 @@ class HIRBuilder:
             )
             funcs.append(HFun(sym="main", params=[], dict_params=[], ret_ty=ty, where_cls=[], body=hexpr))
         return funcs
+
+    def _script_statements(self, root: mast.AstNode) -> list[Any]:
+        """The entry file's top-level statements that DO something at run
+        time, in program order.
+
+        The parser wraps a file in a Module named "main"; the module loader
+        renames every imported file's module to its path, so "main" is the
+        entry file. Declarations (functions, types, imports, module-level
+        `let`, nested `module` blocks) are excluded: each is realized
+        elsewhere. Imported modules are not scanned, because a library
+        file's stray statement must not run behind the importer's back;
+        the loader rejects nothing there today, which is a known gap.
+        """
+        prog = self.id_map.get(root.node_id)
+        stmts: list[Any] = []
+
+        def executable(s: Any) -> bool:
+            return type(s).__name__ not in SCRIPT_EXCLUDED_KINDS
+
+        for s in getattr(prog, "statements", []) or []:
+            if isinstance(s, fast.Module):
+                if str(getattr(s, "name", "")) != "main":
+                    continue
+                body = getattr(s, "body", None)
+                stmts.extend(t for t in (getattr(body, "statements", []) or [])
+                             if executable(t))
+            elif executable(s):
+                stmts.append(s)  # a Program built without the module wrapper
+        return stmts
 
     def _mk_hexpr(self, node_id: int, kind: str, ty: Ty, span: mast.Span, **kw: Any) -> HExpr:
         return HExpr(

@@ -12,7 +12,10 @@
 </header>
 <main>
 <h1>Compiling to native</h1>
-<p>Everything so far ran on the reference interpreter. The native path takes the same MIR, emits an LLVM IR module as text, hands it to clang at <code>-O2</code>, and links the C runtime objects in <code>src/metaxu/runtime/native/</code> (every binary links <code>-pthread</code>). The API is two calls:</p>
+<p>Everything so far ran on the reference interpreter. The native path takes the same MIR, emits an LLVM IR module as text, hands it to clang at <code>-O2</code>, and links the C runtime objects in <code>src/metaxu/runtime/native/</code> (every binary links <code>-pthread</code>). From the command line that is <code>metaxuc build</code>, which chapter 1 introduced:</p>
+<div class="fence"><span class="label">bash</span><pre><code>uv run metaxuc build hello.mx -o hello --keep-ir   # hello and hello.ll
+uv run metaxuc emit hello.mx --stage llvm          # the module, to stdout</code></pre></div>
+<p>Underneath, the API is two calls:</p>
 <div class="fence"><span class="label">bash</span><pre><code>uv run python - &lt;&lt;&#x27;EOF&#x27;
 from metaxu.compiler.pipeline import emit_llvm_from_source
 from metaxu.compiler.llvm_run import compile_and_run

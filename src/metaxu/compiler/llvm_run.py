@@ -54,7 +54,7 @@ from metaxu.runtime.native.build import DEFAULT_BUILD_DIR, runtime_objects
 
 from .codegen_llvm import mangle
 
-__all__ = ["compile_and_run", "LlvmRunError"]
+__all__ = ["compile_and_run", "compile_to_binary", "LlvmRunError"]
 
 
 def _runtime_object_paths(clang_args: tuple[str, ...]) -> list[str]:
@@ -151,24 +151,19 @@ def _clang_supports_memory_attr() -> bool:
     return _MEMORY_ATTR_PROBE[0]
 
 
-def compile_and_run(llvm_ir: str, entry: str = "main", *,
-                    workdir: str | None = None,
-                    timeout: float = 60.0,
-                    clang_args: tuple[str, ...] = (),
-                    run_env: dict[str, str] | None = None,
-                    run_cwd: str | None = None) -> tuple[int, str]:
-    """Compile ``llvm_ir`` with clang and run it; return (exit_code, stdout).
+def compile_to_binary(llvm_ir: str, entry: str = "main", *,
+                      out_path: str,
+                      ll_path: str | None = None,
+                      timeout: float = 60.0,
+                      clang_args: tuple[str, ...] = ()) -> str:
+    """Compile ``llvm_ir`` into a native executable at ``out_path``.
 
-    ``entry`` is the metaxu function name (unmangled).  ``workdir`` keeps the
-    .ll/.bin files for inspection instead of a fresh temp dir.  ``clang_args``
-    are appended to the clang invocation (e.g. ("-fsanitize=address",) so the
-    differential tests can prove the emitted malloc/free pairs sound).
-    ``run_env`` entries are overlaid on the inherited environment for the
-    binary's execution — e.g. {"ASAN_OPTIONS": "detect_leaks=0"} for programs
-    whose payload boxes / heap closure envs leak BY DESIGN, where ASan should
-    prove only no-UAF/no-double-free, not leak-freedom.  ``run_cwd`` pins the
-    binary's working directory (FFI differentials resolve relative fopen
-    paths against it; default: inherit the caller's cwd).
+    Appends the C-ABI ``@main`` wrapper that calls the (mangled) ``entry``
+    function, writes the module to ``ll_path`` (default: next to the
+    binary as ``<out_path>.ll``), links the native runtime and returns
+    ``out_path``.  Raises ``LlvmRunError`` when the entry is not a real
+    zero-argument define or when clang fails.  ``compile_and_run`` is
+    this plus executing the result; ``metaxuc build`` is this alone.
     """
     sym = mangle(entry)
     m = re.search(
@@ -210,10 +205,8 @@ def compile_and_run(llvm_ir: str, entry: str = "main", *,
     full_ir = (llvm_ir + "\n\n; native entry wrapper (llvm_run)\n"
                + _WRAPPERS[rty].format(sym=sym, init=init_call) + "\n")
 
-    if workdir is None:
-        workdir = tempfile.mkdtemp(prefix="metaxu_llvm_")
-    ll_path = os.path.join(workdir, "prog.ll")
-    bin_path = os.path.join(workdir, "prog.bin")
+    if ll_path is None:
+        ll_path = out_path + ".ll"
     with open(ll_path, "w") as fh:
         fh.write(full_ir)
 
@@ -222,13 +215,41 @@ def compile_and_run(llvm_ir: str, entry: str = "main", *,
     # program spawns.
     compile_proc = subprocess.run(
         ["clang", "-O2", "-Wno-override-module", "-pthread", ll_path,
-         *_runtime_object_paths(clang_args), "-o", bin_path, "-lm",
+         *_runtime_object_paths(clang_args), "-o", out_path, "-lm",
          *clang_args],
         capture_output=True, text=True, timeout=timeout)
     if compile_proc.returncode != 0:
         raise LlvmRunError(
             f"clang failed (exit {compile_proc.returncode}) on {ll_path}:\n"
             f"{compile_proc.stderr}")
+    return out_path
+
+
+def compile_and_run(llvm_ir: str, entry: str = "main", *,
+                    workdir: str | None = None,
+                    timeout: float = 60.0,
+                    clang_args: tuple[str, ...] = (),
+                    run_env: dict[str, str] | None = None,
+                    run_cwd: str | None = None) -> tuple[int, str]:
+    """Compile ``llvm_ir`` with clang and run it; return (exit_code, stdout).
+
+    ``entry`` is the metaxu function name (unmangled).  ``workdir`` keeps the
+    .ll/.bin files for inspection instead of a fresh temp dir.  ``clang_args``
+    are appended to the clang invocation (e.g. ("-fsanitize=address",) so the
+    differential tests can prove the emitted malloc/free pairs sound).
+    ``run_env`` entries are overlaid on the inherited environment for the
+    binary's execution — e.g. {"ASAN_OPTIONS": "detect_leaks=0"} for programs
+    whose payload boxes / heap closure envs leak BY DESIGN, where ASan should
+    prove only no-UAF/no-double-free, not leak-freedom.  ``run_cwd`` pins the
+    binary's working directory (FFI differentials resolve relative fopen
+    paths against it; default: inherit the caller's cwd).
+    """
+    if workdir is None:
+        workdir = tempfile.mkdtemp(prefix="metaxu_llvm_")
+    bin_path = compile_to_binary(
+        llvm_ir, entry, out_path=os.path.join(workdir, "prog.bin"),
+        ll_path=os.path.join(workdir, "prog.ll"), timeout=timeout,
+        clang_args=clang_args)
 
     env = None
     if run_env:

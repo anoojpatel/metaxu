@@ -71,7 +71,12 @@ fn main() -&gt; int {
 <p>The rules are enforced by machinery, not by review culture. The unit suite runs a couple of thousand tests, most of them small programs with pinned output on one engine or both. On top of it sit two gates driven by <code>scripts/run_examples.py</code>: every program in <code>examples/</code> must interpret to its pinned output, and every program the native back end claims must compile and match. A change lands when the suite and both gates are green.</p>
 <p>The book is part of the same machinery. <code>test_book_examples.py</code> extracts every <code>metaxu</code> fence from these chapters, runs it through the real pipeline, and compares stdout against the <code>output</code> fence byte for byte; <code>error</code> fences must be rejected with a diagnostic containing their pinned fragment. The harness also counts <code>norun</code> fences against a hard budget, so display-only examples stay the rare exception. Documentation that can&#x27;t drift from the implementation was the cheapest correctness tool this project bought.</p>
 <h2>Poking at the pipeline</h2>
-<p>The whole pipeline is a Python library, and every stage&#x27;s output is inspectable. <code>run_pipeline_ctx</code> runs a source string through the front end and hands back a context object holding each intermediate form:</p>
+<p>Every stage&#x27;s output is inspectable from the command line:</p>
+<div class="fence"><span class="label">bash</span><pre><code>uv run metaxuc emit prog.mx --stage ast    # the frozen syntax tree, as JSON
+uv run metaxuc emit prog.mx --stage hir
+uv run metaxuc emit prog.mx --stage mir
+uv run metaxuc emit prog.mx --stage llvm   # what `metaxuc build` hands to clang</code></pre></div>
+<p>The whole pipeline is also a Python library. <code>run_pipeline_ctx</code> runs a source string through the front end and hands back a context object holding each intermediate form:</p>
 <div class="fence"><span class="label">python</span><pre><code>from metaxu.compiler.pipeline import run_pipeline_ctx
 
 ctx = run_pipeline_ctx(&quot;&quot;&quot;

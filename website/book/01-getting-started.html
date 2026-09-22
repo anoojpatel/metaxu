@@ -24,13 +24,22 @@ uv sync --all-groups</code></pre></div>
     0
 }</code></pre></div>
 <div class="fence output"><span class="label">output</span><pre><code>hello, Metaxu</code></pre></div>
-<p>(A bare <code>.mx</code> file of top-level statements also runs as a script: <code>examples/hello.mx</code> is one line of <code>print</code>. But everything in this book uses <code>main</code>, because that&#x27;s what the native backend compiles.)</p>
+<p>(A bare <code>.mx</code> file of top-level statements also runs as a script: <code>examples/hello.mx</code> is one line of <code>print</code>, and the compiler makes those statements the body of <code>main</code>. A file gets one or the other; a top-level statement next to a declared <code>main</code> is a compile error, not something that silently runs first or not at all. Everything in this book uses <code>main</code>.)</p>
 <p>Two things to notice already. Statements end with <code>;</code>, but the last expression of a block doesn&#x27;t need one, and its value <em>is</em> the block&#x27;s value: that final <code>0</code> is <code>main</code>&#x27;s return. And <code>+</code> concatenates strings when both sides are strings. There&#x27;s no implicit conversion; gluing a number onto a string takes <code>.to_string()</code>, which chapter 2 covers.</p>
 <h2>Running it</h2>
-<p>Two engines run the same program. The example runner drives both; drop your file in <code>examples/</code> or point the pipeline at it from Python:</p>
+<p>Save the program as <code>hello.mx</code>. The <code>metaxuc</code> command installed by <code>uv sync</code> is the front door to the compiler; inside the repository, call it through <code>uv run</code>.</p>
+<div class="fence"><span class="label">bash</span><pre><code>uv run metaxuc run hello.mx        # interpret it
+uv run metaxuc build hello.mx      # compile it to ./hello
+./hello</code></pre></div>
+<p><code>run</code> executes the program in the interpreter, and the process exits with whatever <code>main</code> returned. <code>build</code> emits LLVM IR, hands it to clang at <code>-O2</code>, links the C runtime in <code>src/metaxu/runtime/native/</code>, and writes an executable named after the file (<code>-o</code> picks another path, <code>--keep-ir</code> also leaves the <code>.ll</code> next to it). Both print <code>hello, Metaxu</code>, and both exit 0.</p>
+<p>Two more subcommands are worth knowing on day one. <code>check</code> runs the parser, the type checker and the borrow checker and stops there, which is the fast loop while you write. <code>emit</code> prints one intermediate form:</p>
+<div class="fence"><span class="label">bash</span><pre><code>uv run metaxuc check hello.mx
+uv run metaxuc emit hello.mx --stage mir     # ast, hir, mir, clif or llvm</code></pre></div>
+<p>Every subcommand runs the same strict front end as the test suite, so a program that <code>check</code> accepts is a program the compiler accepts.</p>
+<p>The native path&#x27;s output must match the interpreter byte for byte: stdout, exit code, error messages, float formatting. Differential tests enforce that contract, and it&#x27;s the reason this book can promise its examples behave the same compiled as interpreted. Chapter 14 shows the native entry points directly.</p>
+<p>The repository&#x27;s own examples run through a separate script, which is also the merge gate: every file under <code>examples/</code> must compile, and every one with an entry point must run.</p>
 <div class="fence"><span class="label">bash</span><pre><code>uv run python scripts/run_examples.py --stage run   # interpret examples/
 uv run python scripts/run_examples.py               # full pipeline gate</code></pre></div>
-<p>The native path emits LLVM IR, hands it to clang at <code>-O2</code>, and links the C runtime in <code>src/metaxu/runtime/native/</code>. Its output must match the interpreter byte for byte: stdout, exit code, error messages, float formatting. Differential tests enforce that contract, and it&#x27;s the reason this book can promise its examples behave the same compiled as interpreted. Chapter 14 shows the native entry points directly.</p>
 <h2>Comments</h2>
 <p>Both <code>#</code> and <code>//</code> start a line comment. The standard library uses <code>#</code>; several examples use <code>//</code>. Pick one per file and stay with it.</p>
 <div class="fence"><span class="label">metaxu</span><pre><code class="mx"># a comment

@@ -180,10 +180,18 @@ tool this project bought.
 
 ## Poking at the pipeline
 
-The whole pipeline is a Python library, and every stage's output is
-inspectable. `run_pipeline_ctx` runs a source string through the
-front end and hands back a context object holding each intermediate
-form:
+Every stage's output is inspectable from the command line:
+
+```bash
+uv run metaxuc emit prog.mx --stage ast    # the frozen syntax tree, as JSON
+uv run metaxuc emit prog.mx --stage hir
+uv run metaxuc emit prog.mx --stage mir
+uv run metaxuc emit prog.mx --stage llvm   # what `metaxuc build` hands to clang
+```
+
+The whole pipeline is also a Python library. `run_pipeline_ctx` runs a
+source string through the front end and hands back a context object
+holding each intermediate form:
 
 ```python
 from metaxu.compiler.pipeline import run_pipeline_ctx

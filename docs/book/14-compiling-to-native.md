@@ -3,8 +3,15 @@
 Everything so far ran on the reference interpreter. The native path
 takes the same MIR, emits an LLVM IR module as text, hands it to clang
 at `-O2`, and links the C runtime objects in
-`src/metaxu/runtime/native/` (every binary links `-pthread`). The API
-is two calls:
+`src/metaxu/runtime/native/` (every binary links `-pthread`). From the
+command line that is `metaxuc build`, which chapter 1 introduced:
+
+```bash
+uv run metaxuc build hello.mx -o hello --keep-ir   # hello and hello.ll
+uv run metaxuc emit hello.mx --stage llvm          # the module, to stdout
+```
+
+Underneath, the API is two calls:
 
 ```bash
 uv run python - <<'EOF'
