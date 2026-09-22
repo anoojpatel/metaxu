@@ -51,7 +51,7 @@ a:hover { color: var(--acc); text-decoration-color: var(--acc); }
   display: flex; justify-content: space-between; align-items: baseline;
   gap: 16px; flex-wrap: wrap;
 }
-.brand { font-family: 'EB Garamond', Georgia, serif; font-weight: 700;
+.brand { font-family: 'Space Grotesk', 'Helvetica Neue', Arial, sans-serif; font-weight: 700;
   letter-spacing: .08em; text-transform: uppercase; font-size: 15px;
   text-decoration: none; }
 .topnav { display: flex; gap: 18px; flex-wrap: wrap; }
@@ -59,10 +59,12 @@ a:hover { color: var(--acc); text-decoration-color: var(--acc); }
   color: var(--mut); text-decoration: none; letter-spacing: .04em; }
 .topnav a:hover { color: var(--acc); }
 main { max-width: 780px; margin: 0 auto; padding: 40px 24px 80px; }
-h1 { font-size: clamp(30px, 4.5vw, 40px); letter-spacing: -.015em;
-  line-height: 1.12; margin: 8px 0 20px; text-wrap: balance; }
-h2 { font-size: 23px; letter-spacing: -.01em; margin: 44px 0 12px; }
-h3 { font-size: 18px; margin: 32px 0 10px; }
+h1, h2, h3 { font-family: 'EB Garamond', Georgia, serif; font-weight: 700;
+  letter-spacing: 0; }
+h1 { font-size: clamp(34px, 5vw, 46px);
+  line-height: 1.1; margin: 8px 0 20px; text-wrap: balance; }
+h2 { font-size: 27px; line-height: 1.2; margin: 44px 0 12px; }
+h3 { font-size: 21px; margin: 32px 0 10px; }
 p { max-width: 70ch; }
 li { max-width: 66ch; margin-bottom: 6px; }
 code {
