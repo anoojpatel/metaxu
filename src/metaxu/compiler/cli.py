@@ -123,10 +123,22 @@ def cmd_build(args: argparse.Namespace) -> int:
     return 0
 
 
+def _installed_version() -> str:
+    """The package version, from the installed metadata (the same
+    number pyproject.toml carries and the release tag is made from)."""
+    try:
+        from importlib.metadata import version
+        return version("metaxu")
+    except Exception:  # noqa: BLE001 - a source tree run without install
+        return "unknown"
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="metaxuc",
         description="Compile, run and inspect Metaxu programs.")
+    ap.add_argument("--version", action="version",
+                    version=f"metaxuc {_installed_version()}")
     sub = ap.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser("run", help="interpret a program")

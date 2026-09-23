@@ -101,27 +101,30 @@ because the diff already shows what changed.
 
 ## Cutting a release
 
-Versions are git tags of the form `v0.1.0`, and each one becomes a
-GitHub Release with the wheel and source archive attached. To cut one:
-
-1. Set `version` in `pyproject.toml` and add a `## <version>` section to
-   `CHANGELOG.md`. Commit both to `main`.
-2. Either push a tag, or run the Release workflow by hand from the
-   Actions tab on `main` with the version as its input (it creates the
-   tag itself):
+Versions are SemVer, tags are `v<version>`, and each tag becomes a
+GitHub Release with the wheel and source archive attached. As changes
+land, write a line about them under `## Unreleased` in `CHANGELOG.md`.
+To cut a release, on a clean `main`:
 
 ```bash
-git tag -a v0.1.0 -m "Metaxu 0.1.0"
-git push origin v0.1.0
+uv run python scripts/release.py --bump minor    # or patch, major, or an explicit 0.2.0
 ```
 
-The release workflow (`.github/workflows/release.yml`) checks that the
-version matches `pyproject.toml`, runs the test suite and both gates,
+That one command sets the version in `pyproject.toml`, turns the
+Unreleased notes into the version's section, moves every user-facing
+mention of the old version (README, chapter 1, the website's Download
+button), rebuilds the book site, commits `Release v0.2.0`, tags it and
+pushes. It refuses an empty Unreleased section, a dirty tree, another
+branch, or an existing tag. `--no-push` stops before pushing so you can
+look first.
+
+The tag push starts `.github/workflows/release.yml`, which checks the
+tag against `pyproject.toml`, runs the test suite and both gates,
 builds the wheel and sdist, and publishes the release with the
-changelog section as its notes. If any step fails, nothing is
-published; fix it and run it again (deleting the tag first if you
-pushed one). Then update the version named in `README.md`, the book's
-first chapter and the website's Download button.
+changelog section as its notes. If a step fails nothing is published;
+fix it, delete the tag locally and remotely, and run the script again.
+The same workflow can also be run by hand from the Actions tab with a
+version input, in which case it creates the tag itself.
 
 ## Questions
 

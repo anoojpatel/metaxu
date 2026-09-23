@@ -1,10 +1,16 @@
 # Changelog
 
-Each version has a section here. The release workflow
-(`.github/workflows/release.yml`) refuses to publish a tag whose version
-has no section, and uses the section as the release notes.
+Write notes under `Unreleased` as changes land. `scripts/release.py`
+turns that section into the next version's section and tags it; the
+release workflow (`.github/workflows/release.yml`) refuses a version
+with no section and uses it as the release notes.
 
-## 0.1.0
+## Unreleased
+
+- `metaxuc --version`.
+- `scripts/release.py`: one command to cut a release.
+
+## 0.1.0 (2026-09-23)
 
 The first tagged version: the v1 compiler end to end.
 
