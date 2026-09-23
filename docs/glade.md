@@ -179,6 +179,13 @@ live in, and until it exists a project sets `[glade] registry` to a
 repository or directory of its own; every test runs against a
 directory.
 
+## Writing it in Metaxu
+
+glade is Python today. `docs/glade_in_metaxu.md` lists what the
+language and standard library need before it can be rewritten in
+Metaxu, split into what to build in Metaxu and what to bind to C, and
+the order to do it in.
+
 ## Where the code is
 
 | file | what |

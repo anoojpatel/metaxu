@@ -264,7 +264,9 @@ shipped. Current queue, in rough priority order:)
 - **Packages**: `glade` (`docs/glade.md`) landed on top of the lock and
   vendor layout in `docs/packages.md`: version requirements, a git
   registry index, a PubGrub solver. Open: a hosted index, a `[replace]`
-  table.
+  table, and the rewrite in Metaxu, whose prerequisites (bytes, string
+  builtins, `std.fs` / `std.process` / `std.env` effects, `main`
+  arguments) are inventoried in `docs/glade_in_metaxu.md`.
 - **GPU Stage 2**: the per-simdgroup lowering with 8x8 matrix-unit
   dots landed (`docs/simdgroup_plan.md`, status section). Next in the
   public roadmap's order: lane-distributed elementwise work, half
