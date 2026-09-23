@@ -58,6 +58,10 @@ indirect calls, a ucontext coroutine scheduler for effects, and real SIMD
 for statically-sized vectors — anything unprovable demotes to a reasoned
 placeholder, never wrong code. The standard library lives in `std/*.mx`
 (Ante-modeled, effect-based idioms) and resolves via `import std.foo`.
+Packages: `metaxu/packages.py` is the lock/vendor layout the compiler
+reads (`docs/packages.md`); `metaxu/tap/` is the `tap` package manager
+on top of it (`docs/tap.md`: semver ranges, git registry index, PubGrub
+solver). The compiler never fetches; it reads `mx.lock` only.
 
 ## Where enforcement lives
 

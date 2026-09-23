@@ -261,9 +261,10 @@ shipped. Current queue, in rough priority order:)
   requirements, and promoting the biunifier, which first needs the
   statement-flow edges sharpened so it can stop reading the flat
   solver's union-find pointers.
-- **Packages**: `mxpkg` and the resolver hook landed
-  (`docs/packages.md`); the `[replace]` table and anything registry-
-  shaped are open decisions.
+- **Packages**: `tap` (`docs/tap.md`) landed on top of the lock and
+  vendor layout in `docs/packages.md`: version requirements, a git
+  registry index, a PubGrub solver. Open: a hosted index, a `[replace]`
+  table.
 - **GPU Stage 2**: the per-simdgroup lowering with 8x8 matrix-unit
   dots landed (`docs/simdgroup_plan.md`, status section). Next in the
   public roadmap's order: lane-distributed elementwise work, half

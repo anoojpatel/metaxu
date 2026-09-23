@@ -7,6 +7,12 @@ with no section and uses it as the release notes.
 
 ## Unreleased
 
+- `tap`, the package manager (`docs/tap.md`): version requirements in
+  `mx.toml` (`geom = "^0.2"`), a registry that is a git repository of
+  package descriptions, a PubGrub solver with explained conflicts, and
+  `add`, `remove`, `sync`, `update`, `tree`, `check`, `search`. Lock
+  version 2 adds the resolved `version`; git- and path-only projects
+  keep writing version 1. `mxpkg` forwards to `tap`.
 - `metaxuc --version`.
 - `scripts/release.py`: one command to cut a release.
 

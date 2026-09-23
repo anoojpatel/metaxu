@@ -33,10 +33,15 @@ class Dep:
     git: str | None = None
     rev: str | None = None
     path: str | None = None
+    version: str | None = None      # a registry requirement; resolved by tap (metaxu.tap)
 
     @property
     def source(self) -> str:
-        return f"git+{self.git}" if self.git else f"path+{self.path}"
+        if self.git:
+            return f"git+{self.git}"
+        if self.path:
+            return f"path+{self.path}"
+        return "registry"
 
 
 @dataclass
@@ -46,6 +51,10 @@ class Locked:
     hash: str
     rev: str | None = None
     commit: str | None = None
+    version: str | None = None      # registry packages (tap): the resolved version
+
+
+LOCK_VERSIONS_READ = {1, 2}         # 2 adds the optional `version` field
 
 
 @dataclass
@@ -68,19 +77,25 @@ def read_manifest(root: Path) -> Manifest:
         raise PackageError(f"{path}: [package] needs a name")
     deps: dict[str, Dep] = {}
     for name, spec in (data.get("dependencies") or {}).items():
+        if isinstance(spec, str):
+            deps[name] = Dep(name, version=spec)          # `geom = "^0.2"`
+            continue
         if not isinstance(spec, dict):
-            raise PackageError(f"{path}: dependency '{name}' must be a table")
+            raise PackageError(f"{path}: dependency '{name}' must be a string or a table")
         if "git" in spec:
             if "rev" not in spec:
                 raise PackageError(
                     f"{path}: git dependency '{name}' needs a rev "
-                    "(a tag, branch, or commit); ranges are not supported")
+                    "(a tag, branch, or commit)")
             deps[name] = Dep(name, git=spec["git"], rev=str(spec["rev"]))
         elif "path" in spec:
             deps[name] = Dep(name, path=spec["path"])
+        elif "version" in spec:
+            deps[name] = Dep(name, version=str(spec["version"]))
         else:
             raise PackageError(
-                f"{path}: dependency '{name}' needs `git` + `rev` or `path`")
+                f"{path}: dependency '{name}' needs a version requirement, "
+                "`git` + `rev`, or `path`")
     return Manifest(name=pkg["name"], version=str(pkg.get("version", "0.0.0")),
                     deps=deps, public=list(pkg.get("public", [])))
 
@@ -99,8 +114,10 @@ def write_manifest(root: Path, m: Manifest) -> None:
         d = m.deps[name]
         if d.git:
             lines.append(f"{name} = {{ git = {_toml_str(d.git)}, rev = {_toml_str(d.rev)} }}")
-        else:
+        elif d.path:
             lines.append(f"{name} = {{ path = {_toml_str(d.path)} }}")
+        else:
+            lines.append(f"{name} = {_toml_str(d.version or '*')}")
     (root / MANIFEST).write_text("\n".join(lines) + "\n")
 
 
@@ -111,21 +128,26 @@ def read_lock(root: Path) -> dict[str, Locked]:
     if not path.is_file():
         return {}
     data = tomllib.loads(path.read_text())
-    if data.get("version") != LOCK_VERSION:
+    if data.get("version") not in LOCK_VERSIONS_READ:
         raise PackageError(f"{path}: unsupported lock version {data.get('version')}")
     out: dict[str, Locked] = {}
     for p in data.get("package") or []:
         out[p["name"]] = Locked(name=p["name"], source=p["source"], hash=p["hash"],
-                                rev=p.get("rev"), commit=p.get("commit"))
+                                rev=p.get("rev"), commit=p.get("commit"),
+                                version=p.get("version"))
     return out
 
 
 def write_lock(root: Path, locked: dict[str, Locked]) -> None:
-    lines = [f"version = {LOCK_VERSION}"]
+    # a lock stays at version 1 until it needs the field version 2 adds
+    lock_version = 2 if any(p.version is not None for p in locked.values()) else LOCK_VERSION
+    lines = [f"version = {lock_version}"]
     for name in sorted(locked):
         p = locked[name]
         lines += ["", "[[package]]", f"name = {_toml_str(p.name)}",
                   f"source = {_toml_str(p.source)}"]
+        if p.version is not None:
+            lines.append(f"version = {_toml_str(p.version)}")
         if p.rev is not None:
             lines.append(f"rev = {_toml_str(p.rev)}")
         if p.commit is not None:
@@ -191,6 +213,10 @@ def sync(project: Path, log=lambda s: None) -> dict[str, Locked]:
         dep, req_root, requester = queue.pop(0)
         if dep.name == "std":
             raise PackageError(f"{requester}: 'std' is reserved and cannot be a dependency")
+        if dep.version is not None:
+            raise PackageError(
+                f"{requester}: '{dep.name}' is a registry dependency ({dep.version}); "
+                "resolving it takes the solver: run `tap sync` (metaxu.tap)")
         root = dep_root(project, dep, req_root)
         prior = requested.get(dep.name)
         if prior is not None:
@@ -254,14 +280,14 @@ def check(project: Path) -> list[str]:
         else:
             root = project / VENDOR / name
         if not root.is_dir():
-            problems.append(f"{name}: missing at {root}; run `mxpkg sync`")
+            problems.append(f"{name}: missing at {root}; run `tap sync`")
             continue
         actual = tree_hash(root)
         if actual != entry.hash:
             problems.append(f"{name}: tree hash {actual} differs from lock {entry.hash}")
     for name in manifest.deps:
         if name not in locked:
-            problems.append(f"{name}: in {MANIFEST} but not in {LOCK}; run `mxpkg sync`")
+            problems.append(f"{name}: in {MANIFEST} but not in {LOCK}; run `tap sync`")
     return problems
 
 
@@ -271,7 +297,6 @@ def package_roots(project: Path) -> dict[str, Path]:
     path dependencies, which are used in place."""
     project = project.resolve()
     locked = read_lock(project)
-    manifest = read_manifest(project) if (project / MANIFEST).is_file() else None
     roots: dict[str, Path] = {}
     for name, entry in locked.items():
         if entry.source.startswith("path+"):
@@ -326,7 +351,7 @@ def tree(project: Path) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     import argparse
-    ap = argparse.ArgumentParser(prog="mxpkg", description=__doc__.splitlines()[0])
+    ap = argparse.ArgumentParser(prog="mxpkg (legacy; use tap)", description=__doc__.splitlines()[0])
     ap.add_argument("--project", default=".", help="project root (default: .)")
     sub = ap.add_subparsers(dest="cmd", required=True)
     p_add = sub.add_parser("add", help="add a dependency to mx.toml")

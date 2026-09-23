@@ -130,15 +130,19 @@ fn main() -&gt; int {
     | ^</code></pre></div>
 <p>The rule is about <em>functions</em>: a <code>let __tmp = 1;</code> is accepted today, because a local binding cannot be mistaken for a compiler symbol. Don&#x27;t lean on that; the prefix is reserved in spirit everywhere. Same caveat as the visibility rejection above: <code>ReservedNameError</code> is a plain <code>CompileError</code>, so this is a quoted diagnostic in a plain fence rather than a harness-pinned <code>error</code> block.</p>
 <h2>Packages: code from another repository</h2>
-<p>Everything above is one project. Code that lives elsewhere comes in as a <em>package</em>, and the design is deliberately small (<code>docs/packages.md</code> has the whole of it). The compiler never touches the network. A separate tool, <code>mxpkg</code>, fetches dependencies before a build and leaves files on disk; a build with a complete <code>mx_modules/</code> directory works offline. Dependencies are pinned, never ranged: a git URL plus a revision, or a local path. Two requesters that disagree on a revision are an error naming both, for a person to settle.</p>
-<p>A project declares what it wants in <code>mx.toml</code>:</p>
+<p>Everything above is one project. Code that lives elsewhere comes in as a <em>package</em>. The compiler never touches the network. A separate tool, <code>tap</code>, fetches dependencies before a build and leaves files on disk; a build with a complete <code>mx_modules/</code> directory works offline. <code>docs/packages.md</code> describes the layout on disk and <code>docs/tap.md</code> the tool.</p>
+<p>A project declares what it wants in <code>mx.toml</code>. A dependency is a version requirement against the registry, a git URL plus a revision, or a local path:</p>
 <div class="fence"><span class="label">toml</span><pre><code>[package]
 name = &quot;pkg_app&quot;
 version = &quot;0.1.0&quot;
 
 [dependencies]
 geom = { path = &quot;deps/geom&quot; }</code></pre></div>
-<p><code>mxpkg sync</code> resolves that transitively, fetches whatever the lock lacks (git dependencies are vendored into <code>mx_modules/&lt;name&gt;/</code> with their <code>.git</code> removed; path dependencies are used in place), and writes <code>mx.lock</code>, which records each package&#x27;s source and a hash of its tree. The compiler reads the lock, never the manifest. This is the lock of <code>examples/pkg_app/</code> in the repository, whose <code>geom</code> package itself depends on a <code>util</code> package:</p>
+<div class="fence"><span class="label">toml</span><pre><code>[dependencies]
+shapes = &quot;^0.2&quot;                                           # from the registry
+util = { git = &quot;https://github.com/x/util&quot;, rev = &quot;v0.3.0&quot; }</code></pre></div>
+<p>Requirements use Cargo&#x27;s spelling: <code>^0.2</code> means any <code>0.2.x</code>, <code>~1.4</code> means any <code>1.4.x</code>, <code>&gt;=1, &lt;3</code> is what it says, and a bare <code>1.2.3</code> is <code>^1.2.3</code>. The registry is a git repository with one small file per package listing its versions and their dependencies; publishing a version is a pull request that adds a line. <code>tap add shapes</code> looks the newest version up and writes the requirement for you.</p>
+<p><code>tap sync</code> hands the whole graph to a version solver (PubGrub, the algorithm behind Cargo and uv), which picks one version per name that satisfies every requirement, or explains in plain sentences why none can. Git and path dependencies take part with exactly one version each, so a requirement that excludes them is a reported conflict. Locked versions are kept until you ask <code>tap update</code> to move them. The tool then fetches whatever the lock lacks (git and registry packages are vendored into <code>mx_modules/&lt;name&gt;/</code> with their <code>.git</code> removed; path dependencies are used in place) and writes <code>mx.lock</code>, which records each package&#x27;s source, version and a hash of its tree. The compiler reads the lock, never the manifest. This is the lock of <code>examples/pkg_app/</code> in the repository, whose <code>geom</code> package itself depends on a <code>util</code> package:</p>
 <div class="fence"><span class="label">toml</span><pre><code>version = 1
 
 [[package]]
@@ -150,7 +154,7 @@ hash = &quot;sha256:626013fffbbdb0e268c9b61fbe34d2d37ced1e72da29141b23bab3589c33
 name = &quot;util&quot;
 source = &quot;path+deps/util&quot;
 hash = &quot;sha256:edd308f57cc009399b1917e2927b661c78d30ee27f599969deab4e2c50084c33&quot;</code></pre></div>
-<p>The lock is flat: one root per name, so a name means the same package everywhere in one build, and <code>util</code> is reachable from the application even though only <code>geom</code> asked for it. <code>mxpkg tree</code> shows who asked:</p>
+<p>The lock is flat: one root per name, so a name means the same package everywhere in one build, and <code>util</code> is reachable from the application even though only <code>geom</code> asked for it. <code>tap tree</code> shows who asked:</p>
 <div class="fence"><span class="label">text</span><pre><code>pkg_app 0.1.0
   geom path+deps/geom
     util path+../util</code></pre></div>
@@ -198,7 +202,7 @@ Notes:
   - looked for examples/pkg_app/nothing.mx
   - module paths resolve relative to the root file&#x27;s directory: examples/pkg_app
   - &#x27;nothing&#x27; is not a locked dependency either (examples/pkg_app/mx.lock lists: geom, util)</code></pre></div>
-<p><code>mxpkg check</code> recomputes the tree hashes and exits nonzero on drift, so it catches a hand edit inside <code>mx_modules/</code>; that is the command a CI job should run. There is no registry, no version-range solver, no build scripts, and no binary artifacts; each of those is a separate decision for later, and you need none of them to share a library between two repositories today.</p>
+<p><code>tap check</code> recomputes the tree hashes and exits nonzero on drift, so it catches a hand edit inside <code>mx_modules/</code>; that is the command a CI job should run. There are no build scripts, no feature flags and no binary artifacts; each is a separate decision for later, and you need none of them to share a library between two repositories today.</p>
 <h2>Where this leaves you</h2>
 <p>Modules here are a naming discipline, not a compilation-unit design. One file per concern, an <code>export</code> list you can read in one glance, <code>from</code>-imports for the names you use often, qualified paths for the ones you don&#x27;t, and a lockfile when the code comes from somewhere else. Chapter 12 tours what <code>std</code> itself exports; chapter 17 shows where module resolution sits in the pipeline, which is early, right after the parser and before any type is inferred.</p>
 <nav class="pager"><a href="14-compiling-to-native.html">&#8592; Compiling to native</a><a href="16-unsafe-and-ffi.html">Unsafe and FFI &#8594;</a></nav>

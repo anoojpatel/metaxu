@@ -6,6 +6,11 @@ interface, `std` resolves from the compiler's own tree. What it has no
 answer for is code that lives in another repository. This document is
 that answer, sized to what the language needs now.
 
+The tool is now `tap` (`docs/tap.md`), which adds version requirements,
+a git-hosted registry and a PubGrub solver on top of the layout
+described here. Everything below about `mx.lock`, `mx_modules/` and the
+resolver hook still holds; where this page says `mxpkg`, read `tap`.
+
 ## Principles
 
 - **The compiler never touches the network.** Fetching is a separate
