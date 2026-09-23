@@ -9,13 +9,17 @@ The compiler is one command, `metaxuc`. Install it on your PATH
 straight from the repository:
 
 ```bash
-uv tool install git+https://github.com/anoojpatel/metaxu
+uv tool install git+https://github.com/anoojpatel/metaxu@v0.1.0
 ```
 
-If the shell cannot find it afterwards, `uv tool update-shell` adds
-uv's tool directory to your PATH; open a new terminal and try again.
-`uvx --from git+https://github.com/anoojpatel/metaxu metaxuc ...` runs
-it once without installing.
+`v0.1.0` is the current release; the
+[releases page](https://github.com/anoojpatel/metaxu/releases) lists
+every version with a wheel attached, and leaving the `@v0.1.0` off
+installs the tip of the repository. If the shell cannot find `metaxuc`
+afterwards, `uv tool update-shell` adds uv's tool directory to your
+PATH; open a new terminal and try again.
+`uvx --from git+https://github.com/anoojpatel/metaxu@v0.1.0 metaxuc ...`
+runs it once without installing.
 
 To work from a checkout instead, which is what the rest of this book
 assumes when it mentions `examples/` or the test suite:

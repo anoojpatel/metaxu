@@ -1,0 +1,86 @@
+name: Release
+
+# Cutting a version is one command on a maintainer's machine:
+#
+#     git tag -a v0.1.0 -m "Metaxu 0.1.0" && git push origin v0.1.0
+#
+# This workflow then checks the tag against pyproject's version, runs
+# the test suite and both example gates, builds the wheel and sdist,
+# and publishes a GitHub Release with both attached, using the matching
+# section of CHANGELOG.md as the notes.  The release page is what the
+# website's Download button and the README point at; users install
+# with `uv tool install <wheel url>` or `uv tool install git+...@v0.1.0`.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Tag matches pyproject version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          ver="$(python3 -c 'import tomllib;print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')"
+          if [ "$tag" != "$ver" ]; then
+            echo "tag v$tag does not match pyproject version $ver" >&2
+            exit 1
+          fi
+
+      - name: Install
+        run: uv sync --all-groups
+
+      - name: Test suite
+        run: uv run python -m pytest src/metaxu/compiler/tests -q -p no:cacheprovider
+
+      - name: Example gates
+        run: |
+          uv run python scripts/run_examples.py
+          uv run python scripts/run_examples.py --stage run
+
+      - name: Build wheel and sdist
+        run: uv build
+
+      - name: Release notes from CHANGELOG.md
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          # the section between "## <ver>" and the next "## " heading
+          awk -v ver="$ver" '
+            /^## / { if (found) exit; found = ($2 == ver) ; next }
+            found { print }
+          ' CHANGELOG.md > notes.md
+          if [ ! -s notes.md ]; then
+            echo "no CHANGELOG.md section for $ver" >&2
+            exit 1
+          fi
+          {
+            echo
+            echo '## Install'
+            echo
+            echo '```bash'
+            echo "uv tool install https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/metaxu-${ver}-py3-none-any.whl"
+            echo "# or, from the tagged source:"
+            echo "uv tool install git+https://github.com/${GITHUB_REPOSITORY}@${GITHUB_REF_NAME}"
+            echo '```'
+            echo
+            echo 'Needs Python 3.11+ and clang (for `metaxuc build`).'
+          } >> notes.md
+
+      - name: Publish the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "Metaxu ${GITHUB_REF_NAME#v}" \
+            --notes-file notes.md \
+            --verify-tag

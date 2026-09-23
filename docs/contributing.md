@@ -99,6 +99,28 @@ commit subject in the imperative and keep it under about 70 characters.
 Use the body to say why the change was made and what you checked,
 because the diff already shows what changed.
 
+## Cutting a release
+
+Versions are git tags of the form `v0.1.0`, and each one becomes a
+GitHub Release with the wheel and source archive attached. To cut one:
+
+1. Set `version` in `pyproject.toml` and add a `## <version>` section to
+   `CHANGELOG.md`. Commit both to `main`.
+2. Tag and push:
+
+```bash
+git tag -a v0.1.0 -m "Metaxu 0.1.0"
+git push origin v0.1.0
+```
+
+The release workflow (`.github/workflows/release.yml`) checks that the
+tag matches the version in `pyproject.toml`, runs the test suite and
+both gates, builds the wheel and sdist, and publishes the release with
+the changelog section as its notes. If any step fails, nothing is
+published; fix it, delete the tag locally and remotely, and tag again.
+Then update the version named in `README.md`, the book's first chapter
+and the website's Download button.
+
 ## Questions
 
 Open an issue. There is no chat channel yet.

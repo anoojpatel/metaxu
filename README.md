@@ -144,18 +144,26 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 
 ### Install `metaxuc` as a command
 
-`metaxuc` is the compiler's command-line front door. To have it on your
-PATH without a checkout:
+`metaxuc` is the compiler's command-line front door. Released versions
+are on the [releases page](https://github.com/anoojpatel/metaxu/releases),
+each with a wheel and a source archive attached. To install the current
+release on your PATH without a checkout:
 
 ```bash
-uv tool install git+https://github.com/anoojpatel/metaxu
+uv tool install git+https://github.com/anoojpatel/metaxu@v0.1.0
 metaxuc run hello.mx
 ```
 
-uv puts the executable in its tool directory (`~/.local/bin` by default).
-If your shell cannot find `metaxuc` afterwards, run `uv tool update-shell`
-once and open a new terminal. `uv tool upgrade metaxu` picks up new
-commits. To try it without installing anything:
+The wheel attached to the release installs the same thing without git:
+
+```bash
+uv tool install https://github.com/anoojpatel/metaxu/releases/download/v0.1.0/metaxu-0.1.0-py3-none-any.whl
+```
+
+Dropping the `@v0.1.0` installs the tip of `main` instead. uv puts the
+executable in its tool directory (`~/.local/bin` by default). If your
+shell cannot find `metaxuc` afterwards, run `uv tool update-shell` once
+and open a new terminal. To try it without installing anything:
 
 ```bash
 uvx --from git+https://github.com/anoojpatel/metaxu metaxuc run hello.mx

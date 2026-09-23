@@ -14,8 +14,8 @@
 <h1>Getting started</h1>
 <p>Metaxu is a systems language with a Python front end, an LLVM native backend, and a strict reference interpreter that defines what every program means. You need Python 3.11+, clang, and <a href="https://docs.astral.sh/uv/">uv</a>.</p>
 <p>The compiler is one command, <code>metaxuc</code>. Install it on your PATH straight from the repository:</p>
-<div class="fence"><span class="label">bash</span><pre><code>uv tool install git+https://github.com/anoojpatel/metaxu</code></pre></div>
-<p>If the shell cannot find it afterwards, <code>uv tool update-shell</code> adds uv&#x27;s tool directory to your PATH; open a new terminal and try again. <code>uvx --from git+https://github.com/anoojpatel/metaxu metaxuc ...</code> runs it once without installing.</p>
+<div class="fence"><span class="label">bash</span><pre><code>uv tool install git+https://github.com/anoojpatel/metaxu@v0.1.0</code></pre></div>
+<p><code>v0.1.0</code> is the current release; the <a href="https://github.com/anoojpatel/metaxu/releases">releases page</a> lists every version with a wheel attached, and leaving the <code>@v0.1.0</code> off installs the tip of the repository. If the shell cannot find <code>metaxuc</code> afterwards, <code>uv tool update-shell</code> adds uv&#x27;s tool directory to your PATH; open a new terminal and try again. <code>uvx --from git+https://github.com/anoojpatel/metaxu@v0.1.0 metaxuc ...</code> runs it once without installing.</p>
 <p>To work from a checkout instead, which is what the rest of this book assumes when it mentions <code>examples/</code> or the test suite:</p>
 <div class="fence"><span class="label">bash</span><pre><code>git clone https://github.com/anoojpatel/metaxu.git
 cd metaxu
