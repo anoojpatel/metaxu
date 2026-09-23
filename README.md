@@ -223,7 +223,7 @@ or agent's context at it.
 |---|---|
 | `src/metaxu/lexer.py`, `src/metaxu/parser.py` | the lexer and the PLY grammar |
 | `src/metaxu/compiler/` | the pipeline: module loading, desugaring, type inference, borrow checking, HIR, MIR, the interpreter, the LLVM and Metal emitters |
-| `src/metaxu/tap/` | `tap`, the package manager: requirements, registry, solver |
+| `src/metaxu/glade/` | `glade`, the package manager: requirements, registry, solver |
 | `src/metaxu/compiler/tests/` | the pytest suite; `fixtures/` holds `.mx` programs the tests read |
 | `std/` | the standard library, written in Metaxu |
 | `examples/` | example programs; the gates below run every one of them |

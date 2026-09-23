@@ -23,8 +23,8 @@ entry, the way Homebrew formulae or the early crates.io index worked.
 Every version's dependencies are in the index, so resolution reads one
 small repository and never clones a package until it has been chosen.
 
-The index is cloned once into the cache (`$TAP_CACHE`, default
-`~/.cache/tap`) and refreshed with `git fetch` on `tap sync`; a build
+The index is cloned once into the cache (`$GLADE_CACHE`, default
+`~/.cache/glade`) and refreshed with `git fetch` on `glade sync`; a build
 with a warm cache and a complete `mx_modules/` needs no network.
 """
 from __future__ import annotations
@@ -42,7 +42,7 @@ from metaxu.packages import PackageError
 from .semver import Range, Version, VersionError, parse_requirement
 
 PACKAGES_DIR = "packages"
-DEFAULT_REGISTRY = "https://github.com/anoojpatel/metaxu-index"
+DEFAULT_REGISTRY = "https://github.com/anoojpatel/glade-index"
 
 
 class RegistryError(PackageError):
@@ -66,10 +66,10 @@ class IndexEntry:
 
 
 def cache_dir() -> Path:
-    env = os.environ.get("TAP_CACHE")
+    env = os.environ.get("GLADE_CACHE")
     if env:
         return Path(env)
-    return Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "tap"
+    return Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "glade"
 
 
 def _git(*args: str, cwd: Path | None = None) -> str:

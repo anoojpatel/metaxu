@@ -1,12 +1,12 @@
-"""The old name of the package manager. `tap` replaced it (docs/tap.md);
+"""The old name of the package manager. `glade` replaced it (docs/glade.md);
 this script forwards so existing instructions keep working.
 
-    uv run python scripts/mxpkg.py sync      ==  uv run tap sync
+    uv run python scripts/mxpkg.py sync      ==  uv run glade sync
 """
 import sys
 
-from metaxu.tap.cli import main
+from metaxu.glade.cli import main
 
 if __name__ == "__main__":
-    print("mxpkg is now `tap`; forwarding", file=sys.stderr)
+    print("mxpkg is now `glade`; forwarding", file=sys.stderr)
     sys.exit(main())

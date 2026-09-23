@@ -1,16 +1,16 @@
-"""`tap`: the Metaxu package manager's command line.
+"""`glade`: the Metaxu package manager's command line.
 
-    tap init [DIR] [--name NAME]       start a project (mx.toml, main.mx)
-    tap add NAME [REQ]                 add a registry dependency (REQ defaults to ^newest)
-    tap add NAME --git URL --rev REV   add a git dependency
-    tap add NAME --path DIR            add a path dependency
-    tap remove NAME
-    tap sync                           resolve, fetch, vendor, write mx.lock
-    tap update [NAME ...]              re-resolve, letting locked versions move
-    tap tree                           the dependency tree with versions
-    tap check                          verify mx_modules/ against mx.lock (CI)
-    tap search TEXT                    find packages in the registry
-    tap paths                          name -> root as JSON (what the compiler reads)
+    glade init [DIR] [--name NAME]       start a project (mx.toml, main.mx)
+    glade add NAME [REQ]                 add a registry dependency (REQ defaults to ^newest)
+    glade add NAME --git URL --rev REV   add a git dependency
+    glade add NAME --path DIR            add a path dependency
+    glade remove NAME
+    glade sync                           resolve, fetch, vendor, write mx.lock
+    glade update [NAME ...]              re-resolve, letting locked versions move
+    glade tree                           the dependency tree with versions
+    glade check                          verify mx_modules/ against mx.lock (CI)
+    glade search TEXT                    find packages in the registry
+    glade paths                          name -> root as JSON (what the compiler reads)
 
 `add` and `remove` sync afterwards, so the lock and mx_modules/ always
 match the manifest you just edited.  Every command reads and writes
@@ -110,10 +110,10 @@ def cmd_paths(args) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(prog="tap", description="The Metaxu package manager.")
+    ap = argparse.ArgumentParser(prog="glade", description="The Metaxu package manager.")
     ap.add_argument("--project", default=".", help="project root (default: .)")
-    ap.add_argument("--registry", help="registry URL or directory (default: mx.toml [tap] registry, "
-                                       "then $TAP_REGISTRY, then the Metaxu index)")
+    ap.add_argument("--registry", help="registry URL or directory (default: mx.toml [glade] registry, "
+                                       "then $GLADE_REGISTRY, then the Metaxu index)")
     sub = ap.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser("init", help="start a project")
@@ -158,7 +158,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return args.fn(args)
     except PackageError as e:
-        print(f"tap: {e}", file=sys.stderr)
+        print(f"glade: {e}", file=sys.stderr)
         return 2
 
 

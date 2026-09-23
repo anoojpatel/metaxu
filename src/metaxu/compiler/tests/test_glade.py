@@ -1,7 +1,7 @@
-"""tap end to end: a local registry, real git repositories, the compiler.
+"""glade end to end: a local registry, real git repositories, the compiler.
 
-The registry is a directory in the index layout (docs/tap.md); the
-packages are git repositories with version tags. `tap add` picks a
+The registry is a directory in the index layout (docs/glade.md); the
+packages are git repositories with version tags. `glade add` picks a
 version, `sync` vendors it, the lock records it, and a program that
 imports the package compiles through the real module resolver.
 """
@@ -18,8 +18,8 @@ from metaxu.compiler.hir import HIRBuilder
 from metaxu.compiler.lower_hir_to_mir import lower_hir_to_mir
 from metaxu.compiler.mir_interp import UNIT, MirInterpreter
 from metaxu.packages import PackageError, read_lock
-from metaxu.tap.cli import main as tap
-from metaxu.tap.project import Project, read_manifest
+from metaxu.glade.cli import main as glade
+from metaxu.glade.project import Project, read_manifest
 
 
 def git(*args: str, cwd: Path) -> str:
@@ -81,7 +81,7 @@ def registry(tmp_path):
 
 def project(tmp_path, registry: Registry) -> Path:
     proj = tmp_path / "app"
-    assert tap(["init", str(proj), "--name", "app"]) == 0
+    assert glade(["init", str(proj), "--name", "app"]) == 0
     (proj / "main.mx").write_text(
         "import geom;\n\nfn main() -> int {\n    print(geom.area(3, 4));\n    0\n}\n")
     return proj
@@ -99,7 +99,7 @@ def run_main(proj: Path) -> list[str]:
 
 
 def T(proj: Path, reg: Registry, *args: str) -> int:
-    return tap(["--project", str(proj), "--registry", str(reg.root), *args])
+    return glade(["--project", str(proj), "--registry", str(reg.root), *args])
 
 
 def test_add_picks_newest_syncs_transitively_and_the_compiler_uses_it(tmp_path, registry, capsys):
@@ -214,6 +214,6 @@ def test_project_api_prefers_locked_versions(tmp_path, registry):
                                          "fn area(w: int, h: int) -> int { w * h }\n"})
     p = Project(proj, registry_override=str(registry.root))
     p._collect_pinned(read_lock(proj))
-    from metaxu.tap.semver import Version
+    from metaxu.glade.semver import Version
     assert p.resolve({"geom": Version.parse("0.1.0")})["geom"] == Version.parse("0.1.0")
     assert p.resolve({})["geom"] == Version.parse("0.1.5")

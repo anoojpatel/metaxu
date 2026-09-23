@@ -33,7 +33,7 @@ class Dep:
     git: str | None = None
     rev: str | None = None
     path: str | None = None
-    version: str | None = None      # a registry requirement; resolved by tap (metaxu.tap)
+    version: str | None = None      # a registry requirement; resolved by glade (metaxu.glade)
 
     @property
     def source(self) -> str:
@@ -51,7 +51,7 @@ class Locked:
     hash: str
     rev: str | None = None
     commit: str | None = None
-    version: str | None = None      # registry packages (tap): the resolved version
+    version: str | None = None      # registry packages (glade): the resolved version
 
 
 LOCK_VERSIONS_READ = {1, 2}         # 2 adds the optional `version` field
@@ -216,7 +216,7 @@ def sync(project: Path, log=lambda s: None) -> dict[str, Locked]:
         if dep.version is not None:
             raise PackageError(
                 f"{requester}: '{dep.name}' is a registry dependency ({dep.version}); "
-                "resolving it takes the solver: run `tap sync` (metaxu.tap)")
+                "resolving it takes the solver: run `glade sync` (metaxu.glade)")
         root = dep_root(project, dep, req_root)
         prior = requested.get(dep.name)
         if prior is not None:
@@ -280,14 +280,14 @@ def check(project: Path) -> list[str]:
         else:
             root = project / VENDOR / name
         if not root.is_dir():
-            problems.append(f"{name}: missing at {root}; run `tap sync`")
+            problems.append(f"{name}: missing at {root}; run `glade sync`")
             continue
         actual = tree_hash(root)
         if actual != entry.hash:
             problems.append(f"{name}: tree hash {actual} differs from lock {entry.hash}")
     for name in manifest.deps:
         if name not in locked:
-            problems.append(f"{name}: in {MANIFEST} but not in {LOCK}; run `tap sync`")
+            problems.append(f"{name}: in {MANIFEST} but not in {LOCK}; run `glade sync`")
     return problems
 
 
@@ -351,7 +351,7 @@ def tree(project: Path) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     import argparse
-    ap = argparse.ArgumentParser(prog="mxpkg (legacy; use tap)", description=__doc__.splitlines()[0])
+    ap = argparse.ArgumentParser(prog="mxpkg (legacy; use glade)", description=__doc__.splitlines()[0])
     ap.add_argument("--project", default=".", help="project root (default: .)")
     sub = ap.add_subparsers(dest="cmd", required=True)
     p_add = sub.add_parser("add", help="add a dependency to mx.toml")

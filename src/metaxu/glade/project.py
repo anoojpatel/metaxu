@@ -13,8 +13,8 @@ a version requirement against the registry.
     util = { git = "https://github.com/x/util", rev = "v0.3.0" }
     local = { path = "../local" }
 
-    [tap]
-    registry = "https://github.com/anoojpatel/metaxu-index"   # the default
+    [glade]
+    registry = "https://github.com/anoojpatel/glade-index"   # the default
 
 Resolution hands the whole graph to PubGrub at once. Registry packages
 offer every version the index lists; git and path packages offer
@@ -83,7 +83,7 @@ def read_manifest(root: Path) -> Manifest:
         raise PackageError(f"{path}: [package] needs a name")
     m = Manifest(name=str(pkg["name"]), version=str(pkg.get("version", "0.0.0")),
                  public=list(pkg.get("public", [])),
-                 registry=(data.get("tap") or {}).get("registry"))
+                 registry=(data.get("glade") or {}).get("registry"))
     for name, spec in (data.get("dependencies") or {}).items():
         m.deps[name] = _parse_spec(path, str(name), spec)
     return m
@@ -132,7 +132,7 @@ def write_manifest(root: Path, m: Manifest) -> None:
         else:
             lines.append(f"{name} = {_toml_str(d.requirement_text)}")
     if m.registry:
-        lines += ["", "[tap]", f"registry = {_toml_str(m.registry)}"]
+        lines += ["", "[glade]", f"registry = {_toml_str(m.registry)}"]
     (root / MANIFEST).write_text("\n".join(lines) + "\n")
 
 
@@ -154,7 +154,7 @@ class Project:
         self.log = log
         self.manifest = read_manifest(self.root)
         source = (registry_override or self.manifest.registry
-                  or os.environ.get("TAP_REGISTRY") or DEFAULT_REGISTRY)
+                  or os.environ.get("GLADE_REGISTRY") or DEFAULT_REGISTRY)
         self.cache = cache
         self.registries: dict[str, Registry] = {}
         self.default_registry = self._registry(source)
@@ -273,7 +273,7 @@ class Project:
         """Resolve, fetch what the lock lacks, vendor, write the lock.
 
         `update` names packages whose locked version should not be
-        preferred (`tap update`); None keeps every locked version that
+        preferred (`glade update`); None keeps every locked version that
         still satisfies the requirements."""
         old = read_lock(self.root)
         self._collect_pinned(old)
@@ -379,7 +379,7 @@ class Project:
                 spec = m.deps[name]
                 entry = locked.get(name)
                 if entry is None:
-                    where = "(not locked; run `tap sync`)"
+                    where = "(not locked; run `glade sync`)"
                 elif spec.kind == "registry":
                     where = f"{entry.version} ({spec.requirement_text})"
                 elif spec.kind == "git":

@@ -1,4 +1,4 @@
-"""tap's version model and solver, with no git or registry involved.
+"""glade's version model and solver, with no git or registry involved.
 
 The semver half pins the requirement dialect (chapter 15 documents it);
 the PubGrub half runs the scenarios from the algorithm's own write-up
@@ -10,8 +10,8 @@ from __future__ import annotations
 
 import pytest
 
-from metaxu.tap.pubgrub import NoSolution, Solver
-from metaxu.tap.semver import Range, Version, VersionError, parse_requirement
+from metaxu.glade.pubgrub import NoSolution, Solver
+from metaxu.glade.semver import Range, Version, VersionError, parse_requirement
 
 V = Version.parse
 

@@ -243,9 +243,9 @@ rather than a harness-pinned `error` block.
 
 Everything above is one project. Code that lives elsewhere comes in
 as a *package*. The compiler never touches the network. A separate
-tool, `tap`, fetches dependencies before a build and leaves files on
+tool, `glade`, fetches dependencies before a build and leaves files on
 disk; a build with a complete `mx_modules/` directory works offline.
-`docs/packages.md` describes the layout on disk and `docs/tap.md` the
+`docs/packages.md` describes the layout on disk and `docs/glade.md` the
 tool.
 
 A project declares what it wants in `mx.toml`. A dependency is a
@@ -271,15 +271,15 @@ Requirements use Cargo's spelling: `^0.2` means any `0.2.x`, `~1.4`
 means any `1.4.x`, `>=1, <3` is what it says, and a bare `1.2.3` is
 `^1.2.3`. The registry is a git repository with one small file per
 package listing its versions and their dependencies; publishing a
-version is a pull request that adds a line. `tap add shapes` looks the
+version is a pull request that adds a line. `glade add shapes` looks the
 newest version up and writes the requirement for you.
 
-`tap sync` hands the whole graph to a version solver (PubGrub, the
+`glade sync` hands the whole graph to a version solver (PubGrub, the
 algorithm behind Cargo and uv), which picks one version per name that
 satisfies every requirement, or explains in plain sentences why none
 can. Git and path dependencies take part with exactly one version each,
 so a requirement that excludes them is a reported conflict. Locked
-versions are kept until you ask `tap update` to move them. The tool
+versions are kept until you ask `glade update` to move them. The tool
 then fetches whatever the lock lacks (git and registry packages are
 vendored into `mx_modules/<name>/` with their `.git` removed; path
 dependencies are used in place) and writes `mx.lock`, which records
@@ -304,7 +304,7 @@ hash = "sha256:edd308f57cc009399b1917e2927b661c78d30ee27f599969deab4e2c50084c33"
 
 The lock is flat: one root per name, so a name means the same package
 everywhere in one build, and `util` is reachable from the application
-even though only `geom` asked for it. `tap tree` shows who asked:
+even though only `geom` asked for it. `glade tree` shows who asked:
 
 ```text
 pkg_app 0.1.0
@@ -389,7 +389,7 @@ Notes:
   - 'nothing' is not a locked dependency either (examples/pkg_app/mx.lock lists: geom, util)
 ```
 
-`tap check` recomputes the tree hashes and exits nonzero on drift, so
+`glade check` recomputes the tree hashes and exits nonzero on drift, so
 it catches a hand edit inside `mx_modules/`; that is the command a CI
 job should run. There are no build scripts, no feature flags and no
 binary artifacts; each is a separate decision for later, and you need

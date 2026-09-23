@@ -52,7 +52,7 @@ def _discover_package_roots(start_dir: str) -> tuple[dict[str, str], str | None]
     dependency table it describes (name -> root directory) with the
     project root, or ({}, None) when there is no lock. Only the lock is
     consulted: `mx.toml` says what a project wants, `mx.lock` says what
-    `tap sync` put on disk, and the compiler builds from the latter."""
+    `glade sync` put on disk, and the compiler builds from the latter."""
     d = os.path.abspath(start_dir)
     while True:
         if os.path.isfile(os.path.join(d, LOCK_NAME)):

@@ -17,7 +17,7 @@ Repository = "https://github.com/anoojpatel/metaxu"
 [project.scripts]
 metaxu = "metaxu.metaxu:main"
 metaxuc = "metaxu.compiler.cli:main"
-tap = "metaxu.tap.cli:main"
+glade = "metaxu.glade.cli:main"
 
 [dependency-groups]
 dev = [

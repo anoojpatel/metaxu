@@ -261,7 +261,7 @@ shipped. Current queue, in rough priority order:)
   requirements, and promoting the biunifier, which first needs the
   statement-flow edges sharpened so it can stop reading the flat
   solver's union-find pointers.
-- **Packages**: `tap` (`docs/tap.md`) landed on top of the lock and
+- **Packages**: `glade` (`docs/glade.md`) landed on top of the lock and
   vendor layout in `docs/packages.md`: version requirements, a git
   registry index, a PubGrub solver. Open: a hosted index, a `[replace]`
   table.
