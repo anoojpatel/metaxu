@@ -71,7 +71,7 @@ runtime symbols, the pattern `Thread` and `Mutex` already use
 | `std.path` | join, dirname, basename, normalize, relative-to, `is_absolute` | String only. `relpath` is the one glade needs and gets wrong without care. |
 | `std.json` | a writer | `glade paths` prints a JSON object; no reader needed. |
 | `std.args` | flag and subcommand parsing over `Vec` of strings | Replaces argparse. Depends on `std.env` for the argument vector. |
-| `std.hex` and `std.sha256` | hex encoding; SHA-256 over bytes | SHA-256 is 32-bit arithmetic with wrapping adds and rotates, which the integer ops already give. Writing it in Metaxu keeps the native binary free of libcrypto. Bind C only if the interpreter's speed on large trees becomes a problem. |
+| `std.hex` and `std.sha256` | hex encoding; SHA-256 over bytes | Done. SHA-256 is 32-bit arithmetic with wrapping adds and rotates, which the integer ops already give; the port is FIPS 180-4 in a hundred lines with the constants in decimal (no hex literals yet), tested against hashlib on both engines. Bind C only if the interpreter's speed on large trees becomes a problem. |
 | the tool itself | manifest and lock models, index parsing, resolution, sync, add, remove, tree, check, search | Ordinary code once the pieces above exist. Lives in its own package, built and vendored by glade. |
 
 ### Fill in the language and standard library first
@@ -81,7 +81,7 @@ into, and each needs work in the compiler as well as `std/`.
 
 | gap | why glade hits it | what to add |
 |---|---|---|
-| a byte type and string ↔ bytes | hashing a tree, reading files that are not UTF-8, TOML escapes | `bytes` as a `Vec` of `u8` or a distinct runtime value; `string.to_bytes()`, `bytes.to_string()`, byte indexing. Both engines and the C runtime. |
+| a byte type and string ↔ bytes | hashing a tree, reading files that are not UTF-8, TOML escapes | Done, as the cheaper of the two options: bytes are a `Vec` of ints in 0..255 (what `as_ptr` already accepted), `s.to_bytes()` gives a string's UTF-8 bytes and `v.from_bytes()` decodes them, rejecting a non-byte, a NUL and invalid UTF-8 with the same three messages on both engines. A distinct byte type can replace the representation later without changing callers. |
 | string builtins with linear cost | `std.string` does `starts_with` and `index_of_char` by `char_at` loops, which is O(n²) over a manifest | Done: `split`, `find`, `replace`, `trim`, `join` are `__builtin$m` methods backed by `mx_str_*` in C, with the interpreter matching; `std.parse.trim`/`split_on` and `std.string.join` are thin names over them. `to_int` stays `std.parse.parse_int`, which is linear already. |
 | a hashed `Map` | the solver keeps a dozen maps keyed by package name; O(n) lookups are fine at glade's sizes but wrong in spirit | a `Hash` trait, `impl Hash for string/int`, and a bucketed `std.map` behind the same API. Not blocking. |
 | `main` arguments | the command line | either `fn main(args: Vec) -> int` accepted by both engines, or `std.env.args()`. The native `@main` wrapper already exists; it needs to carry `argv` through. |
@@ -171,6 +171,13 @@ diagnostics (`split: empty separator`, `replace: empty pattern`)
 byte-identical. `test_string_builtins.py` runs a few hundred generated
 cases against Python's `str` methods on the interpreter and the same
 program natively.
+
+**Step 2, bytes, `std.hex`, `std.sha256`: done.** Bytes are a `Vec`
+of ints (see the table above), `std.hex` renders and parses them, and
+`std.sha256` is FIPS 180-4 in Metaxu; `test_std_hash.py` checks every
+padding boundary and a few hundred bytes of patterns against hashlib,
+then runs the same program natively. The interpreter hashes about
+twenty kilobytes a second, enough for manifests and small trees.
 
 What the two programs still leave as placeholders is `std.fail`'s
 higher-order handlers (`try_opt(f)` and friends call a closure passed as

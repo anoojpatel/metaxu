@@ -282,7 +282,39 @@ split: empty separator
 ```
 
 They are also callable as plain functions, `split(line, ",")`, like
-`len`. `std.string` packages the character-level loops you'd otherwise
+`len`.
+
+Bytes are a `Vec` of ints from 0 to 255. `to_bytes` gives a string's
+UTF-8 bytes and `from_bytes` turns such a `Vec` back into a string,
+refusing a value outside the byte range, a zero byte, or invalid UTF-8
+with a catchable error. `std.hex` prints bytes as hex and `std.sha256`
+hashes them:
+
+```metaxu
+from std.hex import to_hex;
+from std.sha256 import sha256_string;
+
+fn main() -> int {
+    let b = "hé".to_bytes();
+    print(len(b));
+    print(to_hex(b));
+    print(b.from_bytes());
+    print(sha256_string("abc"));
+    let @mut broken = Vec.new();
+    broken.push(195);
+    print(try { broken.from_bytes() } catch e { e });
+    0
+}
+```
+```output
+3
+68c3a9
+hé
+ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+from_bytes: invalid UTF-8 at byte 0
+```
+
+`std.string` packages the character-level loops you'd otherwise
 rewrite: `starts_with`, `count_char`, `repeat`, and more:
 
 ```metaxu

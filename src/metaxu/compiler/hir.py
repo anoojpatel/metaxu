@@ -33,6 +33,8 @@ _BUILTIN_METHODS = frozenset({
     # `s.split(sep)`, `s.find(sub)`, `s.replace(old, new)`, `s.trim()`,
     # and `parts.join(sep)` on a Vec of strings.
     "split", "find", "replace", "trim", "join",
+    # `s.to_bytes()` (UTF-8 bytes as a Vec of ints) and `v.from_bytes()`.
+    "to_bytes", "from_bytes",
     # math methods on numbers (runtime library)
     "sqrt", "sin", "cos",
     # FFI: `x.as_ptr()` — raw pointer view of a string/vector's bytes
@@ -145,7 +147,7 @@ def is_tuple_struct(name: str) -> bool:
 BUILTIN_FUNCTION_NAMES = frozenset({
     "print", "println", "assert", "assert_eq",
     "to_string", "int_to_str", "len", "push", "pop",
-    "split", "find", "replace", "trim", "join",
+    "split", "find", "replace", "trim", "join", "to_bytes", "from_bytes",
     "sqrt", "sin", "cos", "neg", "not", "bnot",
     # FFI shims over the interpreter's simulated C heap
     "malloc", "free", "memcpy", "realloc",

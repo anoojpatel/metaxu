@@ -29,6 +29,9 @@ with no section and uses it as the release notes.
   on both engines (C-backed natively); `std.parse.trim`, `split_on` and
   `std.string.join` now delegate to them, and `split_on` accepts a
   separator of any length.
+- `to_bytes` and `from_bytes`: a string's UTF-8 bytes as a `Vec` of
+  ints and back, with the same diagnostics on both engines.
+- `std.hex` and `std.sha256`, pure Metaxu, tested against hashlib.
 - An assignment statement evaluates to `()`. A `-> ()` function ending
   in `s.f = v` used to return the struct.
 - `scripts/release.py`: one command to cut a release.

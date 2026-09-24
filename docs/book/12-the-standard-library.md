@@ -308,6 +308,40 @@ bar 1.0.0
 foo 1.0.0
 ```
 
+## std.hex and std.sha256
+
+Bytes are a `Vec` of ints from 0 to 255 (chapter 5). `std.hex` renders
+them as lowercase hex and parses hex back, and `std.sha256` is SHA-256
+written in Metaxu, tested against Python's `hashlib` on both engines.
+The package manager hashes every vendored tree with it, and a native
+binary that does so needs no crypto library.
+
+```metaxu
+from std.hex import to_hex, from_hex;
+from std.sha256 import sha256_hex, sha256_string;
+
+fn main() -> int {
+    print(sha256_string(""));
+    match from_hex("616263") {
+        None => print("bad hex"),
+        Some(bytes) => {
+            print(bytes.from_bytes());
+            print(sha256_hex(bytes) == sha256_string("abc"));
+            print(to_hex(bytes))
+        }
+    };
+    match from_hex("6x") { None => print("bad hex"), Some(b) => print(len(b)) };
+    0
+}
+```
+```output
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+abc
+1
+616263
+bad hex
+```
+
 ## std.math
 
 Constants are real module-level bindings, read as plain names.

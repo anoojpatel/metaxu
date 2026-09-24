@@ -160,3 +160,69 @@ fn main() -> int {
         exit_code, stdout = compile_and_run(
             llvm_from_source(src), "main", workdir=str(tmp_path))
         assert exit_code == 0 and stdout == out
+
+
+# --- bytes: to_bytes / from_bytes ---------------------------------------------
+
+_BYTES_SRC = """
+fn main() -> int {
+    let b = "héllo".to_bytes();
+    print(len(b));
+    print(b[0]);
+    print(b[1]);
+    print(b.from_bytes());
+    print(from_bytes(to_bytes("abc")));
+    let @mut bad = Vec.new();
+    bad.push(104);
+    bad.push(255);
+    print(try { bad.from_bytes() } catch e { e });
+    let @mut big = Vec.new();
+    big.push(300);
+    print(try { big.from_bytes() } catch e { e });
+    let @mut nul = Vec.new();
+    nul.push(65);
+    nul.push(0);
+    print(try { nul.from_bytes() } catch e { e });
+    let @mut trunc = Vec.new();
+    trunc.push(97);
+    trunc.push(226);
+    trunc.push(130);
+    print(try { trunc.from_bytes() } catch e { e });
+    let @mut sur = Vec.new();
+    sur.push(237);
+    sur.push(160);
+    sur.push(128);
+    print(try { sur.from_bytes() } catch e { e });
+    let empty = Vec.new();
+    print(len(empty.from_bytes()));
+    0
+}
+"""
+
+_BYTES_OUT = [
+    "6", "104", "195", "héllo", "abc",
+    "from_bytes: invalid UTF-8 at byte 1",
+    "from_bytes: element 0 is not a byte (0..255): 300",
+    "from_bytes: element 1 is NUL (a string cannot hold NUL)",
+    "from_bytes: invalid UTF-8 at byte 1",
+    "from_bytes: invalid UTF-8 at byte 0",
+    "0",
+]
+
+
+def test_bytes_round_trip_and_diagnostics_on_the_interpreter():
+    # The UTF-8 bytes of a string as a Vec of ints and back; a non-byte, a
+    # NUL and each malformed UTF-8 shape (truncated sequence, surrogate)
+    # raise, and the byte index matches CPython's decoder.
+    _res, out = interp_run(_BYTES_SRC)
+    assert out.rstrip("\n").split("\n") == _BYTES_OUT
+
+
+@needs_clang
+def test_native_bytes_match_the_interpreter(tmp_path):
+    from metaxu.compiler.llvm_run import compile_and_run
+    ir = llvm_from_source(_BYTES_SRC)
+    assert "placeholder -- unsupported" not in ir
+    exit_code, stdout = compile_and_run(ir, "main", workdir=str(tmp_path))
+    assert exit_code == 0
+    assert stdout.rstrip("\n").split("\n") == _BYTES_OUT

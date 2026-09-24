@@ -1714,6 +1714,8 @@ class MirInterpreter:
         self._builtins["replace"] = _builtin_replace
         self._builtins["trim"] = _builtin_trim
         self._builtins["join"] = _builtin_join
+        self._builtins["to_bytes"] = _builtin_to_bytes
+        self._builtins["from_bytes"] = _builtin_from_bytes
         # --- Runtime library: Tile (docs/gpu_tiles.md Stage 0) --------------
         # Dotted statics only in v1 (the Vec.new resolution path): no
         # method-position names, no collisions with std/user `dot`/`sum`.
@@ -3088,6 +3090,33 @@ def _builtin_join(recv: Any, sep: Any) -> str:
                 f"join: element {i} is not a string, got "
                 f"{_runtime_type_name(e)!r}")
     return sp.join(recv.items)
+
+
+def _builtin_to_bytes(recv: Any) -> Any:
+    """`s.to_bytes()`: the UTF-8 bytes of a string as a Vec of ints."""
+    return MxVec(list(_str_builtin_arg("to_bytes", "receiver", recv).encode("utf-8")))
+
+
+def _builtin_from_bytes(recv: Any) -> str:
+    """`v.from_bytes()`: the string a Vec of byte values spells in UTF-8.
+    Rejects non-bytes, NUL (a native string ends at NUL) and invalid
+    UTF-8; the native runtime raises the same three messages."""
+    if not isinstance(recv, MxVec):
+        raise InterpError(
+            f"from_bytes: expected a Vec receiver, got {_runtime_type_name(recv)!r}")
+    out = bytearray()
+    for i, e in enumerate(recv.items):
+        if not isinstance(e, int) or isinstance(e, bool) or not (0 <= e <= 255):
+            raise InterpError(
+                f"from_bytes: element {i} is not a byte (0..255): {e!r}")
+        if e == 0:
+            raise InterpError(
+                f"from_bytes: element {i} is NUL (a string cannot hold NUL)")
+        out.append(e)
+    try:
+        return out.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise InterpError(f"from_bytes: invalid UTF-8 at byte {exc.start}") from None
 
 
 def _builtin_list_concat(*parts: Any) -> Any:

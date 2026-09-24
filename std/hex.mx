@@ -1,0 +1,57 @@
+# std.hex — bytes as lowercase hexadecimal text and back.
+#
+# Bytes are a Vec of ints in 0..255 on both engines (`s.to_bytes()`
+# gives a string's UTF-8 bytes, `v.from_bytes()` decodes them). This
+# module is what `std.sha256` renders digests with and what a lockfile's
+# `sha256:...` field is parsed from.
+
+export {
+    to_hex,
+    from_hex,
+    hex_digit_value
+}
+
+# The two lowercase hex digits of every byte, concatenated.
+fn to_hex(bytes: Vec) -> string {
+    let digits = "0123456789abcdef";
+    let @mut out = Vec.new();
+    let @mut i = 0;
+    while i < len(bytes) {
+        let b = bytes[i];
+        out.push(digits[b >> 4] + digits[b & 15]);
+        i = i + 1
+    }
+    out.join("")
+}
+
+# The value of one hex digit (either case), or -1.
+fn hex_digit_value(c: string) -> int {
+    let lower = "0123456789abcdef";
+    let upper = "0123456789ABCDEF";
+    let @mut value = 0 - 1;
+    let @mut i = 0;
+    while i < 16 {
+        if lower[i] == c || upper[i] == c { value = i } else { () };
+        i = i + 1
+    }
+    value
+}
+
+# Some(bytes) for an even-length string of hex digits, else None.
+fn from_hex(text: string) -> Option {
+    let n = len(text);
+    if n % 2 != 0 {
+        None
+    } else {
+        let @mut out = Vec.new();
+        let @mut ok = true;
+        let @mut i = 0;
+        while i < n && ok {
+            let hi = hex_digit_value(text[i]);
+            let lo = hex_digit_value(text[i + 1]);
+            if hi < 0 || lo < 0 { ok = false } else { out.push(hi * 16 + lo) };
+            i = i + 2
+        }
+        if ok { Some(out) } else { None }
+    }
+}

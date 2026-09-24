@@ -34,6 +34,8 @@
  * | mx_str_replace   | char* (const char*, const char*, const char*) | fresh string; raises on an empty pattern |
  * | mx_str_trim      | char* (const char*)                        | fresh string without leading/trailing space, tab, newline, return |
  * | mx_str_join      | char* (const mx_vec*, const char*)         | fresh string joining the Vec's string elements |
+ * | mx_str_to_bytes  | mx_vec* (const char*)                      | fresh Vec of the UTF-8 byte values |
+ * | mx_bytes_to_str  | char* (const mx_vec*)                      | fresh string; raises on a non-byte, NUL or invalid UTF-8 |
  * | mx_str_free      | void (char*)                               | frees a produced string; NULL is a no-op |
  * | mx_shift_check   | int64_t (int64_t count, int64_t is_left)   | returns count; aborts unless 0 <= count < 64 |
  * | mx_vec_as_bytes  | unsigned char* (const mx_vec*)             | fresh malloc'd byte SNAPSHOT of the elements |
@@ -315,6 +317,11 @@ mx_vec *mx_str_split(const char *s, const char *sep);
 char   *mx_str_replace(const char *s, const char *old, const char *new_);
 char   *mx_str_trim(const char *s);
 char   *mx_str_join(const mx_vec *parts, const char *sep);
+/* `s.to_bytes()`: the UTF-8 bytes as a fresh Vec of ints; `v.from_bytes()`:
+   the string they spell, raising the interpreter's catchable diagnostics
+   for a non-byte, a NUL or invalid UTF-8. */
+mx_vec *mx_str_to_bytes(const char *s);
+char   *mx_bytes_to_str(const mx_vec *bytes);
 char   *mx_i64_to_str(int64_t value);
 char   *mx_f64_to_str(double value);
 int64_t mx_str_eq(const char *a, const char *b);

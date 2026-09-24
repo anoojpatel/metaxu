@@ -63,14 +63,16 @@ object, a seeded RNG singleton, an aborting `assert`).
 
 The package manager's pieces, ported from `src/metaxu/glade/` with the
 Python module as the oracle for each (`docs/glade_in_metaxu.md`). These
-run on the interpreter; the native backend needs string indexing and
-per-use enum payload kinds first, and each module's differential test
-carries a strict `xfail` for that.
+run on both engines: each module's differential test compares the
+interpreter to the Python module and then the native binary to the
+interpreter.
 
 | Module | Oracle | Status | Contents |
 | --- | --- | --- | --- |
-| `std.semver` | `glade/semver.py` | implemented (interpreter) | `Version`, `Interval`, `Range`; `parse_version`, `version_to_string`, `compare_version`; `range_any/empty/exact/between`, `range_intersect/union/complement`, `range_contains` (prerelease rule), `range_is_subset/disjoint`, `range_to_string`; `parse_requirement` in the Cargo dialect (`^`, `~`, `*`, `=`, comparators, commas) |
-| `std.solve` | `glade/pubgrub.py` | implemented (interpreter) | PubGrub over a `Graph` of `PackageVersion`s (`graph_new`, `graph_add`, `dep`); `solve(graph, root, root_version, prefer_names, prefer_versions)` returns an `Outcome` with the picks or an `explanation` whose sentences match the Python solver's word for word |
+| `std.semver` | `glade/semver.py` | implemented | `Version`, `Interval`, `Range`; `parse_version`, `version_to_string`, `compare_version`; `range_any/empty/exact/between`, `range_intersect/union/complement`, `range_contains` (prerelease rule), `range_is_subset/disjoint`, `range_to_string`; `parse_requirement` in the Cargo dialect (`^`, `~`, `*`, `=`, comparators, commas) |
+| `std.solve` | `glade/pubgrub.py` | implemented | PubGrub over a `Graph` of `PackageVersion`s (`graph_new`, `graph_add`, `dep`); `solve(graph, root, root_version, prefer_names, prefer_versions)` returns an `Outcome` with the picks or an `explanation` whose sentences match the Python solver's word for word |
+| `std.hex` | `bytes.hex` / `bytes.fromhex` | implemented | `to_hex` (lowercase), `from_hex` (Option), `hex_digit_value`, over bytes as a Vec of ints |
+| `std.sha256` | `hashlib.sha256` | implemented | `sha256` (32 bytes), `sha256_hex`, `sha256_string` (UTF-8 of a string); pure Metaxu, so native binaries need no libcrypto |
 | `std.iter` | implemented | the adapters `std.stream` defers, over real tuples: `enumerate`, `zip`, `zip_with`, `take_while`, `drop_while`, `step_by`, `windows`, `chunks` |
 
 ### Round 3

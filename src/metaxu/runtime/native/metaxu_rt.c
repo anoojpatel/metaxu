@@ -1280,6 +1280,71 @@ char *mx_str_trim(const char *s) {
     return mx_str_dup_n(s + start, stop - start);
 }
 
+mx_vec *mx_str_to_bytes(const char *s) {
+    mx_str_check(s, "to_bytes", "receiver");
+    mx_vec *out = mx_vec_new();
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        mx_vec_push(out, (int64_t)*p);
+    }
+    return out;
+}
+
+/* Length of the well-formed UTF-8 sequence starting at b[0] (n bytes
+ * remain), or 0 when it is malformed: the same shapes CPython's strict
+ * decoder rejects (bad lead, truncated, bad continuation, overlong,
+ * surrogate, > U+10FFFF). */
+static size_t mx_utf8_seq_len(const unsigned char *b, size_t n) {
+    unsigned char c = b[0];
+    if (c < 0x80) return 1;
+    size_t need;
+    unsigned char lo = 0x80, hi = 0xBF;
+    if (c >= 0xC2 && c <= 0xDF) { need = 2; }
+    else if (c == 0xE0) { need = 3; lo = 0xA0; }
+    else if (c >= 0xE1 && c <= 0xEC) { need = 3; }
+    else if (c == 0xED) { need = 3; hi = 0x9F; }
+    else if (c >= 0xEE && c <= 0xEF) { need = 3; }
+    else if (c == 0xF0) { need = 4; lo = 0x90; }
+    else if (c >= 0xF1 && c <= 0xF3) { need = 4; }
+    else if (c == 0xF4) { need = 4; hi = 0x8F; }
+    else { return 0; }
+    if (n < need) return 0;
+    if (b[1] < lo || b[1] > hi) return 0;
+    for (size_t i = 2; i < need; i++) {
+        if (b[i] < 0x80 || b[i] > 0xBF) return 0;
+    }
+    return need;
+}
+
+char *mx_bytes_to_str(const mx_vec *bytes) {
+    if (bytes == NULL) {
+        mx_rt_fail("from_bytes: expected a Vec receiver, got NULL");
+    }
+    int64_t n = mx_vec_len(bytes);
+    unsigned char *buf = (unsigned char *)mx_rt_malloc((size_t)n + 1);
+    for (int64_t i = 0; i < n; i++) {
+        int64_t w = mx_vec_get(bytes, i);
+        if (w < 0 || w > 255) {
+            mx_rt_raise("from_bytes: element %lld is not a byte (0..255): %lld",
+                        (long long)i, (long long)w);  /* catchable */
+        }
+        if (w == 0) {
+            mx_rt_raise("from_bytes: element %lld is NUL (a string cannot hold NUL)",
+                        (long long)i);  /* catchable */
+        }
+        buf[i] = (unsigned char)w;
+    }
+    buf[n] = '\0';
+    for (size_t i = 0; i < (size_t)n;) {
+        size_t k = mx_utf8_seq_len(buf + i, (size_t)n - i);
+        if (k == 0) {
+            mx_rt_raise("from_bytes: invalid UTF-8 at byte %lld",
+                        (long long)i);  /* catchable */
+        }
+        i += k;
+    }
+    return (char *)buf;
+}
+
 char *mx_str_join(const mx_vec *parts, const char *sep) {
     if (parts == NULL) {
         mx_rt_fail("join: expected a Vec receiver, got NULL");
