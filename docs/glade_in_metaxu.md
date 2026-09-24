@@ -109,6 +109,39 @@ What is deliberately not on the list: `std.net` (git is the network),
 (the `Thread` effect exists already if wanted), and Windows paths
 (POSIX first, as a stated limit).
 
+## Progress
+
+**Step 1, `std.semver`: done on the interpreter.** `std/semver.mx`
+mirrors the Python module function for function, and
+`test_std_semver.py` runs both over a few hundred generated cases
+(parsing, ordering, requirements, membership with the prerelease rule,
+and the range algebra) and compares every line. The port took one
+syntax correction (an assignment is not a match arm; wrap it in
+braces) and fixed two laxities in the Python oracle on the way: it
+accepted empty identifiers in `1.0.0-a..b` and in requirements.
+
+Compiling the same program natively fails, and the reasons are the
+first two entries the rewrite adds to step 2:
+
+- **String indexing is not lowered.** `s[i]` on a string is
+  interpreter-only ("string indexing stays interpreted" is the
+  backend's own placeholder reason), which means every helper in
+  `std.parse` and `std.string` is too. The linear string builtins
+  above are therefore not an optimisation but the precondition for
+  running any text-handling Metaxu natively.
+- **Enum payload kinds are per module, not per use.** The native
+  backend gives `Option`'s `Some` slot one value kind for the whole
+  compilation unit. `std.semver` puts ints, Vecs, Versions, Intervals,
+  Partials and Ranges into `Option`, so the slot's kind conflicts and
+  every function touching an `Option` demotes to a placeholder.
+  Generic enums need either monomorphization by payload kind (the
+  function-level `monomorphize.py` pass extended to enums) or a boxed
+  uniform payload. Until then the `Option` in a natively compiled file
+  must hold one kind.
+
+The native differential test for `std.semver` is a strict `xfail`
+naming both; it flips to a required pass when they land.
+
 ## Order of work
 
 1. **`std.semver` and `std.solve`.** Pure code, possible today, with

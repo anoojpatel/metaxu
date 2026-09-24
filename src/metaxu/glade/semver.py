@@ -32,7 +32,7 @@ from typing import Iterable
 
 _VERSION_RE = re.compile(
     r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
-    r"(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$")
+    r"(?:-([0-9A-Za-z.-]+))?(?:\+([0-9A-Za-z.-]+))?$")
 _PARTIAL_RE = re.compile(
     r"^(\d+)(?:\.(\d+|\*))?(?:\.(\d+|\*))?(?:-([0-9A-Za-z.-]+))?$")
 
@@ -55,6 +55,9 @@ class Version:
         if not m:
             raise VersionError(f"{text!r} is not a version (MAJOR.MINOR.PATCH[-pre])")
         pre = tuple(int(p) if p.isdigit() else p for p in m.group(4).split(".")) if m.group(4) else ()
+        # dotted identifiers are non-empty (semver.org item 9 and 10)
+        if any(p == "" for p in pre) or (m.group(5) and "" in m.group(5).split(".")):
+            raise VersionError(f"{text!r} has an empty identifier")
         return cls(int(m.group(1)), int(m.group(2)), int(m.group(3)), pre)
 
     @property
@@ -273,6 +276,8 @@ def _partial(text: str) -> tuple[int, int | None, int | None, tuple]:
     if minor is None and patch is not None:
         raise VersionError(f"{text!r}: a patch needs a minor")
     pre = tuple(int(p) if p.isdigit() else p for p in m.group(4).split(".")) if m.group(4) else ()
+    if any(p == "" for p in pre):
+        raise VersionError(f"{text!r} has an empty prerelease identifier")
     return major, minor, patch, pre
 
 

@@ -215,6 +215,52 @@ bad
 3
 ```
 
+## std.semver
+
+The first piece of the package manager written in Metaxu: versions,
+version requirements in the Cargo dialect, and ranges closed under
+intersection, union and complement, which is what a version solver
+needs. It is a line-for-line port of glade's Python module, and a
+test runs both over the same few hundred cases and compares every
+answer (`docs/glade_in_metaxu.md`).
+
+```metaxu
+from std.semver import parse_version, parse_requirement, range_contains,
+    range_intersect, range_to_string;
+
+fn main() -> int {
+    match parse_requirement("^1.2") {
+        None => print("bad requirement"),
+        Some(r) => {
+            print(range_to_string(r));
+            match parse_version("1.5.0") {
+                None => print("bad version"),
+                Some(v) => print(range_contains(r, v))
+            };
+            match parse_version("2.0.0-rc.1") {
+                None => print("bad version"),
+                Some(v) => print(range_contains(r, v))
+            };
+            match parse_requirement(">=1.5, <3") {
+                None => print("bad requirement"),
+                Some(other) => print(range_to_string(range_intersect(r, other)))
+            }
+        }
+    };
+    0
+}
+```
+```output
+>=1.2.0, <2.0.0
+1
+0
+>=1.5.0, <2.0.0
+```
+
+`1.5.0` is inside `^1.2`; `2.0.0-rc.1` is not, because a prerelease
+only satisfies a requirement that names a prerelease of the same
+version. Booleans print as `1` and `0`.
+
 ## std.math
 
 Constants are real module-level bindings, read as plain names.

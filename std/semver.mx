@@ -1,0 +1,821 @@
+# std.semver — semantic versions and version requirements, in Metaxu.
+#
+# This is the first piece of glade (docs/glade_in_metaxu.md) written in
+# the language itself. It mirrors src/metaxu/glade/semver.py function
+# for function, and test_std_semver.py runs both on the same inputs and
+# compares every answer, so the Python module is the oracle and this
+# file is the claim.
+#
+# A Version is MAJOR.MINOR.PATCH with an optional prerelease held as a
+# Vec of identifier strings; ordering follows semver.org (a prerelease
+# sorts before its release; numeric identifiers sort before alphanumeric
+# ones and among themselves by value). A Range is a Vec of disjoint,
+# sorted Intervals, closed under intersect, union and complement, which
+# is what a version solver needs. Requirements use Cargo's dialect:
+# `^1.2.3` (a bare `1.2.3` means the same), `~1.2.3`, `1.2.*`, `=1.2.3`,
+# comparators joined by commas, and `*`.
+#
+# Two honest limits, the same as the Python: no build metadata is kept
+# (`+build` is parsed and dropped), and a prerelease version satisfies a
+# range only when one of the range's ends is a prerelease of the same
+# MAJOR.MINOR.PATCH.
+
+from std.parse import digit_value, is_digit, trim, split_on;
+
+export {
+    Version,
+    Interval,
+    Range,
+    version,
+    parse_version,
+    version_to_string,
+    compare_version,
+    version_eq,
+    version_lt,
+    range_any,
+    range_empty,
+    range_exact,
+    range_between,
+    range_intersect,
+    range_union,
+    range_complement,
+    range_is_empty,
+    range_is_any,
+    range_is_subset,
+    range_is_disjoint,
+    range_contains,
+    range_exact_version,
+    range_to_string,
+    parse_requirement
+};
+
+struct Version {
+    major: int,
+    minor: int,
+    patch: int,
+    pre: Vec
+}
+
+# lo <= v <= hi with each end open or closed; a None end is unbounded.
+struct Interval {
+    lo: Option,
+    lo_inc: bool,
+    hi: Option,
+    hi_inc: bool
+}
+
+# Disjoint intervals in ascending order.
+struct Range {
+    intervals: Vec
+}
+
+# ---------------------------------------------------------------------
+# characters
+
+# Every character a semver identifier may contain, in ASCII order, so
+# an index into this table orders identifiers the way strcmp would.
+let ident_chars = "-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+fn char_rank(c: string) -> int {
+    let @mut i = 0;
+    let @mut rank = 0 - 1;
+    while i < len(ident_chars) {
+        if ident_chars[i] == c { rank = i } else { () };
+        i = i + 1
+    }
+    rank
+}
+
+fn all_digits(s: string) -> bool {
+    let @mut i = 0;
+    let @mut ok = len(s) > 0;
+    while i < len(s) {
+        if is_digit(s[i]) { () } else { ok = false };
+        i = i + 1
+    }
+    ok
+}
+
+# A decimal number with no leading zero (a lone "0" is fine).
+fn numeric_component(s: string) -> Option {
+    if all_digits(s) {
+        if len(s) > 1 && s[0] == "0" {
+            None
+        } else {
+            let @mut i = 0;
+            let @mut acc = 0;
+            while i < len(s) {
+                acc = acc * 10 + digit_value(s[i]);
+                i = i + 1
+            }
+            Some(acc)
+        }
+    } else {
+        None
+    }
+}
+
+# strcmp over identifier characters: negative, zero or positive.
+fn compare_text(a: string, b: string) -> int {
+    let @mut i = 0;
+    let @mut result = 0;
+    let n = if len(a) < len(b) { len(a) } else { len(b) };
+    while i < n && result == 0 {
+        let ra = char_rank(a[i]);
+        let rb = char_rank(b[i]);
+        if ra < rb { result = 0 - 1 } else { if ra > rb { result = 1 } else { () } };
+        i = i + 1
+    }
+    if result == 0 {
+        if len(a) < len(b) { 0 - 1 } else { if len(a) > len(b) { 1 } else { 0 } }
+    } else {
+        result
+    }
+}
+
+# ---------------------------------------------------------------------
+# versions
+
+fn version(major: int, minor: int, patch: int) -> Version {
+    Version { major: major, minor: minor, patch: patch, pre: Vec.new() }
+}
+
+fn valid_identifier(s: string) -> bool {
+    let @mut i = 0;
+    let @mut ok = len(s) > 0;
+    while i < len(s) {
+        if char_rank(s[i]) < 0 { ok = false } else { () };
+        i = i + 1
+    }
+    ok
+}
+
+# Some(Version) for "1.2.3", "1.2.3-rc.1" or "1.2.3+build" (build metadata
+# dropped); None for anything else, including partial versions.
+fn parse_version(text: string) -> Option {
+    let s = trim(text);
+    let no_build = split_on(s, "+");
+    # build metadata is dropped, but it still has to be well formed
+    let build_ok = if len(no_build) == 2 {
+        match parse_pre(no_build[1], true) { None => false, Some(ids) => true }
+    } else { true };
+    if len(no_build) > 2 || len(s) == 0 || build_ok == false {
+        None
+    } else {
+        let main_part = no_build[0];
+        let dash = split_on(main_part, "-");
+        let core = dash[0];
+        # everything after the first "-" is the prerelease, dashes included
+        let pre_text = if len(dash) > 1 { main_part[len(core) + 1:len(main_part)] } else { "" };
+        let parts = split_on(core, ".");
+        if len(parts) != 3 {
+            None
+        } else {
+            match numeric_component(parts[0]) {
+                None => None,
+                Some(major) => match numeric_component(parts[1]) {
+                    None => None,
+                    Some(minor) => match numeric_component(parts[2]) {
+                        None => None,
+                        Some(patch) => match parse_pre(pre_text, len(dash) > 1) {
+                            None => None,
+                            Some(pre) => Some(Version { major: major, minor: minor, patch: patch, pre: pre })
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+# The prerelease identifiers; None when one is empty or holds a stray
+# character. `present` distinguishes "1.0.0-" (invalid) from "1.0.0".
+fn parse_pre(text: string, present: bool) -> Option {
+    if present == false {
+        Some(Vec.new())
+    } else {
+        let ids = split_on(text, ".");
+        let @mut i = 0;
+        let @mut ok = true;
+        while i < len(ids) {
+            if valid_identifier(ids[i]) { () } else { ok = false };
+            i = i + 1
+        }
+        if ok { Some(ids) } else { None }
+    }
+}
+
+fn version_to_string(v: Version) -> string {
+    let core = v.major.to_string() + "." + v.minor.to_string() + "." + v.patch.to_string();
+    if len(v.pre) == 0 {
+        core
+    } else {
+        let @mut out = core + "-";
+        let @mut i = 0;
+        while i < len(v.pre) {
+            if i > 0 { out = out + "." } else { () };
+            out = out + v.pre[i];
+            i = i + 1
+        }
+        out
+    }
+}
+
+fn compare_int(a: int, b: int) -> int {
+    if a < b { 0 - 1 } else { if a > b { 1 } else { 0 } }
+}
+
+# One prerelease identifier against another: numeric before alphanumeric,
+# numerics by value, alphanumerics by character rank.
+fn compare_identifier(a: string, b: string) -> int {
+    let na = all_digits(a);
+    let nb = all_digits(b);
+    if na && nb {
+        compare_int(int_value(a), int_value(b))
+    } else {
+        if na { 0 - 1 } else { if nb { 1 } else { compare_text(a, b) } }
+    }
+}
+
+fn int_value(s: string) -> int {
+    let @mut i = 0;
+    let @mut acc = 0;
+    while i < len(s) {
+        acc = acc * 10 + digit_value(s[i]);
+        i = i + 1
+    }
+    acc
+}
+
+# Negative when a < b, zero when equal, positive when a > b.
+fn compare_version(a: Version, b: Version) -> int {
+    let c1 = compare_int(a.major, b.major);
+    if c1 != 0 {
+        c1
+    } else {
+        let c2 = compare_int(a.minor, b.minor);
+        if c2 != 0 {
+            c2
+        } else {
+            let c3 = compare_int(a.patch, b.patch);
+            if c3 != 0 {
+                c3
+            } else {
+                compare_pre(a.pre, b.pre)
+            }
+        }
+    }
+}
+
+fn compare_pre(pa: Vec, pb: Vec) -> int {
+    if len(pa) == 0 && len(pb) == 0 {
+        0
+    } else {
+        if len(pa) == 0 {
+            1
+        } else {
+            if len(pb) == 0 {
+                0 - 1
+            } else {
+                let @mut i = 0;
+                let @mut result = 0;
+                let n = if len(pa) < len(pb) { len(pa) } else { len(pb) };
+                while i < n && result == 0 {
+                    result = compare_identifier(pa[i], pb[i]);
+                    i = i + 1
+                }
+                if result == 0 { compare_int(len(pa), len(pb)) } else { result }
+            }
+        }
+    }
+}
+
+fn version_eq(a: Version, b: Version) -> bool {
+    compare_version(a, b) == 0
+}
+
+fn version_lt(a: Version, b: Version) -> bool {
+    compare_version(a, b) < 0
+}
+
+# ---------------------------------------------------------------------
+# intervals
+
+fn interval_contains(iv: Interval, v: Version) -> bool {
+    let below = match iv.lo {
+        None => false,
+        Some(lo) => {
+            let c = compare_version(v, lo);
+            c < 0 || (c == 0 && iv.lo_inc == false)
+        }
+    };
+    let above = match iv.hi {
+        None => false,
+        Some(hi) => {
+            let c = compare_version(v, hi);
+            c > 0 || (c == 0 && iv.hi_inc == false)
+        }
+    };
+    below == false && above == false
+}
+
+fn interval_is_empty(iv: Interval) -> bool {
+    match iv.lo {
+        None => false,
+        Some(lo) => match iv.hi {
+            None => false,
+            Some(hi) => {
+                let c = compare_version(lo, hi);
+                if c < 0 { false } else { if c > 0 { true } else { (iv.lo_inc && iv.hi_inc) == false } }
+            }
+        }
+    }
+}
+
+# a's low end is at or after b's low end.
+fn lo_after(a: Interval, b: Interval) -> bool {
+    match b.lo {
+        None => true,
+        Some(blo) => match a.lo {
+            None => false,
+            Some(alo) => {
+                let c = compare_version(alo, blo);
+                c > 0 || (c == 0 && (a.lo_inc == false || b.lo_inc))
+            }
+        }
+    }
+}
+
+# a's high end is at or before b's high end.
+fn hi_before(a: Interval, b: Interval) -> bool {
+    match b.hi {
+        None => true,
+        Some(bhi) => match a.hi {
+            None => false,
+            Some(ahi) => {
+                let c = compare_version(ahi, bhi);
+                c < 0 || (c == 0 && (a.hi_inc == false || b.hi_inc))
+            }
+        }
+    }
+}
+
+fn interval_intersect(a: Interval, b: Interval) -> Option {
+    let lo = if lo_after(a, b) { a } else { b };
+    let hi = if hi_before(a, b) { a } else { b };
+    let r = Interval { lo: lo.lo, lo_inc: lo.lo_inc, hi: hi.hi, hi_inc: hi.hi_inc };
+    if interval_is_empty(r) { None } else { Some(r) }
+}
+
+# a and b (a starting no later than b) form one contiguous interval.
+fn touch_or_overlap(a: Interval, b: Interval) -> bool {
+    match a.hi {
+        None => true,
+        Some(ahi) => match b.lo {
+            None => true,
+            Some(blo) => {
+                let c = compare_version(ahi, blo);
+                c > 0 || (c == 0 && (a.hi_inc || b.lo_inc))
+            }
+        }
+    }
+}
+
+# Sort key order for merging: unbounded lows first, then by version,
+# inclusive before exclusive at the same version.
+fn lo_less(a: Interval, b: Interval) -> bool {
+    match a.lo {
+        None => match b.lo {
+            None => false,
+            Some(x) => true
+        },
+        Some(alo) => match b.lo {
+            None => false,
+            Some(blo) => {
+                let c = compare_version(alo, blo);
+                c < 0 || (c == 0 && a.lo_inc && b.lo_inc == false)
+            }
+        }
+    }
+}
+
+# Drop empties, sort by low end, merge whatever touches or overlaps.
+fn normalize(intervals: Vec) -> Range {
+    let @mut kept = Vec.new();
+    let @mut i = 0;
+    while i < len(intervals) {
+        if interval_is_empty(intervals[i]) { () } else { kept.push(intervals[i]) };
+        i = i + 1
+    }
+    # insertion sort: the inputs are a handful of intervals
+    let @mut sorted = Vec.new();
+    let @mut j = 0;
+    while j < len(kept) {
+        let iv = kept[j];
+        let @mut placed = Vec.new();
+        let @mut inserted = false;
+        let @mut k = 0;
+        while k < len(sorted) {
+            if inserted == false && lo_less(iv, sorted[k]) {
+                placed.push(iv);
+                inserted = true
+            } else { () };
+            placed.push(sorted[k]);
+            k = k + 1
+        }
+        if inserted == false { placed.push(iv) } else { () };
+        sorted = placed;
+        j = j + 1
+    }
+    let @mut merged = Vec.new();
+    let @mut m = 0;
+    while m < len(sorted) {
+        let iv = sorted[m];
+        if len(merged) > 0 && touch_or_overlap(merged[len(merged) - 1], iv) {
+            let last = merged[len(merged) - 1];
+            let hi = if hi_before(iv, last) { last } else { iv };
+            merged[len(merged) - 1] = Interval { lo: last.lo, lo_inc: last.lo_inc, hi: hi.hi, hi_inc: hi.hi_inc }
+        } else {
+            merged.push(iv)
+        };
+        m = m + 1
+    }
+    Range { intervals: merged }
+}
+
+# ---------------------------------------------------------------------
+# ranges
+
+fn range_any() -> Range {
+    let @mut v = Vec.new();
+    v.push(Interval { lo: None, lo_inc: true, hi: None, hi_inc: true });
+    Range { intervals: v }
+}
+
+fn range_empty() -> Range {
+    Range { intervals: Vec.new() }
+}
+
+fn range_exact(v: Version) -> Range {
+    let @mut ivs = Vec.new();
+    ivs.push(Interval { lo: Some(v), lo_inc: true, hi: Some(v), hi_inc: true });
+    Range { intervals: ivs }
+}
+
+# lo and hi are Option[Version]; None means unbounded on that side.
+fn range_between(lo: Option, hi: Option, lo_inc: bool, hi_inc: bool) -> Range {
+    let @mut ivs = Vec.new();
+    ivs.push(Interval { lo: lo, lo_inc: lo_inc, hi: hi, hi_inc: hi_inc });
+    normalize(ivs)
+}
+
+fn range_intersect(a: Range, b: Range) -> Range {
+    let @mut out = Vec.new();
+    let @mut i = 0;
+    while i < len(a.intervals) {
+        let @mut j = 0;
+        while j < len(b.intervals) {
+            match interval_intersect(a.intervals[i], b.intervals[j]) {
+                None => (),
+                Some(r) => out.push(r)
+            };
+            j = j + 1
+        }
+        i = i + 1
+    }
+    normalize(out)
+}
+
+fn range_union(a: Range, b: Range) -> Range {
+    let @mut all = Vec.new();
+    let @mut i = 0;
+    while i < len(a.intervals) { all.push(a.intervals[i]); i = i + 1 }
+    let @mut j = 0;
+    while j < len(b.intervals) { all.push(b.intervals[j]); j = j + 1 }
+    normalize(all)
+}
+
+fn range_complement(r: Range) -> Range {
+    if len(r.intervals) == 0 {
+        range_any()
+    } else {
+        let @mut out = Vec.new();
+        let first = r.intervals[0];
+        match first.lo {
+            None => (),
+            Some(lo) => out.push(Interval { lo: None, lo_inc: true, hi: Some(lo), hi_inc: first.lo_inc == false })
+        };
+        let @mut i = 1;
+        while i < len(r.intervals) {
+            let prev = r.intervals[i - 1];
+            let cur = r.intervals[i];
+            out.push(Interval { lo: prev.hi, lo_inc: prev.hi_inc == false, hi: cur.lo, hi_inc: cur.lo_inc == false });
+            i = i + 1
+        }
+        let last = r.intervals[len(r.intervals) - 1];
+        match last.hi {
+            None => (),
+            Some(hi) => out.push(Interval { lo: Some(hi), lo_inc: last.hi_inc == false, hi: None, hi_inc: true })
+        };
+        normalize(out)
+    }
+}
+
+fn range_is_empty(r: Range) -> bool {
+    len(r.intervals) == 0
+}
+
+fn range_is_any(r: Range) -> bool {
+    if len(r.intervals) != 1 {
+        false
+    } else {
+        let iv = r.intervals[0];
+        let lo_open = match iv.lo { None => true, Some(x) => false };
+        let hi_open = match iv.hi { None => true, Some(x) => false };
+        lo_open && hi_open
+    }
+}
+
+fn range_is_subset(a: Range, b: Range) -> bool {
+    range_is_empty(range_intersect(a, range_complement(b)))
+}
+
+fn range_is_disjoint(a: Range, b: Range) -> bool {
+    range_is_empty(range_intersect(a, b))
+}
+
+fn same_triple(a: Version, b: Version) -> bool {
+    a.major == b.major && a.minor == b.minor && a.patch == b.patch
+}
+
+# A prerelease of the same triple at either end of the interval.
+fn interval_admits_pre(iv: Interval, v: Version) -> bool {
+    let at_lo = match iv.lo {
+        None => false,
+        Some(lo) => len(lo.pre) > 0 && same_triple(lo, v)
+    };
+    let at_hi = match iv.hi {
+        None => false,
+        Some(hi) => len(hi.pre) > 0 && same_triple(hi, v)
+    };
+    at_lo || at_hi
+}
+
+fn range_contains(r: Range, v: Version) -> bool {
+    let @mut i = 0;
+    let @mut found = false;
+    while i < len(r.intervals) {
+        let iv = r.intervals[i];
+        if interval_contains(iv, v) {
+            if len(v.pre) == 0 || interval_admits_pre(iv, v) { found = true } else { () }
+        } else { () };
+        i = i + 1
+    }
+    found
+}
+
+# Some(v) when the range is exactly one version.
+fn range_exact_version(r: Range) -> Option {
+    if len(r.intervals) != 1 {
+        None
+    } else {
+        let iv = r.intervals[0];
+        match iv.lo {
+            None => None,
+            Some(lo) => match iv.hi {
+                None => None,
+                Some(hi) => if iv.lo_inc && iv.hi_inc && version_eq(lo, hi) { Some(lo) } else { None }
+            }
+        }
+    }
+}
+
+fn interval_to_string(iv: Interval) -> string {
+    let exact = match iv.lo {
+        None => false,
+        Some(lo) => match iv.hi { None => false, Some(hi) => version_eq(lo, hi) }
+    };
+    if exact {
+        match iv.lo { None => "", Some(lo) => "=" + version_to_string(lo) }
+    } else {
+        let lo_text = match iv.lo {
+            None => "",
+            Some(lo) => (if iv.lo_inc { ">=" } else { ">" }) + version_to_string(lo)
+        };
+        let hi_text = match iv.hi {
+            None => "",
+            Some(hi) => (if iv.hi_inc { "<=" } else { "<" }) + version_to_string(hi)
+        };
+        if len(lo_text) > 0 && len(hi_text) > 0 {
+            lo_text + ", " + hi_text
+        } else {
+            if len(lo_text) > 0 { lo_text } else { if len(hi_text) > 0 { hi_text } else { "*" } }
+        }
+    }
+}
+
+# The same spelling the Python module prints: "*", "(none)", or
+# intervals joined by " or ".
+fn range_to_string(r: Range) -> string {
+    if range_is_any(r) {
+        "*"
+    } else {
+        if len(r.intervals) == 0 {
+            "(none)"
+        } else {
+            let @mut out = "";
+            let @mut i = 0;
+            while i < len(r.intervals) {
+                if i > 0 { out = out + " or " } else { () };
+                out = out + interval_to_string(r.intervals[i]);
+                i = i + 1
+            }
+            out
+        }
+    }
+}
+
+# ---------------------------------------------------------------------
+# requirements
+
+# A partial version such as "1", "1.2", "1.2.*" or "1.2.3-rc.1".
+struct Partial {
+    major: int,
+    minor: Option,
+    patch: Option,
+    pre: Vec
+}
+
+fn parse_partial(text: string) -> Option {
+    let dash = split_on(text, "-");
+    let core = dash[0];
+    let pre_text = if len(dash) > 1 { text[len(core) + 1:len(text)] } else { "" };
+    let parts = split_on(core, ".");
+    if len(parts) == 0 || len(parts) > 3 {
+        None
+    } else {
+        match numeric_component(parts[0]) {
+            None => None,
+            Some(major) => {
+                let minor = if len(parts) > 1 { component_or_wild(parts[1]) } else { Some(None) };
+                let patch = if len(parts) > 2 { component_or_wild(parts[2]) } else { Some(None) };
+                match minor {
+                    None => None,
+                    Some(minor_opt) => match patch {
+                        None => None,
+                        Some(patch_opt) => {
+                            let minor_missing = match minor_opt { None => true, Some(x) => false };
+                            let patch_present = match patch_opt { None => false, Some(x) => true };
+                            if minor_missing && patch_present {
+                                None
+                            } else {
+                                match parse_pre(pre_text, len(dash) > 1) {
+                                    None => None,
+                                    Some(pre) => Some(Partial { major: major, minor: minor_opt, patch: patch_opt, pre: pre })
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+# Some(Some(n)) for a number, Some(None) for "*", None when malformed.
+fn component_or_wild(s: string) -> Option {
+    if s == "*" {
+        Some(None)
+    } else {
+        match numeric_component(s) {
+            None => None,
+            Some(n) => Some(Some(n))
+        }
+    }
+}
+
+fn or_zero(o: Option) -> int {
+    match o { None => 0, Some(n) => n }
+}
+
+fn caret(p: Partial) -> Range {
+    let lo = Version { major: p.major, minor: or_zero(p.minor), patch: or_zero(p.patch), pre: p.pre };
+    let minor_missing = match p.minor { None => true, Some(x) => false };
+    let patch_missing = match p.patch { None => true, Some(x) => false };
+    let hi = if p.major > 0 || minor_missing {
+        version(p.major + 1, 0, 0)
+    } else {
+        if or_zero(p.minor) > 0 || patch_missing {
+            version(0, or_zero(p.minor) + 1, 0)
+        } else {
+            version(0, 0, or_zero(p.patch) + 1)
+        }
+    };
+    range_between(Some(lo), Some(hi), true, false)
+}
+
+fn tilde(p: Partial) -> Range {
+    let lo = Version { major: p.major, minor: or_zero(p.minor), patch: or_zero(p.patch), pre: p.pre };
+    let hi = match p.minor {
+        None => version(p.major + 1, 0, 0),
+        Some(minor) => version(p.major, minor + 1, 0)
+    };
+    range_between(Some(lo), Some(hi), true, false)
+}
+
+# "1.2.3" exactly, "1.2" the 1.2.x span, "1" the 1.x.x span.
+fn wild_or_exact(p: Partial) -> Range {
+    match p.patch {
+        Some(patch) => range_exact(Version { major: p.major, minor: or_zero(p.minor), patch: patch, pre: p.pre }),
+        None => {
+            let lo = version(p.major, or_zero(p.minor), 0);
+            let hi = match p.minor {
+                None => version(p.major + 1, 0, 0),
+                Some(minor) => version(p.major, minor + 1, 0)
+            };
+            range_between(Some(lo), Some(hi), true, false)
+        }
+    }
+}
+
+fn comparator(op: string, p: Partial) -> Range {
+    match p.patch {
+        Some(patch) => {
+            let v = Version { major: p.major, minor: or_zero(p.minor), patch: patch, pre: p.pre };
+            if op == ">=" { range_between(Some(v), None, true, false) } else {
+            if op == ">" { range_between(Some(v), None, false, false) } else {
+            if op == "<" { range_between(None, Some(v), true, false) } else {
+            if op == "<=" { range_between(None, Some(v), true, true) } else {
+            range_exact(v) } } } }
+        },
+        None => {
+            # a partial version names a whole span
+            let span = wild_or_exact(p);
+            let iv = span.intervals[0];
+            if op == ">=" { range_between(iv.lo, None, true, false) } else {
+            if op == ">" { range_between(iv.hi, None, true, false) } else {
+            if op == "<" { range_between(None, iv.lo, true, false) } else {
+            if op == "<=" { range_between(None, iv.hi, true, false) } else {
+            span } } } }
+        }
+    }
+}
+
+fn has_char(s: string, c: string) -> bool {
+    let @mut i = 0;
+    let @mut found = false;
+    while i < len(s) {
+        if s[i] == c { found = true } else { () };
+        i = i + 1
+    }
+    found
+}
+
+fn starts(s: string, prefix: string) -> bool {
+    len(s) >= len(prefix) && s[0:len(prefix)] == prefix
+}
+
+# One comparator: Some(Range) or None when malformed.
+fn parse_one(part: string) -> Option {
+    if len(part) == 0 {
+        None
+    } else {
+        if starts(part, "^") {
+            match parse_partial(trim(part[1:len(part)])) { None => None, Some(p) => Some(caret(p)) }
+        } else { if starts(part, "~") {
+            match parse_partial(trim(part[1:len(part)])) { None => None, Some(p) => Some(tilde(p)) }
+        } else { if starts(part, ">=") || starts(part, "<=") {
+            match parse_partial(trim(part[2:len(part)])) { None => None, Some(p) => Some(comparator(part[0:2], p)) }
+        } else { if starts(part, ">") || starts(part, "<") || starts(part, "=") {
+            match parse_partial(trim(part[1:len(part)])) { None => None, Some(p) => Some(comparator(part[0:1], p)) }
+        } else { if has_char(part, "*") {
+            if part == "*" { Some(range_any()) } else {
+                match parse_partial(part) { None => None, Some(p) => Some(wild_or_exact(p)) }
+            }
+        } else {
+            match parse_partial(part) { None => None, Some(p) => Some(caret(p)) }
+        } } } } }
+    }
+}
+
+# Some(Range) for a requirement in the Cargo dialect, None when any
+# comparator is malformed.
+fn parse_requirement(text: string) -> Option {
+    let s = trim(text);
+    if len(s) == 0 || s == "*" {
+        Some(range_any())
+    } else {
+        let parts = split_on(s, ",");
+        let @mut result = range_any();
+        let @mut ok = true;
+        let @mut i = 0;
+        while i < len(parts) {
+            match parse_one(trim(parts[i])) {
+                None => { ok = false },
+                Some(r) => { result = range_intersect(result, r) }
+            };
+            i = i + 1
+        }
+        if ok { Some(result) } else { None }
+    }
+}

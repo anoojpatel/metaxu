@@ -58,6 +58,18 @@ object, a seeded RNG singleton, an aborting `assert`).
 | `std.random` | implemented (seeded only) | `effect Random { next }` with **no default** (see below); `with_seed` (xorshift64), `with_sequence` (scripted draws); `next_below`, `next_range`, `next_bool`, `next_sign`, `choose`, `take_random`, `shuffle` |
 | `std.parse` | implemented | `parse_int` (Option) / `parse_int_or` / `parse_int_or_fail` (Fail), `parse_bool`, `digit_value`, `is_digit`, `is_space`, `trim`, `split_on`, `parse_int_vec` |
 | `std.test` | implemented | `effect Report { passed, failed }`; `assert_true`/`assert_false`/`assert_eq`/`assert_ne`/`check`/`check_eq`; runners `run_suite` (failure count), `run_tests` (`TestReport`), `collect_failures` |
+
+### Round 3 — glade in Metaxu
+
+The package manager's pieces, ported from `src/metaxu/glade/` with the
+Python module as the oracle for each (`docs/glade_in_metaxu.md`). These
+run on the interpreter; the native backend needs string indexing and
+per-use enum payload kinds first, and each module's differential test
+carries a strict `xfail` for that.
+
+| Module | Oracle | Status | Contents |
+| --- | --- | --- | --- |
+| `std.semver` | `glade/semver.py` | implemented (interpreter) | `Version`, `Interval`, `Range`; `parse_version`, `version_to_string`, `compare_version`; `range_any/empty/exact/between`, `range_intersect/union/complement`, `range_contains` (prerelease rule), `range_is_subset/disjoint`, `range_to_string`; `parse_requirement` in the Cargo dialect (`^`, `~`, `*`, `=`, comparators, commas) |
 | `std.iter` | implemented | the adapters `std.stream` defers, over real tuples: `enumerate`, `zip`, `zip_with`, `take_while`, `drop_while`, `step_by`, `windows`, `chunks` |
 
 ### Round 3
