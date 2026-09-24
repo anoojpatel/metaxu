@@ -25,6 +25,10 @@ with no section and uses it as the release notes.
   cloned per call-site kinds, which also fixes a helper reached with
   `Vec` of int and `Vec` of float printing `10.0` for `10`. `std.semver`
   and `std.solve` now compile and run natively.
+- String builtins `split`, `find`, `replace`, `trim` and `join`, linear
+  on both engines (C-backed natively); `std.parse.trim`, `split_on` and
+  `std.string.join` now delegate to them, and `split_on` accepts a
+  separator of any length.
 - An assignment statement evaluates to `()`. A `-> ()` function ending
   in `s.f = v` used to return the struct.
 - `scripts/release.py`: one command to cut a release.

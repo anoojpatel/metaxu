@@ -41,7 +41,7 @@ keep compiling unchanged.
 | `std.result` | Result (`Throw.an`) | implemented | `map`, `map_err`, `and_then`, `unwrap_or(_else)`, `is_ok`, `is_err`, `ok`, `err` |
 | `std.math` | `Math.an` | partial | `pi`/`tau`/`e` (module constants), `abs`, `min`, `max`, `clamp`, `sign`, `sqrt`, `sin`, `cos`, `powi` |
 | `std.vec` | `Vec.an` | implemented | `of1..of3`, `range_vec`, `sum`, `product`, `contains`, `index_of`, `first`, `last`, `is_empty`, `map`, `filter`, `reverse`, `concat`, `max_of`, `min_of` |
-| `std.string` | `String.an` | partial | `is_empty`, `eq`, `concat`, `repeat`, `join`, `char_at`, `contains_char`, `count_char`, `index_of_char`, `starts_with`, `ends_with`, `reverse` |
+| `std.string` | `String.an` | partial | `is_empty`, `eq`, `concat`, `repeat`, `join` (over the `join` builtin), `char_at`, `contains_char`, `count_char`, `index_of_char`, `starts_with`, `ends_with`, `reverse` |
 | `std.map` | `HashMap.an` | placeholder (by design) | assoc-list `Map` struct; `empty`, `size`, `is_empty`, `contains_key`, `get`, `get_or`, `put`, `remove`, `keys`, `values` — **every op is O(n)**; API shaped so a real hash map can replace the representation |
 | `std.prelude` | `Prelude.an` | implemented | curated re-exports (`public from ... import`) of the unambiguous names |
 
@@ -56,7 +56,7 @@ object, a seeded RNG singleton, an aborting `assert`).
 | `std.state` | implemented | `effect State { get, put }`; `eval_state`/`with_state` (result), `exec_state` (final state), `run_state` (both, via `StateResult`), `modify`, `gets`, `update`, `increment` |
 | `std.log` | implemented | `effect Log { debug, info, warn, error }` with stdout defaults; `log_*` wrappers; `level_*` constants; handlers `with_stdout_logging`, `quietly`, `collect_logs`, `with_collected_logs`, `run_collected` (`LogRun`), `with_min_level` |
 | `std.random` | implemented (seeded only) | `effect Random { next }` with **no default** (see below); `with_seed` (xorshift64), `with_sequence` (scripted draws); `next_below`, `next_range`, `next_bool`, `next_sign`, `choose`, `take_random`, `shuffle` |
-| `std.parse` | implemented | `parse_int` (Option) / `parse_int_or` / `parse_int_or_fail` (Fail), `parse_bool`, `digit_value`, `is_digit`, `is_space`, `trim`, `split_on`, `parse_int_vec` |
+| `std.parse` | implemented | `parse_int` (Option) / `parse_int_or` / `parse_int_or_fail` (Fail), `parse_bool`, `digit_value`, `is_digit`, `is_space`, `trim` and `split_on` (over the `trim` and `split` builtins), `parse_int_vec` |
 | `std.test` | implemented | `effect Report { passed, failed }`; `assert_true`/`assert_false`/`assert_eq`/`assert_ne`/`check`/`check_eq`; runners `run_suite` (failure count), `run_tests` (`TestReport`), `collect_failures` |
 
 ### Round 3 — glade in Metaxu

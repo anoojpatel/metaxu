@@ -109,7 +109,8 @@ _MATH_EXTERNS: Dict[str, Tuple[Tuple[str, ...], str]] = {
 # function manipulates runtime objects (vectors, strings, trait dictionaries)
 # that the direct subset cannot represent as i64/f64.
 _RUNTIME_PREFIXES = ("__vec_", "__index_", "__slice_", "__range", "__trait$", "__static$")
-_RUNTIME_NAMES = {"to_string", "int_to_str", "type_of", "len", "push", "pop", "Vec.new"}
+_RUNTIME_NAMES = {"to_string", "int_to_str", "type_of", "len", "push", "pop", "Vec.new",
+                  "split", "find", "replace", "trim", "join"}
 
 _HEADER = (
     "; CLIF emitted by metaxu codegen_clif (direct subset + selective CPS)\n"

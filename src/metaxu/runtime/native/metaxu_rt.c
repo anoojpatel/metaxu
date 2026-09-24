@@ -1185,6 +1185,133 @@ int64_t mx_str_eq(const char *a, const char *b) {
     return strcmp(a, b) == 0 ? 1 : 0;
 }
 
+/* The linear string builtins (`s.split(sep)`, `s.find(sub)`,
+ * `s.replace(old, new)`, `s.trim()`, `parts.join(sep)`): each mirrors the
+ * interpreter's Python-backed builtin of the same name, including the two
+ * catchable diagnostics ("split: empty separator", "replace: empty
+ * pattern").  Every result is a FRESH allocation (a string, or a Vec whose
+ * elements are fresh strings); nothing retains its arguments.  Receiver
+ * TYPE errors cannot arise here: the backend's kind checks reject a
+ * non-string receiver at compile time, where the interpreter raises. */
+
+static char *mx_str_dup_n(const char *s, size_t n) {
+    char *out = (char *)mx_rt_malloc(n + 1);
+    memcpy(out, s, n);
+    out[n] = '\0';
+    return out;
+}
+
+int64_t mx_str_find(const char *s, const char *sub) {
+    mx_str_check(s, "find", "receiver");
+    mx_str_check(sub, "find", "argument");
+    const char *p = strstr(s, sub);  /* an empty `sub` is found at 0 */
+    return p == NULL ? -1 : (int64_t)(p - s);
+}
+
+mx_vec *mx_str_split(const char *s, const char *sep) {
+    mx_str_check(s, "split", "receiver");
+    mx_str_check(sep, "split", "separator");
+    size_t ls = strlen(sep);
+    if (ls == 0) {
+        mx_rt_raise("split: empty separator");  /* catchable */
+    }
+    mx_vec *out = mx_vec_new();
+    const char *cur = s;
+    for (;;) {
+        const char *p = strstr(cur, sep);
+        if (p == NULL) {
+            break;
+        }
+        mx_vec_push(out, (int64_t)(intptr_t)mx_str_dup_n(cur, (size_t)(p - cur)));
+        cur = p + ls;
+    }
+    mx_vec_push(out, (int64_t)(intptr_t)mx_str_dup_n(cur, strlen(cur)));
+    return out;
+}
+
+char *mx_str_replace(const char *s, const char *old, const char *new_) {
+    mx_str_check(s, "replace", "receiver");
+    mx_str_check(old, "replace", "pattern");
+    mx_str_check(new_, "replace", "replacement");
+    size_t lo = strlen(old);
+    if (lo == 0) {
+        mx_rt_raise("replace: empty pattern");  /* catchable */
+    }
+    size_t ln = strlen(new_);
+    size_t count = 0;
+    for (const char *p = strstr(s, old); p != NULL; p = strstr(p + lo, old)) {
+        count++;
+    }
+    size_t ls = strlen(s);
+    char *out = (char *)mx_rt_malloc(ls - count * lo + count * ln + 1);
+    char *w = out;
+    const char *cur = s;
+    for (;;) {
+        const char *p = strstr(cur, old);
+        if (p == NULL) {
+            break;
+        }
+        memcpy(w, cur, (size_t)(p - cur));
+        w += p - cur;
+        memcpy(w, new_, ln);
+        w += ln;
+        cur = p + lo;
+    }
+    size_t tail = strlen(cur);
+    memcpy(w, cur, tail);
+    w[tail] = '\0';
+    return out;
+}
+
+static int mx_str_is_trim_space(char c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+}
+
+char *mx_str_trim(const char *s) {
+    mx_str_check(s, "trim", "receiver");
+    size_t start = 0;
+    size_t stop = strlen(s);
+    while (start < stop && mx_str_is_trim_space(s[start])) {
+        start++;
+    }
+    while (stop > start && mx_str_is_trim_space(s[stop - 1])) {
+        stop--;
+    }
+    return mx_str_dup_n(s + start, stop - start);
+}
+
+char *mx_str_join(const mx_vec *parts, const char *sep) {
+    if (parts == NULL) {
+        mx_rt_fail("join: expected a Vec receiver, got NULL");
+    }
+    mx_str_check(sep, "join", "separator");
+    int64_t n = mx_vec_len(parts);
+    size_t ls = strlen(sep);
+    size_t total = 0;
+    for (int64_t i = 0; i < n; i++) {
+        const char *e = (const char *)(intptr_t)mx_vec_get(parts, i);
+        mx_str_check(e, "join", "element");
+        total += strlen(e);
+    }
+    if (n > 1) {
+        total += ls * (size_t)(n - 1);
+    }
+    char *out = (char *)mx_rt_malloc(total + 1);
+    char *w = out;
+    for (int64_t i = 0; i < n; i++) {
+        if (i > 0) {
+            memcpy(w, sep, ls);
+            w += ls;
+        }
+        const char *e = (const char *)(intptr_t)mx_vec_get(parts, i);
+        size_t le = strlen(e);
+        memcpy(w, e, le);
+        w += le;
+    }
+    *w = '\0';
+    return out;
+}
+
 /* ------------------------------------------------------------------------
  * Bitwise shifts: validate the COUNT, then let the caller emit shl/ashr.
  *

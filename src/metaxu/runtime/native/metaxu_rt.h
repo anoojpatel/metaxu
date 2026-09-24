@@ -29,6 +29,11 @@
  * | mx_i64_to_str    | char* (int64_t)                            | fresh malloc'd decimal string |
  * | mx_f64_to_str    | char* (double)                             | fresh malloc'd string, Python str(float) format |
  * | mx_str_eq        | int64_t (const char*, const char*)         | 1 if contents equal, else 0 |
+ * | mx_str_find      | int64_t (const char*, const char*)         | index of the first occurrence, -1 if absent |
+ * | mx_str_split     | mx_vec* (const char*, const char*)         | fresh Vec of fresh strings; raises on an empty separator |
+ * | mx_str_replace   | char* (const char*, const char*, const char*) | fresh string; raises on an empty pattern |
+ * | mx_str_trim      | char* (const char*)                        | fresh string without leading/trailing space, tab, newline, return |
+ * | mx_str_join      | char* (const mx_vec*, const char*)         | fresh string joining the Vec's string elements |
  * | mx_str_free      | void (char*)                               | frees a produced string; NULL is a no-op |
  * | mx_shift_check   | int64_t (int64_t count, int64_t is_left)   | returns count; aborts unless 0 <= count < 64 |
  * | mx_vec_as_bytes  | unsigned char* (const mx_vec*)             | fresh malloc'd byte SNAPSHOT of the elements |
@@ -300,6 +305,16 @@ char   *mx_str_index(const char *s, int64_t idx);
    as mx_fvec_slice).  A zero step raises "slice: step must be non-zero". */
 char   *mx_str_slice(const char *s, int64_t start, int64_t stop,
                      int64_t step, int64_t mask);
+/* The linear string builtins; every result is fresh, nothing is retained.
+   `split` on an empty separator and `replace` with an empty pattern raise
+   the interpreter's catchable diagnostics; `find` answers -1 when absent;
+   `trim` strips ' ', '\t', '\n' and '\r' from both ends; `join` takes a Vec
+   whose element words are strings (the compiler guarantees the kind). */
+int64_t mx_str_find(const char *s, const char *sub);
+mx_vec *mx_str_split(const char *s, const char *sep);
+char   *mx_str_replace(const char *s, const char *old, const char *new_);
+char   *mx_str_trim(const char *s);
+char   *mx_str_join(const mx_vec *parts, const char *sep);
 char   *mx_i64_to_str(int64_t value);
 char   *mx_f64_to_str(double value);
 int64_t mx_str_eq(const char *a, const char *b);

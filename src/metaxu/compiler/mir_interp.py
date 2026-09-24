@@ -1707,6 +1707,13 @@ class MirInterpreter:
         self._builtins["to_string"] = lambda x: "()" if x is UNIT else str(mx_display(x))
         self._builtins["len"] = _builtin_len
         self._builtins["assert"] = _builtin_assert
+        # Linear string builtins (method position `s.split(",")` and plain
+        # `split(s, ",")` alike; C-backed natively, see metaxu_rt.c).
+        self._builtins["split"] = _builtin_split
+        self._builtins["find"] = _builtin_find
+        self._builtins["replace"] = _builtin_replace
+        self._builtins["trim"] = _builtin_trim
+        self._builtins["join"] = _builtin_join
         # --- Runtime library: Tile (docs/gpu_tiles.md Stage 0) --------------
         # Dotted statics only in v1 (the Vec.new resolution path): no
         # method-position names, no collisions with std/user `dot`/`sum`.
@@ -3030,6 +3037,57 @@ def _builtin_push(recv: Any, *vals: Any) -> Any:
         raise InterpError(f"push: expected exactly 1 value, got {len(vals)}")
     recv.items.append(vals[0])
     return UNIT
+
+
+def _str_builtin_arg(op: str, role: str, v: Any) -> str:
+    if not isinstance(v, str):
+        raise InterpError(
+            f"{op}: expected a string {role}, got {_runtime_type_name(v)!r}")
+    return v
+
+
+# The linear string builtins.  The native runtime (metaxu_rt.c, mx_str_*)
+# reproduces each result and each catchable diagnostic byte for byte; the
+# receiver/argument TYPE errors below are the interpreter's alone, because
+# the native backend rejects those programs at compile time.
+
+def _builtin_split(recv: Any, sep: Any) -> Any:
+    s = _str_builtin_arg("split", "receiver", recv)
+    sp = _str_builtin_arg("split", "separator", sep)
+    if sp == "":
+        raise InterpError("split: empty separator")
+    return MxVec(s.split(sp))
+
+
+def _builtin_find(recv: Any, sub: Any) -> int:
+    s = _str_builtin_arg("find", "receiver", recv)
+    return s.find(_str_builtin_arg("find", "argument", sub))
+
+
+def _builtin_replace(recv: Any, old: Any, new: Any) -> str:
+    s = _str_builtin_arg("replace", "receiver", recv)
+    o = _str_builtin_arg("replace", "pattern", old)
+    n = _str_builtin_arg("replace", "replacement", new)
+    if o == "":
+        raise InterpError("replace: empty pattern")
+    return s.replace(o, n)
+
+
+def _builtin_trim(recv: Any) -> str:
+    return _str_builtin_arg("trim", "receiver", recv).strip(" \t\n\r")
+
+
+def _builtin_join(recv: Any, sep: Any) -> str:
+    if not isinstance(recv, MxVec):
+        raise InterpError(
+            f"join: expected a Vec receiver, got {_runtime_type_name(recv)!r}")
+    sp = _str_builtin_arg("join", "separator", sep)
+    for i, e in enumerate(recv.items):
+        if not isinstance(e, str):
+            raise InterpError(
+                f"join: element {i} is not a string, got "
+                f"{_runtime_type_name(e)!r}")
+    return sp.join(recv.items)
 
 
 def _builtin_list_concat(*parts: Any) -> Any:

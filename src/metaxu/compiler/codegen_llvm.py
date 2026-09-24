@@ -1034,6 +1034,10 @@ _INLINE_BUILTINS = {"neg", "not", "bnot"}
 #   to_string / int_to_str -> mx_i64_to_str / mx_f64_to_str / identity(str)
 _NATIVE_RT_CALLS = {"Vec.new", "push", "pop", "len", "to_string",
                     "int_to_str", "__index_get", "__vec_lit",
+                    # Linear string builtins -> mx_str_find / mx_str_split /
+                    # mx_str_replace / mx_str_trim / mx_str_join (fresh
+                    # results, leak by design like concat).
+                    "split", "find", "replace", "trim", "join",
                     # Fixed-vector builtins (increment 10) — mx_fvec_*:
                     "__vec_dim", "__vec_zeros", "__vec_filled",
                     "__vec_comprehension", "__range", "__slice_get",
@@ -1084,7 +1088,18 @@ _FFI_CALLS = set(_EXTERN_C_SIGS) | _FFI_SHIMS
 # dispatch order is UNCHANGED by the plain-call precedence flip -- see
 # docs/name_precedence.md section 5.
 _TRAIT_BUILTIN_FALLBACK = {"to_string", "int_to_str", "len", "push", "pop",
+                           "split", "find", "replace", "trim", "join",
                            "sqrt", "sin", "cos", "assert"} | _FFI_CALLS
+
+# The linear string builtins' native symbols, argument arities and result
+# kinds (every argument is a str, except join's Vec-of-str receiver).
+_STR_BUILTIN_SYMS = {
+    "find": ("mx_str_find", 2, I64),
+    "split": ("mx_str_split", 2, _VEC_PREFIX + STR),
+    "replace": ("mx_str_replace", 3, STR),
+    "trim": ("mx_str_trim", 1, STR),
+    "join": ("mx_str_join", 2, STR),
+}
 
 # Callees still implemented only by the interpreter runtime (demote).
 # `__vec_lit` is native since increment 9 (checked before these prefixes);
@@ -1164,6 +1179,12 @@ _RT_SIGS = {
     # copies with the interpreter's exact bounds diagnostic.
     "mx_str_index": ("ptr", ("ptr", "i64")),
     "mx_str_slice": ("ptr", ("ptr", "i64", "i64", "i64", "i64")),
+    # Linear string builtins (fresh results; split's Vec holds fresh strings).
+    "mx_str_find": ("i64", ("ptr", "ptr")),
+    "mx_str_split": ("ptr", ("ptr", "ptr")),
+    "mx_str_replace": ("ptr", ("ptr", "ptr", "ptr")),
+    "mx_str_trim": ("ptr", ("ptr",)),
+    "mx_str_join": ("ptr", ("ptr", "ptr")),
     "mx_i64_to_str": ("ptr", ("i64",)),
     "mx_f64_to_str": ("ptr", ("double",)),
     "mx_str_eq": ("i64", ("ptr", "ptr")),
@@ -3636,7 +3657,7 @@ def _resolve_trait_call(method: str, recv_kind: str, traits: _TraitTable,
         hit = from_impl("Vec")
         if hit is not None:
             return hit
-        if method in ("push", "pop", "len"):
+        if method in ("push", "pop", "len", "join"):
             return ("builtin", method)
         if method in ("to_string", "int_to_str"):
             return ("demote",
@@ -3669,8 +3690,8 @@ def _resolve_trait_call(method: str, recv_kind: str, traits: _TraitTable,
         hit = from_impl("String")
         if hit is not None:
             return hit
-        if method == "len":
-            return ("builtin", "len")
+        if method in ("len", "find", "split", "replace", "trim"):
+            return ("builtin", method)
         if method in ("to_string", "int_to_str"):
             return ("builtin", "to_string")
         return plain_fn_fallback(
@@ -4009,6 +4030,16 @@ def _infer_kinds(info: _Info, sigs: Dict[str, _Sig], structs: _StructTable,
             pass  # receiver may be vec/vector/str; dst stays i64
         elif name in ("to_string", "int_to_str"):
             ch = mark(dst, STR) or ch
+        elif name in _STR_BUILTIN_SYMS:
+            # Every argument is a string (join's receiver a Vec of strings);
+            # the interpreter rejects anything else at run time, so pinning
+            # is exact for accepted programs and a disagreement conflicts.
+            _sym, arity, res = _STR_BUILTIN_SYMS[name]
+            if len(args) == arity:
+                for i, a in enumerate(args):
+                    ch = mark(a, _vec_of(STR) if (name == "join" and i == 0)
+                              else STR) or ch
+                ch = mark(dst, res) or ch
         elif name in _MATH_EXTERNS:
             for a in args:
                 ch = mark(a, F64) or ch
@@ -5107,6 +5138,21 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                     "(only Vec, fixed vector and string lower natively)")
             elif ty(dst) != I64:
                 probs.append(f"len result {dst!r} promoted to {ty(dst)}")
+        elif name in _STR_BUILTIN_SYMS:
+            _sym, arity, res = _STR_BUILTIN_SYMS[name]
+            if len(args) != arity:
+                probs.append(
+                    f"{name} with {len(args)} arguments (expects {arity})")
+            else:
+                for i, a in enumerate(args):
+                    want = _vec_of(STR) if (name == "join" and i == 0) else STR
+                    if ty(a) != want:
+                        probs.append(
+                            f"{name} argument {a!r} has kind {ty(a)}, "
+                            f"expects {want}")
+                if ty(dst) != res:
+                    probs.append(
+                        f"{name} result {dst!r} is {ty(dst)}, expects {res}")
         elif name in ("to_string", "int_to_str"):
             ak = ty(args[0]) if len(args) == 1 else I64
             if len(args) != 1:
@@ -6296,7 +6342,8 @@ def _compute_slots(info: _Info, kinds: Dict[str, str]) -> List[str]:
 # argument without retaining the pointer (metaxu_rt.c stores no receiver).
 # as_ptr qualifies: mx_vec_as_bytes returns an INDEPENDENT byte snapshot
 # that never aliases the vec's buffer, so freeing the vec leaves it intact.
-_VEC_SAFE_RECEIVER_BUILTINS = {"push", "pop", "len", "__index_get", "as_ptr"}
+_VEC_SAFE_RECEIVER_BUILTINS = {"push", "pop", "len", "__index_get", "as_ptr",
+                               "join"}  # mx_str_join copies the elements out
 
 
 def _provably_dead_vecs(f: MirFunc, kinds: Dict[str, str],
@@ -6576,6 +6623,11 @@ def _owned_strings(f: MirFunc, kinds: Dict[str, str], info: _Info,
                     if bname == "len" and len(args) == 1 \
                             and kd(args[0]) == STR:
                         mark_use(args[0], ("ok",))  # mx_str_len reads only
+                    elif bname in _STR_BUILTIN_SYMS:
+                        # mx_str_find/split/replace/trim/join read their
+                        # string arguments and copy what they keep.
+                        for a in args:
+                            mark_use(a, ("ok",))
                     else:
                         # includes to_string of a str (identity ALIAS), any
                         # module function, push, and every other callee.
@@ -8906,6 +8958,16 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                 mod.runtime_syms.add(sym)
                 v = fresh()
                 lines.append(f"  {v} = call i64 @{sym}(ptr {recv})")
+            setval(dst, v, lines)
+        elif name in _STR_BUILTIN_SYMS:
+            sym, _arity, res = _STR_BUILTIN_SYMS[name]
+            mod.runtime_syms.add(sym)
+            argl = ", ".join(f"ptr {use(a, lines)}" for a in opargs)
+            v = fresh()
+            rty = "i64" if res == I64 else "ptr"
+            note = ("" if res == I64
+                    else "  ; fresh result (leaks by design)")
+            lines.append(f"  {v} = call {rty} @{sym}({argl}){note}")
             setval(dst, v, lines)
         elif name in ("to_string", "int_to_str"):
             k = kind(opargs[0])

@@ -132,45 +132,20 @@ fn parse_bool(s: string) {
     }
 }
 
-# `s` without leading or trailing whitespace.
+# `s` without leading or trailing whitespace (space, tab, newline and
+# carriage return: the same set as `is_space`). A thin name over the
+# `trim` builtin, which is linear on both engines.
 fn trim(s: string) -> string {
-    let n = len(s);
-    let @mut start = 0;
-    while start < n && is_space(s[start]) {
-        start = start + 1
-    }
-    let @mut stop = n;
-    while stop > start && is_space(s[stop - 1]) {
-        stop = stop - 1
-    }
-    let @mut out = "";
-    let @mut i = start;
-    while i < stop {
-        out = out + s[i];
-        i = i + 1
-    }
-    out
+    s.trim()
 }
 
-# `s` split on every occurrence of the one-character string `sep`,
-# as a Vec of strings. Adjacent separators produce empty fields, and the
-# result always has (occurrences of sep) + 1 elements — so `split_on("",
-# ",")` is a Vec holding one empty string.
+# `s` split on every occurrence of `sep`, as a Vec of strings. Adjacent
+# separators produce empty fields, and the result always has
+# (occurrences of sep) + 1 elements — so `split_on("", ",")` is a Vec
+# holding one empty string. `sep` may be longer than one character; an
+# empty `sep` is an error. A thin name over the `split` builtin.
 fn split_on(s: string, sep: string) -> Vec {
-    let @mut parts = Vec.new();
-    let @mut current = "";
-    let @mut i = 0;
-    while i < len(s) {
-        if s[i] == sep {
-            parts.push(current);
-            current = ""
-        } else {
-            current = current + s[i]
-        };
-        i = i + 1
-    }
-    parts.push(current);
-    parts
+    s.split(sep)
 }
 
 # Parse a separated list of integers, performing Fail at the first field

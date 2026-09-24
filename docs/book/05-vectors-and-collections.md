@@ -247,9 +247,43 @@ abc sorts first
 uxatem
 ```
 
-`std.string` packages the loops you'd otherwise rewrite:
-`starts_with`, `count_char`, `repeat`, `join` over a `Vec` of parts,
-and more:
+Five builtin methods do the text work that would otherwise be a loop
+over `s[i]`, and they run in linear time on both engines: `split`
+gives a `Vec` of the pieces between a separator, `find` the index of a
+substring or `-1`, `replace` a copy with every occurrence swapped,
+`trim` a copy without leading or trailing space, tab, newline or
+carriage return, and `join`, on a `Vec` of strings, one string with a
+separator between the parts. An empty separator for `split` and an
+empty pattern for `replace` are errors, so `try` catches them:
+
+```metaxu
+fn main() -> int {
+    let line = "  name = metaxu  ";
+    let fields = line.trim().split(" = ");
+    print(len(fields));
+    print(fields[1]);
+    print("mississippi".find("ss"));
+    print("mississippi".find("xyz"));
+    print("a-b-c".replace("-", ", "));
+    print(fields.join("="));
+    let caught = try { let p = "x".split(""); "no error" } catch e { e };
+    print(caught);
+    0
+}
+```
+```output
+2
+metaxu
+2
+-1
+a, b, c
+name=metaxu
+split: empty separator
+```
+
+They are also callable as plain functions, `split(line, ",")`, like
+`len`. `std.string` packages the character-level loops you'd otherwise
+rewrite: `starts_with`, `count_char`, `repeat`, and more:
 
 ```metaxu
 import std.string

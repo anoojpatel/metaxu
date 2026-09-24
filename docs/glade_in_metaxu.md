@@ -82,7 +82,7 @@ into, and each needs work in the compiler as well as `std/`.
 | gap | why glade hits it | what to add |
 |---|---|---|
 | a byte type and string ↔ bytes | hashing a tree, reading files that are not UTF-8, TOML escapes | `bytes` as a `Vec` of `u8` or a distinct runtime value; `string.to_bytes()`, `bytes.to_string()`, byte indexing. Both engines and the C runtime. |
-| string builtins with linear cost | `std.string` does `starts_with` and `index_of_char` by `char_at` loops, which is O(n²) over a manifest | `split`, `find`, `replace`, `trim`, `to_int`, `join` as `__builtin$m` methods backed by `mx_str_*` in C, with the interpreter matching. |
+| string builtins with linear cost | `std.string` does `starts_with` and `index_of_char` by `char_at` loops, which is O(n²) over a manifest | Done: `split`, `find`, `replace`, `trim`, `join` are `__builtin$m` methods backed by `mx_str_*` in C, with the interpreter matching; `std.parse.trim`/`split_on` and `std.string.join` are thin names over them. `to_int` stays `std.parse.parse_int`, which is linear already. |
 | a hashed `Map` | the solver keeps a dozen maps keyed by package name; O(n) lookups are fine at glade's sizes but wrong in spirit | a `Hash` trait, `impl Hash for string/int`, and a bucketed `std.map` behind the same API. Not blocking. |
 | `main` arguments | the command line | either `fn main(args: Vec) -> int` accepted by both engines, or `std.env.args()`. The native `@main` wrapper already exists; it needs to carry `argv` through. |
 | stderr | diagnostics must not go to stdout | `eprint` builtin, or `std.io.stderr` as an effect operation. |
@@ -163,6 +163,14 @@ backend fixes, each found by these two modules and each now pinned in
   an `if` whose arms are a `push` and a field assignment; the second
   arm's value was the whole `Solver`, merged with unit, and the
   function demoted. Assignments now evaluate to `()` on both engines.
+
+**Step 2, string builtins: done.** `split`, `find`, `replace`, `trim`
+and `join` are builtin methods on both engines, Python-backed in the
+interpreter and `mx_str_*` in C natively, with the two catchable
+diagnostics (`split: empty separator`, `replace: empty pattern`)
+byte-identical. `test_string_builtins.py` runs a few hundred generated
+cases against Python's `str` methods on the interpreter and the same
+program natively.
 
 What the two programs still leave as placeholders is `std.fail`'s
 higher-order handlers (`try_opt(f)` and friends call a closure passed as

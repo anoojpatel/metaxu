@@ -5,8 +5,10 @@
 # `==` comparison, `len`, and single-character indexing `s[i]` (which
 # yields a one-character string — Metaxu has no separate char type, so
 # Ante's Char-based API becomes string-of-length-1 based here).
-# Byte access, casing, parsing and formatting are deferred to runtime
-# builtins that do not exist yet.
+# The linear builtins `split`, `find`, `replace`, `trim` and `join` are
+# methods on strings themselves (`s.split(",")`); this module keeps the
+# character-level helpers. Byte access, casing and formatting are
+# deferred to runtime builtins that do not exist yet.
 
 export {
     is_empty,
@@ -47,16 +49,10 @@ fn repeat(s: string, n: int) -> string {
     out
 }
 
-# The strings in `parts` joined with `sep` between elements.
+# The strings in `parts` joined with `sep` between elements. A thin
+# name over the `join` builtin, which is linear on both engines.
 fn join(parts: Vec, sep: string) -> string {
-    let @mut out = "";
-    let @mut i = 0;
-    while i < len(parts) {
-        if i > 0 { out = out + sep } else { () };
-        out = out + parts[i];
-        i = i + 1
-    }
-    out
+    parts.join(sep)
 }
 
 # The one-character string at index i.
