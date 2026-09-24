@@ -1,0 +1,44 @@
+# glade/hash.mx — the tree hash the lock records: sha256 over every file
+# under a root (relative path, NUL, contents, NUL), files in sorted
+# order, `.git` excluded. Identical to packages.tree_hash.
+
+from std.fs import walk, read_bytes;
+from std.sha256 import sha256_hex;
+
+export { tree_hash };
+
+fn tree_hash(root: string) -> string {
+    let files = walk(root);
+    let @mut data = Vec.new();
+    let @mut i = 0;
+    while i < len(files) {
+        let rel = files[i];
+        if inside_git(rel) { () } else {
+            append(data, rel.to_bytes());
+            data.push(0);
+            append(data, read_bytes(root + "/" + rel));
+            data.push(0)
+        };
+        i = i + 1
+    }
+    "sha256:" + sha256_hex(data)
+}
+
+fn inside_git(rel: string) -> bool {
+    let parts = rel.split("/");
+    let @mut i = 0;
+    let @mut found = false;
+    while i < len(parts) {
+        if parts[i] == ".git" { found = true } else { () };
+        i = i + 1
+    }
+    found
+}
+
+fn append(dst: Vec, src: Vec) -> () {
+    let @mut i = 0;
+    while i < len(src) {
+        dst.push(src[i]);
+        i = i + 1
+    }
+}

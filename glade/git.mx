@@ -1,0 +1,50 @@
+# glade/git.mx — git as a subprocess, the only network glade has.
+
+from std.process import run_in;
+from std.fs import exists, remove_all, mkdir_all;
+from std.path import dirname;
+
+export { git, fetch_git };
+
+# `git <args>` in `cwd` ("" for the current directory); stdout with
+# surrounding whitespace removed. A failure raises the Python's text:
+# "git <args> failed:\n<stderr>".
+fn git(args: Vec, cwd: string) -> string {
+    let @mut argv = Vec.new();
+    argv.push("git");
+    let @mut i = 0;
+    while i < len(args) { argv.push(args[i]); i = i + 1 };
+    let o = run_in(argv, cwd);
+    if o.status != 0 {
+        raise("git " + args.join(" ") + " failed:\n" + o.err.trim())
+    } else { () };
+    o.out.trim()
+}
+
+fn arg2(a: string, b: string) -> Vec {
+    let @mut v = Vec.new();
+    v.push(a);
+    v.push(b);
+    v
+}
+
+# Clone `url` at `rev` into `dest` (replacing what is there), strip .git,
+# answer the commit hash.
+fn fetch_git(url: string, rev: string, dest: string) -> string {
+    if exists(dest) { remove_all(dest) } else { () };
+    mkdir_all(dirname(dest));
+    let @mut clone = Vec.new();
+    clone.push("clone");
+    clone.push("--quiet");
+    clone.push(url);
+    clone.push(dest);
+    let ignored = git(clone, "");
+    let @mut checkout = Vec.new();
+    checkout.push("checkout");
+    checkout.push("--quiet");
+    checkout.push(rev);
+    let ignored2 = git(checkout, dest);
+    let commit = git(arg2("rev-parse", "HEAD"), dest);
+    let cleaned = try { remove_all(dest + "/.git"); true } catch e { false };
+    commit
+}

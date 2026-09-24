@@ -1,0 +1,243 @@
+# glade/manifest.mx — mx.toml: the Spec and Manifest models, reading and
+# writing. A port of read_manifest / write_manifest / _parse_spec in
+# src/metaxu/glade/project.py; every message is the Python one.
+
+from std.toml import Toml, Entry, entry, parse, get, get_str, get_arr, get_table, keys;
+from std.fs import is_file, read_text, write_text;
+from std.json import escape_json_string;
+from std.semver import Range, parse_requirement, range_any;
+
+export {
+    Spec,
+    Manifest,
+    spec_registry,
+    spec_git,
+    spec_path,
+    read_manifest,
+    write_manifest,
+    manifest_find,
+    manifest_put,
+    manifest_remove,
+    toml_str
+};
+
+# One dependency line. `kind` is "registry", "git" or "path"; the
+# fields the kind does not use are "" (the Python uses None).
+struct Spec {
+    name: string,
+    kind: string,
+    requirement_text: string,
+    requirement: Range,
+    git: string,
+    rev: string,
+    path: string,
+    registry: string
+}
+
+struct Manifest {
+    name: string,
+    version: string,
+    deps: Vec,
+    shared: Vec,
+    registry: string
+}
+
+fn spec_registry(name: string, text: string, requirement: Range, registry: string) -> Spec {
+    Spec { name: name, kind: "registry", requirement_text: text, requirement: requirement,
+           git: "", rev: "", path: "", registry: registry }
+}
+
+fn spec_git(name: string, git: string, rev: string) -> Spec {
+    Spec { name: name, kind: "git", requirement_text: "", requirement: range_any(),
+           git: git, rev: rev, path: "", registry: "" }
+}
+
+fn spec_path(name: string, path: string) -> Spec {
+    Spec { name: name, kind: "path", requirement_text: "", requirement: range_any(),
+           git: "", rev: "", path: path, registry: "" }
+}
+
+# A JSON string is a valid basic TOML string, which is what the Python
+# writes (json.dumps).
+fn toml_str(s: string) -> string {
+    escape_json_string(s)
+}
+
+fn read_manifest(root: string) -> Manifest {
+    let path = root + "/mx.toml";
+    if is_file(path) { () } else { raise("no mx.toml in " + root) };
+    let doc = match parse(read_text(path)) {
+        Ok(d) => d,
+        Err(e) => { raise(path + ": " + e); TTable(Vec.new()) }
+    };
+    let pkg = match get_table(doc, "package") { Some(t) => t, None => TTable(Vec.new()) };
+    let name = match get_str(pkg, "name") {
+        Some(n) => n,
+        None => { raise(path + ": [package] needs a name"); "" }
+    };
+    let version = match get_str(pkg, "version") { Some(v) => v, None => "0.0.0" };
+    let @mut shared = Vec.new();
+    match get_arr(pkg, "public") {
+        Some(items) => {
+            let @mut i = 0;
+            while i < len(items) {
+                match items[i] { TStr(s) => shared.push(s), TInt(n) => (), TBool(b) => (), TArr(a) => (), TTable(t) => () };
+                i = i + 1
+            }
+        },
+        None => ()
+    };
+    let registry = match get_table(doc, "glade") {
+        Some(g) => match get_str(g, "registry") { Some(r) => r, None => "" },
+        None => ""
+    };
+    let @mut deps = Vec.new();
+    match get_table(doc, "dependencies") {
+        Some(table) => {
+            let names = keys(table);
+            let @mut i = 0;
+            while i < len(names) {
+                let dep_name = names[i];
+                match get(table, dep_name) {
+                    Some(v) => deps.push(parse_spec(path, dep_name, v)),
+                    None => ()
+                };
+                i = i + 1
+            }
+        },
+        None => ()
+    };
+    Manifest { name: name, version: version, deps: deps, shared: shared, registry: registry }
+}
+
+fn parse_spec(path: string, name: string, v: Toml) -> Spec {
+    match v {
+        TStr(text) => spec_registry(name, text, requirement(path, name, text), ""),
+        TTable(entries) => {
+            match get_str(v, "git") {
+                Some(git) => match get_str(v, "rev") {
+                    Some(rev) => spec_git(name, git, rev),
+                    None => {
+                        raise(path + ": git dependency '" + name + "' needs a rev (tag, branch or commit)");
+                        spec_git(name, git, "")
+                    }
+                },
+                None => match get_str(v, "path") {
+                    Some(p) => spec_path(name, p),
+                    None => match get_str(v, "version") {
+                        Some(text) => {
+                            let registry = match get_str(v, "registry") { Some(r) => r, None => "" };
+                            spec_registry(name, text, requirement(path, name, text), registry)
+                        },
+                        None => {
+                            raise(path + ": dependency '" + name + "' needs a version requirement, `git` + `rev`, or `path`");
+                            spec_path(name, "")
+                        }
+                    }
+                }
+            }
+        },
+        TInt(n) => { raise(path + ": dependency '" + name + "' must be a string or a table"); spec_path(name, "") },
+        TBool(b) => { raise(path + ": dependency '" + name + "' must be a string or a table"); spec_path(name, "") },
+        TArr(a) => { raise(path + ": dependency '" + name + "' must be a string or a table"); spec_path(name, "") }
+    }
+}
+
+fn requirement(path: string, name: string, text: string) -> Range {
+    match parse_requirement(text) {
+        Some(r) => r,
+        None => { raise(path + ": dependency '" + name + "': '" + text + "' is not a version requirement"); range_any() }
+    }
+}
+
+# The index of the dependency called `name`, or -1.
+fn manifest_find(m: Manifest, name: string) -> int {
+    let @mut i = 0;
+    let @mut found = 0 - 1;
+    while i < len(m.deps) && found < 0 {
+        let s = m.deps[i];
+        if s.name == name { found = i } else { () };
+        i = i + 1
+    }
+    found
+}
+
+# Add or replace a dependency (in place: `deps` is a Vec).
+fn manifest_put(m: Manifest, spec: Spec) -> () {
+    let k = manifest_find(m, spec.name);
+    if k < 0 { m.deps.push(spec) } else { m.deps[k] = spec }
+}
+
+# Drop a dependency; false when there was none.
+fn manifest_remove(m: Manifest, name: string) -> bool {
+    let k = manifest_find(m, name);
+    if k < 0 {
+        false
+    } else {
+        let @mut i = k;
+        while i + 1 < len(m.deps) {
+            m.deps[i] = m.deps[i + 1];
+            i = i + 1
+        }
+        let @mut dropped = m.deps.pop();
+        true
+    }
+}
+
+# The exact text the Python writer produces: [package], then the
+# dependencies sorted by name, then [glade] when a registry is set.
+fn write_manifest(root: string, m: Manifest) -> () {
+    let @mut lines = Vec.new();
+    lines.push("[package]");
+    lines.push("name = " + toml_str(m.name));
+    lines.push("version = " + toml_str(m.version));
+    if len(m.shared) > 0 {
+        let @mut quoted = Vec.new();
+        let @mut i = 0;
+        while i < len(m.shared) { quoted.push(toml_str(m.shared[i])); i = i + 1 };
+        lines.push("public = [" + quoted.join(", ") + "]")
+    } else { () };
+    lines.push("");
+    lines.push("[dependencies]");
+    let names = sorted_names(m.deps);
+    let @mut j = 0;
+    while j < len(names) {
+        let d = m.deps[manifest_find(m, names[j])];
+        if d.kind == "git" {
+            lines.push(d.name + " = { git = " + toml_str(d.git) + ", rev = " + toml_str(d.rev) + " }")
+        } else { if d.kind == "path" {
+            lines.push(d.name + " = { path = " + toml_str(d.path) + " }")
+        } else { if d.registry != "" {
+            lines.push(d.name + " = { version = " + toml_str(d.requirement_text) + ", registry = " + toml_str(d.registry) + " }")
+        } else {
+            lines.push(d.name + " = " + toml_str(d.requirement_text))
+        } } };
+        j = j + 1
+    }
+    if m.registry != "" {
+        lines.push("");
+        lines.push("[glade]");
+        lines.push("registry = " + toml_str(m.registry))
+    } else { () };
+    write_text(root + "/mx.toml", lines.join("\n") + "\n")
+}
+
+fn sorted_names(deps: Vec) -> Vec {
+    let @mut names = Vec.new();
+    let @mut i = 0;
+    while i < len(deps) {
+        let s = deps[i];
+        # insertion sort on strings: manifests are short
+        let @mut j = 0;
+        while j < len(names) && names[j] < s.name { j = j + 1 };
+        names.push(s.name);
+        let @mut k = len(names) - 1;
+        while k > j {
+            names[k] = names[k - 1];
+            k = k - 1
+        }
+        names[j] = s.name;
+        i = i + 1
+    }
+    names
+}

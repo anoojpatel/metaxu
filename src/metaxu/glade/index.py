@@ -119,7 +119,9 @@ class Registry:
             self.root = local.resolve()
             self.remote = False
         else:
-            key = hashlib.sha1(source.encode()).hexdigest()[:16]
+            # sha256, which the Metaxu glade (glade/index.mx) computes too,
+            # so both implementations share one cache layout
+            key = hashlib.sha256(source.encode()).hexdigest()[:16]
             self.root = (cache or cache_dir()) / "index" / key
             self.remote = True
 

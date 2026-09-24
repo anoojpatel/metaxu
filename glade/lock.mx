@@ -1,0 +1,137 @@
+# glade/lock.mx — mx.lock: what was picked, read and written exactly as
+# src/metaxu/packages.py does (lock version 1, or 2 once any entry
+# carries a resolved registry version).
+
+from std.toml import Toml, parse, get, get_str, get_int, get_arr;
+from std.fs import is_file, read_text, write_text;
+from manifest import toml_str;
+
+export {
+    Locked,
+    locked,
+    read_lock,
+    write_lock,
+    lock_find,
+    lock_names
+};
+
+# One locked package; fields the entry lacks are "".
+struct Locked {
+    name: string,
+    source: string,
+    hash: string,
+    rev: string,
+    commit: string,
+    version: string
+}
+
+fn locked(name: string, source: string, hash: string, rev: string, commit: string, version: string) -> Locked {
+    Locked { name: name, source: source, hash: hash, rev: rev, commit: commit, version: version }
+}
+
+fn lock_find(entries: Vec, name: string) -> int {
+    let @mut i = 0;
+    let @mut found = 0 - 1;
+    while i < len(entries) && found < 0 {
+        let e = entries[i];
+        if e.name == name { found = i } else { () };
+        i = i + 1
+    }
+    found
+}
+
+fn lock_names(entries: Vec) -> Vec {
+    let @mut out = Vec.new();
+    let @mut i = 0;
+    while i < len(entries) {
+        let e = entries[i];
+        out.push(e.name);
+        i = i + 1
+    }
+    out
+}
+
+# The entries of `root/mx.lock`, empty when there is no lock.
+fn read_lock(root: string) -> Vec {
+    let path = root + "/mx.lock";
+    let @mut out = Vec.new();
+    if is_file(path) {
+        let doc = match parse(read_text(path)) {
+            Ok(d) => d,
+            Err(e) => { raise(path + ": " + e); TTable(Vec.new()) }
+        };
+        let version = match get_int(doc, "version") { Some(v) => v, None => 0 - 1 };
+        if version == 1 || version == 2 { () } else {
+            let shown = if version < 0 { "None" } else { version.to_string() };
+            raise(path + ": unsupported lock version " + shown)
+        };
+        match get_arr(doc, "package") {
+            Some(items) => {
+                let @mut i = 0;
+                while i < len(items) {
+                    let p = items[i];
+                    out.push(Locked {
+                        name: str_or(p, "name", ""), source: str_or(p, "source", ""),
+                        hash: str_or(p, "hash", ""), rev: str_or(p, "rev", ""),
+                        commit: str_or(p, "commit", ""), version: str_or(p, "version", "")
+                    });
+                    i = i + 1
+                }
+            },
+            None => ()
+        }
+    } else { () };
+    out
+}
+
+fn str_or(t: Toml, key: string, default: string) -> string {
+    match get_str(t, key) { Some(s) => s, None => default }
+}
+
+# Written sorted by name; a lock stays at version 1 until an entry
+# needs the field version 2 adds.
+fn write_lock(root: string, entries: Vec) -> () {
+    let @mut any_version = false;
+    let @mut i = 0;
+    while i < len(entries) {
+        let e = entries[i];
+        if e.version != "" { any_version = true } else { () };
+        i = i + 1
+    }
+    let @mut lines = Vec.new();
+    lines.push("version = " + (if any_version { "2" } else { "1" }));
+    let names = sorted(lock_names(entries));
+    let @mut j = 0;
+    while j < len(names) {
+        let p = entries[lock_find(entries, names[j])];
+        lines.push("");
+        lines.push("[[package]]");
+        lines.push("name = " + toml_str(p.name));
+        lines.push("source = " + toml_str(p.source));
+        if p.version != "" { lines.push("version = " + toml_str(p.version)) } else { () };
+        if p.rev != "" { lines.push("rev = " + toml_str(p.rev)) } else { () };
+        if p.commit != "" { lines.push("commit = " + toml_str(p.commit)) } else { () };
+        lines.push("hash = " + toml_str(p.hash));
+        j = j + 1
+    }
+    write_text(root + "/mx.lock", lines.join("\n") + "\n")
+}
+
+fn sorted(names: Vec) -> Vec {
+    let @mut out = Vec.new();
+    let @mut i = 0;
+    while i < len(names) {
+        let s = names[i];
+        let @mut j = 0;
+        while j < len(out) && out[j] < s { j = j + 1 };
+        out.push(s);
+        let @mut k = len(out) - 1;
+        while k > j {
+            out[k] = out[k - 1];
+            k = k - 1
+        }
+        out[j] = s;
+        i = i + 1
+    }
+    out
+}

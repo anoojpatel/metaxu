@@ -179,21 +179,46 @@ live in, and until it exists a project sets `[glade] registry` to a
 repository or directory of its own; every test runs against a
 directory.
 
-## Writing it in Metaxu
+## Written in Metaxu
 
-glade is Python today. `docs/glade_in_metaxu.md` lists what the
-language and standard library need before it can be rewritten in
-Metaxu, split into what to build in Metaxu and what to bind to C, and
-the order to do it in.
+The `glade` command runs the package manager written in Metaxu:
+`glade/*.mx` at the repository root, a Metaxu package of its own over
+`std.semver`, `std.solve`, `std.toml`, `std.sha256`, `std.path`,
+`std.json` and the IO effects. The Python implementation in
+`src/metaxu/glade/` stays as the reference, the way the interpreter is
+the reference for the native backends: `test_glade_metaxu.py` runs both
+over the scenarios of `test_glade.py` (a directory registry, git
+repositories with tags, path and git dependencies, conflicts, a moved
+tag, drift) and requires the same exit code, stdout, stderr, manifest,
+lockfile and vendored trees, byte for byte. Only argparse's own usage
+wording is not mirrored.
+
+`metaxu.glade.launch` picks the engine. With `clang` installed it
+compiles the program once through the LLVM backend into
+`$XDG_CACHE_HOME/glade/bin/glade-<key>` (the key hashes the glade and
+standard library sources and the compiler; the first run after a change
+prints `building the native glade` and takes about a minute) and every
+later command runs that binary. Without clang it runs on the MIR
+interpreter, compiling the sources each time, a few seconds per
+command. `GLADE_IMPL=native`, `interp` or `python` forces an engine;
+`GLADE_SOURCES` points at another copy of the sources. The wheel ships
+`glade/` as `metaxu/glade/mx/`, next to the standard library.
+
+`docs/glade_in_metaxu.md` is the record of how it got here: what the
+language and standard library needed, in what order, and what each
+step found in the compiler.
 
 ## Where the code is
 
 | file | what |
 |---|---|
-| `src/metaxu/glade/semver.py` | versions, requirement parsing, ranges closed under intersection, union and complement |
-| `src/metaxu/glade/pubgrub.py` | the solver and the explanation writer |
-| `src/metaxu/glade/index.py` | index format, the cache, fetching a version |
-| `src/metaxu/glade/project.py` | manifest, resolution, `sync`, `add`, `remove`, `tree` |
-| `src/metaxu/glade/cli.py` | the command |
+| `glade/main.mx` | the command: option parsing, dispatch, `glade: <why>` and exit 2 |
+| `glade/manifest.mx`, `glade/lock.mx` | `mx.toml` and `mx.lock` in and out, in the Python layout byte for byte |
+| `glade/index.mx` | the registry: index format, the cache, fetching a version, the moved-tag check |
+| `glade/project.mx` | resolution over `std.solve`, `sync`, `add`, `remove`, `update`, `tree`, `check`, `paths`, `init` |
+| `glade/hash.mx`, `glade/git.mx` | the tree hash over `std.sha256`; running git |
+| `src/metaxu/glade/launch.py` | the console script: native binary cache, interpreter fallback, `GLADE_IMPL` |
+| `src/metaxu/glade/semver.py`, `pubgrub.py`, `index.py`, `project.py`, `cli.py` | the Python reference implementation |
 | `src/metaxu/packages.py` | the lock and vendor layout the compiler reads |
-| `test_glade_solver.py`, `test_glade.py` | the solver's scenarios; the tool against a local registry and real git repositories |
+| `test_glade_solver.py`, `test_glade.py` | the solver's scenarios; the reference against a local registry and real git repositories |
+| `test_glade_metaxu.py` | the parity test, on the interpreter and natively |

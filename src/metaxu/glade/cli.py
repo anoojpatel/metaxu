@@ -26,6 +26,7 @@ from pathlib import Path
 from metaxu.packages import PackageError, check, package_roots, read_lock
 
 from .project import Project, init
+from .semver import VersionError
 
 
 def _project(args) -> Project:
@@ -157,7 +158,9 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         return args.fn(args)
-    except PackageError as e:
+    except (PackageError, VersionError) as e:
+        # A malformed requirement on the command line (`glade add geom "not
+        # a requirement"`) is a user error like any other, not a traceback.
         print(f"glade: {e}", file=sys.stderr)
         return 2
 

@@ -17,7 +17,7 @@ Repository = "https://github.com/anoojpatel/metaxu"
 [project.scripts]
 metaxu = "metaxu.metaxu:main"
 metaxuc = "metaxu.compiler.cli:main"
-glade = "metaxu.glade.cli:main"
+glade = "metaxu.glade.launch:main"
 
 [dependency-groups]
 dev = [
@@ -34,7 +34,9 @@ build-backend = "hatchling.build"
 # Python package, the C runtime sources (built on first use next to the
 # package) and a copy of the standard library, which lives at the
 # repository root as std/ and is found by module_loader._stdlib_dir at
-# metaxu/std/ inside an installed package. Build products and caches
+# metaxu/std/ inside an installed package. The package manager's Metaxu
+# sources (glade/ at the root) ship the same way, at metaxu/glade/mx/,
+# where metaxu.glade.launch finds them. Build products and caches
 # from a developer's checkout must not ship.
 [tool.hatch.build.targets.wheel]
 packages = ["src/metaxu"]
@@ -48,7 +50,8 @@ exclude = [
 
 [tool.hatch.build.targets.wheel.force-include]
 "std" = "metaxu/std"
+"glade" = "metaxu/glade/mx"
 
 [tool.hatch.build.targets.sdist]
-include = ["src/metaxu", "std", "README.md", "pyproject.toml"]
+include = ["src/metaxu", "std", "glade", "README.md", "pyproject.toml"]
 exclude = ["src/metaxu/runtime/native/_build", "**/__pycache__", "src/metaxu/parser.out", "src/metaxu/parsetab.py"]

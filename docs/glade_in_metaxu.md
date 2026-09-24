@@ -93,7 +93,7 @@ into, and each needs work in the compiler as well as `std/`.
 | effect | operations glade needs | C side | interpreter shim |
 |---|---|---|---|
 | `std.fs` | Done: `read_bytes`, `write_bytes`, `exists`, `is_dir`, `is_file`, `list_dir`, `mkdir_all`, `remove_all`, `rename`, with `read_text`, `write_text`, `try_read_text` (Result) and `walk` in Metaxu | `metaxu_io.c`: `open`/`read`/`write`, `stat`, `opendir`/`readdir`, `mkdir`, `unlink`/`rmdir`, `rename`; POSIX first, Windows later | Python `os`, `shutil` |
-| `std.process` | Done: `run(argv, cwd)` answers a handle read by `status`, `stdout`, `stderr`; `run`, `run_in`, `output_of` wrap it into an `Outcome` or a Result | `fork`+`execvp` with an exec-failure pipe, both streams drained with `poll`, `waitpid` | `subprocess.run` |
+| `std.process` | Done: `run(argv, cwd)` answers a handle read by `status`, `stdout`, `stderr`; `run`, `run_in`, `output_of` wrap it into a `Completed` record or a Result | `fork`+`execvp` with an exec-failure pipe, both streams drained with `poll`, `waitpid` | `subprocess.run` |
 | `std.env` | Done: `lookup(name) -> Option`, `get_or`, `has`, `home()`, `cwd()`, `args()` | `getenv`, `getcwd`, `argv` handed to `mx_io_set_args` by the entry wrapper | `os.environ`, `os.getcwd`, `MirInterpreter.program_args` (set by `metaxuc run file.mx -- a b`) |
 | `std.io` | Done: `eprint`, `eprintln` over `write_err`; `stdin` later | `fputs` on `stderr` after flushing stdout | `sys.stderr` |
 
@@ -207,6 +207,64 @@ What the two programs still leave as placeholders is `std.fail`'s
 higher-order handlers (`try_opt(f)` and friends call a closure passed as
 a parameter), which they import but never call.
 
+**Step 4, glade itself: done.** `glade/*.mx` at the repository root is
+the package manager, about 1,600 lines over the modules above:
+`manifest.mx` and `lock.mx` read and write `mx.toml` and `mx.lock` in
+the Python layout byte for byte, `index.mx` is the registry with its
+cache and the moved-tag check, `project.mx` resolves through
+`std.solve` and does `sync`, `add`, `remove`, `update`, `tree`,
+`check`, `paths` and `init`, `hash.mx` is the tree hash, `git.mx` runs
+git, and `main.mx` is the command. It type-checked after three fixes
+(`where` and `public` are keywords, so a parameter and a manifest field
+were renamed, and `std.process` and `std.solve` both declared an
+`Outcome`) and matched the Python glade on its first run: `add`,
+`check`, `tree`, `paths`, `search`, an unsatisfiable requirement and an
+unknown package all agreed on the lockfile, stdout and stderr.
+
+`test_glade_metaxu.py` is the parity test the plan asked for: both
+implementations run the scenarios of `test_glade.py` (the directory
+registry and tagged git repositories, an older line and `update`,
+conflicts between two requesters, a moved tag, path and git
+dependencies, `remove`, drift under `check`, the usage errors), each in
+its own project and cache, and every step must agree on the exit code,
+stdout, stderr, manifest, lockfile and vendored trees. It found two
+things in the reference: a malformed requirement on the command line
+escaped as a traceback instead of `glade: ...`, and stale vendored
+packages were removed in directory-listing order rather than sorted, so
+the log line order was not deterministic. The Metaxu side adopted the
+Python error texts word for word.
+
+The same program compiles natively; two more backend fixes came out of
+it, both pinned in `test_codegen_llvm.py`:
+
+- **String ordering.** The sorts compare names with `<`, which the
+  backend demoted (`only ==/!= lower to mx_str_eq`). The four ordering
+  comparisons now call `mx_str_cmp`, strcmp on the UTF-8 bytes, which
+  is code point order and so the interpreter's.
+- **A `let` evaluated to its value.** A branch ending in
+  `let a = git(...)` handed back the string, the other branch was `()`,
+  and the merge demoted the function. A `let` is a statement whose
+  value is `()` on both engines now, as an assignment already was.
+
+What still demotes is unreached: `std.toml`'s writer (glade writes its
+files line by line), `std.string.is_empty` and `std.fail`'s
+higher-order handlers, imported by modules glade uses.
+`test_native_glade_matches_and_the_launcher_caches_the_binary` runs the
+native binary against the Python glade on the main scenario.
+
+The console script switched over: `glade` is `metaxu.glade.launch`,
+which compiles the program once into a cached native binary when clang
+is installed (about a minute, printed as `building the native glade`)
+and otherwise runs it on the interpreter at a few seconds per command;
+`GLADE_IMPL=python` is the reference. The Python implementation stays as
+the oracle for the parity test, the way the interpreter is for the
+backends. What the port cost in language terms, beyond the keyword
+clashes: no `Map` of mixed value kinds (the struct-kinds limit below), so
+the project keeps parallel `Vec` tables; `assert` is uncatchable, so
+every user-facing failure is a `raise`; and an effect performed in
+method position (`perform Fs.read_bytes(p).from_bytes()`) must be bound
+first.
+
 Two limits worth knowing before writing more library code:
 
 - A helper taking an empty `Vec` and one taking a `Vec` of strings get
@@ -238,6 +296,13 @@ Two limits worth knowing before writing more library code:
    the Python version becomes the reference the way the interpreter
    is for the backends.
 
-Steps 1 to 3 are done; `docs/io_runtime.md` holds step 3's design
+All four steps are done. `docs/io_runtime.md` holds step 3's design
 decisions (what a `bytes` value is and how effect operations pass
-`Vec` and `bytes` across the C boundary). Step 4 is next.
+`Vec` and `bytes` across the C boundary); `docs/glade.md` describes
+the command as it now runs, and the section above what each step found
+in the compiler. What remains is the language work the port exposed
+rather than glade work: struct specialization by field kinds (or a
+boxed value type) so a `std.map` can hold different value kinds in one
+program, closures passed as parameters natively (the `std.fail`
+helpers), and the interpreter's speed, which is why the console script
+prefers the native binary.

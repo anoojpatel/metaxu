@@ -40,9 +40,10 @@ to it:
     bools and unit are erased to i64, so ``true.to_string()`` yields "1"
     natively where the interpreter says "True"; tests stringify ints,
     floats and strings.
-  * string ``+`` -> mx_str_concat and ``==``/``!=`` -> mx_str_eq; concat
-    and to_string results are fresh malloc'd strings that LEAK BY DESIGN
-    (the box/heap-env contract; ordering comparisons on strings demote).
+  * string ``+`` -> mx_str_concat, ``==``/``!=`` -> mx_str_eq and the
+    ordering comparisons -> mx_str_cmp (strcmp on the UTF-8 bytes, which
+    is code point order); concat and to_string results are fresh
+    malloc'd strings that LEAK BY DESIGN (the box/heap-env contract).
   * ``__trait$m`` calls resolve STATICALLY against the receiver's inferred
     kind, mirroring the interpreter's dispatch order (impl for the
     receiver's type name -> builtin -> plain function); an i64 receiver is
@@ -1225,6 +1226,7 @@ _RT_SIGS = {
     "mx_i64_to_str": ("ptr", ("i64",)),
     "mx_f64_to_str": ("ptr", ("double",)),
     "mx_str_eq": ("i64", ("ptr", "ptr")),
+    "mx_str_cmp": ("i64", ("ptr", "ptr")),
     "mx_str_free": ("void", ("ptr",)),
     "mx_vec_as_bytes": ("ptr", ("ptr",)),
     # Shift-count guard: aborts when the count is outside 0..63, which is
@@ -1374,7 +1376,8 @@ _HEADER = (
     ";   words (f64 bitcast, str/vec ptrtoint) through mx_vec_push/pop/get;\n"
     ";   len routes by kind to mx_vec_len/mx_str_len; to_string routes to\n"
     ";   mx_i64_to_str/mx_f64_to_str/identity; string + is mx_str_concat,\n"
-    ";   ==/!= is mx_str_eq.  Concat/to_string results leak by design; a\n"
+    ";   ==/!= is mx_str_eq, < <= > >= are mx_str_cmp.  Concat/to_string\n"
+    ";   results leak by design; a\n"
     ";   Vec is mx_vec_free'd at frame exit only when provably\n"
     ";   non-escaping, otherwise it leaks by design too;\n"
     ";   __trait$ method calls are resolved statically against the\n"
@@ -5697,12 +5700,11 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                         probs.append(f"comparison result {dst!r} promoted to {ty(dst)}")
                     elif ty(args[0]) == STR and ty(args[1]) == STR:
                         # ==/!= on strings -> mx_str_eq (content equality,
-                        # exactly the interpreter's).  Ordering comparisons
-                        # on strings stay demoted.
-                        if o not in ("==", "!="):
-                            probs.append(
-                                f"string ordering comparison {o!r} (only "
-                                "==/!= lower to mx_str_eq)")
+                        # exactly the interpreter's); the four ordering
+                        # comparisons -> mx_str_cmp, bytewise strcmp order,
+                        # which on UTF-8 is the interpreter's code point
+                        # order.
+                        pass
                     elif ty(args[0]) == PTR and ty(args[1]) == PTR:
                         # ==/!= on raw pointers -> ptr icmp (identity,
                         # exactly the interpreter's structural MxPtr/None
@@ -9532,6 +9534,17 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                         lines.append(f"  {c} = icmp eq i64 {e}, 0")
                         lines.append(f"  {v} = zext i1 {c} to i64")
                         setval(dst, v, lines)
+                elif is_str and o in _CMP_INT:
+                    # Ordering via mx_str_cmp (-1/0/1, strcmp on the UTF-8
+                    # bytes), then the integer predicate against 0: UTF-8
+                    # orders bytewise exactly as code points do, so this is
+                    # the interpreter's Python `str` ordering.
+                    mod.runtime_syms.add("mx_str_cmp")
+                    e, c, v = fresh(), fresh(), fresh()
+                    lines.append(f"  {e} = call i64 @mx_str_cmp(ptr {l}, ptr {r})")
+                    lines.append(f"  {c} = icmp {_CMP_INT[o]} i64 {e}, 0")
+                    lines.append(f"  {v} = zext i1 {c} to i64")
+                    setval(dst, v, lines)
                 elif o in _CMP_INT:
                     c = fresh()
                     if is_flt:

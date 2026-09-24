@@ -3937,7 +3937,9 @@ def test_vector_operations_example_lifts_transpose_and_static_assert():
         (REPO_ROOT / "examples" / "06_vector_operations.mx").read_text())
     assert "define ptr @mx___impl__vector_transpose(ptr" in ir
     assert "define ptr @mx___impl__vector_transpose_lambda8(" in ir
-    assert "define ptr @mx_static_assert()" in ir
+    # static_assert's body ends in `let v2 = ...`: a `let` is a statement, so
+    # the function returns `()` (i64), not the vector it used to leak out.
+    assert "define i64 @mx_static_assert()" in ir
     assert ir.count("call ptr @mx_fvec_map(ptr") >= 2
     # increment 15: SimdOp's ops route dynamically — the handle scope in
     # `with_simd` answers when it is installed, the declared `= None`
@@ -8661,3 +8663,91 @@ def test_assignment_value_is_unit_on_the_interpreter():
 @needs_clang
 def test_native_assignment_value_is_unit_differential(tmp_path):
     assert_native_matches_interp(_ASSIGN_UNIT_SRC, tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# String ordering comparisons and `let` as a statement (found by glade in
+# Metaxu: its sorts compare names with `<`, and a branch ending in
+# `let a = git(...)` merged a string with unit).
+# ---------------------------------------------------------------------------
+
+_STR_ORDER_SRC = """
+fn insert_sorted(v: @mut Vec, s: string) -> () {
+    let @mut j = 0;
+    while j < len(v) && v[j] < s { j = j + 1 };
+    v.push(s);
+    let @mut k = len(v) - 1;
+    while k > j { v[k] = v[k - 1]; k = k - 1 };
+    v[j] = s
+}
+
+fn main() -> int {
+    let @mut names = Vec.new();
+    insert_sorted(names, "util");
+    insert_sorted(names, "geom");
+    insert_sorted(names, "Zed");
+    insert_sorted(names, "geom_git");
+    insert_sorted(names, "héla");
+    insert_sorted(names, "hz");
+    insert_sorted(names, "");
+    let @mut i = 0;
+    while i < len(names) { print(names[i]); i = i + 1 };
+    print("a" < "b");
+    print("b" < "a");
+    print("a" <= "a");
+    print("a" >= "b");
+    print("abc" > "ab");
+    print("" < "a");
+    print("é" > "z");
+    0
+}
+"""
+
+
+def test_string_ordering_lowers_to_mx_str_cmp():
+    ir = llvm_from_source(_STR_ORDER_SRC)
+    assert count_placeholders(ir) == 0
+    assert "call i64 @mx_str_cmp(" in ir
+    assert "define i64 @mx_insert_sorted(" in ir
+
+
+@needs_clang
+def test_native_string_ordering_matches_the_interpreter(tmp_path):
+    # Bytewise UTF-8 order is code point order, so strcmp agrees with
+    # Python on "é" > "z" and on the empty string sorting first.
+    assert_native_matches_interp(_STR_ORDER_SRC, tmp_path)
+
+
+_TRAILING_LET_SRC = """
+fn label() -> string { "x" }
+
+fn note(b: bool) -> () {
+    if b {
+        let a = label()
+    } else { () }
+}
+
+fn main() -> int {
+    note(true);
+    note(false);
+    print("done");
+    0
+}
+"""
+
+
+def test_let_is_a_statement_whose_value_is_unit():
+    # A block ending in `let a = label()` evaluates to `()`, not to `a`:
+    # the `if` above used to merge a string with unit and demote `note`
+    # ("non-string constant for string value").
+    ir = llvm_from_source(_TRAILING_LET_SRC)
+    assert count_placeholders(ir) == 0
+    _result, out = interp_run(_TRAILING_LET_SRC.replace(
+        "    note(true);\n    note(false);\n",
+        "    print(note(true));\n    print(note(false));\n"))
+    assert out == "()\n()\ndone\n"
+
+
+@needs_clang
+def test_native_trailing_let_differential(tmp_path):
+    assert_native_matches_interp(_TRAILING_LET_SRC, tmp_path)

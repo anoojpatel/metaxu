@@ -1185,6 +1185,16 @@ int64_t mx_str_eq(const char *a, const char *b) {
     return strcmp(a, b) == 0 ? 1 : 0;
 }
 
+/* The ordering comparisons (`<`, `<=`, `>`, `>=`) on strings: -1, 0 or 1
+ * by strcmp on the UTF-8 bytes. Bytewise UTF-8 order is code point
+ * order, so this is exactly the interpreter's Python `str` ordering. */
+int64_t mx_str_cmp(const char *a, const char *b) {
+    mx_str_check(a, "str_cmp", "operand");
+    mx_str_check(b, "str_cmp", "operand");
+    int c = strcmp(a, b);
+    return c < 0 ? -1 : (c > 0 ? 1 : 0);
+}
+
 /* The linear string builtins (`s.split(sep)`, `s.find(sub)`,
  * `s.replace(old, new)`, `s.trim()`, `parts.join(sep)`): each mirrors the
  * interpreter's Python-backed builtin of the same name, including the two

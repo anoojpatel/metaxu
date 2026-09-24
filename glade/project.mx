@@ -1,0 +1,617 @@
+# glade/project.mx — a project: its manifest, its lock, resolution and
+# vendoring. A port of src/metaxu/glade/project.py (Project, sync, add,
+# remove, tree, init) and of packages.check / package_roots; the
+# messages are the Python's, and so is the order of the work.
+
+from std.fs import is_dir, is_file, exists, list_dir, remove_all, mkdir_all, write_text;
+from std.env import lookup;
+from std.path import join, normalize, relpath, basename;
+from std.semver import Version, Range, parse_version, version_to_string, compare_version, version_eq,
+    range_exact, range_to_string, parse_requirement;
+from std.solve import Dep, Graph, Outcome, dep, graph_new, graph_add, solve;
+from std.json import Json, member, to_json_pretty;
+from manifest import Spec, Manifest, spec_registry, spec_git, spec_path, read_manifest, write_manifest,
+    manifest_find, manifest_put, manifest_remove;
+from lock import Locked, locked, read_lock, write_lock, lock_find, lock_names;
+from hash import tree_hash;
+from git import fetch_git, git;
+from index import IndexEntry, VersionEntry, Registry, DEFAULT_REGISTRY, registry_new, registry_refresh,
+    registry_available, registry_entry, registry_names, registry_fetch, entry_version, absolute;
+
+export {
+    Project,
+    project_open,
+    project_sync,
+    project_add,
+    project_remove,
+    project_tree,
+    project_resolve,
+    default_registry,
+    check,
+    package_roots,
+    paths_json,
+    init,
+    version_or_zero,
+    lower
+};
+
+struct Project {
+    root: string,
+    manifest: Manifest,
+    default_source: string,
+    cache: string,
+    log: bool,
+    # registries by source, in creation order (refresh order matters for
+    # the log lines)
+    reg_sources: Vec,
+    reg_values: Vec,
+    # pinned (git/path) packages found before solving
+    pinned_names: Vec,
+    pinned_specs: Vec,
+    pinned_roots: Vec,
+    pinned_subs: Vec,
+    # packages whose spec named a registry other than the default
+    regof_names: Vec,
+    regof_sources: Vec
+}
+
+fn project_open(root: string, registry_override: string, log: bool) -> Project {
+    let abs = absolute(root);
+    let m = read_manifest(abs);
+    let source = if registry_override != "" { registry_override } else {
+        if m.registry != "" { m.registry } else {
+            match lookup("GLADE_REGISTRY") { Some(r) => if r == "" { DEFAULT_REGISTRY } else { r }, None => DEFAULT_REGISTRY }
+        }
+    };
+    let p = Project {
+        root: abs, manifest: m, default_source: source, cache: "", log: log,
+        reg_sources: Vec.new(), reg_values: Vec.new(),
+        pinned_names: Vec.new(), pinned_specs: Vec.new(), pinned_roots: Vec.new(), pinned_subs: Vec.new(),
+        regof_names: Vec.new(), regof_sources: Vec.new()
+    };
+    let d = registry_of_source(p, source);
+    p
+}
+
+fn index_of(names: Vec, name: string) -> int {
+    let @mut i = 0;
+    let @mut found = 0 - 1;
+    while i < len(names) && found < 0 {
+        if names[i] == name { found = i } else { () };
+        i = i + 1
+    }
+    found
+}
+
+fn registry_of_source(p: Project, source: string) -> Registry {
+    let k = index_of(p.reg_sources, source);
+    if k < 0 {
+        let r = registry_new(source, p.cache);
+        p.reg_sources.push(source);
+        p.reg_values.push(r);
+        r
+    } else {
+        p.reg_values[k]
+    }
+}
+
+fn default_registry(p: Project) -> Registry {
+    registry_of_source(p, p.default_source)
+}
+
+# The registry a package comes from: the one its spec named, else the default.
+fn registry_for_package(p: Project, name: string) -> Registry {
+    let k = index_of(p.regof_names, name);
+    if k < 0 { default_registry(p) } else { registry_of_source(p, p.regof_sources[k]) }
+}
+
+fn version_or_zero(text: string) -> Version {
+    match parse_version(text) {
+        Some(v) => v,
+        None => Version { major: 0, minor: 0, patch: 0, pre: Vec.new() }
+    }
+}
+
+fn log(p: Project, line: string) -> () {
+    if p.log { print(line) } else { () }
+}
+
+# --- pinned (git/path) packages: fetched before solving, because their
+# manifests are the only place their own dependencies are written
+
+fn place_pinned(p: Project, spec: Spec, requester_root: string, old: Vec) -> string {
+    if spec.kind == "path" {
+        let root = normalize(join(requester_root, spec.path));
+        if is_dir(root) { () } else { raise("path dependency '" + spec.name + "' not found at " + root) };
+        root
+    } else {
+        let root = p.root + "/mx_modules/" + spec.name;
+        let k = lock_find(old, spec.name);
+        let fresh = if k < 0 { true } else {
+            let have = old[k];
+            have.source != "git+" + spec.git || have.rev != spec.rev || is_dir(root) == false || tree_hash(root) != have.hash
+        };
+        if fresh {
+            log(p, "fetch " + spec.name + " " + spec.git + "@" + spec.rev);
+            let c = fetch_git(spec.git, spec.rev, root)
+        } else { () };
+        root
+    }
+}
+
+fn collect_pinned(p: Project, old: Vec) -> () {
+    # a queue of (spec, requester root, requester name)
+    let @mut q_specs = Vec.new();
+    let @mut q_roots = Vec.new();
+    let @mut q_names = Vec.new();
+    let @mut i = 0;
+    while i < len(p.manifest.deps) {
+        let s = p.manifest.deps[i];
+        if s.kind != "registry" { q_specs.push(s); q_roots.push(p.root); q_names.push(p.manifest.name) } else { () };
+        i = i + 1
+    }
+    let @mut head = 0;
+    while head < len(q_specs) {
+        let spec = q_specs[head];
+        let req_root = q_roots[head];
+        let requester = q_names[head];
+        head = head + 1;
+        if spec.name == "std" { raise(requester + ": 'std' is reserved and cannot be a dependency") } else { () };
+        let root = place_pinned(p, spec, req_root, old);
+        let k = index_of(p.pinned_names, spec.name);
+        if k >= 0 {
+            let p_spec = p.pinned_specs[k];
+            let p_root = p.pinned_roots[k];
+            let same = if spec.kind == "git" || p_spec.kind == "git" {
+                p_spec.git == spec.git && p_spec.rev == spec.rev
+            } else { p_root == root };
+            if same { () } else {
+                raise("conflicting requirements for '" + spec.name + "': one requester wants "
+                      + pinned_source(p_spec) + "@" + p_spec.rev + ", " + requester + " wants "
+                      + pinned_source(spec) + "@" + spec.rev + "; pin one in the root manifest")
+            }
+        } else {
+            let sub = if is_file(root + "/mx.toml") { Some(read_manifest(root)) } else { None };
+            p.pinned_names.push(spec.name);
+            p.pinned_specs.push(spec);
+            p.pinned_roots.push(root);
+            p.pinned_subs.push(sub);
+            match sub {
+                Some(m) => {
+                    let @mut j = 0;
+                    while j < len(m.deps) {
+                        let s = m.deps[j];
+                        if s.kind != "registry" { q_specs.push(s); q_roots.push(root); q_names.push(m.name) } else { () };
+                        j = j + 1
+                    }
+                },
+                None => ()
+            }
+        }
+    }
+}
+
+fn pinned_source(s: Spec) -> string {
+    if s.kind == "git" { "git+" + s.git } else { "path+" + s.path }
+}
+
+fn pinned_version(p: Project, k: int) -> Version {
+    match p.pinned_subs[k] {
+        Some(m) => version_or_zero(m.version),
+        None => version_or_zero("0.0.0")
+    }
+}
+
+# The solver's view of a manifest's dependencies (registry requirements
+# as ranges, pinned packages as their one exact version); records which
+# registry a spec named on the way.
+fn deps_of(p: Project, m: Manifest) -> Vec {
+    let @mut out = Vec.new();
+    let @mut i = 0;
+    while i < len(m.deps) {
+        let s = m.deps[i];
+        if s.kind == "registry" {
+            out.push(dep(s.name, s.requirement));
+            if s.registry != "" {
+                let k = index_of(p.regof_names, s.name);
+                if k < 0 { p.regof_names.push(s.name); p.regof_sources.push(s.registry) } else { p.regof_sources[k] = s.registry };
+                let r = registry_of_source(p, s.registry)
+            } else { () }
+        } else {
+            let k = index_of(p.pinned_names, s.name);
+            let v = if k < 0 { version_or_zero("0.0.0") } else { pinned_version(p, k) };
+            out.push(dep(s.name, range_exact(v)))
+        };
+        i = i + 1
+    }
+    out
+}
+
+# Run the solver over the root, the pinned packages and every registry
+# package reachable from them; `prefer_*` (usually the lock) break ties.
+# Answers the picks without the root.
+fn project_resolve(p: Project, prefer_names: Vec, prefer_versions: Vec) -> Outcome {
+    let @mut g = graph_new();
+    let root_name = p.manifest.name;
+    let root_version = version_or_zero(p.manifest.version);
+    let @mut pending = Vec.new();
+    let root_deps = deps_of(p, p.manifest);
+    graph_add(g, root_name, root_version, root_deps);
+    enqueue_registry_deps(p, root_deps, pending);
+    let @mut i = 0;
+    while i < len(p.pinned_names) {
+        let deps = match p.pinned_subs[i] { Some(m) => deps_of(p, m), None => Vec.new() };
+        graph_add(g, p.pinned_names[i], pinned_version(p, i), deps);
+        enqueue_registry_deps(p, deps, pending);
+        i = i + 1
+    }
+    let @mut added = Vec.new();
+    let @mut head = 0;
+    while head < len(pending) {
+        let name = pending[head];
+        head = head + 1;
+        if index_of(added, name) >= 0 || index_of(p.pinned_names, name) >= 0 || name == root_name { () } else {
+            added.push(name);
+            match registry_entry(registry_for_package(p, name), name) {
+                Some(e) => {
+                    let @mut j = 0;
+                    while j < len(e.versions) {
+                        let ve = e.versions[j];
+                        graph_add(g, name, ve.version, ve.deps);
+                        enqueue_registry_deps(p, ve.deps, pending);
+                        j = j + 1
+                    }
+                },
+                None => ()
+            }
+        }
+    }
+    let outcome = solve(g, root_name, root_version, prefer_names, prefer_versions);
+    if outcome.ok { () } else { raise("version solving failed:\n" + outcome.explanation) };
+    let @mut names = Vec.new();
+    let @mut versions = Vec.new();
+    let @mut k = 0;
+    while k < len(outcome.names) {
+        if outcome.names[k] == root_name { () } else { names.push(outcome.names[k]); versions.push(outcome.versions[k]) };
+        k = k + 1
+    }
+    Outcome { ok: true, names: names, versions: versions, explanation: "" }
+}
+
+fn enqueue_registry_deps(p: Project, deps: Vec, pending: Vec) -> () {
+    let @mut i = 0;
+    while i < len(deps) {
+        let d = deps[i];
+        if index_of(p.pinned_names, d.name) < 0 { pending.push(d.name) } else { () };
+        i = i + 1
+    }
+}
+
+fn all_specs(p: Project) -> Vec {
+    let @mut out = Vec.new();
+    let @mut i = 0;
+    while i < len(p.manifest.deps) { out.push(p.manifest.deps[i]); i = i + 1 };
+    let @mut j = 0;
+    while j < len(p.pinned_subs) {
+        match p.pinned_subs[j] {
+            Some(m) => {
+                let @mut k = 0;
+                while k < len(m.deps) { out.push(m.deps[k]); k = k + 1 }
+            },
+            None => ()
+        };
+        j = j + 1
+    }
+    out
+}
+
+fn sorted_strings(names: Vec) -> Vec {
+    let @mut out = Vec.new();
+    let @mut i = 0;
+    while i < len(names) {
+        let s = names[i];
+        let @mut j = 0;
+        while j < len(out) && out[j] < s { j = j + 1 };
+        out.push(s);
+        let @mut k = len(out) - 1;
+        while k > j { out[k] = out[k - 1]; k = k - 1 };
+        out[j] = s;
+        i = i + 1
+    }
+    out
+}
+
+# Resolve, fetch what the lock lacks, vendor, write the lock. `update`
+# names packages whose locked version should not be preferred;
+# `update_all` means every one of them.
+fn project_sync(p: Project, update: Vec, update_all: bool, refresh: bool) -> Vec {
+    let old = read_lock(p.root);
+    collect_pinned(p, old);
+    let specs = all_specs(p);
+    let @mut needs_registry = false;
+    let @mut i = 0;
+    while i < len(specs) {
+        let s = specs[i];
+        if s.kind == "registry" { needs_registry = true } else { () };
+        i = i + 1
+    }
+    if needs_registry && refresh {
+        let @mut r = 0;
+        while r < len(p.reg_values) { registry_refresh(p.reg_values[r], p.log); r = r + 1 }
+    } else { () };
+    if needs_registry && registry_available(default_registry(p)) == false {
+        raise("registry " + p.default_source + " has no packages/ directory (is it an index?)")
+    } else { () };
+    let @mut prefer_names = Vec.new();
+    let @mut prefer_versions = Vec.new();
+    let @mut j = 0;
+    while j < len(old) {
+        let e = old[j];
+        if e.version != "" && (update_all == false && index_of(update, e.name) < 0) {
+            match parse_version(e.version) {
+                Some(v) => { prefer_names.push(e.name); prefer_versions.push(v) },
+                None => ()
+            }
+        } else { () };
+        j = j + 1
+    }
+    let picked = project_resolve(p, prefer_names, prefer_versions);
+    let @mut out = Vec.new();
+    let names = sorted_strings(picked.names);
+    let @mut n = 0;
+    while n < len(names) {
+        let name = names[n];
+        let version = picked.versions[index_of(picked.names, name)];
+        let pk = index_of(p.pinned_names, name);
+        if pk >= 0 {
+            let spec = p.pinned_specs[pk];
+            let root = p.pinned_roots[pk];
+            if spec.kind == "path" {
+                let source = "path+" + relpath(root, p.root);
+                out.push(locked(name, source, tree_hash(root), "", "", ""))
+            } else {
+                let hk = lock_find(old, name);
+                let commit = if hk >= 0 && old[hk].rev == spec.rev { old[hk].commit } else {
+                    if is_dir(root + "/.git") {
+                        let @mut rp = Vec.new();
+                        rp.push("rev-parse"); rp.push("HEAD");
+                        git(rp, root)
+                    } else { if hk >= 0 { old[hk].commit } else { "" } }
+                };
+                out.push(locked(name, "git+" + spec.git, tree_hash(root), spec.rev, commit, ""))
+            }
+        } else {
+            let reg = registry_for_package(p, name);
+            let entry = match registry_entry(reg, name) {
+                Some(e) => e,
+                None => { raise("internal: picked " + name + " has no index entry"); IndexEntry { name: name, git: "", description: "", versions: Vec.new() } }
+            };
+            let ve = match entry_version(entry, version) {
+                Some(x) => x,
+                None => { raise("internal: picked version missing"); VersionEntry { version: version, tag: "", commit: "", deps: Vec.new() } }
+            };
+            let root = p.root + "/mx_modules/" + name;
+            let hk = lock_find(old, name);
+            let source = "registry+" + reg.source;
+            let vtext = version_to_string(version);
+            let fresh = if hk < 0 { true } else {
+                let have = old[hk];
+                have.source != source || have.version != vtext || is_dir(root) == false || tree_hash(root) != have.hash
+            };
+            let commit = if fresh {
+                log(p, "fetch " + name + " " + vtext + " (" + entry.git + "@" + ve.tag + ")");
+                registry_fetch(entry, version, root)
+            } else { old[hk].commit };
+            out.push(locked(name, source, tree_hash(root), ve.tag, commit, vtext))
+        };
+        n = n + 1
+    }
+    let vendor = p.root + "/mx_modules";
+    if is_dir(vendor) {
+        let children = list_dir(vendor);
+        let @mut c = 0;
+        while c < len(children) {
+            let child = children[c];
+            if is_dir(vendor + "/" + child) && lock_find(out, child) < 0 {
+                log(p, "remove " + child + " (no longer required)");
+                remove_all(vendor + "/" + child)
+            } else { () };
+            c = c + 1
+        }
+    } else { () };
+    write_lock(p.root, out);
+    out
+}
+
+# ASCII lowercase, what str.lower does for the names `search` sees.
+fn lower(s: string) -> string {
+    let upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    let lowr = "abcdefghijklmnopqrstuvwxyz";
+    let @mut out = Vec.new();
+    let @mut i = 0;
+    while i < len(s) {
+        let k = upper.find(s[i]);
+        if k >= 0 && len(s[i]) == 1 { out.push(lowr[k]) } else { out.push(s[i]) };
+        i = i + 1
+    }
+    out.join("")
+}
+
+# Add a dependency to the manifest (not yet synced); answers the spec.
+fn project_add(p: Project, name: string, requirement: string, git_url: string, rev: string, path: string, registry: string) -> Spec {
+    if name == "std" { raise("'std' is the standard library, not a dependency") } else { () };
+    let spec = if git_url != "" {
+        if rev == "" { raise("--git needs --rev (a tag, branch or commit)") } else { () };
+        spec_git(name, git_url, rev)
+    } else { if path != "" {
+        spec_path(name, path)
+    } else {
+        let reg = if registry != "" { registry_of_source(p, registry) } else { default_registry(p) };
+        registry_refresh(reg, p.log);
+        let entry = match registry_entry(reg, name) {
+            Some(e) => e,
+            None => {
+                let all = registry_names(reg);
+                let @mut near = Vec.new();
+                let @mut i = 0;
+                while i < len(all) {
+                    if all[i].find(name) >= 0 || name.find(all[i]) >= 0 { near.push(all[i]) } else { () };
+                    i = i + 1
+                }
+                let hint = if len(near) > 0 { "; did you mean " + near.join(", ") + "?" } else { "" };
+                raise("no package '" + name + "' in " + reg.source + hint);
+                IndexEntry { name: name, git: "", description: "", versions: Vec.new() }
+            }
+        };
+        let text = if requirement == "" || requirement == "*" { "^" + version_to_string(newest(entry)) } else { requirement };
+        let range = match parse_requirement(text) {
+            Some(r) => r,
+            None => { raise("'" + text + "' is not a version requirement"); range_exact(version_or_zero("0.0.0")) }
+        };
+        spec_registry(name, text, range, registry)
+    } };
+    manifest_put(p.manifest, spec);
+    write_manifest(p.root, p.manifest);
+    spec
+}
+
+# The newest release, or the newest prerelease when there is nothing else.
+fn newest(e: IndexEntry) -> Version {
+    let @mut best = None;
+    let @mut best_any = None;
+    let @mut i = 0;
+    while i < len(e.versions) {
+        let ve = e.versions[i];
+        let v = ve.version;
+        best_any = match best_any { None => Some(v), Some(b) => if compare_version(v, b) > 0 { Some(v) } else { Some(b) } };
+        if len(v.pre) == 0 {
+            best = match best { None => Some(v), Some(b) => if compare_version(v, b) > 0 { Some(v) } else { Some(b) } }
+        } else { () };
+        i = i + 1
+    }
+    match best {
+        Some(v) => v,
+        None => match best_any { Some(v) => v, None => version_or_zero("0.0.0") }
+    }
+}
+
+fn project_remove(p: Project, name: string) -> () {
+    if manifest_remove(p.manifest, name) { () } else { raise("'" + name + "' is not a dependency in mx.toml") };
+    write_manifest(p.root, p.manifest)
+}
+
+# The dependency tree with versions, from the lock.
+fn project_tree(p: Project) -> string {
+    let lock = read_lock(p.root);
+    let @mut lines = Vec.new();
+    lines.push(p.manifest.name + " " + p.manifest.version);
+    let @mut seen = Vec.new();
+    tree_walk(p, lock, p.manifest, p.root, "  ", seen, lines);
+    lines.join("\n")
+}
+
+fn tree_walk(p: Project, lock: Vec, m: Manifest, m_root: string, indent: string, seen: Vec, lines: Vec) -> () {
+    let @mut names = Vec.new();
+    let @mut i = 0;
+    while i < len(m.deps) { let s = m.deps[i]; names.push(s.name); i = i + 1 };
+    let ordered = sorted_strings(names);
+    let @mut j = 0;
+    while j < len(ordered) {
+        let name = ordered[j];
+        let spec = m.deps[manifest_find(m, name)];
+        let lk = lock_find(lock, name);
+        let place = if lk < 0 { "(not locked; run `glade sync`)" } else {
+            let e = lock[lk];
+            if spec.kind == "registry" { e.version + " (" + spec.requirement_text + ")" } else {
+            if spec.kind == "git" { (e.source + "@" + e.rev + " " + e.commit[0:10]).trim() } else { e.source } }
+        };
+        let marker = if index_of(seen, name) >= 0 { " (*)" } else { "" };
+        lines.push(indent + name + " " + place + marker);
+        if index_of(seen, name) >= 0 || lk < 0 { () } else {
+            seen.push(name);
+            let sub_root = if spec.kind == "path" { normalize(join(m_root, spec.path)) } else { p.root + "/mx_modules/" + name };
+            if is_file(sub_root + "/mx.toml") {
+                tree_walk(p, lock, read_manifest(sub_root), sub_root, indent + "  ", seen, lines)
+            } else { () }
+        };
+        j = j + 1
+    }
+}
+
+# Hash drift between the lock and what is on disk; empty means clean.
+fn check(project: string) -> Vec {
+    let root = absolute(project);
+    let lock = read_lock(root);
+    let m = read_manifest(root);
+    let @mut problems = Vec.new();
+    let @mut i = 0;
+    while i < len(lock) {
+        let e = lock[i];
+        let dir = if e.source[0:5] == "path+" { normalize(join(root, e.source[5:len(e.source)])) } else { root + "/mx_modules/" + e.name };
+        if is_dir(dir) {
+            let actual = tree_hash(dir);
+            if actual != e.hash { problems.push(e.name + ": tree hash " + actual + " differs from lock " + e.hash) } else { () }
+        } else {
+            problems.push(e.name + ": missing at " + dir + "; run `glade sync`")
+        };
+        i = i + 1
+    }
+    let @mut j = 0;
+    while j < len(m.deps) {
+        let s = m.deps[j];
+        if lock_find(lock, s.name) < 0 { problems.push(s.name + ": in mx.toml but not in mx.lock; run `glade sync`") } else { () };
+        j = j + 1
+    }
+    problems
+}
+
+# name -> root, from the lock: the table the module resolver consumes.
+# Two parallel Vecs in lock order.
+fn package_roots(project: string) -> Vec {
+    let root = absolute(project);
+    let lock = read_lock(root);
+    let @mut out = Vec.new();
+    let @mut i = 0;
+    while i < len(lock) {
+        let e = lock[i];
+        let dir = if e.source[0:5] == "path+" { normalize(join(root, e.source[5:len(e.source)])) } else { root + "/mx_modules/" + e.name };
+        out.push(e.name);
+        out.push(dir);
+        i = i + 1
+    }
+    out
+}
+
+# `glade paths`: the roots as a JSON object with sorted keys, indent 2.
+fn paths_json(project: string) -> string {
+    let pairs = package_roots(project);
+    let @mut names = Vec.new();
+    let @mut i = 0;
+    while i < len(pairs) { names.push(pairs[i]); i = i + 2 };
+    let ordered = sorted_strings(names);
+    let @mut members = Vec.new();
+    let @mut j = 0;
+    while j < len(ordered) {
+        let @mut k = 0;
+        while k < len(pairs) {
+            if pairs[k] == ordered[j] { members.push(member(ordered[j], JStr(pairs[k + 1]))) } else { () };
+            k = k + 2
+        };
+        j = j + 1
+    }
+    to_json_pretty(JObj(members))
+}
+
+# Start a project: mx.toml and a main.mx; answers the manifest path.
+fn init(dir: string, name: string) -> string {
+    let root = absolute(dir);
+    if exists(root + "/mx.toml") { raise(root + "/mx.toml already exists") } else { () };
+    mkdir_all(root);
+    let m = Manifest { name: if name == "" { basename(root) } else { name }, version: "0.1.0",
+                       deps: Vec.new(), shared: Vec.new(), registry: "" };
+    write_manifest(root, m);
+    if exists(root + "/main.mx") || exists(root + "/src") { () } else {
+        write_text(root + "/main.mx", "fn main() -> int {\n    print(\"hello\");\n    0\n}\n")
+    };
+    root + "/mx.toml"
+}

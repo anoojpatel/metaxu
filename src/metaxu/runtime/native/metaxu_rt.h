@@ -29,6 +29,7 @@
  * | mx_i64_to_str    | char* (int64_t)                            | fresh malloc'd decimal string |
  * | mx_f64_to_str    | char* (double)                             | fresh malloc'd string, Python str(float) format |
  * | mx_str_eq        | int64_t (const char*, const char*)         | 1 if contents equal, else 0 |
+ * | mx_str_cmp       | int64_t (const char*, const char*)         | -1/0/1, strcmp order (UTF-8 bytewise = code point order) |
  * | mx_str_find      | int64_t (const char*, const char*)         | index of the first occurrence, -1 if absent |
  * | mx_str_split     | mx_vec* (const char*, const char*)         | fresh Vec of fresh strings; raises on an empty separator |
  * | mx_str_replace   | char* (const char*, const char*, const char*) | fresh string; raises on an empty pattern |
@@ -325,6 +326,7 @@ char   *mx_bytes_to_str(const mx_vec *bytes);
 char   *mx_i64_to_str(int64_t value);
 char   *mx_f64_to_str(double value);
 int64_t mx_str_eq(const char *a, const char *b);
+int64_t mx_str_cmp(const char *a, const char *b);
 void    mx_str_free(char *s);
 int64_t mx_shift_check(int64_t count, int64_t is_left);
 

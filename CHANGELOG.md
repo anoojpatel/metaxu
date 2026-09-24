@@ -42,7 +42,22 @@ with no section and uses it as the release notes.
   line (`metaxuc run file.mx -- a b`; native binaries take it from
   `argv`). A handler in scope virtualizes any of them.
 - An assignment statement evaluates to `()`. A `-> ()` function ending
-  in `s.f = v` used to return the struct.
+  in `s.f = v` used to return the struct. A `let` does too: a block
+  ending in `let a = f()` used to evaluate to `a`.
+- glade is written in Metaxu (`glade/*.mx`, `docs/glade.md`). The
+  `glade` command now runs that program: compiled once into a cached
+  native binary when clang is installed, on the interpreter otherwise;
+  `GLADE_IMPL=python` runs the Python implementation, which stays as the
+  reference. `test_glade_metaxu.py` runs both over the same registries
+  and requires identical exit codes, output, error text, lockfiles and
+  vendored trees. The parity test also fixed two things in the Python
+  glade: a malformed requirement on the command line was a traceback,
+  and stale packages were removed in an unspecified order.
+- Native backend: the ordering comparisons on strings (`<`, `<=`, `>`,
+  `>=`) lower to `mx_str_cmp` (code point order, the interpreter's)
+  instead of demoting the function.
+- `std.process`'s record of a finished program is `Completed` (it was
+  `Outcome`, which `std.solve` also declares).
 - `scripts/release.py`: one command to cut a release.
 
 ## 0.1.0 (2026-09-23)

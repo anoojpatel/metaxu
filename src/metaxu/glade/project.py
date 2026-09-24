@@ -319,7 +319,7 @@ class Project:
                                   commit=commit, version=str(version))
         vendor = self.root / VENDOR
         if vendor.is_dir():
-            for child in vendor.iterdir():
+            for child in sorted(vendor.iterdir()):
                 if child.is_dir() and child.name not in locked:
                     self.log(f"remove {child.name} (no longer required)")
                     shutil.rmtree(child)

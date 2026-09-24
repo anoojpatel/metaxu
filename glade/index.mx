@@ -1,0 +1,241 @@
+# glade/index.mx — the registry: a git repository (or a directory) of
+# package descriptions, `packages/<name>.toml` each. A port of
+# src/metaxu/glade/index.py.
+
+from std.toml import Toml, parse, get, get_str, get_arr, get_table, keys;
+from std.fs import is_dir, is_file, exists, read_text, list_dir, remove_all, mkdir_all;
+from std.env import lookup, home, cwd;
+from std.path import join, normalize, is_absolute, dirname;
+from std.semver import Version, Range, parse_version, version_to_string, version_eq, parse_requirement;
+from std.solve import Dep, dep;
+from std.sha256 import sha256_string;
+from std.string import starts_with, ends_with;
+from git import git;
+
+export {
+    VersionEntry,
+    IndexEntry,
+    Registry,
+    DEFAULT_REGISTRY,
+    cache_dir,
+    registry_new,
+    registry_refresh,
+    registry_available,
+    registry_entry,
+    registry_names,
+    registry_fetch,
+    entry_version,
+    absolute
+};
+
+let DEFAULT_REGISTRY = "https://github.com/anoojpatel/glade-index";
+
+struct VersionEntry {
+    version: Version,
+    tag: string,
+    commit: string,
+    deps: Vec
+}
+
+struct IndexEntry {
+    name: string,
+    git: string,
+    description: string,
+    versions: Vec
+}
+
+# One index, addressed by git URL or local directory. A remote index is
+# cloned shallowly into the cache under a key derived from its URL.
+struct Registry {
+    source: string,
+    root: string,
+    remote: bool
+}
+
+# $GLADE_CACHE, else $XDG_CACHE_HOME/glade, else ~/.cache/glade.
+fn cache_dir() -> string {
+    match lookup("GLADE_CACHE") {
+        Some(c) => if c == "" { default_cache() } else { c },
+        None => default_cache()
+    }
+}
+
+fn default_cache() -> string {
+    let base = match lookup("XDG_CACHE_HOME") {
+        Some(x) => if x == "" { home() + "/.cache" } else { x },
+        None => home() + "/.cache"
+    };
+    base + "/glade"
+}
+
+# An absolute, normalized form of `p` (relative paths hang off the cwd).
+fn absolute(p: string) -> string {
+    if is_absolute(p) { normalize(p) } else { normalize(join(cwd(), p)) }
+}
+
+fn expand_user(p: string) -> string {
+    if p == "~" { home() } else {
+        if starts_with(p, "~/") { home() + p[1:len(p)] } else { p }
+    }
+}
+
+fn registry_new(source: string, cache: string) -> Registry {
+    let local = expand_user(source);
+    if is_dir(local) {
+        Registry { source: source, root: absolute(local), remote: false }
+    } else {
+        let key = sha256_string(source)[0:16];
+        let base = if cache == "" { cache_dir() } else { cache };
+        Registry { source: source, root: base + "/index/" + key, remote: true }
+    }
+}
+
+# Clone or fast-forward a remote index; a directory needs nothing.
+fn registry_refresh(r: Registry, log: bool) -> () {
+    if r.remote {
+        if is_dir(r.root + "/.git") {
+            if log { print("update index " + r.source) } else { () };
+            let @mut fetch = Vec.new();
+            fetch.push("fetch"); fetch.push("--quiet"); fetch.push("--depth"); fetch.push("1"); fetch.push("origin");
+            let a = git(fetch, r.root);
+            let @mut reset = Vec.new();
+            reset.push("reset"); reset.push("--quiet"); reset.push("--hard"); reset.push("origin/HEAD");
+            let b = git(reset, r.root)
+        } else {
+            if log { print("clone index " + r.source) } else { () };
+            mkdir_all(dirname(r.root));
+            let @mut clone = Vec.new();
+            clone.push("clone"); clone.push("--quiet"); clone.push("--depth"); clone.push("1");
+            clone.push(r.source); clone.push(r.root);
+            let c = git(clone, "")
+        }
+    } else { () }
+}
+
+fn registry_available(r: Registry) -> bool {
+    is_dir(r.root + "/packages")
+}
+
+# The package's description, or None when the index has no such file.
+fn registry_entry(r: Registry, name: string) -> Option {
+    let path = r.root + "/packages/" + name + ".toml";
+    if is_file(path) { Some(parse_entry(read_text(path), path)) } else { None }
+}
+
+# Every package name in the index, sorted.
+fn registry_names(r: Registry) -> Vec {
+    let dir = r.root + "/packages";
+    let @mut out = Vec.new();
+    if is_dir(dir) {
+        let files = list_dir(dir);
+        let @mut i = 0;
+        while i < len(files) {
+            let f = files[i];
+            if ends_with(f, ".toml") { out.push(f[0:len(f) - 5]) } else { () };
+            i = i + 1
+        }
+    } else { () };
+    out
+}
+
+fn parse_entry(text: string, origin: string) -> IndexEntry {
+    let doc = match parse(text) {
+        Ok(d) => d,
+        Err(e) => { raise(origin + ": " + e); TTable(Vec.new()) }
+    };
+    let name = match get_str(doc, "name") { Some(n) => n, None => { raise(origin + ": missing `name`"); "" } };
+    let git_url = match get_str(doc, "git") { Some(g) => g, None => { raise(origin + ": missing `git`"); "" } };
+    let description = match get_str(doc, "description") { Some(d) => d, None => "" };
+    let @mut versions = Vec.new();
+    match get_arr(doc, "versions") {
+        Some(items) => {
+            let @mut i = 0;
+            while i < len(items) {
+                let v = items[i];
+                let ver_text = match get_str(v, "version") {
+                    Some(t) => t,
+                    None => { raise(origin + ": bad version entry: 'version'"); "" }
+                };
+                let ver = match parse_version(ver_text) {
+                    Some(p) => p,
+                    None => { raise(origin + ": bad version entry: '" + ver_text + "' is not a version (MAJOR.MINOR.PATCH[-pre])"); parse_version_or_zero() }
+                };
+                let @mut deps = Vec.new();
+                match get_table(v, "dependencies") {
+                    Some(table) => {
+                        let names = keys(table);
+                        let @mut j = 0;
+                        while j < len(names) {
+                            let req = match get_str(table, names[j]) { Some(s) => s, None => "" };
+                            match parse_requirement(req) {
+                                Some(range) => deps.push(dep(names[j], range)),
+                                None => raise(origin + ": " + name + " " + ver_text + ": dependency " + names[j] + ": '" + req + "' is not a version requirement")
+                            };
+                            j = j + 1
+                        }
+                    },
+                    None => ()
+                };
+                if has_version(versions, ver) { raise(origin + ": version " + ver_text + " listed twice") } else { () };
+                let tag = match get_str(v, "tag") { Some(t) => if t == "" { "v" + ver_text } else { t }, None => "v" + ver_text };
+                let commit = match get_str(v, "commit") { Some(c) => c, None => "" };
+                versions.push(VersionEntry { version: ver, tag: tag, commit: commit, deps: deps });
+                i = i + 1
+            }
+        },
+        None => ()
+    };
+    IndexEntry { name: name, git: git_url, description: description, versions: versions }
+}
+
+fn parse_version_or_zero() -> Version {
+    match parse_version("0.0.0") { Some(v) => v, None => { raise("unreachable"); Version { major: 0, minor: 0, patch: 0, pre: Vec.new() } } }
+}
+
+fn has_version(versions: Vec, v: Version) -> bool {
+    let @mut i = 0;
+    let @mut found = false;
+    while i < len(versions) {
+        let e = versions[i];
+        if version_eq(e.version, v) { found = true } else { () };
+        i = i + 1
+    }
+    found
+}
+
+# The entry's record for `v`, if listed.
+fn entry_version(e: IndexEntry, v: Version) -> Option {
+    let @mut i = 0;
+    let @mut found = None;
+    while i < len(e.versions) {
+        let ve = e.versions[i];
+        if version_eq(ve.version, v) { found = Some(ve) } else { () };
+        i = i + 1
+    }
+    found
+}
+
+# Shallow-clone the version's tag into `dest` (replacing it), check the
+# commit when the index pins one, strip .git, answer the commit hash.
+fn registry_fetch(e: IndexEntry, v: Version, dest: string) -> string {
+    let ve = match entry_version(e, v) {
+        Some(x) => x,
+        None => { raise(e.name + " " + version_to_string(v) + ": not in the index"); VersionEntry { version: v, tag: "", commit: "", deps: Vec.new() } }
+    };
+    if exists(dest) { remove_all(dest) } else { () };
+    mkdir_all(dirname(dest));
+    let @mut clone = Vec.new();
+    clone.push("clone"); clone.push("--quiet"); clone.push("--depth"); clone.push("1");
+    clone.push("--branch"); clone.push(ve.tag); clone.push(e.git); clone.push(dest);
+    let ignored = git(clone, "");
+    let @mut rp = Vec.new();
+    rp.push("rev-parse"); rp.push("HEAD");
+    let commit = git(rp, dest);
+    if ve.commit != "" && starts_with(commit, ve.commit) == false {
+        remove_all(dest);
+        raise(e.name + " " + version_to_string(v) + ": tag " + ve.tag + " is at " + commit[0:12]
+              + " but the index pins " + ve.commit[0:12] + "; the tag moved, refusing to use it")
+    } else { () };
+    let cleaned = try { remove_all(dest + "/.git"); true } catch err { false };
+    commit
+}

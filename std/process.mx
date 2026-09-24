@@ -9,7 +9,7 @@
 
 export {
     Process,
-    Outcome,
+    Completed,
     run,
     run_in,
     output_of
@@ -24,21 +24,21 @@ effect Process = {
 
 # What a finished program left behind: its exit status (minus the
 # signal number when a signal ended it), and both streams as text.
-struct Outcome {
+struct Completed {
     status: int,
     out: string,
     err: string
 }
 
 # Run `argv` in the current directory.
-fn run(argv: Vec) -> Outcome {
+fn run(argv: Vec) -> Completed {
     run_in(argv, "")
 }
 
 # Run `argv` with `cwd` as its working directory ("" keeps the current one).
-fn run_in(argv: Vec, cwd: string) -> Outcome {
+fn run_in(argv: Vec, cwd: string) -> Completed {
     let h = perform Process.run(argv, cwd);
-    Outcome {
+    Completed {
         status: perform Process.status(h),
         out: perform Process.stdout(h),
         err: perform Process.stderr(h)

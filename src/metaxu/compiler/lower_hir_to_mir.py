@@ -85,6 +85,17 @@ class _FuncLowerer:
         self.emit(("let", dst, ("const_ty", "Unit"), ()))
         return dst
 
+    def _lower_let(self, e: HExpr) -> None:
+        """Bind a `let`'s names; the statement itself has no value."""
+        for (name, sube) in e.bindings or ():
+            val = self.lower_expr(sube)
+            # Bind into a dedicated slot (not an alias of the initializer's
+            # temp) so later assignments to this variable cannot clobber
+            # the initializer's own slot (e.g. `let j = b; j = j - 1`).
+            slot = self.state.fresh(f"{name}_")
+            self.emit(("let", slot, ("copy",), (val,)))
+            self.state.env[name] = slot
+
     def finish_body(self, res: str, drop_names: Sequence[str] = ()) -> None:
         """Terminate the function body whose result value is ``res``.
 
@@ -290,20 +301,25 @@ class _FuncLowerer:
             self.emit(("let", dst, ("binop", e.binop), (l, r)))
             return dst
         if e.op == "Let" and e.bindings is not None:
-            last_val: str | None = None
-            for (name, sube) in e.bindings:
-                val = self.lower_expr(sube)
-                # Bind into a dedicated slot (not an alias of the initializer's
-                # temp) so later assignments to this variable cannot clobber
-                # the initializer's own slot (e.g. `let j = b; j = j - 1`).
-                slot = self.state.fresh(f"{name}_")
-                self.emit(("let", slot, ("copy",), (val,)))
-                self.state.env[name] = slot
-                last_val = slot
-            return last_val if last_val is not None else self.unit_value()
+            self._lower_let(e)
+            # A `let` is a statement: its value is `()`, like an assignment's
+            # (see "Assign" below). It used to hand back the bound slot, so a
+            # block ending in `let a = g()` evaluated to `a`; an `if` whose
+            # one arm ended that way and whose other arm was `()` then merged
+            # a string with unit and the native backend demoted the function.
+            return self.unit_value()
         if e.op == "Block" and e.operands is not None:
             last: str | None = None
             for sube in e.operands:
+                if sube.op == "Let" and sube.bindings is not None:
+                    # Statement position: bind without materializing the
+                    # `()` (one constant per `let` would be most of a
+                    # function's MIR, and would shift every later fresh
+                    # name, lambda names included). A block whose LAST
+                    # statement is a `let` still evaluates to `()` below.
+                    self._lower_let(sube)
+                    last = None
+                    continue
                 last = self.lower_expr(sube)
                 # A bare name read emits NO instruction: `lower_expr("Var")`
                 # just answers the slot name. In value position the consumer

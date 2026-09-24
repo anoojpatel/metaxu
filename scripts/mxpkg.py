@@ -5,7 +5,7 @@ this script forwards so existing instructions keep working.
 """
 import sys
 
-from metaxu.glade.cli import main
+from metaxu.glade.launch import main
 
 if __name__ == "__main__":
     print("mxpkg is now `glade`; forwarding", file=sys.stderr)
