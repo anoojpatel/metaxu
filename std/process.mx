@@ -1,0 +1,57 @@
+# std.process — running other programs, as an effect.
+#
+# `run` starts a program by name (searched on PATH), waits for it, and
+# captures both of its streams in full (docs/io_runtime.md). The
+# runtime answers a handle; the accessors read it. A missing program or
+# working directory is a CATCHABLE error, "run: <name>: <reason>", the
+# same words on both engines. A handler in scope overrides the mapping,
+# which is how a test replaces `git` with a script of answers.
+
+export {
+    Process,
+    Outcome,
+    run,
+    run_in,
+    output_of
+}
+
+effect Process = {
+    fn run(argv: Vec, cwd: string) -> int with EFFECT_PROCESS_RUN
+    fn status(handle: int) -> int with EFFECT_PROCESS_STATUS
+    fn stdout(handle: int) -> string with EFFECT_PROCESS_STDOUT
+    fn stderr(handle: int) -> string with EFFECT_PROCESS_STDERR
+}
+
+# What a finished program left behind: its exit status (minus the
+# signal number when a signal ended it), and both streams as text.
+struct Outcome {
+    status: int,
+    out: string,
+    err: string
+}
+
+# Run `argv` in the current directory.
+fn run(argv: Vec) -> Outcome {
+    run_in(argv, "")
+}
+
+# Run `argv` with `cwd` as its working directory ("" keeps the current one).
+fn run_in(argv: Vec, cwd: string) -> Outcome {
+    let h = perform Process.run(argv, cwd);
+    Outcome {
+        status: perform Process.status(h),
+        out: perform Process.stdout(h),
+        err: perform Process.stderr(h)
+    }
+}
+
+# Ok(stdout) when the program exits 0, else Err(its stderr, or a note
+# with the status when it printed nothing there).
+fn output_of(argv: Vec, cwd: string) -> Result {
+    let o = run_in(argv, cwd);
+    if o.status == 0 {
+        Ok(o.out)
+    } else {
+        if o.err == "" { Err(argv[0] + " exited with status " + o.status.to_string()) } else { Err(o.err) }
+    }
+}

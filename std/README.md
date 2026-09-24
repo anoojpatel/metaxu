@@ -76,6 +76,10 @@ interpreter.
 | `std.path` | `posixpath` | implemented | `join`, `dirname`, `basename`, `normalize`, `relpath` (both absolute or both relative), `is_absolute`, `components`; POSIX text only, no filesystem |
 | `std.json` | `json.dumps` | implemented (writer) | `Json` (`JNull`, `JBool`, `JInt`, `JStr`, `JArr`, `JObj` of `Member`s), `to_json` (compact), `to_json_pretty` (two-space indent), `escape_json_string` |
 | `std.toml` | `tomllib` | implemented (manifest subset) | `Toml` (`TStr`, `TInt`, `TBool`, `TArr`, `TTable` of `Entry`s); `parse` → `Ok`/`Err("line N: why")` for tables, arrays of tables, dotted and quoted keys, inline tables, basic strings, integers, booleans, arrays; `to_toml` in glade's layout; `get`, `get_str/int/bool/arr/table`, `keys` |
+| `std.fs` | `os`, `shutil` | implemented | `effect Fs` (`read_bytes`, `write_bytes`, `exists`, `is_dir`, `is_file`, `list_dir`, `mkdir_all`, `remove_all`, `rename`, each `with EFFECT_FS_*`); `read_text`/`write_text`/`try_read_text`, `walk`; POSIX-backed natively (`metaxu_io.c`), catchable `<op>: <path>: <reason>` errors identical on both engines (`docs/io_runtime.md`) |
+| `std.process` | `subprocess.run` | implemented | `effect Process` (`run(argv, cwd)` -> handle, `status`, `stdout`, `stderr`); `run`, `run_in`, `output_of` (Result); both streams captured in full |
+| `std.env` | `os.environ`, `sys.argv` | implemented | `effect Env` (`args`, `get_raw`, `has`, `home`, `cwd`); `args`, `lookup` (Option), `get_or`, `has`, `home`, `cwd`; `metaxuc run file.mx -- a b` and the native entry wrapper feed `args` |
+| `std.io` | `sys.stderr` | implemented | `effect Io` (`write_err`); `eprint`, `eprintln` |
 | `std.iter` | implemented | the adapters `std.stream` defers, over real tuples: `enumerate`, `zip`, `zip_with`, `take_while`, `drop_while`, `step_by`, `windows`, `chunks` |
 
 ### Round 3

@@ -397,6 +397,84 @@ geom = { git = "https://x/geom", rev = "v1" }
 line 1: floats are not supported
 ```
 
+## std.fs, std.process, std.env and std.io
+
+Files, other programs, the environment and the error stream are
+effects. Each operation has a runtime mapping on both engines (POSIX
+calls natively, Python's `os` and `subprocess` on the interpreter), and
+a failure is an ordinary catchable error whose text is the same on
+both: `read: mx.toml: No such file or directory`. Because they are
+effects, a handler in scope replaces the machine. This program writes
+and reads a manifest and runs `git`, and nothing touches the disk or
+starts a process: two handlers answer everything.
+
+```metaxu
+from std.fs import Fs, read_text, write_text, exists;
+from std.process import Process, output_of;
+
+fn index_of(names: Vec, name: string) -> int {
+    let @mut i = 0;
+    let @mut found = 0 - 1;
+    while i < len(names) && found < 0 {
+        if names[i] == name { found = i } else { () };
+        i = i + 1
+    }
+    found
+}
+
+fn main() -> int {
+    let @mut names = Vec.new();
+    let @mut bodies = Vec.new();
+    handle Fs with {
+        write_bytes(path, bytes) -> {
+            let k = index_of(names, path);
+            if k < 0 { names.push(path); bodies.push(bytes) } else { bodies[k] = bytes };
+            resume(())
+        },
+        read_bytes(path) -> {
+            let k = index_of(names, path);
+            if k < 0 { raise("virtual read: " + path + " was never written") } else { resume(bodies[k]) }
+        },
+        exists(path) -> resume(index_of(names, path) >= 0)
+    } in {
+        write_text("mx.toml", "[package]\nname = \"app\"");
+        print(read_text("mx.toml"));
+        print(exists("mx.lock"));
+        if exists("mx.lock") { print(read_text("mx.lock")) } else { print("no lock yet") }
+    };
+    let @mut git = Vec.new();
+    git.push("git");
+    git.push("rev-parse");
+    git.push("HEAD");
+    handle Process with {
+        run(argv, cwd) -> resume(1),
+        status(h) -> resume(0),
+        stdout(h) -> resume("0123abcd\n"),
+        stderr(h) -> resume("")
+    } in {
+        match output_of(git, "") { Ok(t) => print("fake git said " + t.trim()), Err(e) => print(e) }
+    };
+    0
+}
+```
+```output
+[package]
+name = "app"
+0
+no lock yet
+fake git said 0123abcd
+```
+
+Without the handlers the same calls reach the real filesystem and the
+real `git`. One thing to know when writing such a handler: a failure
+raised inside a handler arm surfaces at the `handle` expression, not
+inside a `try` that sits in the handled body (the arm runs in the
+handler's frame), so a virtual filesystem reports a missing file
+through `exists` or a Result rather than by raising. `std.env.args()` gives the command line (`metaxuc run
+prog.mx -- a b`, or a native binary's own arguments), `std.env.lookup`
+an environment variable as an Option, and `std.io.eprintln` writes to
+stderr. `docs/io_runtime.md` is the contract for all four.
+
 ## std.math
 
 Constants are real module-level bindings, read as plain names.

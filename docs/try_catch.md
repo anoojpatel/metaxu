@@ -17,9 +17,11 @@ built on the same delimitation mechanism as effect handlers:
    (abort semantics, matching a non-resuming effect handler).
 3. Runtime failures are: an unhandled effect `perform` (no handler
    installed dynamically), builtin contract violations (pop on empty Vec,
-   index out of bounds, wrong-arity effect op, missing trait impl), and
-   match failures. Borrow/type errors are compile-time and are NOT
-   catchable.
+   index out of bounds, wrong-arity effect op, missing trait impl),
+   match failures, the IO effects' failures (`read: mx.toml: No such
+   file or directory`, docs/io_runtime.md), and an explicit
+   `raise(message)`, the program's own failure with exactly that text.
+   Borrow/type errors are compile-time and are NOT catchable.
 4. Nested `try` scopes: the innermost one catches. A failure raised inside
    a `catch` handler propagates outward; it is not caught by its own try.
 5. The error value in v1 is the failure's message string (example 04 does

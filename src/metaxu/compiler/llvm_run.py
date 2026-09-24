@@ -79,31 +79,38 @@ class LlvmRunError(RuntimeError):
     """The module could not be compiled or the entry point is unusable."""
 
 
+# The C entry point hands argc/argv to the IO runtime (std.env.args(),
+# docs/io_runtime.md) before the module initializer and the entry run.
+_ARGS_HOOK = "  call void @mx_io_set_args(i32 %argc, ptr %argv)\n"
+_ARGS_DECL = "declare void @mx_io_set_args(i32, ptr)\n"
 _WRAPPERS = {
     "i64": (
-        "define i32 @main() {{\n"
+        "define i32 @main(i32 %argc, ptr %argv) {{\n"
         "entry:\n"
+        + _ARGS_HOOK +
         "{init}"
         "  %r = call i64 @{sym}()\n"
         "  %t = trunc i64 %r to i32\n"
         "  ret i32 %t\n"
-        "}}"
+        "}}\n" + _ARGS_DECL
     ),
     "double": (
-        "define i32 @main() {{\n"
+        "define i32 @main(i32 %argc, ptr %argv) {{\n"
         "entry:\n"
+        + _ARGS_HOOK +
         "{init}"
         "  %r = call double @{sym}()\n"
         "  ret i32 0\n"
-        "}}"
+        "}}\n" + _ARGS_DECL
     ),
     "ptr": (
-        "define i32 @main() {{\n"
+        "define i32 @main(i32 %argc, ptr %argv) {{\n"
         "entry:\n"
+        + _ARGS_HOOK +
         "{init}"
         "  %r = call ptr @{sym}()\n"
         "  ret i32 0\n"
-        "}}"
+        "}}\n" + _ARGS_DECL
     ),
 }
 
@@ -230,7 +237,8 @@ def compile_and_run(llvm_ir: str, entry: str = "main", *,
                     timeout: float = 60.0,
                     clang_args: tuple[str, ...] = (),
                     run_env: dict[str, str] | None = None,
-                    run_cwd: str | None = None) -> tuple[int, str]:
+                    run_cwd: str | None = None,
+                    run_args: tuple[str, ...] = ()) -> tuple[int, str]:
     """Compile ``llvm_ir`` with clang and run it; return (exit_code, stdout).
 
     ``entry`` is the metaxu function name (unmangled).  ``workdir`` keeps the
@@ -242,7 +250,8 @@ def compile_and_run(llvm_ir: str, entry: str = "main", *,
     whose payload boxes / heap closure envs leak BY DESIGN, where ASan should
     prove only no-UAF/no-double-free, not leak-freedom.  ``run_cwd`` pins the
     binary's working directory (FFI differentials resolve relative fopen
-    paths against it; default: inherit the caller's cwd).
+    paths against it; default: inherit the caller's cwd).  ``run_args`` are
+    the program's command-line arguments (what std.env.args() answers).
     """
     if workdir is None:
         workdir = tempfile.mkdtemp(prefix="metaxu_llvm_")
@@ -256,6 +265,6 @@ def compile_and_run(llvm_ir: str, entry: str = "main", *,
         env = dict(os.environ)
         env.update(run_env)
     run_proc = subprocess.run(
-        [bin_path], capture_output=True, text=True, timeout=timeout, env=env,
-        cwd=run_cwd)
+        [bin_path, *run_args], capture_output=True, text=True, timeout=timeout,
+        env=env, cwd=run_cwd)
     return run_proc.returncode, run_proc.stdout

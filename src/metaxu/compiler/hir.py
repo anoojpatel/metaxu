@@ -148,6 +148,9 @@ BUILTIN_FUNCTION_NAMES = frozenset({
     "print", "println", "assert", "assert_eq",
     "to_string", "int_to_str", "len", "push", "pop",
     "split", "find", "replace", "trim", "join", "to_bytes", "from_bytes",
+    # `raise(message)`: a catchable runtime failure carrying `message`
+    # (what `try` binds), on both engines.
+    "raise",
     "sqrt", "sin", "cos", "neg", "not", "bnot",
     # FFI shims over the interpreter's simulated C heap
     "malloc", "free", "memcpy", "realloc",

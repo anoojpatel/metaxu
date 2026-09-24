@@ -75,6 +75,11 @@ def cmd_run(args: argparse.Namespace) -> int:
     hir = HIRBuilder(ctx.tables, id_map=ctx.id_map).build(ctx.frozen_root)
     interp = MirInterpreter()
     interp.load(lower_hir_to_mir(hir))
+    # `metaxuc run file.mx -- a b`: what std.env.args() answers.
+    program_args = list(args.args or [])
+    if program_args and program_args[0] == "--":
+        program_args = program_args[1:]
+    interp.program_args = program_args
     entry = _pick_entry(interp, args.entry, args.file)
     result = interp.call(entry, [])
     if result is UNIT or result is None:
@@ -144,6 +149,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("run", help="interpret a program")
     p.add_argument("file")
     p.add_argument("--entry", help="function to call (default: main)")
+    p.add_argument("args", nargs=argparse.REMAINDER,
+                   help="arguments the program sees through std.env.args() "
+                        "(write them after `--`)")
     p.set_defaults(fn=cmd_run)
 
     p = sub.add_parser("build", help="compile a program to a native executable")

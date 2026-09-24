@@ -1,0 +1,121 @@
+# std.fs — the filesystem as an effect.
+#
+# Whole files in and out as bytes (a Vec of ints 0..255, the bytes
+# representation `to_bytes`/`from_bytes` use), plus the directory
+# operations a build tool needs (docs/io_runtime.md). Every operation
+# maps to a runtime primitive on both engines and fails CATCHABLY with
+# "<op>: <path>: <reason>", the reason being the C library's text for
+# the error, so a `try` around a read binds the same message natively
+# and on the interpreter. A handler in scope overrides the mapping: a
+# test serves an in-memory tree and the program under test never knows.
+
+export {
+    Fs,
+    read_bytes,
+    write_bytes,
+    read_text,
+    write_text,
+    try_read_text,
+    exists,
+    is_dir,
+    is_file,
+    list_dir,
+    mkdir_all,
+    remove_all,
+    rename,
+    walk
+}
+
+effect Fs = {
+    fn read_bytes(path: string) -> Vec with EFFECT_FS_READ
+    fn write_bytes(path: string, bytes: Vec) -> () with EFFECT_FS_WRITE
+    fn exists(path: string) -> bool with EFFECT_FS_EXISTS
+    fn is_dir(path: string) -> bool with EFFECT_FS_IS_DIR
+    fn is_file(path: string) -> bool with EFFECT_FS_IS_FILE
+    fn list_dir(path: string) -> Vec with EFFECT_FS_LIST_DIR
+    fn mkdir_all(path: string) -> () with EFFECT_FS_MKDIR_ALL
+    fn remove_all(path: string) -> () with EFFECT_FS_REMOVE_ALL
+    fn rename(source: string, target: string) -> () with EFFECT_FS_RENAME
+}
+
+# The file's bytes.
+fn read_bytes(path: string) -> Vec {
+    perform Fs.read_bytes(path)
+}
+
+# Create or replace the file with these bytes.
+fn write_bytes(path: string, bytes: Vec) -> () {
+    perform Fs.write_bytes(path, bytes)
+}
+
+# The file's text; invalid UTF-8 is a catchable error (see from_bytes).
+fn read_text(path: string) -> string {
+    let bytes = perform Fs.read_bytes(path);
+    bytes.from_bytes()
+}
+
+fn write_text(path: string, text: string) -> () {
+    perform Fs.write_bytes(path, text.to_bytes())
+}
+
+# Ok(text), or Err(the failure message) for a missing or unreadable file.
+fn try_read_text(path: string) -> Result {
+    try { Ok(read_text(path)) } catch e { Err(e) }
+}
+
+fn exists(path: string) -> bool {
+    perform Fs.exists(path)
+}
+
+fn is_dir(path: string) -> bool {
+    perform Fs.is_dir(path)
+}
+
+fn is_file(path: string) -> bool {
+    perform Fs.is_file(path)
+}
+
+# The entry names of a directory, sorted, without "." and "..".
+fn list_dir(path: string) -> Vec {
+    perform Fs.list_dir(path)
+}
+
+# Create the directory and any missing parents; an existing directory
+# is fine.
+fn mkdir_all(path: string) -> () {
+    perform Fs.mkdir_all(path)
+}
+
+# Delete a file, or a directory and everything in it. A missing path is
+# an error, like a failed remove anywhere else.
+fn remove_all(path: string) -> () {
+    perform Fs.remove_all(path)
+}
+
+fn rename(source: string, target: string) -> () {
+    perform Fs.rename(source, target)
+}
+
+# Every file under `root`, as paths relative to it joined with "/",
+# in the order Python's sorted Path walk gives: directory contents
+# sorted by name, depth first.
+fn walk(root: string) -> Vec {
+    let @mut out = Vec.new();
+    walk_into(root, "", out);
+    out
+}
+
+fn walk_into(root: string, rel: string, out: @mut Vec) -> () {
+    let dir = if rel == "" { root } else { root + "/" + rel };
+    let names = perform Fs.list_dir(dir);
+    let @mut i = 0;
+    while i < len(names) {
+        let child = if rel == "" { names[i] } else { rel + "/" + names[i] };
+        if perform Fs.is_dir(root + "/" + child) {
+            walk_into(root, child, out)
+        } else {
+            out.push(child)
+        };
+        i = i + 1
+    }
+}

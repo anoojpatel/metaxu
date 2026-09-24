@@ -1,0 +1,27 @@
+# std.io — the standard error stream as an effect.
+#
+# `print` writes stdout. Diagnostics belong on stderr, and an effect is
+# the right shape for it: a handler in scope collects the messages, the
+# runtime mapping writes them (docs/io_runtime.md). Stdout is flushed
+# first on both engines, so a program's two streams interleave the same
+# way when they share a terminal.
+
+export {
+    Io,
+    eprint,
+    eprintln
+}
+
+effect Io = {
+    fn write_err(text: string) -> () with EFFECT_STDERR
+}
+
+# `text` to stderr, no newline added.
+fn eprint(text: string) -> () {
+    perform Io.write_err(text)
+}
+
+# `text` and a newline to stderr.
+fn eprintln(text: string) -> () {
+    perform Io.write_err(text + "\n")
+}

@@ -1039,6 +1039,8 @@ _NATIVE_RT_CALLS = {"Vec.new", "push", "pop", "len", "to_string",
                     # results, leak by design like concat).
                     "split", "find", "replace", "trim", "join",
                     "to_bytes", "from_bytes",
+                    # raise(message) -> mx_raise (catchable, never returns)
+                    "raise",
                     # Fixed-vector builtins (increment 10) — mx_fvec_*:
                     "__vec_dim", "__vec_zeros", "__vec_filled",
                     "__vec_comprehension", "__range", "__slice_get",
@@ -1130,12 +1132,39 @@ _EFFECT_RUNTIME_PREFIX = "__effect_runtime$"
 # the unit word 0.  A `with SYMBOL` outside this table demotes with a
 # reason (the interpreter errors loudly at perform time there too).
 _EFFECT_PRIMITIVE_CALL_PREFIX = "__mx_effect_runtime$"
+
+# IO effect primitives (docs/io_runtime.md, metaxu_io.c): symbol ->
+# (C symbol, argument kinds, result kind).  Every value is one word:
+# i64, a str pointer or a Vec pointer (bytes as ints, or strings), so the
+# kinds are fixed per primitive and checked like a builtin's.
+_IO_PRIMITIVE_SIGS = {
+    "EFFECT_ENV_ARGS": ("mx_env_args", (), _VEC_PREFIX + STR),
+    "EFFECT_ENV_GET": ("mx_env_get", (STR,), STR),
+    "EFFECT_ENV_HAS": ("mx_env_has", (STR,), I64),
+    "EFFECT_ENV_HOME": ("mx_env_home", (), STR),
+    "EFFECT_ENV_CWD": ("mx_env_cwd", (), STR),
+    "EFFECT_STDERR": ("mx_io_stderr", (STR,), I64),
+    "EFFECT_FS_READ": ("mx_fs_read", (STR,), _VEC_PREFIX + I64),
+    "EFFECT_FS_WRITE": ("mx_fs_write", (STR, _VEC_PREFIX + I64), I64),
+    "EFFECT_FS_EXISTS": ("mx_fs_exists", (STR,), I64),
+    "EFFECT_FS_IS_DIR": ("mx_fs_is_dir", (STR,), I64),
+    "EFFECT_FS_IS_FILE": ("mx_fs_is_file", (STR,), I64),
+    "EFFECT_FS_LIST_DIR": ("mx_fs_list_dir", (STR,), _VEC_PREFIX + STR),
+    "EFFECT_FS_MKDIR_ALL": ("mx_fs_mkdir_all", (STR,), I64),
+    "EFFECT_FS_REMOVE_ALL": ("mx_fs_remove_all", (STR,), I64),
+    "EFFECT_FS_RENAME": ("mx_fs_rename", (STR, STR), I64),
+    "EFFECT_PROCESS_RUN": ("mx_process_run", (_VEC_PREFIX + STR, STR), I64),
+    "EFFECT_PROCESS_STATUS": ("mx_process_status", (I64,), I64),
+    "EFFECT_PROCESS_STDOUT": ("mx_process_stdout", (I64,), STR),
+    "EFFECT_PROCESS_STDERR": ("mx_process_stderr", (I64,), STR),
+}
 _EFFECT_PRIMITIVES = {
     "EFFECT_SPAWN": ("mx_thread_spawn", 1),         # (closure) -> handle
     "EFFECT_JOIN": ("mx_thread_join", 1),           # (handle) -> result word
     "EFFECT_MUTEX_CREATE": ("mx_mutex_create", 0),  # () -> handle
     "EFFECT_MUTEX_LOCK": ("mx_mutex_lock", 1),      # (handle) -> unit
     "EFFECT_MUTEX_UNLOCK": ("mx_mutex_unlock", 1),  # (handle) -> unit
+    **{sym: (csym, len(pks)) for sym, (csym, pks, _r) in _IO_PRIMITIVE_SIGS.items()},
     # Metal launches are interpreter/Mac-hosted (the runtime introspects
     # the closure and emits MSL — machinery a native binary does not
     # carry).  The native primitive exists so std.gpu's Metal effect
@@ -1221,6 +1250,10 @@ _RT_SIGS = {
     # Threads runtime (metaxu_threads.c, docs/threads_runtime.md): opaque
     # i64 handle words; spawn takes the closure's {fn, env} split into two
     # pointer words (the env is compiler-forced heap/immortal).
+    # IO effect primitives (metaxu_io.c): str/Vec words are ptr.
+    **{csym: ("i64" if r == I64 else "ptr",
+              tuple("i64" if k == I64 else "ptr" for k in pks))
+       for (csym, pks, r) in _IO_PRIMITIVE_SIGS.values()},
     "mx_thread_spawn": ("i64", ("ptr", "ptr")),
     "mx_thread_join": ("i64", ("i64",)),
     "mx_mutex_create": ("i64", ()),
@@ -4056,6 +4089,9 @@ def _infer_kinds(info: _Info, sigs: Dict[str, _Sig], structs: _StructTable,
             pass  # receiver may be vec/vector/str; dst stays i64
         elif name in ("to_string", "int_to_str"):
             ch = mark(dst, STR) or ch
+        elif name == "raise":
+            if len(args) == 1:
+                ch = mark(args[0], STR) or ch  # dst is unit (never produced)
         elif name in _STR_BUILTIN_SIGS:
             # Argument kinds are fixed per builtin (the interpreter rejects
             # anything else at run time), so pinning is exact for accepted
@@ -4456,6 +4492,15 @@ def _infer_kinds(info: _Info, sigs: Dict[str, _Sig], structs: _StructTable,
                         elif sres == "builtin":
                             changed = apply_builtin(
                                 starget, dst, args, plain_call=True) or changed
+                    elif callee.startswith(_EFFECT_PRIMITIVE_CALL_PREFIX):
+                        # An IO primitive's words have fixed kinds; the
+                        # thread/mutex ones are checked by kind elsewhere.
+                        psig = _IO_PRIMITIVE_SIGS.get(
+                            callee[len(_EFFECT_PRIMITIVE_CALL_PREFIX):])
+                        if psig is not None and len(args) == len(psig[1]):
+                            for a, pk in zip(args, psig[1]):
+                                changed = mark(a, pk) or changed
+                            changed = mark(dst, psig[2]) or changed
                     elif bname in _NATIVE_RT_CALLS:
                         # NAME PRECEDENCE: _builtin_name already decided
                         # builtin-vs-module-function for this callee.
@@ -5207,6 +5252,14 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                     "(only Vec, fixed vector and string lower natively)")
             elif ty(dst) != I64:
                 probs.append(f"len result {dst!r} promoted to {ty(dst)}")
+        elif name == "raise":
+            if len(args) != 1:
+                probs.append(f"raise with {len(args)} arguments (expects 1)")
+            elif ty(args[0]) != STR:
+                probs.append(
+                    f"raise message {args[0]!r} has kind {ty(args[0])}, not str")
+            elif ty(dst) != I64:
+                probs.append(f"raise result {dst!r} promoted to {ty(dst)}")
         elif name in _STR_BUILTIN_SIGS:
             _sym, pks, res = _STR_BUILTIN_SIGS[name]
             if len(args) != len(pks):
@@ -5447,6 +5500,16 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
             # The native primitive aborts before reading its arguments,
             # so any kinds are fine — nothing to validate.
             pass
+        elif symbol in _IO_PRIMITIVE_SIGS:
+            _csym, pks, rk_ = _IO_PRIMITIVE_SIGS[symbol]
+            for a, pk in zip(pargs, pks):
+                if ty(a) != pk:
+                    probs.append(
+                        f"{symbol} argument {a!r} has kind {ty(a)}, "
+                        f"expects {pk}")
+            if ty(pdst) != rk_:
+                probs.append(
+                    f"{symbol} result {pdst!r} is {ty(pdst)}, expects {rk_}")
         else:  # EFFECT_MUTEX_CREATE / _LOCK / _UNLOCK
             for a in pargs:
                 if ty(a) != I64:
@@ -9031,6 +9094,16 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                 v = fresh()
                 lines.append(f"  {v} = call i64 @{sym}(ptr {recv})")
             setval(dst, v, lines)
+        elif name == "raise":
+            # A catchable failure with the program's own message: the
+            # nearest try's landing pad (or the top-level handler) takes
+            # over; control never comes back, so the unit result below is
+            # never observed.
+            mod.runtime_syms.add("mx_raise")
+            m = use(opargs[0], lines)
+            lines.append(f"  call void @mx_raise(ptr {m})  ; raise(message): "
+                         "catchable, never returns")
+            setval(dst, "0", lines)
         elif name in _STR_BUILTIN_SIGS:
             sym, _pks, res = _STR_BUILTIN_SIGS[name]
             mod.runtime_syms.add(sym)
@@ -9652,7 +9725,19 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                             "implementation")
                     csym = prim[0]
                     mod.runtime_syms.add(csym)
-                    if symbol == "EFFECT_SPAWN":
+                    if symbol in _IO_PRIMITIVE_SIGS:
+                        _c, pks, rk_ = _IO_PRIMITIVE_SIGS[symbol]
+                        argl = ", ".join(
+                            f"{'i64' if pk == I64 else 'ptr'} {use(a, lines)}"
+                            for a, pk in zip(opargs, pks))
+                        v = fresh()
+                        rty = "i64" if rk_ == I64 else "ptr"
+                        lines.append(
+                            f"  {v} = call {rty} @{csym}({argl})"
+                            f"  ; {symbol} (docs/io_runtime.md; failures "
+                            "raise catchably)")
+                        setval(dst, v, lines)
+                    elif symbol == "EFFECT_SPAWN":
                         # Hand the closure's {fn, env} to the C runtime:
                         # the child thread invokes fn(env) through the
                         # word-uniform ABI; the env is a heap (immortal)

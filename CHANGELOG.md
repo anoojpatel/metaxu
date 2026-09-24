@@ -36,6 +36,11 @@ with no section and uses it as the release notes.
   `json.dumps`) and `std.toml` (the manifest subset, with a writer in
   glade's layout), each tested against its Python oracle on both
   engines. Recursive enums held in `Vec`s now compile natively.
+- `std.fs`, `std.process`, `std.env` and `std.io`: files, processes,
+  the environment and stderr as effects with runtime mappings on both
+  engines (`docs/io_runtime.md`); `std.env.args()` answers the command
+  line (`metaxuc run file.mx -- a b`; native binaries take it from
+  `argv`). A handler in scope virtualizes any of them.
 - An assignment statement evaluates to `()`. A `-> ()` function ending
   in `s.f = v` used to return the struct.
 - `scripts/release.py`: one command to cut a release.

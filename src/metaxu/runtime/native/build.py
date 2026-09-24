@@ -28,6 +28,8 @@ EFFECTS_C = NATIVE_DIR / "metaxu_effects.c"
 EFFECTS_H = NATIVE_DIR / "metaxu_effects.h"
 THREADS_C = NATIVE_DIR / "metaxu_threads.c"
 THREADS_H = NATIVE_DIR / "metaxu_threads.h"
+IO_C = NATIVE_DIR / "metaxu_io.c"
+IO_H = NATIVE_DIR / "metaxu_io.h"
 DEFAULT_BUILD_DIR = NATIVE_DIR / "_build"
 
 # C11, optimized, PIC so the object can also land in shared objects later.
@@ -141,13 +143,40 @@ def compile_threads_runtime(
     return obj
 
 
+def _io_mtime() -> float:
+    # metaxu_io.c includes metaxu_rt.h (Vec words) and metaxu_effects.h
+    # (mx_raisef: the catchable failures).
+    return max(p.stat().st_mtime
+               for p in (IO_C, IO_H, RUNTIME_H, EFFECTS_H, Path(__file__)))
+
+
+def compile_io_runtime(
+    build_dir: Optional[Path] = None,
+    clang: str = "clang",
+    extra_cflags: Sequence[str] = (),
+) -> Path:
+    """Compile metaxu_io.c (the POSIX-backed IO effect primitives,
+    docs/io_runtime.md) to metaxu_io.o and return its path.  Same
+    contract as compile_runtime."""
+    build_dir = Path(build_dir) if build_dir is not None else DEFAULT_BUILD_DIR
+    build_dir.mkdir(parents=True, exist_ok=True)
+    obj = build_dir / "metaxu_io.o"
+    if obj.exists() and obj.stat().st_mtime >= _io_mtime():
+        return obj
+    _run(
+        [clang, *CFLAGS, *extra_cflags, "-c", str(IO_C), "-o", str(obj)],
+        "compiling metaxu_io.c",
+    )
+    return obj
+
+
 def runtime_objects(
     build_dir: Optional[Path] = None,
     clang: str = "clang",
     extra_cflags: Sequence[str] = (),
-) -> tuple[Path, Path, Path]:
+) -> tuple[Path, Path, Path, Path]:
     """Every native runtime object a metaxu binary links: (metaxu_rt.o,
-    metaxu_effects.o, metaxu_threads.o)."""
+    metaxu_effects.o, metaxu_threads.o, metaxu_io.o)."""
     return (
         compile_runtime(build_dir=build_dir, clang=clang,
                         extra_cflags=extra_cflags),
@@ -155,6 +184,8 @@ def runtime_objects(
                                 extra_cflags=extra_cflags),
         compile_threads_runtime(build_dir=build_dir, clang=clang,
                                 extra_cflags=extra_cflags),
+        compile_io_runtime(build_dir=build_dir, clang=clang,
+                           extra_cflags=extra_cflags),
     )
 
 
@@ -168,11 +199,13 @@ def build_archive(
     obj = compile_runtime(build_dir=build_dir, clang=clang)
     fx = compile_effects_runtime(build_dir=build_dir, clang=clang)
     thr = compile_threads_runtime(build_dir=build_dir, clang=clang)
+    io = compile_io_runtime(build_dir=build_dir, clang=clang)
     lib = obj.parent / "libmetaxu_rt.a"
     if _is_fresh(lib) and lib.stat().st_mtime >= max(
-            obj.stat().st_mtime, fx.stat().st_mtime, thr.stat().st_mtime):
+            obj.stat().st_mtime, fx.stat().st_mtime, thr.stat().st_mtime,
+            io.stat().st_mtime):
         return lib
-    _run([ar, "rcs", str(lib), str(obj), str(fx), str(thr)],
+    _run([ar, "rcs", str(lib), str(obj), str(fx), str(thr), str(io)],
          "archiving libmetaxu_rt.a")
     return lib
 

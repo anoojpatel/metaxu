@@ -55,7 +55,7 @@ only plain functions are kept out of method position.
 
 **Implementation.** A method-position call to a runtime builtin method
 (`to_string`, `len`, `push`, `pop`, `split`, `find`, `replace`, `trim`,
-`join`, `sqrt`, `sin`, `cos`, `as_ptr`) lowers
+`join`, `to_bytes`, `from_bytes`, `sqrt`, `sin`, `cos`, `as_ptr`) lowers
 to `Call(callee="__builtin$m", operands=(recv, *args))`
 (`hir._method_callee`).  A method name declared by any trait or impl keeps
 lowering to `__trait$m`, so impls still win.  Any other method name keeps

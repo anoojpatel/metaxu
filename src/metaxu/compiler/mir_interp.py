@@ -22,6 +22,9 @@ Usage:
 """
 from __future__ import annotations
 
+import os
+import sys
+
 import math
 import struct as _structmod
 import threading
@@ -721,7 +724,36 @@ class MirInterpreter:
             "EFFECT_SPAWN": self._rt_thread_spawn,
             "EFFECT_JOIN": self._rt_thread_join,
             "EFFECT_METAL_LAUNCH": self._rt_metal_launch,
+            # IO effects (docs/io_runtime.md): std.env / std.io / std.fs /
+            # std.process.  Native counterparts in metaxu_io.c share the
+            # error wording byte for byte.
+            "EFFECT_ENV_ARGS": self._rt_env_args,
+            "EFFECT_ENV_GET": self._rt_env_get,
+            "EFFECT_ENV_HAS": self._rt_env_has,
+            "EFFECT_ENV_HOME": self._rt_env_home,
+            "EFFECT_ENV_CWD": self._rt_env_cwd,
+            "EFFECT_STDERR": self._rt_io_stderr,
+            "EFFECT_FS_READ": self._rt_fs_read,
+            "EFFECT_FS_WRITE": self._rt_fs_write,
+            "EFFECT_FS_EXISTS": self._rt_fs_exists,
+            "EFFECT_FS_IS_DIR": self._rt_fs_is_dir,
+            "EFFECT_FS_IS_FILE": self._rt_fs_is_file,
+            "EFFECT_FS_LIST_DIR": self._rt_fs_list_dir,
+            "EFFECT_FS_MKDIR_ALL": self._rt_fs_mkdir_all,
+            "EFFECT_FS_REMOVE_ALL": self._rt_fs_remove_all,
+            "EFFECT_FS_RENAME": self._rt_fs_rename,
+            "EFFECT_PROCESS_RUN": self._rt_process_run,
+            "EFFECT_PROCESS_STATUS": self._rt_process_status,
+            "EFFECT_PROCESS_STDOUT": self._rt_process_stdout,
+            "EFFECT_PROCESS_STDERR": self._rt_process_stderr,
         }
+        # What std.env.args() answers: the arguments after the program
+        # name (metaxuc run sets it from the command line; the native
+        # entry wrapper hands argv to mx_io_set_args).
+        self.program_args: List[str] = []
+        # Completed process runs, by handle (std.process; immortal like
+        # the native records, so a stale handle is a range check).
+        self._procs: List[Tuple[int, str, str]] = []
         self._next_mutex_id: int = 1
         self._next_thread_id: int = 1
         # Module-level constants: initialized by running __module_init (if
@@ -1716,6 +1748,7 @@ class MirInterpreter:
         self._builtins["join"] = _builtin_join
         self._builtins["to_bytes"] = _builtin_to_bytes
         self._builtins["from_bytes"] = _builtin_from_bytes
+        self._builtins["raise"] = _builtin_raise
         # --- Runtime library: Tile (docs/gpu_tiles.md Stage 0) --------------
         # Dotted statics only in v1 (the Vec.new resolution path): no
         # method-position names, no collisions with std/user `dot`/`sum`.
@@ -2247,6 +2280,200 @@ class MirInterpreter:
             raise InterpError(f"Metal.launch: kernel {kname!r} is not a "
                               "module function")
         return kfunc, bufs
+
+    # ------------------------------------------------------------------
+    # IO effect primitives (docs/io_runtime.md).  Reference semantics for
+    # metaxu_io.c: same results, same catchable messages.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _io_str_arg(symbol: str, role: str, args: List[Any], i: int) -> str:
+        if i >= len(args) or not isinstance(args[i], str):
+            got = _runtime_type_name(args[i]) if i < len(args) else "nothing"
+            raise InterpError(f"{symbol} expects a string {role}, got {got!r}")
+        return args[i]
+
+    @staticmethod
+    def _io_arity(symbol: str, args: List[Any], n: int) -> None:
+        if len(args) != n:
+            raise InterpError(
+                f"{symbol} expects {n} argument(s), got {len(args)}")
+
+    @staticmethod
+    def _io_oserror(op: str, exc: OSError, path: str) -> InterpError:
+        # "<op>: <path>: <strerror>" -- strerror is the C library's text,
+        # which is what metaxu_io.c prints too.
+        return InterpError(f"{op}: {path}: {exc.strerror or str(exc)}")
+
+    def _rt_env_args(self, args: List[Any]) -> Any:
+        self._io_arity("EFFECT_ENV_ARGS", args, 0)
+        return MxVec(list(self.program_args))
+
+    def _rt_env_get(self, args: List[Any]) -> Any:
+        self._io_arity("EFFECT_ENV_GET", args, 1)
+        name = self._io_str_arg("EFFECT_ENV_GET", "name", args, 0)
+        return os.environ.get(name, "")
+
+    def _rt_env_has(self, args: List[Any]) -> Any:
+        self._io_arity("EFFECT_ENV_HAS", args, 1)
+        return self._io_str_arg("EFFECT_ENV_HAS", "name", args, 0) in os.environ
+
+    def _rt_env_home(self, args: List[Any]) -> Any:
+        self._io_arity("EFFECT_ENV_HOME", args, 0)
+        home = os.environ.get("HOME")
+        if home:
+            return home
+        try:
+            import pwd
+            return pwd.getpwuid(os.getuid()).pw_dir or ""
+        except (ImportError, KeyError):
+            return ""
+
+    def _rt_env_cwd(self, args: List[Any]) -> Any:
+        self._io_arity("EFFECT_ENV_CWD", args, 0)
+        try:
+            return os.getcwd()
+        except OSError as exc:
+            raise self._io_oserror("cwd", exc, ".") from None
+
+    def _rt_io_stderr(self, args: List[Any]) -> Any:
+        self._io_arity("EFFECT_STDERR", args, 1)
+        text = self._io_str_arg("EFFECT_STDERR", "text", args, 0)
+        sys.stdout.flush()
+        sys.stderr.write(text)
+        sys.stderr.flush()
+        return UNIT
+
+    def _rt_fs_read(self, args: List[Any]) -> Any:
+        self._io_arity("EFFECT_FS_READ", args, 1)
+        path = self._io_str_arg("EFFECT_FS_READ", "path", args, 0)
+        try:
+            with open(path, "rb") as fh:
+                data = fh.read()
+        except OSError as exc:
+            raise self._io_oserror("read", exc, path) from None
+        return MxVec(list(data))
+
+    def _rt_fs_write(self, args: List[Any]) -> Any:
+        self._io_arity("EFFECT_FS_WRITE", args, 2)
+        path = self._io_str_arg("EFFECT_FS_WRITE", "path", args, 0)
+        if not isinstance(args[1], MxVec):
+            raise InterpError(
+                f"EFFECT_FS_WRITE expects a Vec of bytes, got "
+                f"{_runtime_type_name(args[1])!r}")
+        out = bytearray()
+        for i, e in enumerate(args[1].items):
+            if not isinstance(e, int) or isinstance(e, bool) or not (0 <= e <= 255):
+                raise InterpError(
+                    f"write: element {i} is not a byte (0..255): {e!r}")
+            out.append(e)
+        try:
+            with open(path, "wb") as fh:
+                fh.write(bytes(out))
+        except OSError as exc:
+            raise self._io_oserror("write", exc, path) from None
+        return UNIT
+
+    def _rt_fs_exists(self, args: List[Any]) -> Any:
+        self._io_arity("EFFECT_FS_EXISTS", args, 1)
+        return os.path.exists(self._io_str_arg("EFFECT_FS_EXISTS", "path", args, 0))
+
+    def _rt_fs_is_dir(self, args: List[Any]) -> Any:
+        self._io_arity("EFFECT_FS_IS_DIR", args, 1)
+        return os.path.isdir(self._io_str_arg("EFFECT_FS_IS_DIR", "path", args, 0))
+
+    def _rt_fs_is_file(self, args: List[Any]) -> Any:
+        self._io_arity("EFFECT_FS_IS_FILE", args, 1)
+        return os.path.isfile(self._io_str_arg("EFFECT_FS_IS_FILE", "path", args, 0))
+
+    def _rt_fs_list_dir(self, args: List[Any]) -> Any:
+        self._io_arity("EFFECT_FS_LIST_DIR", args, 1)
+        path = self._io_str_arg("EFFECT_FS_LIST_DIR", "path", args, 0)
+        try:
+            names = sorted(os.listdir(path))
+        except OSError as exc:
+            raise self._io_oserror("list_dir", exc, path) from None
+        return MxVec(names)
+
+    def _rt_fs_mkdir_all(self, args: List[Any]) -> Any:
+        self._io_arity("EFFECT_FS_MKDIR_ALL", args, 1)
+        path = self._io_str_arg("EFFECT_FS_MKDIR_ALL", "path", args, 0)
+        try:
+            os.makedirs(path, exist_ok=True)
+        except OSError as exc:
+            raise self._io_oserror("mkdir_all", exc, path) from None
+        return UNIT
+
+    def _rt_fs_remove_all(self, args: List[Any]) -> Any:
+        self._io_arity("EFFECT_FS_REMOVE_ALL", args, 1)
+        path = self._io_str_arg("EFFECT_FS_REMOVE_ALL", "path", args, 0)
+        import shutil
+        try:
+            if os.path.islink(path) or not os.path.isdir(path):
+                os.remove(path)
+            else:
+                shutil.rmtree(path)
+        except OSError as exc:
+            raise self._io_oserror("remove_all", exc, path) from None
+        return UNIT
+
+    def _rt_fs_rename(self, args: List[Any]) -> Any:
+        self._io_arity("EFFECT_FS_RENAME", args, 2)
+        src = self._io_str_arg("EFFECT_FS_RENAME", "path", args, 0)
+        dst = self._io_str_arg("EFFECT_FS_RENAME", "path", args, 1)
+        try:
+            os.rename(src, dst)
+        except OSError as exc:
+            raise self._io_oserror("rename", exc, src) from None
+        return UNIT
+
+    def _rt_process_run(self, args: List[Any]) -> Any:
+        self._io_arity("EFFECT_PROCESS_RUN", args, 2)
+        if not isinstance(args[0], MxVec):
+            raise InterpError(
+                f"EFFECT_PROCESS_RUN expects a Vec argv, got "
+                f"{_runtime_type_name(args[0])!r}")
+        argv = list(args[0].items)
+        for i, a in enumerate(argv):
+            if not isinstance(a, str):
+                raise InterpError(
+                    f"run: argument {i} is not a string, got "
+                    f"{_runtime_type_name(a)!r}")
+        cwd = self._io_str_arg("EFFECT_PROCESS_RUN", "cwd", args, 1)
+        if not argv:
+            raise InterpError("run: empty argv")
+        import subprocess
+        sys.stdout.flush()
+        try:
+            proc = subprocess.run(argv, cwd=cwd or None, capture_output=True)
+        except OSError as exc:
+            # exec failures name argv[0]; a bad cwd names the cwd (Python
+            # sets filename accordingly), which is what metaxu_io.c does.
+            what = exc.filename if isinstance(exc.filename, str) else argv[0]
+            raise self._io_oserror("run", exc, what) from None
+        self._procs.append((proc.returncode,
+                            proc.stdout.decode("utf-8", errors="replace"),
+                            proc.stderr.decode("utf-8", errors="replace")))
+        return len(self._procs)
+
+    def _proc_record(self, symbol: str, op: str, args: List[Any]) -> Tuple[int, str, str]:
+        self._io_arity(symbol, args, 1)
+        h = args[0]
+        if isinstance(h, bool) or not isinstance(h, int):
+            raise InterpError(
+                f"{symbol} expects a process handle, got {_runtime_type_name(h)!r}")
+        if h < 1 or h > len(self._procs):
+            raise InterpError(f"{op}: no such process handle {h}")
+        return self._procs[h - 1]
+
+    def _rt_process_status(self, args: List[Any]) -> Any:
+        return self._proc_record("EFFECT_PROCESS_STATUS", "status", args)[0]
+
+    def _rt_process_stdout(self, args: List[Any]) -> Any:
+        return self._proc_record("EFFECT_PROCESS_STDOUT", "stdout", args)[1]
+
+    def _rt_process_stderr(self, args: List[Any]) -> Any:
+        return self._proc_record("EFFECT_PROCESS_STDERR", "stderr", args)[2]
 
     def _rt_metal_launch(self, args: List[Any]) -> Any:
         from .emit_msl import MslError, _emit
@@ -3117,6 +3344,16 @@ def _builtin_from_bytes(recv: Any) -> str:
         return out.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise InterpError(f"from_bytes: invalid UTF-8 at byte {exc.start}") from None
+
+
+def _builtin_raise(message: Any) -> Any:
+    """`raise(message)`: a CATCHABLE runtime failure whose text is exactly
+    `message` (docs/try_catch.md), the program's own way to fail the way
+    a builtin contract violation does.  Natively this is mx_raise."""
+    if not isinstance(message, str):
+        raise InterpError(
+            f"raise: expected a string message, got {_runtime_type_name(message)!r}")
+    raise InterpError(message)
 
 
 def _builtin_list_concat(*parts: Any) -> Any:

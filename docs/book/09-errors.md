@@ -49,10 +49,42 @@ try.
 The catchable failures are: builtin contract violations (indexing out
 of bounds, `pop` on an empty Vec, `Tile.get` outside the tile's shape,
 a shift count outside 0..63); a `perform` with no handler installed; a
-match that no pattern accepts at runtime; and a trait method call
-whose receiver type has no impl (chapter 7 catches one). The
-unhandled-`perform` case defines the division of labor between `try`
-and `handle`:
+match that no pattern accepts at runtime; a trait method call whose
+receiver type has no impl (chapter 7 catches one); a failed file or
+process operation from `std.fs` and friends (chapter 12); and your
+own `raise(message)`, which fails with exactly that text:
+
+```metaxu
+fn parse_port(text: string) -> int {
+    let @mut value = 0;
+    let @mut i = 0;
+    while i < len(text) {
+        let d = "0123456789".find(text[i]);
+        if d < 0 { raise("parse_port: not a number: " + text) } else { () };
+        value = value * 10 + d;
+        i = i + 1
+    }
+    if value > 65535 { raise("parse_port: out of range: " + text) } else { () };
+    value
+}
+
+fn main() -> int {
+    print(parse_port("8080"));
+    print(try { parse_port("80x") } catch e { print(e); 0 - 1 });
+    print(try { parse_port("99999") } catch e { print(e); 0 - 1 });
+    0
+}
+```
+```output
+8080
+parse_port: not a number: 80x
+-1
+parse_port: out of range: 99999
+-1
+```
+
+The unhandled-`perform` case defines the division of labor between
+`try` and `handle`:
 
 ```metaxu
 effect Parser { parse(input: string) -> int }

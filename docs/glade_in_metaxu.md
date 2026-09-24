@@ -84,18 +84,18 @@ into, and each needs work in the compiler as well as `std/`.
 | a byte type and string ↔ bytes | hashing a tree, reading files that are not UTF-8, TOML escapes | Done, as the cheaper of the two options: bytes are a `Vec` of ints in 0..255 (what `as_ptr` already accepted), `s.to_bytes()` gives a string's UTF-8 bytes and `v.from_bytes()` decodes them, rejecting a non-byte, a NUL and invalid UTF-8 with the same three messages on both engines. A distinct byte type can replace the representation later without changing callers. |
 | string builtins with linear cost | `std.string` does `starts_with` and `index_of_char` by `char_at` loops, which is O(n²) over a manifest | Done: `split`, `find`, `replace`, `trim`, `join` are `__builtin$m` methods backed by `mx_str_*` in C, with the interpreter matching; `std.parse.trim`/`split_on` and `std.string.join` are thin names over them. `to_int` stays `std.parse.parse_int`, which is linear already. |
 | a hashed `Map` | the solver keeps a dozen maps keyed by package name; O(n) lookups are fine at glade's sizes but wrong in spirit | a `Hash` trait, `impl Hash for string/int`, and a bucketed `std.map` behind the same API. Not blocking. |
-| `main` arguments | the command line | either `fn main(args: Vec) -> int` accepted by both engines, or `std.env.args()`. The native `@main` wrapper already exists; it needs to carry `argv` through. |
-| stderr | diagnostics must not go to stdout | `eprint` builtin, or `std.io.stderr` as an effect operation. |
-| a process-exit with a message | `glade: <error>` then exit 2 | falls out of `std.fail` plus `eprint` and `main`'s return. |
+| `main` arguments | the command line | Done as `std.env.args()`: the native `@main` wrapper takes `argc, argv` and hands them to the IO runtime; `metaxuc run file.mx -- a b` sets them on the interpreter. `main` keeps its signature. |
+| stderr | diagnostics must not go to stdout | Done: `std.io.eprint` / `eprintln` as an effect operation. |
+| a process-exit with a message | `glade: <error>` then exit 2 | falls out of `try`/`catch` plus `eprintln` and `main`'s return. |
 
 ### FFI out, as effects with C handlers
 
 | effect | operations glade needs | C side | interpreter shim |
 |---|---|---|---|
-| `std.fs` | `read(path) -> Result[bytes]`, `write(path, bytes)`, `exists`, `is_dir`, `is_file`, `list_dir`, `mkdir_all`, `remove_all`, `rename`, `walk` (or `list_dir` and recursion in Metaxu) | `fopen`/`fread`/`fwrite`/`fclose`, `stat`, `opendir`/`readdir`/`closedir`, `mkdir`, `unlink`/`rmdir`, `rename`; POSIX first, Windows later | Python `os`, `pathlib`, `shutil` |
-| `std.process` | `run(argv: Vec, cwd) -> {status, stdout, stderr}` | `posix_spawn` or `fork`+`execvp`, pipes, `waitpid`; capture both streams without deadlock | `subprocess.run` |
-| `std.env` | `get(name) -> Option[string]`, `home()`, `cwd()`, `args()` | `getenv`, `getcwd`, `argv` from the entry wrapper | `os.environ`, `os.getcwd`, `sys.argv` |
-| `std.io` | `stderr(text)`, and `stdin` later | `fputs` on `stderr` | `sys.stderr` |
+| `std.fs` | Done: `read_bytes`, `write_bytes`, `exists`, `is_dir`, `is_file`, `list_dir`, `mkdir_all`, `remove_all`, `rename`, with `read_text`, `write_text`, `try_read_text` (Result) and `walk` in Metaxu | `metaxu_io.c`: `open`/`read`/`write`, `stat`, `opendir`/`readdir`, `mkdir`, `unlink`/`rmdir`, `rename`; POSIX first, Windows later | Python `os`, `shutil` |
+| `std.process` | Done: `run(argv, cwd)` answers a handle read by `status`, `stdout`, `stderr`; `run`, `run_in`, `output_of` wrap it into an `Outcome` or a Result | `fork`+`execvp` with an exec-failure pipe, both streams drained with `poll`, `waitpid` | `subprocess.run` |
+| `std.env` | Done: `lookup(name) -> Option`, `get_or`, `has`, `home()`, `cwd()`, `args()` | `getenv`, `getcwd`, `argv` handed to `mx_io_set_args` by the entry wrapper | `os.environ`, `os.getcwd`, `MirInterpreter.program_args` (set by `metaxuc run file.mx -- a b`) |
+| `std.io` | Done: `eprint`, `eprintln` over `write_err`; `stdin` later | `fputs` on `stderr` after flushing stdout | `sys.stderr` |
 
 Making these effects rather than plain externs is the point of the
 language: a test installs a handler that serves an in-memory
@@ -191,6 +191,18 @@ module-wide cells so those cells stay unmixed, and a recursive
 function's self-call never opens a new specialization group. With
 that, every non-IO part of glade can now be written.
 
+**Step 3, the IO effects: done.** `std.fs`, `std.process`, `std.env`
+and `std.io` are effects whose operations map to runtime primitives on
+both engines, POSIX in `metaxu_io.c` natively and `os`/`shutil`/
+`subprocess` on the interpreter, with the error text shared word for
+word; `docs/io_runtime.md` is the contract (one word per value, bytes
+as a `Vec` of ints, catchable `<op>: <path>: <reason>` failures, a
+handle per finished process, `args()` for the command line).
+`test_std_io.py` runs one program through both engines inside a scratch
+directory and a second one entirely under handlers that serve an
+in-memory tree and a fake `git`, which is the shape glade's own tests
+will take. Every primitive the package manager needs now exists.
+
 What the two programs still leave as placeholders is `std.fail`'s
 higher-order handlers (`try_opt(f)` and friends call a closure passed as
 a parameter), which they import but never call.
@@ -226,7 +238,6 @@ Two limits worth knowing before writing more library code:
    the Python version becomes the reference the way the interpreter
    is for the backends.
 
-Steps 1 and 2 can start now. Step 3 is where the design decisions
-are, chiefly what a `bytes` value is and how effect operations pass
-`Vec` and `bytes` across the C boundary; those deserve their own
-notes before code.
+Steps 1 to 3 are done; `docs/io_runtime.md` holds step 3's design
+decisions (what a `bytes` value is and how effect operations pass
+`Vec` and `bytes` across the C boundary). Step 4 is next.
