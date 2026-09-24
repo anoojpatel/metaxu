@@ -32,6 +32,10 @@ with no section and uses it as the release notes.
 - `to_bytes` and `from_bytes`: a string's UTF-8 bytes as a `Vec` of
   ints and back, with the same diagnostics on both engines.
 - `std.hex` and `std.sha256`, pure Metaxu, tested against hashlib.
+- `std.path` (posixpath semantics), `std.json` (a writer matching
+  `json.dumps`) and `std.toml` (the manifest subset, with a writer in
+  glade's layout), each tested against its Python oracle on both
+  engines. Recursive enums held in `Vec`s now compile natively.
 - An assignment statement evaluates to `()`. A `-> ()` function ending
   in `s.f = v` used to return the struct.
 - `scripts/release.py`: one command to cut a release.

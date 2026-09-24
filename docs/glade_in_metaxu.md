@@ -67,9 +67,9 @@ runtime symbols, the pattern `Thread` and `Mutex` already use
 |---|---|---|
 | `std.semver` | `Version`, `Range` as sorted disjoint intervals with intersect, union, complement; requirement parsing (`^`, `~`, `>=`, `<`, `=`, `*`, commas) | Pure. Portable today. The prerelease rule and partial versions are the fiddly parts; the Python tests transfer one to one. |
 | `std.solve` | PubGrub: terms, incompatibilities, partial solution, propagation, conflict resolution, the widening step, the explanation writer | Pure. Needs `std.map` keyed by strings, recursion, and a `Provider` trait with `versions` and `dependencies`. The largest single piece, and the best stress test of traits and enums the language has had. |
-| `std.toml` | a reader for the subset the manifests use (tables, arrays of tables, inline tables, strings, ints, bools, arrays) and a writer | Needs `std.bytes` for correct string escapes. A full TOML 1.0 reader can come later; the lock and index never use dates or multiline strings. |
-| `std.path` | join, dirname, basename, normalize, relative-to, `is_absolute` | String only. `relpath` is the one glade needs and gets wrong without care. |
-| `std.json` | a writer | `glade paths` prints a JSON object; no reader needed. |
+| `std.toml` | a reader for the subset the manifests use (tables, arrays of tables, inline tables, strings, ints, bools, arrays) and a writer | Done. The reader accepts exactly what the manifests, locks and index entries use and rejects the rest by name (floats, dates, literal strings, hex); the writer produces glade's layout (inline tables inside sections, one `[[package]]` per lock entry). A full TOML 1.0 reader can come later. |
+| `std.path` | join, dirname, basename, normalize, relative-to, `is_absolute` | Done, against `posixpath` case for case. `relpath` takes two absolute or two relative paths, since there is no working directory to resolve against yet. |
+| `std.json` | a writer | Done: `to_json` and `to_json_pretty` match `json.dumps` compact and `indent=2`. `glade paths` prints a JSON object; no reader needed. |
 | `std.args` | flag and subcommand parsing over `Vec` of strings | Replaces argparse. Depends on `std.env` for the argument vector. |
 | `std.hex` and `std.sha256` | hex encoding; SHA-256 over bytes | Done. SHA-256 is 32-bit arithmetic with wrapping adds and rotates, which the integer ops already give; the port is FIPS 180-4 in a hundred lines with the constants in decimal (no hex literals yet), tested against hashlib on both engines. Bind C only if the interpreter's speed on large trees becomes a problem. |
 | the tool itself | manifest and lock models, index parsing, resolution, sync, add, remove, tree, check, search | Ordinary code once the pieces above exist. Lives in its own package, built and vendored by glade. |
@@ -178,6 +178,18 @@ of ints (see the table above), `std.hex` renders and parses them, and
 padding boundary and a few hundred bytes of patterns against hashlib,
 then runs the same program natively. The interpreter hashes about
 twenty kilobytes a second, enough for manifests and small trees.
+
+**Step 2, `std.path`, `std.json`, `std.toml`: done.** Each has a
+Python oracle test (`posixpath`, `json.dumps`, `tomllib`) on the
+interpreter and a native differential. The TOML reader and the JSON
+writer are the first recursive-enum programs (a `Toml` holds `Vec`s of
+`Toml`) to compile natively, and they took three more backend fixes:
+a name-only enum kind (past the refinement depth) must never become a
+value's kind but read as the canonical refinement, an empty `Vec`
+stored into a payload slot learns the slot's element kind from the
+module-wide cells so those cells stay unmixed, and a recursive
+function's self-call never opens a new specialization group. With
+that, every non-IO part of glade can now be written.
 
 What the two programs still leave as placeholders is `std.fail`'s
 higher-order handlers (`try_opt(f)` and friends call a closure passed as

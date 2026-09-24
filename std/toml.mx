@@ -1,0 +1,842 @@
+# std.toml — a TOML reader and writer for the subset manifests use.
+#
+# The package manager's files (`mx.toml`, `mx.lock`, a registry's
+# `packages/<name>.toml`) use tables, arrays of tables, dotted keys,
+# inline tables, basic strings, integers, booleans and arrays. This
+# module reads exactly that subset and rejects the rest loudly (dates,
+# floats, literal and multi-line strings, hex integers): an `Err` names
+# the line. Python's `tomllib` is the oracle for everything accepted.
+#
+# A document is a `TTable` of `Entry`s in document order; `[[name]]`
+# headers build a `TArr` of `TTable`s under `name`. Keys are strings
+# (bare or quoted; a dotted key `a.b = 1` nests). `parse` answers
+# `Ok(table)` or `Err(message)`.
+#
+# The writer renders a table in the layout glade's Python writes:
+# scalar and array entries first (`key = value`), then one `[name]`
+# section per table entry and one `[[name]]` section per table in an
+# array of tables, nested tables inside those as inline tables.
+
+export {
+    Toml,
+    Entry,
+    entry,
+    parse,
+    to_toml,
+    get,
+    get_str,
+    get_int,
+    get_bool,
+    get_arr,
+    get_table,
+    keys,
+    toml_string
+}
+
+enum Toml {
+    TStr(string),
+    TInt(int),
+    TBool(bool),
+    TArr(Vec),
+    TTable(Vec)
+}
+
+struct Entry {
+    key: string,
+    value: Toml
+}
+
+fn entry(key: string, value: Toml) -> Entry {
+    Entry { key: key, value: value }
+}
+
+# ---------------------------------------------------------------------
+# lookups
+
+# The value under `key` in a table, or None.
+fn get(t: Toml, key: string) -> Option {
+    match t {
+        TTable(entries) => {
+            let @mut i = 0;
+            let @mut found = None;
+            while i < len(entries) {
+                let e = entries[i];
+                if e.key == key { found = Some(e.value) } else { () };
+                i = i + 1
+            };
+            found
+        },
+        TStr(s) => None,
+        TInt(n) => None,
+        TBool(b) => None,
+        TArr(items) => None
+    }
+}
+
+fn get_str(t: Toml, key: string) -> Option {
+    match get(t, key) { None => None, Some(v) => match v { TStr(s) => Some(s), TInt(n) => None, TBool(b) => None, TArr(a) => None, TTable(e) => None } }
+}
+
+fn get_int(t: Toml, key: string) -> Option {
+    match get(t, key) { None => None, Some(v) => match v { TInt(n) => Some(n), TStr(s) => None, TBool(b) => None, TArr(a) => None, TTable(e) => None } }
+}
+
+fn get_bool(t: Toml, key: string) -> Option {
+    match get(t, key) { None => None, Some(v) => match v { TBool(b) => Some(b), TStr(s) => None, TInt(n) => None, TArr(a) => None, TTable(e) => None } }
+}
+
+fn get_arr(t: Toml, key: string) -> Option {
+    match get(t, key) { None => None, Some(v) => match v { TArr(a) => Some(a), TStr(s) => None, TInt(n) => None, TBool(b) => None, TTable(e) => None } }
+}
+
+fn get_table(t: Toml, key: string) -> Option {
+    match get(t, key) { None => None, Some(v) => match v { TTable(e) => Some(v), TStr(s) => None, TInt(n) => None, TBool(b) => None, TArr(a) => None } }
+}
+
+# The keys of a table in document order.
+fn keys(t: Toml) -> Vec {
+    let @mut out = Vec.new();
+    match t {
+        TTable(entries) => {
+            let @mut i = 0;
+            while i < len(entries) {
+                let e = entries[i];
+                out.push(e.key);
+                i = i + 1
+            }
+        },
+        TStr(s) => (),
+        TInt(n) => (),
+        TBool(b) => (),
+        TArr(items) => ()
+    };
+    out
+}
+
+# ---------------------------------------------------------------------
+# reader
+
+struct Reader {
+    text: string,
+    pos: int,
+    line: int,
+    error: string,
+    # Key paths (joined with newlines, which no key can contain) that a
+    # `[header]` or a dotted key has defined: a second `[t]` is an error.
+    declared: Vec,
+    # Key paths of inline tables, which are closed: nothing may be added
+    # to them afterwards, by a dotted key or by a header.
+    closed: Vec
+}
+
+# Ok(TTable) for a document in the subset, Err("line N: why") otherwise.
+fn parse(text: string) -> Result {
+    let @mut r = Reader { text: text, pos: 0, line: 1, error: "", declared: Vec.new(), closed: Vec.new() };
+    let @mut root = Vec.new();
+    # The table the next `key = value` lines land in, as a key path from
+    # the root; empty means the root itself.
+    let @mut current = Vec.new();
+    let @mut array_header = false;
+    skip_blank_lines(r);
+    while r.error == "" && r.pos < len(r.text) {
+        let c = r.text[r.pos];
+        if c == "[" {
+            if r.pos + 1 < len(r.text) && r.text[r.pos + 1] == "[" {
+                r.pos = r.pos + 2;
+                let path = read_key_path(r, "]");
+                expect(r, "]");
+                expect(r, "]");
+                if r.error == "" {
+                    current = path;
+                    array_header = true;
+                    root = append_table(root, path, r)
+                } else { () }
+            } else {
+                r.pos = r.pos + 1;
+                let path = read_key_path(r, "]");
+                expect(r, "]");
+                if r.error == "" {
+                    let joined = scoped(root, path, len(path));
+                    if contains(r.declared, joined) {
+                        fail(r, "table '" + path.join(".") + "' declared twice")
+                    } else {
+                        check_open(r, root, path);
+                        r.declared.push(joined);
+                        current = path;
+                        array_header = false;
+                        root = declare_table(root, path, r)
+                    }
+                } else { () }
+            }
+        } else {
+            let path = read_key_path(r, "=");
+            expect(r, "=");
+            let value = read_value(r);
+            if r.error == "" {
+                let full = concat_paths(current, path);
+                check_open(r, root, full);
+                # a dotted key defines every table on its own way (not the
+                # section's), which a later `[a]` header may not redefine
+                let @mut d = len(current) + 1;
+                while d < len(full) {
+                    let prefix = scoped(root, full, d);
+                    if contains(r.declared, prefix) { () } else { r.declared.push(prefix) };
+                    d = d + 1
+                }
+                root = insert(root, current, path, value, r);
+                # an inline table is closed from now on
+                match value {
+                    TTable(e) => r.closed.push(scoped(root, full, len(full))),
+                    TStr(s) => (),
+                    TInt(n) => (),
+                    TBool(b) => (),
+                    TArr(a) => ()
+                }
+            } else { () }
+        };
+        end_of_line(r);
+        skip_blank_lines(r)
+    }
+    if r.error == "" { Ok(TTable(root)) } else { Err(r.error) }
+}
+
+fn contains(v: Vec, s: string) -> bool {
+    let @mut i = 0;
+    let @mut found = false;
+    while i < len(v) {
+        if v[i] == s { found = true } else { () };
+        i = i + 1
+    }
+    found
+}
+
+fn concat_paths(a: Vec, b: Vec) -> Vec {
+    let @mut out = Vec.new();
+    let @mut i = 0;
+    while i < len(a) { out.push(a[i]); i = i + 1 }
+    let @mut j = 0;
+    while j < len(b) { out.push(b[j]); j = j + 1 }
+    out
+}
+
+# The scope key of `path` under `root`: the keys joined with newlines,
+# where a key that names an array of tables also carries the index of
+# its current (last) element, so `dependencies` inside the second
+# `[[versions]]` is a different scope from the first's.
+fn scoped(root: Vec, path: Vec, n: int) -> string {
+    let @mut parts = Vec.new();
+    let @mut entries = root;
+    let @mut live = true;
+    let @mut i = 0;
+    while i < n {
+        let key = path[i];
+        let k = if live { index_of_key(entries, key) } else { 0 - 1 };
+        if k < 0 {
+            parts.push(key);
+            live = false
+        } else {
+            let e = entries[k];
+            match e.value {
+                TArr(items) => {
+                    parts.push(key + "#" + len(items).to_string());
+                    if len(items) > 0 {
+                        match items[len(items) - 1] {
+                            TTable(inner) => { entries = inner },
+                            TStr(x) => { live = false },
+                            TInt(x) => { live = false },
+                            TBool(x) => { live = false },
+                            TArr(x) => { live = false }
+                        }
+                    } else { live = false }
+                },
+                TTable(inner) => {
+                    parts.push(key);
+                    entries = inner
+                },
+                TStr(x) => { parts.push(key); live = false },
+                TInt(x) => { parts.push(key); live = false },
+                TBool(x) => { parts.push(key); live = false }
+            }
+        };
+        i = i + 1
+    }
+    parts.join("\n")
+}
+
+# The first `n` keys of a path joined with `sep` (Vec slicing is not
+# native yet, so this is a loop).
+fn path_prefix(path: Vec, n: int, sep: string) -> string {
+    let @mut out = Vec.new();
+    let @mut i = 0;
+    while i < n {
+        out.push(path[i]);
+        i = i + 1
+    }
+    out.join(sep)
+}
+
+# An error when `path` lands on or passes through a closed inline table.
+fn check_open(r: @mut Reader, root: Vec, path: Vec) -> () {
+    let @mut d = 1;
+    while d <= len(path) {
+        if contains(r.closed, scoped(root, path, d)) {
+            fail(r, "cannot extend inline table '" + path_prefix(path, d, ".") + "'")
+        } else { () };
+        d = d + 1
+    }
+}
+
+fn fail(r: @mut Reader, why: string) -> () {
+    if r.error == "" { r.error = "line " + r.line.to_string() + ": " + why } else { () }
+}
+
+fn at_end(r: Reader) -> bool {
+    r.pos >= len(r.text)
+}
+
+fn peek(r: Reader) -> string {
+    if r.pos < len(r.text) { r.text[r.pos] } else { "" }
+}
+
+fn skip_spaces(r: @mut Reader) -> () {
+    while r.pos < len(r.text) && (r.text[r.pos] == " " || r.text[r.pos] == "\t") {
+        r.pos = r.pos + 1
+    }
+}
+
+# Spaces, comments and newlines, counting lines.
+fn skip_blank_lines(r: @mut Reader) -> () {
+    let @mut going = true;
+    while going {
+        skip_spaces(r);
+        let c = peek(r);
+        if c == "#" {
+            while r.pos < len(r.text) && r.text[r.pos] != "\n" { r.pos = r.pos + 1 }
+        } else {
+            if c == "\n" { r.pos = r.pos + 1; r.line = r.line + 1 } else {
+            if c == "\r" { r.pos = r.pos + 1 } else { going = false } }
+        }
+    }
+}
+
+# After a header or a key/value pair: only spaces, a comment and the line end.
+fn end_of_line(r: @mut Reader) -> () {
+    skip_spaces(r);
+    let c = peek(r);
+    if c == "#" {
+        while r.pos < len(r.text) && r.text[r.pos] != "\n" { r.pos = r.pos + 1 }
+    } else {
+        if c == "" || c == "\n" || c == "\r" { () } else {
+            fail(r, "expected end of line, found " + quote(c))
+        }
+    }
+}
+
+fn expect(r: @mut Reader, c: string) -> () {
+    skip_spaces(r);
+    if peek(r) == c { r.pos = r.pos + 1 } else {
+        fail(r, "expected " + quote(c) + ", found " + quote(peek(r)))
+    }
+}
+
+fn quote(c: string) -> string {
+    if c == "" { "end of input" } else { "'" + c + "'" }
+}
+
+fn is_bare_key_char(c: string) -> bool {
+    let ok = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-";
+    c != "" && ok.find(c) >= 0
+}
+
+# `a`, `"a b"`, or a dotted `a.b.c`, up to (not including) `stop`.
+fn read_key_path(r: @mut Reader, stop: string) -> Vec {
+    let @mut path = Vec.new();
+    let @mut going = true;
+    while going && r.error == "" {
+        skip_spaces(r);
+        let c = peek(r);
+        if c == "\"" {
+            path.push(read_basic_string(r))
+        } else {
+            let @mut key = "";
+            while is_bare_key_char(peek(r)) {
+                key = key + peek(r);
+                r.pos = r.pos + 1
+            }
+            if key == "" { fail(r, "expected a key, found " + quote(c)) } else { path.push(key) }
+        };
+        skip_spaces(r);
+        if peek(r) == "." { r.pos = r.pos + 1 } else { going = false }
+    }
+    path
+}
+
+fn read_value(r: @mut Reader) -> Toml {
+    skip_spaces(r);
+    let c = peek(r);
+    if c == "\"" { TStr(read_basic_string(r)) } else {
+    if c == "[" { read_array(r) } else {
+    if c == "{" { read_inline_table(r) } else {
+    if c == "t" || c == "f" { read_bool(r) } else {
+    if c == "-" || c == "+" || is_digit_char(c) { read_int(r) } else {
+    if c == "'" { fail(r, "literal strings are not supported"); TInt(0) } else {
+        fail(r, "expected a value, found " + quote(c));
+        TInt(0)
+    } } } } } }
+}
+
+fn is_digit_char(c: string) -> bool {
+    c != "" && "0123456789".find(c) >= 0
+}
+
+fn read_bool(r: @mut Reader) -> Toml {
+    if starts_at(r, "true") { r.pos = r.pos + 4; TBool(true) } else {
+    if starts_at(r, "false") { r.pos = r.pos + 5; TBool(false) } else {
+        fail(r, "expected true or false");
+        TBool(false)
+    } }
+}
+
+fn starts_at(r: Reader, word: string) -> bool {
+    r.pos + len(word) <= len(r.text) && r.text[r.pos:r.pos + len(word)] == word
+}
+
+# A decimal integer with an optional sign; `_` separators are accepted
+# between digits. Anything that would make it a float or a date fails.
+fn read_int(r: @mut Reader) -> Toml {
+    let @mut negative = false;
+    if peek(r) == "-" { negative = true; r.pos = r.pos + 1 } else {
+    if peek(r) == "+" { r.pos = r.pos + 1 } else { () } };
+    let @mut value = 0;
+    let @mut digits = 0;
+    let first_digit = peek(r);
+    let @mut going = true;
+    while going {
+        let c = peek(r);
+        if is_digit_char(c) {
+            value = value * 10 + "0123456789".find(c);
+            digits = digits + 1;
+            r.pos = r.pos + 1
+        } else {
+            if c == "_" && digits > 0 && is_digit_char(char_after(r)) { r.pos = r.pos + 1 } else { going = false }
+        }
+    }
+    let c = peek(r);
+    if digits == 0 { fail(r, "expected digits") } else {
+    if digits > 1 && first_digit == "0" { fail(r, "leading zeros are not allowed") } else {
+    if c == "." || c == "e" || c == "E" { fail(r, "floats are not supported") } else {
+    if c == "-" || c == ":" { fail(r, "dates and times are not supported") } else {
+    if c == "x" || c == "o" || c == "b" { fail(r, "only decimal integers are supported") } else { () } } } } };
+    if negative { TInt(0 - value) } else { TInt(value) }
+}
+
+fn char_after(r: Reader) -> string {
+    if r.pos + 1 < len(r.text) { r.text[r.pos + 1] } else { "" }
+}
+
+# `"..."` with the escapes \" \\ \n \t \r \b \f and \uXXXX (BMP only);
+# TOML has no \/ escape, unlike JSON.
+fn read_basic_string(r: @mut Reader) -> string {
+    r.pos = r.pos + 1;
+    let @mut parts = Vec.new();
+    let @mut going = true;
+    while going && r.error == "" {
+        if at_end(r) { fail(r, "unterminated string"); going = false } else {
+            let c = r.text[r.pos];
+            if c == "\"" { r.pos = r.pos + 1; going = false } else {
+            if c == "\n" { fail(r, "newline in a string"); going = false } else {
+            if c == "\\" {
+                r.pos = r.pos + 1;
+                let e = peek(r);
+                r.pos = r.pos + 1;
+                if e == "n" { parts.push("\n") } else {
+                if e == "t" { parts.push("\t") } else {
+                if e == "r" { parts.push("\r") } else {
+                if e == "\"" { parts.push("\"") } else {
+                if e == "\\" { parts.push("\\") } else {
+                if e == "b" { parts.push(byte_string(8)) } else {
+                if e == "f" { parts.push(byte_string(12)) } else {
+                if e == "u" { parts.push(read_unicode_escape(r)) } else {
+                    fail(r, "unknown escape \\" + e)
+                } } } } } } } }
+            } else {
+                parts.push(c);
+                r.pos = r.pos + 1
+            } } }
+        }
+    }
+    parts.join("")
+}
+
+# Four hex digits after `\u`, as the UTF-8 text of that code point.
+fn read_unicode_escape(r: @mut Reader) -> string {
+    let @mut code = 0;
+    let @mut i = 0;
+    while i < 4 && r.error == "" {
+        let v = hex_value(peek(r));
+        if v < 0 { fail(r, "bad \\u escape") } else { code = code * 16 + v; r.pos = r.pos + 1 };
+        i = i + 1
+    }
+    if r.error == "" { code_point_string(code) } else { "" }
+}
+
+fn hex_value(c: string) -> int {
+    let lower = "0123456789abcdef";
+    let upper = "0123456789ABCDEF";
+    let l = lower.find(c);
+    if c == "" { 0 - 1 } else { if l >= 0 { l } else { upper.find(c) } }
+}
+
+fn byte_string(b: int) -> string {
+    let @mut v = Vec.new();
+    v.push(b);
+    v.from_bytes()
+}
+
+# The UTF-8 encoding of a code point below 0x10000, via bytes.
+fn code_point_string(code: int) -> string {
+    let @mut v = Vec.new();
+    if code < 128 { v.push(code) } else {
+    if code < 2048 {
+        v.push(192 | (code >> 6));
+        v.push(128 | (code & 63))
+    } else {
+        v.push(224 | (code >> 12));
+        v.push(128 | ((code >> 6) & 63));
+        v.push(128 | (code & 63))
+    } };
+    v.from_bytes()
+}
+
+# `[v, v, ...]`, over several lines if wanted, trailing comma allowed.
+fn read_array(r: @mut Reader) -> Toml {
+    r.pos = r.pos + 1;
+    let @mut items = Vec.new();
+    let @mut going = true;
+    while going && r.error == "" {
+        skip_blank_lines(r);
+        if peek(r) == "]" { r.pos = r.pos + 1; going = false } else {
+            items.push(read_value(r));
+            skip_blank_lines(r);
+            if peek(r) == "," { r.pos = r.pos + 1 } else {
+            if peek(r) == "]" { r.pos = r.pos + 1; going = false } else {
+                fail(r, "expected ',' or ']' in an array, found " + quote(peek(r)));
+                going = false
+            } }
+        }
+    }
+    TArr(items)
+}
+
+# `{ k = v, k = v }` on one line.
+fn read_inline_table(r: @mut Reader) -> Toml {
+    r.pos = r.pos + 1;
+    let @mut entries = Vec.new();
+    skip_spaces(r);
+    if peek(r) == "}" { r.pos = r.pos + 1; TTable(entries) } else {
+        let @mut going = true;
+        while going && r.error == "" {
+            let path = read_key_path(r, "=");
+            expect(r, "=");
+            let value = read_value(r);
+            if r.error == "" { entries = insert(entries, Vec.new(), path, value, r) } else { () };
+            skip_spaces(r);
+            if peek(r) == "," {
+                r.pos = r.pos + 1;
+                skip_spaces(r);
+                if peek(r) == "}" { fail(r, "trailing comma in an inline table"); going = false } else { () }
+            } else {
+            if peek(r) == "}" { r.pos = r.pos + 1; going = false } else {
+                fail(r, "expected ',' or '}' in an inline table, found " + quote(peek(r)));
+                going = false
+            } }
+        };
+        TTable(entries)
+    }
+}
+
+# ---------------------------------------------------------------------
+# building the tree
+
+# The index of `key` in `entries`, or -1.
+fn index_of_key(entries: Vec, key: string) -> int {
+    let @mut i = 0;
+    let @mut found = 0 - 1;
+    while i < len(entries) && found < 0 {
+        let e = entries[i];
+        if e.key == key { found = i } else { () };
+        i = i + 1
+    }
+    found
+}
+
+# Store `value` at `table_path ++ key_path` under `root`, creating the
+# tables on the way; a `[[name]]` array on the path means its LAST
+# table. Overwriting an existing value is an error.
+fn insert(root: Vec, table_path: Vec, key_path: Vec, value: Toml, r: @mut Reader) -> Vec {
+    let @mut full = Vec.new();
+    let @mut i = 0;
+    while i < len(table_path) { full.push(table_path[i]); i = i + 1 }
+    let @mut j = 0;
+    while j < len(key_path) { full.push(key_path[j]); j = j + 1 }
+    store(root, full, 0, value, r, false)
+}
+
+# Make sure the table at `path` exists (a `[name]` header).
+fn declare_table(root: Vec, path: Vec, r: @mut Reader) -> Vec {
+    store(root, path, 0, TTable(Vec.new()), r, true)
+}
+
+# Append a fresh table to the array at `path` (a `[[name]]` header).
+fn append_table(root: Vec, path: Vec, r: @mut Reader) -> Vec {
+    let @mut items = Vec.new();
+    items.push(TTable(Vec.new()));
+    store(root, path, 0, TArr(items), r, true)
+}
+
+# The recursive worker. `declaring` is true for headers, which may
+# revisit a table (`[a]` after `a.b = 1`) or extend an array of tables.
+fn store(entries: Vec, path: Vec, depth: int, value: Toml, r: @mut Reader, declaring: bool) -> Vec {
+    let key = path[depth];
+    let last = depth == len(path) - 1;
+    let k = index_of_key(entries, key);
+    if k < 0 {
+        if last {
+            entries.push(Entry { key: key, value: value })
+        } else {
+            let child = store(Vec.new(), path, depth + 1, value, r, declaring);
+            entries.push(Entry { key: key, value: TTable(child) })
+        }
+    } else {
+        let existing = entries[k];
+        match existing.value {
+            TTable(inner) => {
+                if last {
+                    if declaring {
+                        match value {
+                            TArr(fresh) => fail(r, "cannot redefine table '" + key + "' as an array of tables"),
+                            TTable(e) => (),
+                            TStr(s) => (),
+                            TInt(n) => (),
+                            TBool(b) => ()
+                        }
+                    } else {
+                        fail(r, "duplicate key '" + key + "'")
+                    }
+                } else {
+                    let child = store(inner, path, depth + 1, value, r, declaring);
+                    entries[k] = Entry { key: key, value: TTable(child) }
+                }
+            },
+            TArr(items) => {
+                if last {
+                    if declaring {
+                        match value {
+                            TArr(fresh) => {
+                                items.push(fresh[0]);
+                                entries[k] = Entry { key: key, value: TArr(items) }
+                            },
+                            TTable(e) => fail(r, "cannot redefine array '" + key + "' as a table"),
+                            TStr(s) => (),
+                            TInt(n) => (),
+                            TBool(b) => ()
+                        }
+                    } else {
+                        fail(r, "duplicate key '" + key + "'")
+                    }
+                } else {
+                    # descend into the last table of an array of tables
+                    if len(items) == 0 { fail(r, "'" + key + "' is an empty array") } else {
+                        match items[len(items) - 1] {
+                            TTable(inner) => {
+                                let child = store(inner, path, depth + 1, value, r, declaring);
+                                items[len(items) - 1] = TTable(child);
+                                entries[k] = Entry { key: key, value: TArr(items) }
+                            },
+                            TStr(s) => fail(r, "'" + key + "' is not an array of tables"),
+                            TInt(n) => fail(r, "'" + key + "' is not an array of tables"),
+                            TBool(b) => fail(r, "'" + key + "' is not an array of tables"),
+                            TArr(a) => fail(r, "'" + key + "' is not an array of tables")
+                        }
+                    }
+                }
+            },
+            TStr(s) => fail(r, "duplicate key '" + key + "'"),
+            TInt(n) => fail(r, "duplicate key '" + key + "'"),
+            TBool(b) => fail(r, "duplicate key '" + key + "'")
+        }
+    };
+    entries
+}
+
+# ---------------------------------------------------------------------
+# writer
+
+# A TOML document for a table: plain entries first, then `[name]` and
+# `[[name]]` sections for its tables and arrays of tables.
+fn to_toml(t: Toml) -> string {
+    let @mut lines = Vec.new();
+    match t {
+        TTable(entries) => write_table(entries, lines),
+        TStr(s) => (),
+        TInt(n) => (),
+        TBool(b) => (),
+        TArr(items) => ()
+    };
+    lines.join("")
+}
+
+# Root entries that are not sections come first as `key = value`; then
+# every root table is a `[name]` section and every root array of tables
+# a run of `[[name]]` sections. Inside a section everything is inline
+# (`dep = { git = "...", rev = "..." }`), which is how glade lays out a
+# manifest and a lock.
+fn write_table(entries: Vec, lines: @mut Vec) -> () {
+    let @mut i = 0;
+    while i < len(entries) {
+        let e = entries[i];
+        if is_section(e.value) { () } else {
+            lines.push(toml_key(e.key) + " = " + toml_value(e.value) + "\n")
+        };
+        i = i + 1
+    }
+    let @mut j = 0;
+    while j < len(entries) {
+        let e = entries[j];
+        match e.value {
+            TTable(inner) => {
+                if len(lines) > 0 { lines.push("\n") } else { () };
+                lines.push("[" + toml_key(e.key) + "]\n");
+                write_section(inner, lines)
+            },
+            TArr(items) => {
+                if is_section(e.value) {
+                    let @mut k = 0;
+                    while k < len(items) {
+                        match items[k] {
+                            TTable(inner) => {
+                                if len(lines) > 0 { lines.push("\n") } else { () };
+                                lines.push("[[" + toml_key(e.key) + "]]\n");
+                                write_section(inner, lines)
+                            },
+                            TStr(s) => (),
+                            TInt(n) => (),
+                            TBool(b) => (),
+                            TArr(a) => ()
+                        };
+                        k = k + 1
+                    }
+                } else { () }
+            },
+            TStr(s) => (),
+            TInt(n) => (),
+            TBool(b) => ()
+        };
+        j = j + 1
+    }
+}
+
+fn write_section(entries: Vec, lines: @mut Vec) -> () {
+    let @mut i = 0;
+    while i < len(entries) {
+        let e = entries[i];
+        lines.push(toml_key(e.key) + " = " + toml_value(e.value) + "\n");
+        i = i + 1
+    }
+}
+
+# A key as written: bare when it can be, quoted otherwise.
+fn toml_key(key: string) -> string {
+    let @mut bare = len(key) > 0;
+    let @mut i = 0;
+    while i < len(key) {
+        if is_bare_key_char(key[i]) { () } else { bare = false };
+        i = i + 1
+    }
+    if bare { key } else { toml_string(key) }
+}
+
+# A table, or a non-empty array whose elements are all tables, is
+# written as sections rather than inline.
+fn is_section(v: Toml) -> bool {
+    match v {
+        TTable(e) => true,
+        TArr(items) => len(items) > 0 && all_tables(items),
+        TStr(s) => false,
+        TInt(n) => false,
+        TBool(b) => false
+    }
+}
+
+fn all_tables(items: Vec) -> bool {
+    let @mut i = 0;
+    let @mut ok = true;
+    while i < len(items) {
+        match items[i] {
+            TTable(e) => (),
+            TStr(s) => { ok = false },
+            TInt(n) => { ok = false },
+            TBool(b) => { ok = false },
+            TArr(a) => { ok = false }
+        };
+        i = i + 1
+    }
+    ok
+}
+
+# A value on one line: strings quoted with the JSON escapes (a JSON
+# string is a valid basic TOML string, which is also what glade's
+# Python writes), arrays `[a, b]`, tables `{ k = v, k = v }`.
+fn toml_value(v: Toml) -> string {
+    match v {
+        TStr(s) => toml_string(s),
+        TInt(n) => n.to_string(),
+        TBool(b) => if b { "true" } else { "false" },
+        TArr(items) => {
+            let @mut parts = Vec.new();
+            let @mut i = 0;
+            while i < len(items) { parts.push(toml_value(items[i])); i = i + 1 };
+            "[" + parts.join(", ") + "]"
+        },
+        TTable(entries) => {
+            if len(entries) == 0 { "{}" } else {
+                let @mut parts = Vec.new();
+                let @mut i = 0;
+                while i < len(entries) {
+                    let e = entries[i];
+                    parts.push(toml_key(e.key) + " = " + toml_value(e.value));
+                    i = i + 1
+                };
+                "{ " + parts.join(", ") + " }"
+            }
+        }
+    }
+}
+
+# A basic string: quote, backslash, tab, newline, return and the other
+# C0 controls escaped, everything else as is.
+fn toml_string(s: string) -> string {
+    let @mut out = Vec.new();
+    out.push("\"");
+    let @mut i = 0;
+    while i < len(s) {
+        let c = s[i];
+        if c == "\"" { out.push("\\\"") } else {
+        if c == "\\" { out.push("\\\\") } else {
+        if c == "\n" { out.push("\\n") } else {
+        if c == "\t" { out.push("\\t") } else {
+        if c == "\r" { out.push("\\r") } else {
+            let b = c.to_bytes();
+            if len(b) == 1 && b[0] < 32 {
+                if b[0] == 8 { out.push("\\b") } else {
+                if b[0] == 12 { out.push("\\f") } else {
+                    let digits = "0123456789abcdef";
+                    out.push("\\u00" + digits[b[0] >> 4] + digits[b[0] & 15])
+                } }
+            } else { out.push(c) }
+        } } } } };
+        i = i + 1
+    }
+    out.push("\"");
+    out.join("")
+}

@@ -73,6 +73,9 @@ interpreter.
 | `std.solve` | `glade/pubgrub.py` | implemented | PubGrub over a `Graph` of `PackageVersion`s (`graph_new`, `graph_add`, `dep`); `solve(graph, root, root_version, prefer_names, prefer_versions)` returns an `Outcome` with the picks or an `explanation` whose sentences match the Python solver's word for word |
 | `std.hex` | `bytes.hex` / `bytes.fromhex` | implemented | `to_hex` (lowercase), `from_hex` (Option), `hex_digit_value`, over bytes as a Vec of ints |
 | `std.sha256` | `hashlib.sha256` | implemented | `sha256` (32 bytes), `sha256_hex`, `sha256_string` (UTF-8 of a string); pure Metaxu, so native binaries need no libcrypto |
+| `std.path` | `posixpath` | implemented | `join`, `dirname`, `basename`, `normalize`, `relpath` (both absolute or both relative), `is_absolute`, `components`; POSIX text only, no filesystem |
+| `std.json` | `json.dumps` | implemented (writer) | `Json` (`JNull`, `JBool`, `JInt`, `JStr`, `JArr`, `JObj` of `Member`s), `to_json` (compact), `to_json_pretty` (two-space indent), `escape_json_string` |
+| `std.toml` | `tomllib` | implemented (manifest subset) | `Toml` (`TStr`, `TInt`, `TBool`, `TArr`, `TTable` of `Entry`s); `parse` → `Ok`/`Err("line N: why")` for tables, arrays of tables, dotted and quoted keys, inline tables, basic strings, integers, booleans, arrays; `to_toml` in glade's layout; `get`, `get_str/int/bool/arr/table`, `keys` |
 | `std.iter` | implemented | the adapters `std.stream` defers, over real tuples: `enumerate`, `zip`, `zip_with`, `take_while`, `drop_while`, `step_by`, `windows`, `chunks` |
 
 ### Round 3

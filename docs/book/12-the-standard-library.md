@@ -342,6 +342,61 @@ abc
 bad hex
 ```
 
+## std.path, std.json and std.toml
+
+Three text formats the package manager lives on, each written in
+Metaxu and each tested against the Python module that defines it:
+`std.path` follows `posixpath` (join, dirname, basename, normalize,
+relpath), `std.json` writes what `json.dumps` writes, and `std.toml`
+reads the subset of TOML that manifests and lockfiles use (tables,
+arrays of tables, dotted and quoted keys, inline tables, strings,
+integers, booleans, arrays) and writes it back in the same layout.
+The values are ordinary enums, `Json` and `Toml`, so a document is
+something you pattern match on.
+
+```metaxu
+from std.path import join, normalize, relpath;
+from std.json import Json, member, to_json;
+from std.toml import Toml, parse, to_toml, get_table, get_str;
+
+fn main() -> int {
+    print(normalize(join("pkgs/geom", "../util/./src")));
+    print(relpath("/work/app/vendor/geom", "/work/app"));
+    let @mut fields = Vec.new();
+    fields.push(member("name", JStr("app")));
+    fields.push(member("deps", JArr(Vec.new())));
+    print(to_json(JObj(fields)));
+    match parse("[package]\nname = \"app\"\n\n[dependencies]\ngeom = { git = \"https://x/geom\", rev = \"v1\" }\n") {
+        Err(e) => print(e),
+        Ok(doc) => {
+            match get_table(doc, "package") {
+                None => print("no package table"),
+                Some(pkg) => match get_str(pkg, "name") {
+                    None => print("no name"),
+                    Some(name) => print(name)
+                }
+            };
+            print(to_toml(doc))
+        }
+    };
+    match parse("version = 1.5\n") { Err(e) => print(e), Ok(doc) => print("parsed") };
+    0
+}
+```
+```output
+pkgs/util/src
+vendor/geom
+{"name":"app","deps":[]}
+app
+[package]
+name = "app"
+
+[dependencies]
+geom = { git = "https://x/geom", rev = "v1" }
+
+line 1: floats are not supported
+```
+
 ## std.math
 
 Constants are real module-level bindings, read as plain names.

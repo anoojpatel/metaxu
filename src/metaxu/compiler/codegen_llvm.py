@@ -1567,11 +1567,11 @@ def _enum_name(kind: str) -> str:
 
 def _strip_refinement(kind: str) -> str:
     """The name-only form of a kind, as stored in module-wide variant cells:
-    refined enum kinds drop their refinement; every other kind is
-    unchanged."""
-    if _is_enum(kind):
-        return _ENUM_PREFIX + _enum_name(kind)
-    return kind
+    refined enum kinds drop their refinement, through vec/fixed-vector
+    element kinds too (`vec:enum:T{...}` -> `vec:enum:T`, so two stores of
+    Vecs of the same enum at different nesting depths agree); every other
+    kind is unchanged."""
+    return _truncate_refinement(kind, 0)
 
 
 # How deep a refinement string describes nested enum payloads.  A slot
@@ -1646,6 +1646,13 @@ def _repr_compatible(store: str, slot: str) -> bool:
                 return False
         return True
     return False
+
+
+def _kind_leaf(kind: str) -> str:
+    """The kind under any vec/fixed-vector prefixes."""
+    while _is_vec(kind) or _is_fvec(kind):
+        kind = _vec_elem(kind) if _is_vec(kind) else _fvec_elem(kind)
+    return kind
 
 
 def _split_top(body: str, sep: str) -> List[str]:
@@ -3802,6 +3809,15 @@ def _infer_kinds(info: _Info, sigs: Dict[str, _Sig], structs: _StructTable,
         return kinds.get(n, I64)
 
     def mark(n: str, k: str) -> bool:
+        if _is_enum(k) and _enum_refinement(k) is None:
+            # A name-only enum kind is only ever a NESTED slot or element
+            # kind past the refinement depth cutoff (it is the top of its
+            # enum's lattice there).  A VALUE never has one: reading such an
+            # element or slot yields the canonical representation, and a
+            # refined value stored next to one keeps its own refinement.
+            # Normalizing here covers every edge at once (element reads,
+            # pushes and stores into a name-only-element Vec, params).
+            k = variants.canon_kind(_enum_name(k))
         nk = _join(get(n), k)
         if nk != get(n):
             kinds[n] = nk
@@ -3872,6 +3888,8 @@ def _infer_kinds(info: _Info, sigs: Dict[str, _Sig], structs: _StructTable,
                     nk = _join(_vec_elem(rk), get(other))
                     if nk != CONFLICT:
                         ch = mark(args[0], _vec_of(nk)) or ch
+                        # (a name-only element kind reaches `other` as the
+                        # canonical refinement: see mark)
                         ch = mark(other, nk) or ch
                     else:
                         ch = mark(args[0], CONFLICT) or ch
@@ -4518,6 +4536,18 @@ def _infer_kinds(info: _Info, sigs: Dict[str, _Sig], structs: _StructTable,
                             tk = _slot_kind_for_store(get(a))
                             if tk != sk and _repr_compatible(tk, sk):
                                 changed = mark(a, sk) or changed
+                    # An EMPTY Vec (`TTable(Vec.new())`) stored into a slot
+                    # whose module-wide cell holds Vecs of something
+                    # pointer-sized learns that element kind from the cell,
+                    # so the canonical cells stay unmixed and a later
+                    # canonical read of the slot is sound.  Scalar element
+                    # kinds are excluded: a real Vec of ints promoted to
+                    # vec:f64 would retype its literals.
+                    for i, a in enumerate(args):
+                        if get(a) == _vec_of(I64):
+                            ck = variants.cell_kind(ename, vname, i)
+                            if _is_vec(ck) and _vec_elem(ck) not in (I64, F64, CONFLICT):
+                                changed = mark(a, ck) or changed
                     # One-way: store kinds also accumulate into the
                     # module-wide per-(variant, slot) cells backing canon();
                     # the driver marks cells `mixed` post-fixpoint when a
@@ -4723,6 +4753,36 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
         elif _is_agg(kind) and _kind_size(kind, structs, variants) is None:
             probs.append(f"{what} has an infinite layout")
 
+    def stores_into(vk: str, elem: str) -> bool:
+        """May a value of kind `vk` be stored in a Vec slot of kind
+        `elem` unchanged?  Equal kinds; or, past the refinement depth
+        cutoff, an enum value into a name-only slot of the same enum (the
+        slot's canonical representation covers every refinement, and a
+        read back goes through the mixed-cells check)."""
+        if vk == elem:
+            return True
+        if _is_vec(vk) and _is_vec(elem):
+            return stores_into(_vec_elem(vk), _vec_elem(elem))
+        return (_is_enum(elem) and _enum_refinement(elem) is None
+                and _is_enum(vk) and _enum_name(vk) == _enum_name(elem))
+
+    def canon_read_problem(what: str, elem: str, dst: str, mismatch: str) -> None:
+        """A Vec element read whose result kind differs from the element
+        kind: fine when the element is a name-only enum (past the
+        refinement depth cutoff) read through the canonical cells and no
+        cell is mixed; otherwise the mismatch is reported."""
+        if _is_enum(elem) and _enum_refinement(elem) is None \
+                and _is_enum(ty(dst)) and _enum_name(ty(dst)) == _enum_name(elem):
+            mixed = variants.mixed_slots_of(_enum_name(elem))
+            if mixed:
+                descr = ", ".join(f"{v}[{i}]" for (_e, v, i) in mixed)
+                probs.append(
+                    f"{what} reads an element of enum {_enum_name(elem) or 'anon'!r} "
+                    f"whose payload slots ({descr}) have instantiation-"
+                    "dependent representations (lost at the boxing boundary)")
+            return
+        probs.append(mismatch)
+
     def check_vec_slot(elem: str, what: str) -> bool:
         """A native Vec element slot is ONE 8-byte word.  Word kinds sit in
         it directly; struct/enum AGGREGATES sit in it as a pointer to an
@@ -4763,7 +4823,7 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                     "not a Vec (fixed vectors are immutable)")
             elif not check_vec_slot(_vec_elem(ty(args[0])), "Vec"):
                 pass  # check_vec_slot reported it
-            elif ty(args[1]) != _vec_elem(ty(args[0])):
+            elif not stores_into(ty(args[1]), _vec_elem(ty(args[0]))):
                 probs.append(
                     f"push of {ty(args[1])} into a Vec of "
                     f"{_vec_elem(ty(args[0]))}")
@@ -4777,7 +4837,8 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
             elif not check_vec_slot(_vec_elem(ty(args[0])), "Vec"):
                 pass  # check_vec_slot reported it
             elif ty(dst) != _vec_elem(ty(args[0])):
-                probs.append(
+                canon_read_problem(
+                    "pop", _vec_elem(ty(args[0])), dst,
                     f"pop result {dst!r} is {ty(dst)}, Vec elements are "
                     f"{_vec_elem(ty(args[0]))}")
         elif name == "__index_get":
@@ -4812,7 +4873,8 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                         f"vector of {elem} elements (only 8-byte word kinds "
                         "fit native element slots)")
             elif ty(dst) != elem:
-                probs.append(
+                canon_read_problem(
+                    "__index_get", elem, dst,
                     f"__index_get result {dst!r} is {ty(dst)}, elements are "
                     f"{elem}")
         elif name == "__index_store":
@@ -4842,7 +4904,7 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                     probs.append(
                         f"vector of {elem} elements (only 8-byte word kinds "
                         "fit native element slots)")
-            elif ty(args[2]) != elem:
+            elif not stores_into(ty(args[2]), elem):
                 probs.append(
                     f"__index_store of {ty(args[2])} into elements of {elem}")
             elif ty(dst) != rk0:
@@ -4873,7 +4935,7 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                     f"__index_set index {args[1]!r} is {ty(args[1])}")
             elif not check_vec_slot(_vec_elem(rk0), "Vec"):
                 pass  # check_vec_slot reported it
-            elif ty(args[2]) != _vec_elem(rk0):
+            elif not stores_into(ty(args[2]), _vec_elem(rk0)):
                 probs.append(
                     f"__index_set of {ty(args[2])} into a Vec of "
                     f"{_vec_elem(rk0)}")
@@ -6027,9 +6089,11 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                         f"a closure ({sk}) (its env pointer may outlive the "
                         "creating frame)")
                 elif ty(dst) != sk and not (
-                        _is_enum(sk) and _repr_compatible(sk, ty(dst))):
-                    # (An extracted nested enum may flow on into a value
-                    # with a wider refinement; same layout, no coercion.)
+                        _is_enum(_kind_leaf(sk))
+                        and _repr_compatible(sk, ty(dst))):
+                    # (An extracted nested enum, or a Vec of them, may flow
+                    # on into a value with a wider refinement; same layout,
+                    # no coercion.)
                     probs.append(
                         f"variant_field {idx} of enum {ename or 'anon'!r} "
                         f"variant {vname!r}: result {dst!r} is {ty(dst)}, "
@@ -11012,6 +11076,10 @@ def _refines_to(kind: str, joined: str) -> bool:
     clone."""
     if kind == joined:
         return True
+    if _is_vec(kind) and _is_vec(joined):
+        return _refines_to(_vec_elem(kind), _vec_elem(joined))
+    if _is_fvec(kind) and _is_fvec(joined):
+        return _refines_to(_fvec_elem(kind), _fvec_elem(joined))
     if _is_enum(kind) and _is_enum(joined) \
             and _enum_name(kind) == _enum_name(joined):
         rk, rj = _enum_refinement(kind), _enum_refinement(joined)
@@ -11091,6 +11159,12 @@ def _specialize_by_kind(funcs: List[MirFunc]) -> List[MirFunc]:
             kinds = probe.kind_sets.get(info.f.name, {})
             for (dst, callee, args) in info.calls:
                 if callee not in candidates or callee in info.def_count:
+                    continue
+                if callee == info.f.name:
+                    # A self-call never opens a group: it stays inside
+                    # whichever clone the function becomes (a recursive
+                    # enum walk passes an ever-narrower refinement down,
+                    # which would otherwise clone the clone each round).
                     continue
                 key = tuple(kinds.get(a, I64) for a in args)
                 if any(CONFLICT in k for k in key):

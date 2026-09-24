@@ -1,0 +1,166 @@
+# std.path — POSIX path text: join, split, normalize, relative paths.
+#
+# Pure string work, no filesystem access (that is std.fs, an effect).
+# The semantics are Python's `posixpath`, which the test compares against
+# case by case, with one stated difference: `relpath` takes two absolute
+# or two relative paths, because Metaxu has no working directory to
+# resolve a relative path against yet. Windows separators are not
+# handled; POSIX first is the documented limit.
+
+export {
+    join,
+    dirname,
+    basename,
+    normalize,
+    relpath,
+    is_absolute,
+    components
+}
+
+fn is_absolute(p: string) -> bool {
+    len(p) > 0 && p[0] == "/"
+}
+
+# `a/b`; an absolute `b` replaces `a`; an empty `a` gives `b`; an empty
+# `b` keeps `a`'s trailing slash (`join("a", "")` is `a/`).
+fn join(a: string, b: string) -> string {
+    if is_absolute(b) || a == "" {
+        b
+    } else {
+        if a[len(a) - 1] == "/" { a + b } else { a + "/" + b }
+    }
+}
+
+# Everything before the last slash, with trailing slashes of that head
+# stripped unless the head is all slashes (`dirname("/a")` is `/`).
+fn dirname(p: string) -> string {
+    let cut = last_slash(p) + 1;
+    let head = p[0:cut];
+    if cut > 0 && !all_slashes(head) { strip_trailing_slashes(head) } else { head }
+}
+
+# Everything after the last slash.
+fn basename(p: string) -> string {
+    p[last_slash(p) + 1:len(p)]
+}
+
+# The path with `.` parts dropped, `..` parts folded into their parent
+# where one exists, and repeated slashes collapsed. A relative path that
+# folds to nothing is `.`; leading `..` parts of a relative path stay;
+# `..` at the root of an absolute path vanishes. Two leading slashes are
+# kept (POSIX allows them a meaning), three or more become one.
+fn normalize(p: string) -> string {
+    if p == "" {
+        "."
+    } else {
+        let prefix = if is_absolute(p) {
+            if len(p) > 1 && p[1] == "/" && (len(p) == 2 || p[2] != "/") { "//" } else { "/" }
+        } else { "" };
+        let parts = components(p);
+        let @mut kept = Vec.new();
+        let @mut i = 0;
+        while i < len(parts) {
+            let part = parts[i];
+            if part == "." { () } else {
+                if part == ".." {
+                    if len(kept) > 0 && kept[len(kept) - 1] != ".." {
+                        let @mut dropped = kept.pop();
+                        ()
+                    } else {
+                        if prefix == "" { kept.push(part) } else { () }
+                    }
+                } else {
+                    kept.push(part)
+                }
+            };
+            i = i + 1
+        }
+        let body = kept.join("/");
+        if prefix == "" {
+            if body == "" { "." } else { body }
+        } else {
+            prefix + body
+        }
+    }
+}
+
+# The non-empty parts between slashes (`"a//b/"` gives `["a", "b"]`).
+fn components(p: string) -> Vec {
+    let raw = p.split("/");
+    let @mut out = Vec.new();
+    let @mut i = 0;
+    while i < len(raw) {
+        if raw[i] == "" { () } else { out.push(raw[i]) };
+        i = i + 1
+    }
+    out
+}
+
+# `path` relative to `start`, both normalized first; `.` when they are
+# the same place. Both must be absolute or both relative (see the module
+# comment); mixing them is an error.
+fn relpath(path: string, start: string) -> string {
+    if is_absolute(path) != is_absolute(start) {
+        assert(false, "relpath: both paths must be absolute or both relative");
+        ""
+    } else {
+        let a = real_components(normalize(path));
+        let b = real_components(normalize(start));
+        let @mut common = 0;
+        while common < len(a) && common < len(b) && a[common] == b[common] {
+            common = common + 1
+        }
+        let @mut out = Vec.new();
+        let @mut i = common;
+        while i < len(b) {
+            out.push("..");
+            i = i + 1
+        }
+        let @mut j = common;
+        while j < len(a) {
+            out.push(a[j]);
+            j = j + 1
+        }
+        if len(out) == 0 { "." } else { out.join("/") }
+    }
+}
+
+# `components` without a lone "." (what `normalize` gives an empty path).
+fn real_components(p: string) -> Vec {
+    let parts = components(p);
+    let @mut out = Vec.new();
+    let @mut i = 0;
+    while i < len(parts) {
+        if parts[i] == "." { () } else { out.push(parts[i]) };
+        i = i + 1
+    }
+    out
+}
+
+fn last_slash(p: string) -> int {
+    let @mut i = len(p) - 1;
+    let @mut found = 0 - 1;
+    while i >= 0 && found < 0 {
+        if p[i] == "/" { found = i } else { () };
+        i = i - 1
+    }
+    found
+}
+
+fn all_slashes(s: string) -> bool {
+    let @mut i = 0;
+    let @mut ok = true;
+    while i < len(s) {
+        if s[i] != "/" { ok = false } else { () };
+        i = i + 1
+    }
+    ok
+}
+
+fn strip_trailing_slashes(s: string) -> string {
+    let @mut stop = len(s);
+    while stop > 0 && s[stop - 1] == "/" {
+        stop = stop - 1
+    }
+    s[0:stop]
+}

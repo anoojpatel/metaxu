@@ -1,0 +1,142 @@
+# std.json — a JSON writer.
+#
+# A `Json` value is built from the constructors below and rendered with
+# `to_json` (compact, Python's `json.dumps(v, separators=(",", ":"))`)
+# or `to_json_pretty` (two-space indent, `json.dumps(v, indent=2)`),
+# both with non-ASCII text passed through (`ensure_ascii=False`). Object
+# members keep their insertion order; sort them yourself if the output
+# must be canonical. There is no reader yet: the package manager only
+# prints JSON (`glade paths`).
+
+export {
+    Json,
+    Member,
+    member,
+    to_json,
+    to_json_pretty,
+    escape_json_string
+}
+
+enum Json {
+    JNull,
+    JBool(bool),
+    JInt(int),
+    JStr(string),
+    JArr(Vec),
+    JObj(Vec)
+}
+
+struct Member {
+    key: string,
+    value: Json
+}
+
+fn member(key: string, value: Json) -> Member {
+    Member { key: key, value: value }
+}
+
+# The value on one line.
+fn to_json(v: Json) -> string {
+    render(v, 0 - 1, 0)
+}
+
+# The value over several lines, nested levels indented by two spaces.
+fn to_json_pretty(v: Json) -> string {
+    render(v, 2, 0)
+}
+
+# `indent` < 0 means compact; `depth` is the current nesting level.
+fn render(v: Json, indent: int, depth: int) -> string {
+    match v {
+        JNull => "null",
+        JBool(b) => if b { "true" } else { "false" },
+        JInt(n) => n.to_string(),
+        JStr(s) => escape_json_string(s),
+        JArr(items) => {
+            if len(items) == 0 {
+                "[]"
+            } else {
+                let @mut parts = Vec.new();
+                let @mut i = 0;
+                while i < len(items) {
+                    parts.push(render(items[i], indent, depth + 1));
+                    i = i + 1
+                };
+                wrap("[", parts, "]", indent, depth)
+            }
+        },
+        JObj(members) => {
+            if len(members) == 0 {
+                "{}"
+            } else {
+                let @mut parts = Vec.new();
+                let @mut i = 0;
+                let colon = if indent < 0 { ":" } else { ": " };
+                while i < len(members) {
+                    let m = members[i];
+                    parts.push(escape_json_string(m.key) + colon + render(m.value, indent, depth + 1));
+                    i = i + 1
+                };
+                wrap("{", parts, "}", indent, depth)
+            }
+        }
+    }
+}
+
+fn wrap(open: string, parts: Vec, close: string, indent: int, depth: int) -> string {
+    if indent < 0 {
+        open + parts.join(",") + close
+    } else {
+        let inner = "\n" + spaces(indent * (depth + 1));
+        open + inner + parts.join("," + inner) + "\n" + spaces(indent * depth) + close
+    }
+}
+
+fn spaces(n: int) -> string {
+    let @mut out = "";
+    let @mut i = 0;
+    while i < n {
+        out = out + " ";
+        i = i + 1
+    }
+    out
+}
+
+# `s` as a quoted JSON string: quote, backslash and the C0 controls
+# escaped (the short forms for \b \f \n \r \t, \u00XX for the rest),
+# everything else passed through.
+fn escape_json_string(s: string) -> string {
+    let @mut out = Vec.new();
+    out.push("\"");
+    let @mut i = 0;
+    while i < len(s) {
+        let c = s[i];
+        if c == "\"" { out.push("\\\"") } else {
+        if c == "\\" { out.push("\\\\") } else {
+        if c == "\n" { out.push("\\n") } else {
+        if c == "\t" { out.push("\\t") } else {
+        if c == "\r" { out.push("\\r") } else {
+            let code = control_code(c);
+            if code < 0 { out.push(c) } else {
+                if code == 8 { out.push("\\b") } else {
+                if code == 12 { out.push("\\f") } else {
+                    out.push("\\u00" + hex2(code))
+                } }
+            }
+        } } } } };
+        i = i + 1
+    }
+    out.push("\"");
+    out.join("")
+}
+
+# The byte value of a one-character control string (below 0x20), or -1.
+fn control_code(c: string) -> int {
+    let b = c.to_bytes();
+    if len(b) == 1 && b[0] < 32 { b[0] } else { 0 - 1 }
+}
+
+fn hex2(n: int) -> string {
+    let digits = "0123456789abcdef";
+    digits[n >> 4] + digits[n & 15]
+}
