@@ -8139,3 +8139,109 @@ fn main() -> int {
     _res, out = interp_run(src)
     assert out.splitlines() == ["dot", "7"]
     assert_native_matches_interp(src, tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Strings: `s[i]` and `s[a:b:c]` lower to mx_str_index / mx_str_slice
+# (fresh copies, the interpreter's exact diagnostics).  Until these landed
+# every helper in std.parse and std.string was interpreter-only, which is
+# how std.semver found the gap (docs/glade_in_metaxu.md).
+# ---------------------------------------------------------------------------
+
+@needs_clang
+def test_native_string_index_reverses_and_counts(tmp_path):
+    src = """
+fn reverse(s: string) -> string {
+    let @mut out = "";
+    let @mut i = len(s) - 1;
+    while i >= 0 {
+        out = out + s[i];
+        i = i - 1
+    }
+    out
+}
+
+fn count(s: string, c: string) -> int {
+    let @mut i = 0;
+    let @mut n = 0;
+    while i < len(s) {
+        if s[i] == c { n = n + 1 } else { () };
+        i = i + 1
+    }
+    n
+}
+
+fn main() -> int {
+    print(reverse("stressed"));
+    print(count("mississippi", "s"));
+    print("abc"[0] + "abc"[2]);
+    0
+}
+"""
+    _res, out = interp_run(src)
+    assert out.splitlines() == ["desserts", "4", "ac"]
+    ir = assert_native_matches_interp(src, tmp_path)
+    assert "@mx_str_index" in ir and count_placeholders(ir) == 0
+
+
+@needs_clang
+def test_native_string_slices_follow_python_indices(tmp_path):
+    src = """
+fn main() -> int {
+    let s = "hello, world";
+    print(s[0:5]);
+    print(s[7:len(s)]);
+    print(s[7:]);
+    print(s[:5]);
+    print(s[-5:]);
+    print(s[3:100]);
+    print(s[5:2]);
+    print(s[::2]);
+    print(s[::-1]);
+    print(s[1:len(s) - 1]);
+    0
+}
+"""
+    _res, out = interp_run(src)
+    assert out.splitlines() == ["hello", "world", "world", "hello", "world", "lo, world",
+                                "", "hlo ol", "dlrow ,olleh", "ello, worl"]
+    ir = assert_native_matches_interp(src, tmp_path)
+    assert "@mx_str_slice" in ir and count_placeholders(ir) == 0
+
+
+@needs_clang
+def test_native_string_index_out_of_range_is_the_interpreters_error(tmp_path):
+    src = """
+fn main() -> int {
+    let s = "abc";
+    let r = try { s[3] } catch e { e };
+    print(r);
+    let n = try { s[0 - 1] } catch e { e };
+    print(n);
+    0
+}
+"""
+    _res, out = interp_run(src)
+    assert out.splitlines() == ["index out of bounds: 3 (length 3)",
+                                "index out of bounds: -1 (length 3)"]
+    assert_native_matches_interp(src, tmp_path)
+
+
+@needs_clang
+def test_native_std_parse_helpers_now_compile(tmp_path):
+    """std.parse's digit loops were the first text code to become native."""
+    src = """
+from std.parse import parse_int, trim, split_on;
+
+fn main() -> int {
+    match parse_int(trim("  42 ")) { Some(n) => print(n), None => print("bad") };
+    match parse_int("4x2") { Some(n) => print(n), None => print("bad") };
+    let parts = split_on("3,14,15", ",");
+    print(len(parts));
+    print(parts[1]);
+    0
+}
+"""
+    _res, out = interp_run(src)
+    assert out.splitlines() == ["42", "bad", "3", "14"]
+    assert_native_matches_interp(src, tmp_path)

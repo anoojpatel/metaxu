@@ -135,12 +135,14 @@ port keeps its own insertion-ordered tables.
 Compiling either module natively fails, and the reasons are the
 first two entries the rewrite adds to step 2:
 
-- **String indexing is not lowered.** `s[i]` on a string is
-  interpreter-only ("string indexing stays interpreted" is the
-  backend's own placeholder reason), which means every helper in
-  `std.parse` and `std.string` is too. The linear string builtins
-  above are therefore not an optimisation but the precondition for
-  running any text-handling Metaxu natively.
+- **String indexing was not lowered** (fixed). `s[i]` and `s[a:b:c]`
+  on a string were interpreter-only, which made every helper in
+  `std.parse` and `std.string` interpreter-only too. They now lower to
+  `mx_str_index` and `mx_str_slice` in the C runtime, fresh copies with
+  the interpreter's exact bounds diagnostic, and `std.parse`'s digit
+  loops run natively; `test_codegen_llvm.py` pins the differential. The
+  linear string builtins above remain the way to make that text code
+  fast rather than merely native.
 - **Enum payload kinds are per module, not per use.** The native
   backend gives `Option`'s `Some` slot one value kind for the whole
   compilation unit. `std.semver` puts ints, Vecs, Versions, Intervals,

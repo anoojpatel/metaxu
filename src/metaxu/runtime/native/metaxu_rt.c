@@ -1115,6 +1115,70 @@ int64_t mx_str_len(const char *s) {
     return (int64_t)strlen(s);
 }
 
+char *mx_str_index(const char *s, int64_t idx) {
+    mx_str_check(s, "index", "receiver");
+    int64_t len = (int64_t)strlen(s);
+    if (idx < 0 || idx >= len) {
+        mx_rt_raise("index out of bounds: %lld (length %lld)",
+                    (long long)idx, (long long)len);
+    }
+    char *out = (char *)mx_rt_malloc(2);
+    out[0] = s[idx];
+    out[1] = '\0';
+    return out;
+}
+
+char *mx_str_slice(const char *s, int64_t start, int64_t stop,
+                   int64_t step, int64_t mask) {
+    /* The same normalisation as mx_fvec_slice: CPython's slice.indices(). */
+    mx_str_check(s, "slice", "receiver");
+    int64_t len = (int64_t)strlen(s);
+    if (!(mask & 4)) {
+        step = 1;
+    }
+    if (step == 0) {
+        mx_rt_raise("slice: step must be non-zero");  /* catchable */
+    }
+    int64_t lo_clamp = step < 0 ? -1 : 0;
+    int64_t hi_clamp = step < 0 ? len - 1 : len;
+    if (mask & 1) {
+        if (start < 0) {
+            start += len;
+            if (start < 0) {
+                start = lo_clamp;
+            }
+        } else if (start >= len) {
+            start = hi_clamp;
+        }
+    } else {
+        start = step < 0 ? len - 1 : 0;
+    }
+    if (mask & 2) {
+        if (stop < 0) {
+            stop += len;
+            if (stop < 0) {
+                stop = lo_clamp;
+            }
+        } else if (stop >= len) {
+            stop = hi_clamp;
+        }
+    } else {
+        stop = step < 0 ? -1 : len;
+    }
+    int64_t count;
+    if (step > 0) {
+        count = stop > start ? (stop - start + step - 1) / step : 0;
+    } else {
+        count = start > stop ? (start - stop + (-step) - 1) / (-step) : 0;
+    }
+    char *out = (char *)mx_rt_malloc((size_t)count + 1);
+    for (int64_t i = 0; i < count; i++) {
+        out[i] = s[start + i * step];
+    }
+    out[count] = '\0';
+    return out;
+}
+
 int64_t mx_str_eq(const char *a, const char *b) {
     mx_str_check(a, "str_eq", "operand");
     mx_str_check(b, "str_eq", "operand");

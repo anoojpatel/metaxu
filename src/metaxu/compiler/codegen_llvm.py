@@ -148,6 +148,12 @@ runs natively):
     program could mutate natively instead of erroring.  len /
     __index_get / as_ptr work uniformly; elementwise vector arithmetic
     and __vec_dim/__slice_get/... still demote.
+  * STRING indexing and slicing lower too: ``s[i]`` -> mx_str_index (a
+    fresh one-character string; out of range raises the interpreter's
+    exact "index out of bounds: i (length n)") and ``s[a:b:c]`` ->
+    mx_str_slice (a fresh copy, CPython slice.indices() semantics, the
+    same mask protocol as mx_fvec_slice).  Every text helper in std.parse
+    and std.string was interpreter-only until these existed.
   * ``__static$Type$method`` calls resolve at COMPILE TIME exactly like
     the interpreter's _dispatch_static_call: the unique __impl$*$Type$
     method fn, else the plain dotted module function ``Type.method``,
@@ -1116,6 +1122,10 @@ _RT_SIGS = {
     "mx_vec_mark_contended": ("void", ("ptr",)),
     "mx_str_concat": ("ptr", ("ptr", "ptr")),
     "mx_str_len": ("i64", ("ptr",)),
+    # `s[i]` and `s[a:b]` on a string: fresh one-character / substring
+    # copies with the interpreter's exact bounds diagnostic.
+    "mx_str_index": ("ptr", ("ptr", "i64")),
+    "mx_str_slice": ("ptr", ("ptr", "i64", "i64", "i64", "i64")),
     "mx_i64_to_str": ("ptr", ("i64",)),
     "mx_f64_to_str": ("ptr", ("double",)),
     "mx_str_eq": ("i64", ("ptr", "ptr")),
@@ -3657,7 +3667,10 @@ def _infer_kinds(info: _Info, sigs: Dict[str, _Sig], structs: _StructTable,
                     # settled.
                     ch = mark(args[0], _vec_of(I64)) or ch
             rk = get(args[0])
-            if _is_vec(rk):
+            if rk == STR and name == "__index_get":
+                # `s[i]` on a string is a fresh one-character string.
+                ch = mark(dst, STR) or ch
+            elif _is_vec(rk):
                 # Two-way element unification: pushed values and read
                 # elements are one type per vec.  (push's own dst is unit.)
                 if name == "push":
@@ -3725,11 +3738,11 @@ def _infer_kinds(info: _Info, sigs: Dict[str, _Sig], structs: _StructTable,
         elif name == "__vec_dim":
             pass  # receiver typed by its producer; dst stays i64
         elif name == "__slice_get":
-            # A slice of a fixed vector is a fresh vector of the same kind
-            # (bounds stay i64 / None).
+            # A slice of a fixed vector is a fresh vector of the same kind,
+            # a slice of a string a fresh string (bounds stay i64 / None).
             if args:
                 nk = _join(get(dst), get(args[0]))
-                if nk != CONFLICT and _is_fvec(nk):
+                if nk != CONFLICT and (_is_fvec(nk) or nk == STR):
                     ch = mark(dst, nk) or ch
                     ch = mark(args[0], nk) or ch
         elif name == "__cast":
@@ -4273,6 +4286,26 @@ def _infer_kinds(info: _Info, sigs: Dict[str, _Sig], structs: _StructTable,
                                              for a in args)}
                     changed = mark(
                         dst, _format_enum_kind(ename, site_ref)) or changed
+                    # Vec payloads learn back from the destination: once
+                    # this value has merged with another site's (a return
+                    # joining `Some(Vec.new())` with `Some(strings)`), the
+                    # slot's element kind is the join, and the fresh Vec
+                    # here is still at the vec bottom (vec:i64, nothing
+                    # pushed).  Promoting it is the same element promotion
+                    # a push performs and costs no representation change
+                    # (a vec is one mx_vec pointer whatever it holds).
+                    # Scalars are NOT back-propagated: `Some(3)` merged
+                    # with `Some(2.5)` must keep demoting (retyping the
+                    # literal would print 3.0 where the interpreter prints
+                    # 3), which the post-fixpoint check enforces.
+                    dref = _enum_refinement(get(dst)) or {}
+                    dslots = dref.get(vname)
+                    if dslots is not None and len(dslots) == len(args):
+                        for a, sk in zip(args, dslots):
+                            ak = get(a)
+                            if _is_vec(ak) and _is_vec(sk) and ak != sk \
+                                    and _join(ak, sk) == sk:
+                                changed = mark(a, sk) or changed
                     # One-way: store kinds also accumulate into the
                     # module-wide per-(variant, slot) cells backing canon();
                     # the driver marks cells `mixed` post-fixpoint when a
@@ -4538,15 +4571,23 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
         elif name == "__index_get":
             rk0 = ty(args[0]) if args else I64
             elem = (_vec_elem(rk0) if _is_vec(rk0)
-                    else _fvec_elem(rk0) if _is_fvec(rk0) else None)
+                    else _fvec_elem(rk0) if _is_fvec(rk0)
+                    else STR if rk0 == STR else None)
             if len(args) != 2:
                 probs.append(
                     f"__index_get with {len(args)} arguments (expects 2)")
             elif elem is None:
                 probs.append(
                     f"__index_get receiver {args[0]!r} has kind {rk0}, "
-                    "not a Vec or fixed vector (string indexing stays "
-                    "interpreted)")
+                    "not a Vec, fixed vector or string")
+            elif rk0 == STR:
+                # `s[i]`: a fresh one-character string via mx_str_index.
+                if ty(args[1]) != I64:
+                    probs.append(f"__index_get index {args[1]!r} is {ty(args[1])}")
+                elif ty(dst) != STR:
+                    probs.append(
+                        f"__index_get result {dst!r} is {ty(dst)}, a string "
+                        "index yields a str")
             elif ty(args[1]) != I64:
                 probs.append(f"__index_get index {args[1]!r} is {ty(args[1])}")
             elif not (check_vec_slot(elem, "Vec") if _is_vec(rk0)
@@ -4741,11 +4782,11 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
             if len(args) != 4:
                 probs.append(
                     f"__slice_get with {len(args)} arguments (expects 4)")
-            elif not _is_fvec(rk0):
+            elif not _is_fvec(rk0) and rk0 != STR:
                 probs.append(
                     f"__slice_get receiver {args[0]!r} has kind {rk0} "
-                    "(Vec/string slicing stays interpreted)")
-            elif not _is_word_kind(_fvec_elem(rk0)):
+                    "(Vec slicing stays interpreted)")
+            elif rk0 != STR and not _is_word_kind(_fvec_elem(rk0)):
                 probs.append(
                     f"vector of {_fvec_elem(rk0)} elements (only 8-byte "
                     "word kinds fit native element slots)")
@@ -8112,7 +8153,14 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
             recv = use(opargs[0], lines)
             rk0 = kind(opargs[0])
             idx = use(opargs[1], lines)
-            if _is_fvec(rk0):
+            if rk0 == STR:
+                mod.runtime_syms.add("mx_str_index")
+                v = fresh()
+                lines.append(
+                    f"  {v} = call ptr @mx_str_index(ptr {recv}, i64 {idx})"
+                    "  ; s[i]: fresh one-char string")
+                setval(dst, v, lines)
+            elif _is_fvec(rk0):
                 elem = _fvec_elem(rk0)
                 mod.runtime_syms.add("mx_fvec_get")
                 w = fresh()
@@ -8150,7 +8198,8 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                 ep = _vec_data_ep(recv, idx, lines)
                 w = fresh()
                 lines.append(f"  {w} = load i64, ptr {ep}, align 8{TBAA_ELEM}")
-            vec_elem_into(dst, elem, w, lines)
+            if rk0 != STR:
+                vec_elem_into(dst, elem, w, lines)
         elif name == "__index_store":
             # Store-back index assignment `place = __index_store(place, i,
             # x)`.  Vec receiver: mx_vec_set mutates the one shared vector
@@ -8451,10 +8500,11 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                 else:
                     mask |= bit
                     words.append(use(a, lines))
-            mod.runtime_syms.add("mx_fvec_slice")
+            slicer = "mx_str_slice" if kind(opargs[0]) == STR else "mx_fvec_slice"
+            mod.runtime_syms.add(slicer)
             v = fresh()
             lines.append(
-                f"  {v} = call ptr @mx_fvec_slice(ptr {recv}, "
+                f"  {v} = call ptr @{slicer}(ptr {recv}, "
                 f"i64 {words[0]}, i64 {words[1]}, i64 {words[2]}, "
                 f"i64 {mask})  ; honest copy, never a view")
             setval(dst, v, lines)

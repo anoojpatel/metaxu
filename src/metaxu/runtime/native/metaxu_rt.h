@@ -292,6 +292,14 @@ unsigned char *mx_fvec_as_bytes(const mx_fvec *v);
 /* --- Strings ------------------------------------------------------------ */
 char   *mx_str_concat(const char *a, const char *b);
 int64_t mx_str_len(const char *s);
+/* `s[i]`: a FRESH one-character string; out of range raises the
+   interpreter's exact diagnostic ("index out of bounds: i (length n)"). */
+char   *mx_str_index(const char *s, int64_t idx);
+/* `s[a:b:c]`: a FRESH copy with CPython slice.indices() semantics; `mask`
+   bits 1/2/4 say which of start/stop/step were given (the same protocol
+   as mx_fvec_slice).  A zero step raises "slice: step must be non-zero". */
+char   *mx_str_slice(const char *s, int64_t start, int64_t stop,
+                     int64_t step, int64_t mask);
 char   *mx_i64_to_str(int64_t value);
 char   *mx_f64_to_str(double value);
 int64_t mx_str_eq(const char *a, const char *b);
