@@ -261,6 +261,53 @@ fn main() -> int {
 only satisfies a requirement that names a prerelease of the same
 version. Booleans print as `1` and `0`.
 
+## std.solve
+
+The version solver, PubGrub, ported from glade's Python. It takes the
+dependency graph as data: every version of every package with its
+requirements, which is what a registry index lists. Here the newest
+`foo` wants a `bar` the project rules out, so the solver settles on
+the older `foo`; had nothing fit, `out.explanation` would hold the
+reason as sentences.
+
+```metaxu
+from std.semver import version, parse_requirement, range_any, version_to_string;
+from std.solve import graph_new, graph_add, dep, solve;
+
+fn req(name: string, text: string) -> Dep {
+    match parse_requirement(text) { None => dep(name, range_any()), Some(r) => dep(name, r) }
+}
+
+fn main() -> int {
+    let @mut g = graph_new();
+    let @mut foo10 = Vec.new();
+    foo10.push(req("bar", "^1"));
+    graph_add(g, "foo", version(1, 0, 0), foo10);
+    let @mut foo11 = Vec.new();
+    foo11.push(req("bar", "^2"));
+    graph_add(g, "foo", version(1, 1, 0), foo11);
+    graph_add(g, "bar", version(1, 0, 0), Vec.new());
+    graph_add(g, "bar", version(2, 0, 0), Vec.new());
+    let @mut root = Vec.new();
+    root.push(req("foo", "^1"));
+    root.push(req("bar", "^1"));
+    graph_add(g, "app", version(0, 1, 0), root);
+    let out = solve(g, "app", version(0, 1, 0), Vec.new(), Vec.new());
+    print(out.ok);
+    let @mut i = 0;
+    while i < len(out.names) {
+        print(out.names[i] + " " + version_to_string(out.versions[i]));
+        i = i + 1
+    }
+    0
+}
+```
+```output
+1
+bar 1.0.0
+foo 1.0.0
+```
+
 ## std.math
 
 Constants are real module-level bindings, read as plain names.

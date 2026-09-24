@@ -13,9 +13,10 @@ with no section and uses it as the release notes.
   `add`, `remove`, `sync`, `update`, `tree`, `check`, `search`. Lock
   version 2 adds the resolved `version`; git- and path-only projects
   keep writing version 1. `mxpkg` forwards to `glade`.
-- `std.semver`: versions, requirements and ranges in Metaxu, the first
-  piece of glade written in the language, differentially tested against
-  the Python module (`docs/glade_in_metaxu.md` tracks the rest).
+- `std.semver` and `std.solve`: versions, requirements, ranges and the
+  PubGrub solver in Metaxu, the first pieces of glade written in the
+  language, each differentially tested against its Python module
+  (`docs/glade_in_metaxu.md` tracks the rest).
 - `metaxuc --version`.
 - `scripts/release.py`: one command to cut a release.
 

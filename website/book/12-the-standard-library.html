@@ -165,6 +165,41 @@ fn main() -&gt; int {
 0
 &gt;=1.5.0, &lt;2.0.0</code></pre></div>
 <p><code>1.5.0</code> is inside <code>^1.2</code>; <code>2.0.0-rc.1</code> is not, because a prerelease only satisfies a requirement that names a prerelease of the same version. Booleans print as <code>1</code> and <code>0</code>.</p>
+<h2>std.solve</h2>
+<p>The version solver, PubGrub, ported from glade&#x27;s Python. It takes the dependency graph as data: every version of every package with its requirements, which is what a registry index lists. Here the newest <code>foo</code> wants a <code>bar</code> the project rules out, so the solver settles on the older <code>foo</code>; had nothing fit, <code>out.explanation</code> would hold the reason as sentences.</p>
+<div class="fence"><span class="label">metaxu</span><pre><code class="mx">from std.semver import version, parse_requirement, range_any, version_to_string;
+from std.solve import graph_new, graph_add, dep, solve;
+
+fn req(name: string, text: string) -&gt; Dep {
+    match parse_requirement(text) { None =&gt; dep(name, range_any()), Some(r) =&gt; dep(name, r) }
+}
+
+fn main() -&gt; int {
+    let @mut g = graph_new();
+    let @mut foo10 = Vec.new();
+    foo10.push(req(&quot;bar&quot;, &quot;^1&quot;));
+    graph_add(g, &quot;foo&quot;, version(1, 0, 0), foo10);
+    let @mut foo11 = Vec.new();
+    foo11.push(req(&quot;bar&quot;, &quot;^2&quot;));
+    graph_add(g, &quot;foo&quot;, version(1, 1, 0), foo11);
+    graph_add(g, &quot;bar&quot;, version(1, 0, 0), Vec.new());
+    graph_add(g, &quot;bar&quot;, version(2, 0, 0), Vec.new());
+    let @mut root = Vec.new();
+    root.push(req(&quot;foo&quot;, &quot;^1&quot;));
+    root.push(req(&quot;bar&quot;, &quot;^1&quot;));
+    graph_add(g, &quot;app&quot;, version(0, 1, 0), root);
+    let out = solve(g, &quot;app&quot;, version(0, 1, 0), Vec.new(), Vec.new());
+    print(out.ok);
+    let @mut i = 0;
+    while i &lt; len(out.names) {
+        print(out.names[i] + &quot; &quot; + version_to_string(out.versions[i]));
+        i = i + 1
+    }
+    0
+}</code></pre></div>
+<div class="fence output"><span class="label">output</span><pre><code>1
+bar 1.0.0
+foo 1.0.0</code></pre></div>
 <h2>std.math</h2>
 <p>Constants are real module-level bindings, read as plain names. <code>sqrt</code>/<code>sin</code>/<code>cos</code> wrap the builtin methods; <code>abs</code>/<code>min</code>/<code>max</code>/<code>clamp</code> take unannotated parameters and work on ints and floats.</p>
 <div class="fence"><span class="label">metaxu</span><pre><code class="mx">from std.math import pi, abs, sqrt, powi;

@@ -456,6 +456,43 @@ def _corpus() -> list[str]:
             + sorted(glob.glob(os.path.join(REPO_ROOT, "std", "*.mx"))))
 
 
+class TestImportsAreModuleScoped:
+    """An import binds a name in its own module only. A file that imports
+    a module does not inherit that module's imports; before the resolver
+    walked each module body with its own imports, `main` below compiled
+    clean and died at run time with `Unknown callee: 'trim'`."""
+
+    def _project(self, tmp_path):
+        (tmp_path / "util.mx").write_text(
+            "export { helper };\nfrom std.parse import trim;\n"
+            "fn helper(s: string) -> string { trim(s) }\n")
+        return tmp_path / "main.mx"
+
+    def test_a_dependencys_import_is_not_in_the_importers_scope(self, tmp_path):
+        main = self._project(tmp_path)
+        src = "import util;\n\nfn main() -> int {\n    print(trim(\" x \"));\n    0\n}\n"
+        main.write_text(src)
+        errs = unresolved(src, file_path=str(main))
+        assert len(errs) == 1 and "undefined function 'trim'" in str(errs[0])
+
+    def test_the_dependency_itself_and_an_own_import_are_clean(self, tmp_path):
+        main = self._project(tmp_path)
+        src = ("import util;\nfrom std.parse import trim;\n\n"
+               "fn main() -> int {\n    print(util.helper(trim(\" x \")));\n    0\n}\n")
+        main.write_text(src)
+        compiles_clean(src, file_path=str(main))
+
+    def test_a_nested_module_block_sees_the_files_imports(self):
+        compiles_clean("""
+            from std.parse import trim;
+            module inner {
+                export { tidy };
+                fn tidy(s: string) -> string { trim(s) }
+            }
+            fn main() -> int { print(inner.tidy(" a ")); 0 }
+        """)
+
+
 class TestCorpus:
     """Not one false positive anywhere in the shipped corpus."""
 

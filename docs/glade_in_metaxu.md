@@ -120,7 +120,19 @@ syntax correction (an assignment is not a match arm; wrap it in
 braces) and fixed two laxities in the Python oracle on the way: it
 accepted empty identifiers in `1.0.0-a..b` and in requirements.
 
-Compiling the same program natively fails, and the reasons are the
+**Step 1, `std.solve`: done on the interpreter.** `std/solve.mx` is
+PubGrub over a data `Graph` (a registry index lists every version's
+dependencies, so no Provider trait is needed yet).
+`test_std_solve.py` runs thirteen graphs through both solvers,
+including deep backtracking and the fifty-version widening case, and
+requires identical picks and identical explanation sentences. It
+matched on the first run. Two Metaxu facts shaped the port: a struct
+passed as `@mut` is shared, so the solver state is one struct that
+helpers mutate; and `std.map` moves a key to the end on overwrite,
+which would change which package the solver tries first, so the
+port keeps its own insertion-ordered tables.
+
+Compiling either module natively fails, and the reasons are the
 first two entries the rewrite adds to step 2:
 
 - **String indexing is not lowered.** `s[i]` on a string is

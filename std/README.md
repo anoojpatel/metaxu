@@ -70,6 +70,7 @@ carries a strict `xfail` for that.
 | Module | Oracle | Status | Contents |
 | --- | --- | --- | --- |
 | `std.semver` | `glade/semver.py` | implemented (interpreter) | `Version`, `Interval`, `Range`; `parse_version`, `version_to_string`, `compare_version`; `range_any/empty/exact/between`, `range_intersect/union/complement`, `range_contains` (prerelease rule), `range_is_subset/disjoint`, `range_to_string`; `parse_requirement` in the Cargo dialect (`^`, `~`, `*`, `=`, comparators, commas) |
+| `std.solve` | `glade/pubgrub.py` | implemented (interpreter) | PubGrub over a `Graph` of `PackageVersion`s (`graph_new`, `graph_add`, `dep`); `solve(graph, root, root_version, prefer_names, prefer_versions)` returns an `Outcome` with the picks or an `explanation` whose sentences match the Python solver's word for word |
 | `std.iter` | implemented | the adapters `std.stream` defers, over real tuples: `enumerate`, `zip`, `zip_with`, `take_while`, `drop_while`, `step_by`, `windows`, `chunks` |
 
 ### Round 3

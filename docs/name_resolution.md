@@ -126,7 +126,7 @@ had a `where` clause.
 | enum variant constructors | every variant of every `enum`, plus the language-provided `Some` / `None` / `Ok` / `Err` (`hir` builds `Option`/`Result` variants even when no user enum declares them) |
 | effect operation names | every `op` of every `effect`, callable unqualified (`emit(x)` is `perform Emit.emit(x)`) |
 | module constants | direct module-level `let` statements, which `hir.build` hoists into `__module_init` and publishes as globals before the entry point runs |
-| imported names | every local name an `import` / `from … import` statement introduces, alias included |
+| imported names | every local name an `import` / `from … import` statement introduces, alias included, **in the module that contains the import** (plus enclosing module blocks). A file does not inherit the imports of a module it imports: `std.solve` importing `range_any` from `std.semver` gives a file that imports `std.solve` no `range_any`. The resolver walks each module body with that body's imports installed (`_bodies_with_imports`, `enter_module`); collecting every module's imports into one program-wide set was a false negative that surfaced only at run time as `Unknown callee`. |
 | runtime builtins | `hir.BUILTIN_FUNCTION_NAMES` (pinned equal to `mir_interp._register_builtins`), plus the dotted `Vec.new`, plus `type_of` / `Vec` / `vector` |
 | the `__` namespace | every name starting with `__` is the compiler's (`module_loader.check_reserved_names`) and is exempt |
 | `null` | the null-pointer literal; the parser produces a plain `Variable`, which `hir` lowers to a literal |

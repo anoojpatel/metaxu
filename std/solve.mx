@@ -1,0 +1,944 @@
+# std.solve — PubGrub version solving, in Metaxu.
+#
+# A port of src/metaxu/glade/pubgrub.py, the second piece of glade
+# written in the language (docs/glade_in_metaxu.md). The algorithm is
+# Dart pub's, also used by Cargo and uv: a CDCL SAT solver specialised
+# to package versions. Every decision's consequences are propagated;
+# a contradiction is analysed to the earliest choice that caused it,
+# a fact explaining the conflict is learned, and the solver jumps back
+# there instead of trying versions one by one. When there is no
+# solution the derivation is rendered as sentences.
+#
+# The Python module is the oracle: test_std_solve.py runs both over the
+# same graphs and compares the picks and the explanation text line for
+# line, so the wording here is deliberately identical.
+#
+# Instead of a Provider trait the solver takes the dependency graph as
+# data (a `Graph`): a registry index already lists every version's
+# dependencies up front, so glade can build one before solving.
+#
+# Metaxu notes. A struct passed as `@mut` is shared, so the solver's
+# state lives in one `Solver` struct that helper functions mutate.
+# Elements read out of a Vec are copies, so anything that must change in
+# place is written back with `v[i] = ...`. Name-to-value tables are pairs
+# of Vecs kept in insertion order with updates in place, because the
+# Python dicts they mirror keep a key's position on overwrite and the
+# order decides which package the solver picks first.
+
+from std.semver import Version, Range, parse_version, version_to_string,
+    compare_version, version_eq, range_any, range_exact, range_between,
+    range_intersect, range_union, range_complement, range_is_empty,
+    range_is_subset, range_is_disjoint, range_contains,
+    range_exact_version, range_to_string;
+
+export {
+    Dep,
+    PackageVersion,
+    Graph,
+    Term,
+    Incompat,
+    Outcome,
+    dep,
+    graph_new,
+    graph_add,
+    graph_versions,
+    graph_deps,
+    solve,
+    explain
+};
+
+# ---------------------------------------------------------------------
+# the graph
+
+struct Dep {
+    name: string,
+    range: Range
+}
+
+struct PackageVersion {
+    version: Version,
+    deps: Vec
+}
+
+struct Graph {
+    names: Vec,
+    entries: Vec
+}
+
+fn dep(name: string, range: Range) -> Dep {
+    Dep { name: name, range: range }
+}
+
+fn graph_new() -> Graph {
+    Graph { names: Vec.new(), entries: Vec.new() }
+}
+
+fn index_of(keys: Vec, k: string) -> int {
+    let @mut i = 0;
+    let @mut at = 0 - 1;
+    while i < len(keys) {
+        if at < 0 && keys[i] == k { at = i } else { () };
+        i = i + 1
+    }
+    at
+}
+
+# Register `version` of `name` with its dependencies (a Vec of Dep).
+fn graph_add(g: @mut Graph, name: string, version: Version, deps: Vec) -> () {
+    let at = index_of(g.names, name);
+    let pv = PackageVersion { version: version, deps: deps };
+    if at < 0 {
+        let @mut vs = Vec.new();
+        vs.push(pv);
+        g.names.push(name);
+        g.entries.push(vs)
+    } else {
+        let @mut vs = g.entries[at];
+        vs.push(pv)
+    }
+}
+
+fn sort_versions_desc(vs: Vec) -> Vec {
+    let @mut sorted = Vec.new();
+    let @mut j = 0;
+    while j < len(vs) {
+        let v = vs[j];
+        let @mut placed = Vec.new();
+        let @mut inserted = false;
+        let @mut k = 0;
+        while k < len(sorted) {
+            if inserted == false && compare_version(v, sorted[k]) > 0 {
+                placed.push(v);
+                inserted = true
+            } else { () };
+            placed.push(sorted[k]);
+            k = k + 1
+        }
+        if inserted == false { placed.push(v) } else { () };
+        sorted = placed;
+        j = j + 1
+    }
+    sorted
+}
+
+# Every known version of `name`, newest first; empty for an unknown name.
+fn graph_versions(g: Graph, name: string) -> Vec {
+    let at = index_of(g.names, name);
+    if at < 0 {
+        Vec.new()
+    } else {
+        let entries = g.entries[at];
+        let @mut vs = Vec.new();
+        let @mut i = 0;
+        while i < len(entries) {
+            vs.push(entries[i].version);
+            i = i + 1
+        }
+        sort_versions_desc(vs)
+    }
+}
+
+# Some(Vec of Dep) for a known version, else None.
+fn graph_deps(g: Graph, name: string, v: Version) -> Option {
+    let at = index_of(g.names, name);
+    if at < 0 {
+        None
+    } else {
+        let entries = g.entries[at];
+        let @mut found = None;
+        let @mut i = 0;
+        while i < len(entries) {
+            if version_eq(entries[i].version, v) { found = Some(entries[i].deps) } else { () };
+            i = i + 1
+        }
+        found
+    }
+}
+
+fn dep_range(deps: Vec, name: string) -> Option {
+    let @mut i = 0;
+    let @mut found = None;
+    while i < len(deps) {
+        if deps[i].name == name { found = Some(deps[i].range) } else { () };
+        i = i + 1
+    }
+    found
+}
+
+# ---------------------------------------------------------------------
+# terms
+
+struct Term {
+    package: string,
+    range: Range,
+    positive: bool
+}
+
+fn term_allowed(t: Term) -> Range {
+    if t.positive { t.range } else { range_complement(t.range) }
+}
+
+fn term_negate(t: Term) -> Term {
+    Term { package: t.package, range: t.range, positive: t.positive == false }
+}
+
+fn term_intersect(a: Term, b: Term) -> Term {
+    if a.positive && b.positive {
+        Term { package: a.package, range: range_intersect(a.range, b.range), positive: true }
+    } else {
+        if a.positive == false && b.positive == false {
+            Term { package: a.package, range: range_union(a.range, b.range), positive: false }
+        } else {
+            let pos = if a.positive { a } else { b };
+            let neg = if a.positive { b } else { a };
+            Term { package: a.package, range: range_intersect(pos.range, range_complement(neg.range)), positive: true }
+        }
+    }
+}
+
+fn term_satisfies(a: Term, b: Term) -> bool {
+    range_is_subset(term_allowed(a), term_allowed(b))
+}
+
+fn term_contradicts(a: Term, b: Term) -> bool {
+    range_is_disjoint(term_allowed(a), term_allowed(b))
+}
+
+fn term_to_string(t: Term) -> string {
+    if t.positive {
+        t.package + " " + range_to_string(t.range)
+    } else {
+        "not " + t.package + " " + range_to_string(t.range)
+    }
+}
+
+# ---------------------------------------------------------------------
+# incompatibilities
+
+struct Incompat {
+    terms: Vec,
+    kind: string,
+    package: string,
+    version: Option,
+    dependency: string,
+    left: Option,
+    right: Option
+}
+
+fn inc_root(root: string, v: Version) -> Incompat {
+    let @mut terms = Vec.new();
+    terms.push(Term { package: root, range: range_exact(v), positive: false });
+    Incompat { terms: terms, kind: "root", package: root, version: None, dependency: "", left: None, right: None }
+}
+
+fn inc_dependency(package: string, covered: Range, v: Version, dependency: string, range: Range) -> Incompat {
+    let @mut terms = Vec.new();
+    terms.push(Term { package: package, range: covered, positive: true });
+    terms.push(Term { package: dependency, range: range, positive: false });
+    Incompat { terms: terms, kind: "dependency", package: package, version: Some(v), dependency: dependency, left: None, right: None }
+}
+
+fn inc_no_versions(t: Term) -> Incompat {
+    let @mut terms = Vec.new();
+    terms.push(t);
+    Incompat { terms: terms, kind: "no_versions", package: "", version: None, dependency: "", left: None, right: None }
+}
+
+fn inc_unavailable(package: string, v: Version) -> Incompat {
+    let @mut terms = Vec.new();
+    terms.push(Term { package: package, range: range_exact(v), positive: true });
+    Incompat { terms: terms, kind: "unavailable", package: package, version: Some(v), dependency: "", left: None, right: None }
+}
+
+fn inc_derived(terms: Vec, left: Incompat, right: Incompat) -> Incompat {
+    Incompat { terms: terms, kind: "derived", package: "", version: None, dependency: "", left: Some(left), right: Some(right) }
+}
+
+fn inc_term_for(inc: Incompat, package: string) -> Option {
+    let @mut i = 0;
+    let @mut found = None;
+    while i < len(inc.terms) {
+        if inc.terms[i].package == package { found = Some(inc.terms[i]) } else { () };
+        i = i + 1
+    }
+    found
+}
+
+fn version_text(o: Option) -> string {
+    match o { None => "", Some(v) => version_to_string(v) }
+}
+
+# The sentence for one fact, worded exactly as the Python module words it.
+fn inc_describe(inc: Incompat) -> string {
+    if inc.kind == "dependency" {
+        let dep_range = match inc_term_for(inc, inc.dependency) { None => range_any(), Some(t) => t.range };
+        let own_range = match inc_term_for(inc, inc.package) { None => range_any(), Some(t) => t.range };
+        let who = match range_exact_version(own_range) {
+            None => range_to_string(own_range),
+            Some(v) => version_text(inc.version)
+        };
+        inc.package + " " + who + " depends on " + inc.dependency + " " + range_to_string(dep_range)
+    } else { if inc.kind == "no_versions" {
+        let t = inc.terms[0];
+        "no versions of " + t.package + " match " + range_to_string(t.range)
+    } else { if inc.kind == "unavailable" {
+        inc.package + " " + version_text(inc.version) + " cannot be used (its manifest is missing or broken)"
+    } else { if inc.kind == "root" {
+        inc.package + " is the project"
+    } else {
+        describe_derived(inc)
+    } } } }
+}
+
+fn describe_derived(inc: Incompat) -> string {
+    if len(inc.terms) == 0 {
+        "version solving failed"
+    } else { if len(inc.terms) == 1 {
+        let t = inc.terms[0];
+        if t.positive {
+            t.package + " " + range_to_string(t.range) + " is forbidden"
+        } else {
+            t.package + " must be " + range_to_string(t.range)
+        }
+    } else {
+        let @mut pos = Vec.new();
+        let @mut neg = Vec.new();
+        let @mut i = 0;
+        while i < len(inc.terms) {
+            if inc.terms[i].positive { pos.push(inc.terms[i]) } else { neg.push(inc.terms[i]) };
+            i = i + 1
+        }
+        if len(pos) == 1 && len(neg) == 1 {
+            let p = pos[0];
+            let n = neg[0];
+            p.package + " " + range_to_string(p.range) + " requires " + n.package + " " + range_to_string(n.range)
+        } else {
+            let @mut out = "";
+            let @mut j = 0;
+            while j < len(inc.terms) {
+                if j > 0 { out = out + " and " } else { () };
+                out = out + term_to_string(inc.terms[j]);
+                j = j + 1
+            }
+            out + " are incompatible"
+        }
+    } }
+}
+
+# ---------------------------------------------------------------------
+# the partial solution and the solver state
+
+struct Assignment {
+    term: Term,
+    level: int,
+    index: int,
+    cause: Option,
+    decision: bool
+}
+
+struct Solver {
+    graph: Graph,
+    root: string,
+    prefer_names: Vec,
+    prefer_versions: Vec,
+    assignments: Vec,
+    decision_names: Vec,
+    decision_versions: Vec,
+    derivation_names: Vec,
+    derivation_terms: Vec,
+    level: int,
+    incompats: Vec,
+    by_names: Vec,
+    by_lists: Vec,
+    added: Vec
+}
+
+fn add_incompat(s: @mut Solver, inc: Incompat) -> () {
+    let at = len(s.incompats);
+    s.incompats.push(inc);
+    let @mut i = 0;
+    while i < len(inc.terms) {
+        let pkg = inc.terms[i].package;
+        let k = index_of(s.by_names, pkg);
+        if k < 0 {
+            let @mut lst = Vec.new();
+            lst.push(at);
+            s.by_names.push(pkg);
+            s.by_lists.push(lst)
+        } else {
+            let @mut lst = s.by_lists[k];
+            lst.push(at)
+        };
+        i = i + 1
+    }
+}
+
+fn incompats_for(s: Solver, pkg: string) -> Vec {
+    let k = index_of(s.by_names, pkg);
+    if k < 0 { Vec.new() } else { s.by_lists[k] }
+}
+
+fn derivation_of(s: Solver, pkg: string) -> Option {
+    let k = index_of(s.derivation_names, pkg);
+    if k < 0 { None } else { Some(s.derivation_terms[k]) }
+}
+
+fn record(s: @mut Solver, term: Term, cause: Option, decision: bool) -> () {
+    s.assignments.push(Assignment { term: term, level: s.level, index: len(s.assignments), cause: cause, decision: decision });
+    let k = index_of(s.derivation_names, term.package);
+    if k < 0 {
+        s.derivation_names.push(term.package);
+        s.derivation_terms.push(term)
+    } else {
+        let prior = s.derivation_terms[k];
+        s.derivation_terms[k] = term_intersect(prior, term)
+    }
+}
+
+fn decide(s: @mut Solver, pkg: string, v: Version) -> () {
+    s.level = s.level + 1;
+    let k = index_of(s.decision_names, pkg);
+    if k < 0 {
+        s.decision_names.push(pkg);
+        s.decision_versions.push(v)
+    } else {
+        s.decision_versions[k] = v
+    };
+    record(s, Term { package: pkg, range: range_exact(v), positive: true }, None, true)
+}
+
+fn derive(s: @mut Solver, term: Term, cause: Incompat) -> () {
+    record(s, term, Some(cause), false)
+}
+
+# "subset" when the solution implies the term, "disjoint" when it
+# contradicts it, else "overlapping".
+fn relation(s: Solver, term: Term) -> string {
+    match derivation_of(s, term.package) {
+        None => "overlapping",
+        Some(have) => {
+            if term_satisfies(have, term) { "subset" } else {
+                if term_contradicts(have, term) { "disjoint" } else { "overlapping" }
+            }
+        }
+    }
+}
+
+struct Relation {
+    kind: string,
+    term: Option
+}
+
+# satisfied, contradicted, almost (with the one open term) or inconclusive.
+fn relation_of(s: Solver, inc: Incompat) -> Relation {
+    let @mut unsatisfied = None;
+    let @mut open = 0;
+    let @mut contradicted = None;
+    let @mut i = 0;
+    while i < len(inc.terms) {
+        let t = inc.terms[i];
+        let rel = relation(s, t);
+        if rel == "disjoint" {
+            match contradicted { None => { contradicted = Some(t) }, Some(x) => () }
+        } else { if rel == "overlapping" {
+            open = open + 1;
+            unsatisfied = Some(t)
+        } else { () } };
+        i = i + 1
+    }
+    match contradicted {
+        Some(t) => Relation { kind: "contradicted", term: Some(t) },
+        None => {
+            if open == 0 { Relation { kind: "satisfied", term: None } } else {
+                if open == 1 { Relation { kind: "almost", term: unsatisfied } } else {
+                    Relation { kind: "inconclusive", term: None }
+                }
+            }
+        }
+    }
+}
+
+fn undecided_positive(s: Solver) -> Vec {
+    let @mut out = Vec.new();
+    let @mut i = 0;
+    while i < len(s.derivation_names) {
+        let name = s.derivation_names[i];
+        if s.derivation_terms[i].positive && index_of(s.decision_names, name) < 0 { out.push(name) } else { () };
+        i = i + 1
+    }
+    out
+}
+
+fn backtrack(s: @mut Solver, level: int) -> () {
+    let @mut keep = Vec.new();
+    let @mut i = 0;
+    while i < len(s.assignments) {
+        if s.assignments[i].level <= level { keep.push(s.assignments[i]) } else { () };
+        i = i + 1
+    }
+    s.assignments = Vec.new();
+    s.decision_names = Vec.new();
+    s.decision_versions = Vec.new();
+    s.derivation_names = Vec.new();
+    s.derivation_terms = Vec.new();
+    s.level = level;
+    let @mut j = 0;
+    while j < len(keep) {
+        let a = keep[j];
+        if a.decision {
+            match range_exact_version(a.term.range) {
+                None => (),
+                Some(v) => {
+                    s.decision_names.push(a.term.package);
+                    s.decision_versions.push(v)
+                }
+            }
+        } else { () };
+        s.assignments.push(Assignment { term: a.term, level: a.level, index: len(s.assignments), cause: a.cause, decision: a.decision });
+        let k = index_of(s.derivation_names, a.term.package);
+        if k < 0 {
+            s.derivation_names.push(a.term.package);
+            s.derivation_terms.push(a.term)
+        } else {
+            let prior = s.derivation_terms[k];
+            s.derivation_terms[k] = term_intersect(prior, a.term)
+        };
+        j = j + 1
+    }
+}
+
+# The earliest assignment such that the assignments up to and including
+# it satisfy the incompatibility (its index into s.assignments).
+fn satisfier_index(s: Solver, inc: Incompat) -> int {
+    let @mut result = 0 - 1;
+    let @mut t = 0;
+    while t < len(inc.terms) {
+        let term = inc.terms[t];
+        let @mut acc = None;
+        let @mut found = 0 - 1;
+        let @mut i = 0;
+        while i < len(s.assignments) && found < 0 {
+            let a = s.assignments[i];
+            if a.term.package == term.package {
+                acc = match acc { None => Some(a.term), Some(prev) => Some(term_intersect(prev, a.term)) };
+                match acc {
+                    None => (),
+                    Some(cur) => if term_satisfies(cur, term) { found = i } else { () }
+                }
+            } else { () };
+            i = i + 1
+        }
+        if found > result { result = found } else { () };
+        t = t + 1
+    }
+    if result < 0 { len(s.assignments) - 1 } else { result }
+}
+
+# The decision level of the latest assignment before the satisfier that
+# is still needed for the incompatibility to hold, or 1 when the
+# satisfier alone suffices (or nothing earlier can be found).
+fn previous_level(s: Solver, inc: Incompat, satisfier: Assignment) -> int {
+    let @mut best = 0 - 1;
+    let @mut best_level = 1;
+    let @mut t = 0;
+    while t < len(inc.terms) {
+        let term = inc.terms[t];
+        let @mut acc = None;
+        let @mut skip = false;
+        if term.package == satisfier.term.package {
+            acc = Some(satisfier.term);
+            if term_satisfies(satisfier.term, term) { skip = true } else { () }
+        } else { () };
+        if skip == false {
+            let @mut found = 0 - 1;
+            let @mut i = 0;
+            while i < len(s.assignments) && found < 0 {
+                let a = s.assignments[i];
+                if a.index < satisfier.index && a.term.package == term.package {
+                    acc = match acc { None => Some(a.term), Some(prev) => Some(term_intersect(prev, a.term)) };
+                    match acc {
+                        None => (),
+                        Some(cur) => if term_satisfies(cur, term) { found = i } else { () }
+                    }
+                } else { () };
+                i = i + 1
+            }
+            if found >= 0 && found > best {
+                best = found;
+                best_level = s.assignments[found].level
+            } else { () }
+        } else { () };
+        t = t + 1
+    }
+    if best < 0 { 1 } else { best_level }
+}
+
+struct Conflict {
+    failed: bool,
+    inc: Incompat
+}
+
+fn is_terminal(s: Solver, inc: Incompat) -> bool {
+    if len(inc.terms) == 0 {
+        true
+    } else {
+        len(inc.terms) == 1 && inc.terms[0].positive && inc.terms[0].package == s.root
+    }
+}
+
+fn resolve_conflict(s: @mut Solver, start: Incompat) -> Conflict {
+    let @mut inc = start;
+    let @mut fresh = false;
+    let @mut done = false;
+    let @mut failed = false;
+    while done == false {
+        if is_terminal(s, inc) {
+            failed = true;
+            done = true
+        } else {
+            let si = satisfier_index(s, inc);
+            let satisfier = s.assignments[si];
+            let term = match inc_term_for(inc, satisfier.term.package) { None => satisfier.term, Some(t) => t };
+            let @mut prev_level = 1;
+            if len(inc.terms) > 1 || term_satisfies(satisfier.term, term) == false {
+                prev_level = previous_level(s, inc, satisfier)
+            } else { () };
+            if satisfier.decision || prev_level != satisfier.level {
+                if fresh { add_incompat(s, inc) } else { () };
+                backtrack(s, prev_level);
+                done = true
+            } else {
+                let cause = match satisfier.cause { None => inc, Some(c) => c };
+                let @mut names = Vec.new();
+                let @mut terms = Vec.new();
+                let @mut i = 0;
+                while i < len(inc.terms) + len(cause.terms) {
+                    let t = if i < len(inc.terms) { inc.terms[i] } else { cause.terms[i - len(inc.terms)] };
+                    if t.package == satisfier.term.package { () } else {
+                        let k = index_of(names, t.package);
+                        if k < 0 {
+                            names.push(t.package);
+                            terms.push(t)
+                        } else {
+                            terms[k] = term_intersect(terms[k], t)
+                        }
+                    };
+                    i = i + 1
+                }
+                if term_satisfies(satisfier.term, term) == false {
+                    let leftover = term_intersect(satisfier.term, term_negate(term));
+                    let k = index_of(names, satisfier.term.package);
+                    if k < 0 {
+                        names.push(satisfier.term.package);
+                        terms.push(term_negate(leftover))
+                    } else {
+                        terms[k] = term_negate(leftover)
+                    }
+                } else { () };
+                inc = inc_derived(terms, inc, cause);
+                fresh = true
+            }
+        }
+    }
+    Conflict { failed: failed, inc: inc }
+}
+
+# Unit propagation from `pkg`; Some(incompatibility) when solving failed.
+fn propagate(s: @mut Solver, pkg: string) -> Option {
+    let @mut changed = Vec.new();
+    changed.push(pkg);
+    let @mut failure = None;
+    while len(changed) > 0 && is_none(failure) {
+        let current = changed.pop();
+        let list = incompats_for(s, current);
+        let @mut i = len(list) - 1;
+        let @mut stop = false;
+        while i >= 0 && stop == false {
+            let inc = s.incompats[list[i]];
+            let rel = relation_of(s, inc);
+            if rel.kind == "satisfied" {
+                let c = resolve_conflict(s, inc);
+                if c.failed {
+                    failure = Some(c.inc);
+                    stop = true
+                } else {
+                    let rel2 = relation_of(s, c.inc);
+                    match rel2.term {
+                        None => (),
+                        Some(t) => {
+                            derive(s, term_negate(t), c.inc);
+                            changed = Vec.new();
+                            changed.push(t.package)
+                        }
+                    };
+                    stop = true
+                }
+            } else { if rel.kind == "almost" {
+                match rel.term {
+                    None => (),
+                    Some(t) => {
+                        derive(s, term_negate(t), inc);
+                        changed.push(t.package)
+                    }
+                }
+            } else { () } };
+            i = i - 1
+        }
+    }
+    failure
+}
+
+fn is_none(o: Option) -> bool {
+    match o { None => true, Some(x) => false }
+}
+
+fn versions_preferred(s: Solver, pkg: string) -> Vec {
+    let vs = graph_versions(s.graph, pkg);
+    let k = index_of(s.prefer_names, pkg);
+    if k < 0 {
+        vs
+    } else {
+        let want = s.prefer_versions[k];
+        let @mut present = false;
+        let @mut i = 0;
+        while i < len(vs) {
+            if version_eq(vs[i], want) { present = true } else { () };
+            i = i + 1
+        }
+        if present {
+            let @mut out = Vec.new();
+            out.push(want);
+            let @mut j = 0;
+            while j < len(vs) {
+                if version_eq(vs[j], want) { () } else { out.push(vs[j]) };
+                j = j + 1
+            }
+            out
+        } else {
+            vs
+        }
+    }
+}
+
+fn range_eq(a: Range, b: Range) -> bool {
+    range_to_string(a) == range_to_string(b)
+}
+
+fn sort_versions_asc(vs: Vec) -> Vec {
+    let desc = sort_versions_desc(vs);
+    let @mut out = Vec.new();
+    let @mut i = len(desc) - 1;
+    while i >= 0 {
+        out.push(desc[i]);
+        i = i - 1
+    }
+    out
+}
+
+# The contiguous run of versions around `v` that all depend on `d` with
+# exactly `range`: one fact covers the run instead of one per version.
+fn widen(s: Solver, pkg: string, v: Version, d: string, range: Range) -> Range {
+    let ordered = sort_versions_asc(graph_versions(s.graph, pkg));
+    let @mut at = 0;
+    let @mut i = 0;
+    while i < len(ordered) {
+        if version_eq(ordered[i], v) { at = i } else { () };
+        i = i + 1
+    }
+    let @mut lo = at;
+    let @mut hi = at;
+    let @mut go = true;
+    while go && lo > 0 {
+        if same_dep(s, pkg, ordered[lo - 1], d, range) { lo = lo - 1 } else { go = false }
+    }
+    go = true;
+    while go && hi + 1 < len(ordered) {
+        if same_dep(s, pkg, ordered[hi + 1], d, range) { hi = hi + 1 } else { go = false }
+    }
+    if lo == hi {
+        range_exact(v)
+    } else {
+        range_between(Some(ordered[lo]), Some(ordered[hi]), true, true)
+    }
+}
+
+fn same_dep(s: Solver, pkg: string, v: Version, d: string, range: Range) -> bool {
+    match graph_deps(s.graph, pkg, v) {
+        None => false,
+        Some(deps) => match dep_range(deps, d) {
+            None => false,
+            Some(r) => range_eq(r, range)
+        }
+    }
+}
+
+fn added_key(pkg: string, v: Version) -> string {
+    pkg + "@" + version_to_string(v)
+}
+
+# Pick the next package and version; None when every positive
+# derivation has a decision, which means the solution is complete.
+fn choose(s: @mut Solver) -> Option {
+    let candidates = undecided_positive(s);
+    if len(candidates) == 0 {
+        None
+    } else {
+        let @mut best_pkg = candidates[0];
+        let @mut best_versions = Vec.new();
+        let @mut best_count = 0 - 1;
+        let @mut i = 0;
+        while i < len(candidates) {
+            let pkg = candidates[i];
+            let term = match derivation_of(s, pkg) { None => Term { package: pkg, range: range_any(), positive: true }, Some(t) => t };
+            let all = versions_preferred(s, pkg);
+            let @mut matching = Vec.new();
+            let @mut j = 0;
+            while j < len(all) {
+                if range_contains(term.range, all[j]) { matching.push(all[j]) } else { () };
+                j = j + 1
+            }
+            if best_count < 0 || len(matching) < best_count {
+                best_pkg = pkg;
+                best_versions = matching;
+                best_count = len(matching)
+            } else { () };
+            i = i + 1
+        }
+        let best_term = match derivation_of(s, best_pkg) { None => Term { package: best_pkg, range: range_any(), positive: true }, Some(t) => t };
+        if len(best_versions) == 0 {
+            add_incompat(s, inc_no_versions(Term { package: best_pkg, range: best_term.range, positive: true }));
+            Some(best_pkg)
+        } else {
+            let v = best_versions[0];
+            match graph_deps(s.graph, best_pkg, v) {
+                None => {
+                    add_incompat(s, inc_unavailable(best_pkg, v));
+                    Some(best_pkg)
+                },
+                Some(deps) => {
+                    let @mut conflict = false;
+                    let key = added_key(best_pkg, v);
+                    if index_of(s.added, key) < 0 {
+                        s.added.push(key);
+                        let @mut d = 0;
+                        while d < len(deps) {
+                            let dp = deps[d];
+                            let covered = widen(s, best_pkg, v, dp.name, dp.range);
+                            add_incompat(s, inc_dependency(best_pkg, covered, v, dp.name, dp.range));
+                            if relation(s, Term { package: dp.name, range: dp.range, positive: false }) == "subset" {
+                                conflict = true
+                            } else { () };
+                            d = d + 1
+                        }
+                    } else { () };
+                    if conflict { () } else { decide(s, best_pkg, v) };
+                    Some(best_pkg)
+                }
+            }
+        }
+    }
+}
+
+# ---------------------------------------------------------------------
+# the result
+
+struct Outcome {
+    ok: bool,
+    names: Vec,
+    versions: Vec,
+    explanation: string
+}
+
+# Solve for `root` (a version of it must be in the graph, with its
+# dependencies). `prefer_names`/`prefer_versions` are tried first for
+# their packages (the lock). On success `names`/`versions` hold every
+# chosen package except the root; on failure `explanation` says why.
+fn solve(g: Graph, root: string, root_version: Version, prefer_names: Vec, prefer_versions: Vec) -> Outcome {
+    let @mut s = Solver {
+        graph: g, root: root,
+        prefer_names: prefer_names, prefer_versions: prefer_versions,
+        assignments: Vec.new(),
+        decision_names: Vec.new(), decision_versions: Vec.new(),
+        derivation_names: Vec.new(), derivation_terms: Vec.new(),
+        level: 0, incompats: Vec.new(),
+        by_names: Vec.new(), by_lists: Vec.new(), added: Vec.new()
+    };
+    add_incompat(s, inc_root(root, root_version));
+    let @mut next = Some(root);
+    let @mut failure = None;
+    while is_none(next) == false && is_none(failure) {
+        match next {
+            None => (),
+            Some(pkg) => {
+                failure = propagate(s, pkg);
+                if is_none(failure) { next = choose(s) } else { () }
+            }
+        }
+    }
+    match failure {
+        Some(inc) => Outcome { ok: false, names: Vec.new(), versions: Vec.new(), explanation: explain(inc) },
+        None => {
+            let @mut names = Vec.new();
+            let @mut versions = Vec.new();
+            let @mut i = 0;
+            while i < len(s.decision_names) {
+                if s.decision_names[i] == root { () } else {
+                    names.push(s.decision_names[i]);
+                    versions.push(s.decision_versions[i])
+                };
+                i = i + 1
+            }
+            Outcome { ok: true, names: names, versions: versions, explanation: "" }
+        }
+    }
+}
+
+# ---------------------------------------------------------------------
+# explanations
+
+fn is_derived(o: Option) -> bool {
+    match o { None => false, Some(inc) => inc.kind == "derived" }
+}
+
+fn write_lines(inc: Incompat, lines: @mut Vec) -> () {
+    if inc.kind != "derived" {
+        lines.push(inc_describe(inc) + ".")
+    } else {
+        match inc.left {
+            None => (),
+            Some(left) => match inc.right {
+                None => (),
+                Some(right) => {
+                    let l_der = left.kind == "derived";
+                    let r_der = right.kind == "derived";
+                    if l_der && r_der {
+                        write_lines(left, lines);
+                        write_lines(right, lines);
+                        lines.push("Thus, " + inc_describe(inc) + ".")
+                    } else { if l_der || r_der {
+                        let derived = if l_der { left } else { right };
+                        let ext = if l_der { right } else { left };
+                        write_lines(derived, lines);
+                        lines.push("And because " + inc_describe(ext) + ", " + inc_describe(inc) + ".")
+                    } else {
+                        lines.push("Because " + inc_describe(left) + " and " + inc_describe(right) + ", " + inc_describe(inc) + ".")
+                    } }
+                }
+            }
+        }
+    }
+}
+
+# The derivation of a failure as sentences, one per line.
+fn explain(inc: Incompat) -> string {
+    let @mut lines = Vec.new();
+    write_lines(inc, lines);
+    let @mut out = "";
+    let @mut i = 0;
+    while i < len(lines) {
+        if i > 0 { out = out + "\n" } else { () };
+        out = out + lines[i];
+        i = i + 1
+    }
+    out
+}

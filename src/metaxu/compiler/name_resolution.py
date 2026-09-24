@@ -230,8 +230,15 @@ class _GlobalNames:
         self.types: set[str] = set()           # struct / enum / trait / alias
         self.impl_types: set[str] = set()      # types with an `implement` block
         self.effect_ops: set[str] = set()
-        self.imported: set[str] = set()        # import / from-import locals
-        # Materialized by freeze(), below.
+        # The import / from-import locals of the module being walked. An
+        # import binds a name in ITS module only: `std.solve` importing
+        # `range_any` from `std.semver` does not make `range_any` a name in
+        # a file that imports `std.solve`. Before this was per module, that
+        # file compiled clean and died at run time with `Unknown callee`.
+        self.imported: set[str] = set()
+        # Materialized by freeze(), below; the module part by enter_module().
+        self.callable_base: set[str] = set()
+        self.value_base: set[str] = set()
         self.callable_names: set[str] = set()
         self.value_names: set[str] = set()
 
@@ -242,14 +249,23 @@ class _GlobalNames:
         the unions per reference made resolution quadratic in program size.
         Call once, after collection, before the scoped walk.
         """
-        self.callable_names = (
+        self.callable_base = (
             self.functions | self.methods | self.variants | self.types
-            | self.effect_ops | self.imported
+            | self.effect_ops
             | set(BUILTIN_FUNCTION_NAMES) | set(EXTRA_BUILTIN_NAMES))
-        self.value_names = (
-            self.functions | self.variants | self.types | self.imported
+        self.value_base = (
+            self.functions | self.variants | self.types
             | set(LANGUAGE_VALUE_NAMES)
             | set(BUILTIN_FUNCTION_NAMES) | set(EXTRA_BUILTIN_NAMES))
+        self.enter_module(frozenset())
+
+    def enter_module(self, imports: frozenset[str] | set[str]) -> None:
+        """Switch the lookup sets to the module whose imports are `imports`
+        (its own import statements plus those of the module blocks that
+        enclose it). Called once per module body, so the unions stay cheap."""
+        self.imported = set(imports)
+        self.callable_names = self.callable_base | self.imported
+        self.value_names = self.value_base | self.imported
 
 
 def collect_global_names(root: Any) -> _GlobalNames:
@@ -315,18 +331,33 @@ def collect_global_names(root: Any) -> _GlobalNames:
             _add(g.types, getattr(node, "name", None))
             for op in getattr(node, "operations", None) or []:
                 _add(g.effect_ops, getattr(op, "name", None))
-        # --- imports: every local name an import statement introduces ------
-        # For a RESOLVED module the loader has already rewritten references
-        # to dotted paths, so these bindings are usually unused; for the
-        # `std.*` external placeholder (std.simd, std.effects, ... — modules
-        # with no file under the stdlib root) nothing is rewritten and the
-        # bare imported name is all the program has.  Both are the same
-        # category: a name an import statement brought into scope.
-        elif isinstance(node, fast.Import):
+    # Imported names are NOT collected here: an import binds a name in its
+    # own module only, so they are gathered per module body by
+    # _bodies_with_imports and installed with enter_module while that
+    # body is walked.
+    # Module-level `let` constants are bound by the scoped walk, which is
+    # the only place that can tell a module-level binding from a local.
+    g.freeze()
+    return g
+
+
+def _import_locals(statements: Iterable[Any]) -> set[str]:
+    """Every local name the import statements among `statements` introduce.
+
+    For a RESOLVED module the loader has already rewritten references to
+    dotted paths, so these bindings are usually unused; for the `std.*`
+    external placeholder (std.simd, std.effects, ... — modules with no file
+    under the stdlib root) nothing is rewritten and the bare imported name
+    is all the program has.  Both are the same category: a name an import
+    statement brought into scope, in the module that contains the import.
+    """
+    names: set[str] = set()
+    for node in statements:
+        if isinstance(node, fast.Import):
             alias = getattr(node, "alias", None)
             path = getattr(node, "module_path", None) or []
             local = alias or (str(path[-1]) if path else None)
-            _add(g.imported, local)
+            _add(names, local)
         elif isinstance(node, fast.FromImport):
             # `names` is a list of (name, alias) pairs; the alias, when
             # present, is the local spelling.
@@ -335,13 +366,40 @@ def collect_global_names(root: Any) -> _GlobalNames:
                     if not entry:
                         continue
                     alias = entry[1] if len(entry) > 1 else None
-                    _add(g.imported, alias if alias else entry[0])
+                    _add(names, alias if alias else entry[0])
                 elif entry is not None:
-                    _add(g.imported, entry)
-    # Module-level `let` constants are bound by the scoped walk, which is
-    # the only place that can tell a module-level binding from a local.
-    g.freeze()
-    return g
+                    _add(names, entry)
+    return names
+
+
+def _bodies_with_imports(root: Any) -> list[tuple[list[Any], frozenset[str]]]:
+    """(statements, imports) for every module body in the program.
+
+    A body's imports are its own import statements plus those of every
+    module block enclosing it, so a nested `module m { }` sees the file's
+    imports. A program with no module body (a bare Program) is one body.
+    """
+    out: list[tuple[list[Any], frozenset[str]]] = []
+    seen: set[int] = set()
+
+    def walk(node: Any, inherited: frozenset[str]) -> None:
+        if node is None or id(node) in seen or not _is_node(node):
+            return
+        seen.add(id(node))
+        current = inherited
+        if isinstance(node, fast.ModuleBody):
+            stmts = list(getattr(node, "statements", None) or [])
+            current = inherited | frozenset(_import_locals(stmts))
+            out.append((stmts, current))
+        for child in _sub_nodes(node):
+            walk(child, current)
+
+    walk(root, frozenset())
+    if not out:
+        stmts = (list(getattr(root, "statements", None) or [])
+                 if isinstance(root, fast.Program) else [root])
+        out.append((stmts, frozenset(_import_locals(stmts))))
+    return out
 
 
 def _base_name(type_node: Any) -> str | None:
@@ -952,7 +1010,11 @@ def check_names(root: Any, file_path: str | None = None) -> list[BorrowError]:
     # Module-level `let` bindings are program-wide constants (they become
     # globals through __module_init), so bind them all before walking.
     _bind_module_constants(root, resolver)
-    resolver.visit_all(_module_statements(root))
+    # Each module body is walked with ITS imports in scope, not the union
+    # of every module's imports.
+    for statements, imports in _bodies_with_imports(root):
+        globals_.enter_module(imports)
+        resolver.visit_all(statements)
     return resolver.errors
 
 
