@@ -354,14 +354,19 @@ class _FuncLowerer:
                     self.emit(("let", nxt, ("field_set", fname), (holder, updated)))
                     updated = nxt
                 self.emit(("let", base_slot, ("copy",), (updated,)))
-                return base_slot
+                # An assignment is a statement: its value is unit, never the
+                # struct it wrote.  (Returning the base slot made a `-> ()`
+                # function whose last statement was `s.f = v` hand back the
+                # whole struct, and an if/else whose arms end in a push and
+                # a field write merged unit with a struct.)
+                return self.unit_value()
             slot = self.state.env.get(e.var_name)
             if slot is None:
                 # First assignment introduces the slot (named after the variable)
                 slot = e.var_name
                 self.state.env[e.var_name] = slot
             self.emit(("let", slot, ("copy",), (val,)))
-            return slot
+            return self.unit_value()
         # Match: decision-tree lowering, first-match-wins top-to-bottom.
         if e.op == "Match" and e.scrutinee is not None:
             return self._lower_match(e)

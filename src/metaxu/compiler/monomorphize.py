@@ -54,7 +54,12 @@ Who runs it
 -----------
 ``pipeline.emit_llvm_from_source`` runs it by default: the LLVM backend's
 value-kind cells are per-function and monomorphic, so one generic reached
-at two types joins to ``conflict`` and demotes.  The interpreter front door
+at two types joins to ``conflict`` and demotes.  (The backend has its own
+complementary pass since the std.solve port, ``_specialize_by_kind`` in
+codegen_llvm.py, which clones a function that is generic WITHOUT saying so
+— ``fn is_none(o: Option)`` reached at two payload kinds — per call-site
+kind tuple; this pass still resolves declared generics first, on types
+rather than backend kinds.)  The interpreter front door
 (``run_pipeline_from_source`` / ``run_pipeline_ctx``) keeps the flag OFF —
 it is the semantics reference, and every native differential compares
 specialized native code against unspecialized interpreted semantics.

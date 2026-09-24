@@ -207,13 +207,12 @@ def test_range_algebra(transcript):
 
 
 @needs_clang
-@pytest.mark.xfail(strict=True, reason=(
-    "two native-backend gaps found by this module (docs/glade_in_metaxu.md): "
-    "string indexing `s[i]` is not lowered (every std.parse/std.string helper "
-    "stays interpreted), and enum payload kinds are per module, so an Option "
-    "that holds ints, Vecs, Versions and Ranges in one file demotes everything "
-    "that touches it. When both land this test flips green and must be kept."))
 def test_native_prints_what_the_interpreter_printed(tmp_path, transcript):
+    # This module found two native-backend gaps (docs/glade_in_metaxu.md):
+    # string indexing was not lowered, and a nested `Some(Some(n))` read its
+    # inner payload through the module-wide Option cells, which conflict as
+    # soon as one file puts ints, Vecs and structs into Option.  Both are
+    # fixed; this differential is the pin.
     from metaxu.compiler.tests.test_codegen_llvm import llvm_from_source
     from metaxu.compiler.llvm_run import compile_and_run
     exit_code, stdout = compile_and_run(llvm_from_source(program()), "main",

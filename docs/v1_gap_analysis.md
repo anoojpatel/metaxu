@@ -186,6 +186,18 @@ fn main() -> int {
 Change the second lambda to `fn() -> "s"` and `apply` demotes with
 `irreconcilable value kinds`, taking its callers with it.
 
+**Implemented (2026-09-24): kind specialization in the backend.** The
+std.solve port hit the same mechanism without a closure in sight:
+`fn is_none(o: Option)` reached with `Option` of string and `Option`
+of a struct. `codegen_llvm._specialize_by_kind` now clones any plain
+function per distinct call-site kind tuple before inference (a probe
+fixpoint with the callee's signature one-way shows each site's own
+kinds), so the backend no longer depends on the HIR pass seeing the
+polymorphism. It also closed a silent wrong answer: a helper reached
+with `Vec` of int and `Vec` of float merged to float (i64 is the
+lattice bottom) and printed `10.0` for `10`; the two sites now get two
+clones. `docs/glade_in_metaxu.md` lists what it cannot reach.
+
 **Implemented (2026-08-14): per-call-site cloning.** monomorphize.py now
 rewrites a call site passing a lambda LITERAL to a known non-generic
 function into a clone of that function unique to the site (`apply$ho1`).

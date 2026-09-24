@@ -267,6 +267,17 @@ def count_placeholders(ir: str) -> int:
     return len(re.findall(r"placeholder -- unsupported", ir))
 
 
+@pytest.fixture
+def no_kind_specialization(monkeypatch):
+    """Switch the backend's kind-specialization pre-pass off for tests that
+    pin what happens at ONE shared site: the dynamic closure ABI (word-
+    uniform calls, boundary boxes) and the HIR monomorphizer's own effect.
+    With the pass on, such programs are split into per-kind clones before
+    those mechanisms are ever needed."""
+    from metaxu.compiler import codegen_llvm
+    monkeypatch.setattr(codegen_llvm, "_SPECIALIZE_ROUNDS", 0)
+
+
 def assert_native_matches_interp(source: str, tmp_path, entry: str = "main",
                                  clang_args: tuple[str, ...] = ()):
     """The differential assertion: clang-compiled result == interpreter."""
@@ -1265,14 +1276,7 @@ fn main() -> int { let x = pick(1); 0 }
     assert "no coercion through tagged-union storage" in ir
 
 
-def test_nested_mixed_enum_extraction_demotes():
-    # An enum whose slot representation is instantiation-dependent (W holds
-    # i64 in one use, str in another) loses its per-value refinement when
-    # boxed inside ANOTHER enum's payload: extraction would have to guess a
-    # representation, so the reader demotes with the boxing-boundary reason.
-    # NOTE: ill-typed under the strict gate (W("s") into W(int)) — pins the
-    # backend's honesty on strict=False inputs.
-    ir = llvm_from_source_nonstrict("""
+_NESTED_MIXED_SRC = """
 enum Inner { W(int), Z }
 enum Outer { O(Inner), E }
 fn use_int() -> Inner { W(1) }
@@ -1285,13 +1289,160 @@ fn main() -> int {
     let b = O(use_str());
     peel(a)
 }
-""")
+"""
+
+
+def test_nested_enum_payload_keeps_its_own_refinement():
+    # An enum boxed inside another enum's payload keeps its OWN refinement
+    # (to _MAX_REFINEMENT_DEPTH levels), so `peel`, which only ever sees the
+    # int-holding value, knows the inner slot is i64 and compiles natively.
+    # The str-holding value is built but never flows into it.
+    # NOTE: ill-typed under the strict gate (W("s") into W(int)) — pins the
+    # backend's precision on strict=False inputs.
+    ir = llvm_from_source_nonstrict(_NESTED_MIXED_SRC)
+    assert count_placeholders(ir) == 0
+    for fname in ("peel", "use_int", "use_str", "main"):
+        assert re.search(rf"^define \S+ @mx_{fname}\(", ir, re.M)
+
+
+def test_nested_mixed_enum_extraction_demotes_at_the_depth_cutoff(monkeypatch):
+    # Below the refinement depth cutoff a nested enum is name-only and its
+    # slots are read through the module-wide canonical cells.  When those
+    # cells disagree (W holds i64 in one use, str in another) extraction
+    # would have to guess a representation, so the reader demotes with the
+    # boxing-boundary reason.  Depth 1 makes every nested enum name-only,
+    # which is what a recursive enum sees past the cutoff.
+    from metaxu.compiler import codegen_llvm
+    monkeypatch.setattr(codegen_llvm, "_MAX_REFINEMENT_DEPTH", 1)
+    ir = llvm_from_source_nonstrict(_NESTED_MIXED_SRC)
     assert "; function @mx_peel: placeholder" in ir
     assert "extracts nested enum 'Inner'" in ir
     assert "instantiation-dependent" in ir
     # the writers themselves stay native: each value knows its own kinds
     for fname in ("use_int", "use_str"):
         assert re.search(rf"^define \S+ @mx_{fname}\(", ir, re.M)
+
+
+def test_nested_mixed_enum_both_readers_split_by_kind():
+    # Both instantiations reaching `peel` are two call-site kinds, so kind
+    # specialization gives each its own clone and the program is native.
+    ir = llvm_from_source_nonstrict(_NESTED_MIXED_SRC.replace(
+        "    peel(a)\n", "    peel(a) + peel(b)\n"))
+    assert count_placeholders(ir) == 0
+    assert re.search(r"^define \S+ @mx_peel_k1\(", ir, re.M)
+    assert re.search(r"^define \S+ @mx_peel_k2\(", ir, re.M)
+
+
+def test_nested_mixed_enum_merged_into_one_reader_demotes(no_kind_specialization):
+    # Without the split, both instantiations flowing into ONE reader merge
+    # two levels down: i64 is the lattice bottom, so the merged inner slot
+    # reads str, and the site that stores the int-holding Inner into that
+    # merged flow is the one that demotes (heterogeneous payload, no
+    # coercion) — the same rule as a flat `Some(3)` meeting `Some("s")`.
+    # Nothing ever reads int bits as a string pointer; the writers stay
+    # native.
+    ir = llvm_from_source_nonstrict(_NESTED_MIXED_SRC.replace(
+        "    peel(a)\n", "    peel(a) + peel(b)\n"))
+    assert "; function @mx_main: placeholder" in ir
+    assert re.search(
+        r"heterogeneous payload slot 0 of enum 'Outer': variant 'O' stores "
+        r"enum:Inner\{W:i64\} where merged flows require enum:Inner\{W:str\}",
+        ir)
+    for fname in ("use_int", "use_str"):
+        assert re.search(rf"^define \S+ @mx_{fname}\(", ir, re.M)
+
+
+_OPTION_OF_OPTION_SRC = """
+fn component_or_wild(s: string) -> Option {
+    if s == "*" { Some(None) } else {
+        if s == "" { None } else { Some(Some(len(s))) }
+    }
+}
+fn or_zero(o: Option) -> int { match o { None -> 0, Some(n) -> n } }
+fn describe(s: string) -> int {
+    match component_or_wild(s) {
+        None -> 0 - 1,
+        Some(inner) -> or_zero(inner)
+    }
+}
+fn main() -> int {
+    print(describe("*"));
+    print(describe(""));
+    print(describe("1234"));
+    let deep = Some(Some(Some(7)));
+    match deep {
+        Some(a) -> match a {
+            Some(b) -> match b { Some(c) -> print(c), None -> print(0) },
+            None -> print(0)
+        },
+        None -> print(0)
+    };
+    describe("12")
+}
+"""
+
+
+def test_option_of_option_is_fully_native():
+    # `Some(Some(n))` merged with `Some(None)`: the outer slot's kind is the
+    # join of the inner refinements, the inner value learns the merged
+    # refinement back (no representation change), and nothing goes through
+    # the canonical cells.  This is the std.semver `component_or_wild` shape.
+    ir = llvm_from_source(_OPTION_OF_OPTION_SRC)
+    assert count_placeholders(ir) == 0
+    for fname in ("component_or_wild", "or_zero", "describe", "main"):
+        assert re.search(rf"^define \S+ @mx_{fname}\(", ir, re.M)
+
+
+@needs_clang
+def test_native_option_of_option_differential(tmp_path):
+    assert_native_matches_interp(_OPTION_OF_OPTION_SRC, tmp_path)
+
+
+def test_option_nested_past_the_cutoff_demotes_through_the_cells():
+    # Four levels of Some exceed _MAX_REFINEMENT_DEPTH: the innermost read
+    # goes through the canonical cells, and Option's Some slot holds both
+    # ints and Options module-wide, so that read demotes with the boundary
+    # reason instead of guessing.  (The bound is what keeps recursive enum
+    # kinds finite; homogeneous recursive shapes — the list and tree tests
+    # above — stay native through the same cells.)
+    ir = llvm_from_source("""
+fn main() -> int {
+    let deep = Some(Some(Some(Some(11))));
+    match deep {
+        Some(a) -> match a {
+            Some(b) -> match b {
+                Some(c) -> match c { Some(d) -> print(d), None -> print(0) },
+                None -> print(0)
+            },
+            None -> print(0)
+        },
+        None -> print(0)
+    };
+    0
+}
+""")
+    assert "; function @mx_main: placeholder" in ir
+    assert "instantiation-dependent" in ir
+
+
+def test_nested_option_with_scalar_mismatch_still_demotes():
+    # Back-propagation never retypes a scalar: an inner Some(3) merged with
+    # an inner Some(2.5) is a real slot conflict two levels down, and the
+    # merging site demotes rather than printing 3.0 for 3.
+    ir = llvm_from_source_nonstrict("""
+fn pick(flag: bool) -> Option {
+    if flag { Some(Some(3)) } else { Some(Some(2.5)) }
+}
+fn main() -> int {
+    match pick(true) {
+        Some(inner) -> match inner { Some(v) -> print(v), None -> print(0) },
+        None -> print(0)
+    };
+    0
+}
+""")
+    assert "; function @mx_pick: placeholder" in ir
+    assert count_placeholders(ir) >= 1
 
 
 def test_dead_statement_position_match_result_does_not_poison_kinds():
@@ -4620,7 +4771,7 @@ def test_native_module_constants_differential(tmp_path):
     # @mx___module_init first (the interpreter's _ensure_globals).
     ir = assert_native_matches_interp(_GLOBALS_SRC, tmp_path)
     wrapper = (tmp_path / "prog.ll").read_text()
-    assert "call ptr @mx___module_init()" in wrapper
+    assert re.search(r"call (ptr|i64) @mx___module_init\(\)", wrapper)
 
 
 @needs_asan
@@ -4798,7 +4949,7 @@ fn main() -> int {
 """
 
 
-def test_dynamic_closure_join_instead_of_conflict():
+def test_dynamic_closure_join_instead_of_conflict(no_kind_specialization):
     # Two different lambdas reach apply/twice's `f`: the kinds JOIN to a
     # dynamic member set instead of conflicting, and the whole program
     # emits with zero placeholders.
@@ -4875,7 +5026,7 @@ fn main() -> int { pick(true) }
     assert "irreconcilable value kinds for 'f" in ir
 
 
-def test_aggregate_args_through_indirect_call_now_box():
+def test_aggregate_args_through_indirect_call_now_box(no_kind_specialization):
     # Increment 16: two lambdas taking a STRUCT parameter reach one site.
     # The struct arg travels as a pointer word and both lambdas take
     # `i64 %aw.p` and copy out.  This replaces the increment-13
@@ -5527,7 +5678,8 @@ fn main() {
 def test_collections_push_emits_with_both_fields():
     ir = llvm_from_source(_COLLECTIONS_PUSH_SRC)
     assert "%struct.List = type { ptr, i64 }  ; data, len" in ir
-    assert "define void @mx_push_item(" in ir
+    # `push_item` ends in an assignment, so it returns unit (i64 0).
+    assert "define i64 @mx_push_item(" in ir
     assert "has no field" not in ir
     assert count_placeholders(ir) == 0
 
@@ -5870,7 +6022,7 @@ fn main() -> int {
 # split into per-site clones by monomorphize and each would pin instead.
 
 
-def test_indirect_aggregate_param_and_return_box_at_the_site():
+def test_indirect_aggregate_param_and_return_box_at_the_site(no_kind_specialization):
     # The target shape: two different lambdas through one indirect site,
     # a struct in AND a struct out.
     ir = llvm_from_source(_IND_AGG_ROUNDTRIP_SRC)
@@ -5936,7 +6088,7 @@ fn main() -> int {
 """
 
 
-def test_indirect_enum_return_boxes():
+def test_indirect_enum_return_boxes(no_kind_specialization):
     # A lambda returning an ENUM through an indirect call: the tagged
     # union boxes on the way out (the callee's storage dies, so this box
     # is real) and the caller VIEWS the box instead of copying it out
@@ -5969,7 +6121,7 @@ fn main() -> int {
 """
 
 
-def test_indirect_closure_capturing_and_taking_an_aggregate():
+def test_indirect_closure_capturing_and_taking_an_aggregate(no_kind_specialization):
     # A closure that CAPTURES an aggregate (env field, inline copy) and
     # TAKES one through the word ABI (boundary box) in the same lambda.
     ir = llvm_from_source(_IND_AGG_CAPTURE_SRC)
@@ -6020,7 +6172,7 @@ fn main() -> int {
         r"ptr %a\.q\)", ir, re.M)
 
 
-def test_closure_pair_in_indirect_args_still_demotes():
+def test_closure_pair_in_indirect_args_still_demotes(no_kind_specialization):
     # Kind agreement / honest demotion: a closure PAIR travelling through
     # an indirect site has no boundary box (the boxed env pointer's
     # lifetime cannot be vouched for), so the site demotes with a reason.
@@ -6063,8 +6215,35 @@ fn main() -> int {
 }
 """)
     # (Lambdas via variables on purpose — see the note on the closure-pair
-    # test above; the split-clone version of this program emits cleanly and
-    # is pinned separately below.)
+    # test above.)  Kind specialization now splits `apply` per call-site
+    # kinds (apply$k1 for the struct site, apply$k2 for the enum site), so
+    # the whole program emits cleanly; the unsplit demotion is pinned by
+    # the test right below with the pass switched off.
+    assert count_placeholders(ir) == 0
+    assert re.search(r"^define \S+ @mx_apply_k1\(", ir, re.M)
+    assert re.search(r"^define \S+ @mx_apply_k2\(", ir, re.M)
+    assert "@mx_apply(" not in ir
+
+
+def test_indirect_members_disagreeing_without_specialization_demote(monkeypatch):
+    # The same program with kind specialization off: one member says the
+    # position is a STRUCT, the other an ENUM, the two-way fixpoint
+    # conflicts the kind and the site demotes rather than guessing a
+    # representation.
+    from metaxu.compiler import codegen_llvm
+    monkeypatch.setattr(codegen_llvm, "_SPECIALIZE_ROUNDS", 0)
+    ir = llvm_from_source("""
+struct P { a: int }
+enum E { X(int), Y }
+fn apply(f, v) { f(v) }
+fn main() -> int {
+    let fp = fn(p: P) -> p.a + 1;
+    let fe = fn(e: E) -> match e { E.X(n) => n * 2, E.Y => 0 };
+    print(apply(fp, P { a: 4 }));
+    print(apply(fe, E.X(5)));
+    0
+}
+""")
     assert count_placeholders(ir) >= 1
     assert "reason: irreconcilable value kinds for 'v'" in ir
     assert re.search(
@@ -6072,7 +6251,7 @@ fn main() -> int {
         r"conflict has no word encoding and no boundary box", ir)
 
 
-def test_mut_aggregate_param_through_indirect_call_demotes():
+def test_mut_aggregate_param_through_indirect_call_demotes(no_kind_specialization):
     # A @mut aggregate param has WRITE-BACK semantics (the callee copies
     # it out through the caller's pointer).  A boundary box is dropped by
     # the caller, so the write-back would be lost: demote, never emit a
@@ -6512,7 +6691,7 @@ fn main() -> int {
 # machinery, which monomorphize's per-site cloning would otherwise bypass.
 
 
-def test_readonly_aggregate_indirect_argument_needs_no_box():
+def test_readonly_aggregate_indirect_argument_needs_no_box(no_kind_specialization):
     # Elision (2): both members are word-uniform and neither writes back
     # through the position, so the argument travels as a pointer to the
     # caller's own storage.  apply() allocates NOTHING.
@@ -6732,9 +6911,20 @@ def test_mono_two_instantiations_undemote():
     # WITHOUT the pass, identity's kind cells see both an i64 and a str
     # argument and main demotes.  WITH it, each instantiation is its own
     # function and the module emits completely.
-    plain = llvm_from_source(_MONO_TWO_TYPES_SRC, monomorphize=False)
+    from metaxu.compiler import codegen_llvm
+    saved = codegen_llvm._SPECIALIZE_ROUNDS
+    codegen_llvm._SPECIALIZE_ROUNDS = 0
+    try:
+        plain = llvm_from_source(_MONO_TWO_TYPES_SRC, monomorphize=False)
+    finally:
+        codegen_llvm._SPECIALIZE_ROUNDS = saved
     assert count_placeholders(plain) == 1
     assert "define i64 @mx_main(" not in plain
+    # The backend's kind specialization reaches the same split on its own
+    # (identity$k1 / identity$k2) when the HIR pass is off.
+    plain_split = llvm_from_source(_MONO_TWO_TYPES_SRC, monomorphize=False)
+    assert count_placeholders(plain_split) == 0
+    assert "define i64 @mx_main(" in plain_split
 
     ir = llvm_from_source(_MONO_TWO_TYPES_SRC)
     assert count_placeholders(ir) == 0
@@ -6748,7 +6938,13 @@ def test_mono_two_instantiations_undemote():
 def test_mono_resolves_through_let_bindings():
     # `let a = 1; identity(a)` is the same instantiation as `identity(1)`;
     # before let-resolution the pass could not see it and the module demoted.
-    plain = llvm_from_source(_MONO_LET_SRC, monomorphize=False)
+    from metaxu.compiler import codegen_llvm
+    saved = codegen_llvm._SPECIALIZE_ROUNDS
+    codegen_llvm._SPECIALIZE_ROUNDS = 0
+    try:
+        plain = llvm_from_source(_MONO_LET_SRC, monomorphize=False)
+    finally:
+        codegen_llvm._SPECIALIZE_ROUNDS = saved
     assert count_placeholders(plain) == 1
 
     ir = llvm_from_source(_MONO_LET_SRC)
@@ -6758,7 +6954,13 @@ def test_mono_resolves_through_let_bindings():
 
 
 def test_mono_resolves_through_declared_primitive_params():
-    plain = llvm_from_source(_MONO_DECLARED_PARAM_SRC, monomorphize=False)
+    from metaxu.compiler import codegen_llvm
+    saved = codegen_llvm._SPECIALIZE_ROUNDS
+    codegen_llvm._SPECIALIZE_ROUNDS = 0
+    try:
+        plain = llvm_from_source(_MONO_DECLARED_PARAM_SRC, monomorphize=False)
+    finally:
+        codegen_llvm._SPECIALIZE_ROUNDS = saved
     assert count_placeholders(plain) == 1
 
     ir = llvm_from_source(_MONO_DECLARED_PARAM_SRC)
@@ -6833,8 +7035,14 @@ fn main() -> int {
 
     grown = defs(ir) - defs(plain)
     assert grown == {"mx_identity_Int", "mx_identity_String",
-                     "mx_identity_Float", "mx_main"}, grown
+                     "mx_identity_Float"}, grown
     assert "mx_identity" not in defs(ir)
+    # Without the HIR pass the backend's kind specialization reaches the
+    # same three instantiations from the call-site kinds (`identity$k1..3`),
+    # so `main` is native either way; the two passes are complementary.
+    assert {n for n in defs(plain) if n.startswith("mx_identity_k")} == {
+        "mx_identity_k1", "mx_identity_k2", "mx_identity_k3"}
+    assert "mx_main" in defs(plain)
 
 
 def test_mono_polymorphic_recursion_terminates():
@@ -8245,3 +8453,211 @@ fn main() -> int {
     _res, out = interp_run(src)
     assert out.splitlines() == ["42", "bad", "3", "14"]
     assert_native_matches_interp(src, tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Kind specialization: kind-polymorphic helpers cloned per call-site kinds
+# ---------------------------------------------------------------------------
+
+_KIND_SPEC_SRC = """
+struct Inc { kind: string, n: int }
+fn is_none(o: Option) -> bool {
+    match o { None -> true, Some(x) -> false }
+}
+fn count_somes(xs: Vec) -> int {
+    let @mut i = 0;
+    let @mut n = 0;
+    while i < len(xs) {
+        if is_none(xs[i]) { () } else { n = n + 1 };
+        i = i + 1
+    }
+    n
+}
+fn main() -> int {
+    let @mut names = Vec.new();
+    names.push(Some("a"));
+    names.push(None);
+    names.push(Some("c"));
+    let @mut incs = Vec.new();
+    incs.push(Some(Inc { kind: "derived", n: 1 }));
+    incs.push(None);
+    let @mut nums = Vec.new();
+    nums.push(Some(4));
+    nums.push(Some(5));
+    print(count_somes(names));
+    print(count_somes(incs));
+    print(count_somes(nums));
+    print(is_none(Some(1.5)));
+    print(is_none(None));
+    0
+}
+"""
+
+
+def test_kind_specialization_clones_a_helper_per_call_site_kinds():
+    # `is_none` meets Option-of-str, Option-of-struct, Option-of-int and
+    # Option-of-float; `count_somes` meets three Vec element kinds.  Each
+    # gets one clone per distinct kind tuple, the originals are erased, and
+    # nothing demotes.
+    ir = llvm_from_source(_KIND_SPEC_SRC)
+    assert count_placeholders(ir) == 0
+    clones = set(re.findall(r"^define \S+ @mx_(\w+)\(", ir, re.M))
+    assert {c for c in clones if c.startswith("count_somes")} == {
+        "count_somes_k1", "count_somes_k2", "count_somes_k3"}
+    # str / struct / int / float payloads: four clones.  `is_none(None)`
+    # (an Option with no Some slot at all) shares one of them: its kind
+    # refines to the group's join, so no clone is spent on it.
+    assert len({c for c in clones if c.startswith("is_none")}) == 4
+    assert "@mx_is_none(" not in ir
+    assert "@mx_count_somes(" not in ir
+
+
+@needs_clang
+def test_native_kind_specialization_differential(tmp_path):
+    assert_native_matches_interp(_KIND_SPEC_SRC, tmp_path)
+
+
+def test_kind_specialization_keeps_the_polymorphic_original_for_conflicted_sites():
+    # `both` cannot be cloned (it owns a closure), so its call to `is_none`
+    # still carries a conflicted argument; that site keeps calling the
+    # original, which stays polymorphic and demotes honestly, while the
+    # concrete sites in main are served by clones.
+    ir = llvm_from_source("""
+struct P { a: int }
+fn is_none(o: Option) -> bool {
+    match o { None -> true, Some(x) -> false }
+}
+fn both(o: Option) -> bool {
+    let f = fn(q: Option) -> is_none(q);
+    f(o)
+}
+fn main() -> int {
+    print(is_none(Some("s")));
+    print(is_none(Some(P { a: 2 })));
+    print(both(Some("s")));
+    print(both(Some(P { a: 2 })));
+    0
+}
+""")
+    assert re.search(r"^define \S+ @mx_is_none_k1\(", ir, re.M)
+    assert re.search(r"^define \S+ @mx_is_none_k2\(", ir, re.M)
+    assert "; function @mx_is_none: placeholder" in ir
+    assert "; function @mx_both: placeholder" in ir
+    assert "irreconcilable value kinds for 'o'" in ir
+
+
+_VEC_INT_FLOAT_HELPER_SRC = """
+fn total(xs: Vec, i: int) -> int {
+    if i >= len(xs) { 0 } else { xs[i].to_string().len() + total(xs, i + 1) }
+}
+fn main() -> int {
+    let @mut a = Vec.new();
+    a.push(10);
+    a.push(200);
+    let @mut b = Vec.new();
+    b.push(1.5);
+    print(total(a, 0));
+    print(total(b, 0));
+    0
+}
+"""
+
+
+@needs_clang
+def test_native_vec_int_and_float_helper_differential(tmp_path):
+    # Before kind specialization this printed 9 natively (the int literals
+    # were retyped as doubles through the shared parameter: "10.0" and
+    # "200.0") where the interpreter prints 5.  vec:i64 and vec:f64 sites
+    # never share a clone.
+    assert_native_matches_interp(_VEC_INT_FLOAT_HELPER_SRC, tmp_path)
+
+
+def test_kind_specialization_keeps_recursion_inside_the_clone():
+    ir = llvm_from_source("""
+fn total(xs: Vec, i: int) -> int {
+    if i >= len(xs) { 0 } else { xs[i].to_string().len() + total(xs, i + 1) }
+}
+fn main() -> int {
+    let @mut a = Vec.new();
+    a.push(10);
+    a.push(200);
+    let @mut b = Vec.new();
+    b.push(1.5);
+    print(total(a, 0));
+    print(total(b, 0));
+    0
+}
+""")
+    assert count_placeholders(ir) == 0
+    assert re.search(r"call i64 @mx_total_k1\(", ir)
+    assert re.search(r"call i64 @mx_total_k2\(", ir)
+    assert "@mx_total(" not in ir
+
+
+def test_kind_specialization_is_a_no_op_for_monomorphic_modules():
+    # Nothing conflicts: no clone, no rename, IR identical to the pass
+    # being off.
+    from metaxu.compiler import codegen_llvm
+    src = """
+fn is_none(o: Option) -> bool { match o { None -> true, Some(x) -> false } }
+fn main() -> int { print(is_none(Some(1))); print(is_none(None)); 0 }
+"""
+    with_pass = llvm_from_source(src)
+    saved = codegen_llvm._SPECIALIZE_ROUNDS
+    codegen_llvm._SPECIALIZE_ROUNDS = 0
+    try:
+        without = llvm_from_source(src)
+    finally:
+        codegen_llvm._SPECIALIZE_ROUNDS = saved
+    assert with_pass == without
+    assert "$k" not in with_pass and "_k1" not in with_pass
+
+
+# ---------------------------------------------------------------------------
+# Assignment statements evaluate to unit
+# ---------------------------------------------------------------------------
+
+_ASSIGN_UNIT_SRC = """
+struct S { x: int, v: Vec }
+fn bump(s: @mut S) -> () { s.x = s.x + 1 }
+fn either(s: @mut S, flag: bool) -> () {
+    if flag { s.v.push(1) } else { s.x = s.x + 10 }
+}
+fn main() -> int {
+    let @mut s = S { x: 0, v: Vec.new() };
+    bump(s);
+    either(s, true);
+    either(s, false);
+    print(s.x);
+    print(len(s.v));
+    0
+}
+"""
+
+
+def test_assignment_ending_unit_functions_compile_natively():
+    # A `-> ()` function whose last statement is a field write used to
+    # return the whole struct (the assignment's value), and an if/else
+    # whose arms end in a push and a field write merged unit with a
+    # struct, demoting the function ("scalar assignment to aggregate
+    # variable").  Assignments are statements: their value is unit.
+    ir = llvm_from_source(_ASSIGN_UNIT_SRC)
+    assert count_placeholders(ir) == 0
+    assert "define i64 @mx_bump(" in ir
+    assert "define i64 @mx_either(" in ir
+
+
+def test_assignment_value_is_unit_on_the_interpreter():
+    # (Interpreter only: the native backend prints unit as 0, a separate
+    # and older parity gap — unit has no kind of its own there.)
+    src = _ASSIGN_UNIT_SRC.replace(
+        "    bump(s);\n    either(s, true);\n    either(s, false);\n",
+        "    print(bump(s));\n    print(either(s, true));\n"
+        "    print(either(s, false));\n")
+    _result, out = interp_run(src)
+    assert out == "()\n()\n()\n11\n1\n"
+
+
+@needs_clang
+def test_native_assignment_value_is_unit_differential(tmp_path):
+    assert_native_matches_interp(_ASSIGN_UNIT_SRC, tmp_path)

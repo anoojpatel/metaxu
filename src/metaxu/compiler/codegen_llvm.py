@@ -638,10 +638,19 @@ VALUE, replacing the old module-wide per-(enum, slot) cells:
     sorted, slots comma-separated).  make_variant refines its destination
     with its own arg kinds; refinements join pointwise per (variant, slot)
     along every dataflow edge (copies, params/returns, struct fields,
-    captures) — the same monotone fixpoint as all other kinds.  Slot kinds
-    inside a refinement are NAME-ONLY (a nested enum appears as ``enum:F``
-    with no braces), which keeps refinement strings finite for recursive
-    enums.
+    captures) — the same monotone fixpoint as all other kinds.  A slot
+    holding an enum carries that enum's OWN refinement
+    (``enum:Option{Some:enum:Option{None:;Some:i64}}`` for a
+    ``Some(Some(3))`` merged with a ``Some(None)``) down to
+    _MAX_REFINEMENT_DEPTH levels; below the cutoff the nested enum is
+    NAME-ONLY (``enum:F`` with no braces), which keeps refinement strings
+    finite for recursive enums.  A name-only kind is the TOP of its enum
+    in the join (the canonical representation, see below), never a
+    bottom.  make_variant lets a Vec or enum argument learn the merged
+    slot kind back when the argument's kind refines to it (the vec bottom,
+    a variant subset): same bytes, wider refinement.  Scalars never learn
+    back (i64 into an f64 slot would retype the literal), and neither
+    does a name-only slot (it would strip the argument's refinement).
   * ``variant_field`` reads its variant's slot kind out of the BASE
     VALUE's refinement (the op names its variant, see above).  Different
     variants — or different instantiations of one variant in different
@@ -657,13 +666,40 @@ VALUE, replacing the old module-wide per-(enum, slot) cells:
     no coercion"), which now fires only for genuinely MERGED mixed flows
     (e.g. one variable holding both Some(3) and Some(node)), not for
     disjoint uses.
-  * enum-in-enum nesting is the one boundary where a value's refinement is
-    stripped (slot kinds are name-only): extraction therefore assumes the
-    CANONICAL representation — module-wide per-(enum, variant, slot) cells
-    joining every make_variant store — and demotes when any store
-    disagrees with the join (`mixed` cells: the nested enum's slot
-    representation is instantiation-dependent and was lost at the boxing
-    boundary).
+  * enum-in-enum nesting PAST THE DEPTH CUTOFF is the one boundary where a
+    value's refinement is stripped (the slot kind is name-only):
+    extraction therefore assumes the CANONICAL representation —
+    module-wide per-(enum, variant, slot) cells joining every make_variant
+    store — and demotes when any store disagrees with the join (`mixed`
+    cells: the nested enum's slot representation is instantiation-
+    dependent and was lost at the boxing boundary).  Within the cutoff a
+    nested extraction reads the exact kind out of the nested refinement,
+    so an Option-of-Option in a module that also puts ints, Vecs and
+    structs into Option no longer goes near the (mixed) cells.
+
+KIND SPECIALIZATION (the pre-pass _specialize_by_kind) clones a plain
+function per distinct call-site kind tuple before any of the above runs.
+Signatures join two-way over every call site, so ``fn is_none(o: Option)``
+reached with Option-of-string and Option-of-struct would otherwise get a
+CONFLICT parameter that flows back into both callers — and, worse, a
+helper reached with vec:i64 and vec:f64 would merge to vec:f64 (i64 is the
+bottom) and retype the int caller's literals.  The pass runs the fixpoint
+with candidate callees ONE-WAY (their signatures do not flow back into
+arguments), groups each callee's direct sites by argument kinds — two
+kinds share a group only when both refine to their join with equal scalar
+and vec leaves, so ``Option{None:}`` joins ``Option{Some:str}`` but
+``vec:i64`` never joins ``vec:f64`` — and emits one clone ``f$kN`` per
+group, self-calls included.  Candidates are plain functions with at least
+two direct sites: not lambdas, handle-scope members, the entry points,
+suspending functions or owners of closure/scope ops (bound to their owner
+by name), and sites inside unreached or still-polymorphic callers wait for
+a later round.  Originals and superseded clones nothing mentions are
+dropped; runtime messages keep the original's name via
+MirFunc.origin_name.  Every clone goes through the same fixpoint and
+checks as any function, so a wrong grouping can only demote.  Known
+redundancy: an EMPTY Vec argument is the vec bottom, indistinguishable from
+a Vec of ints, so ``f(Vec.new())`` and ``f(strings)`` get two clones where
+one would do.
   * the union layout is unchanged and instantiation-independent:
     ``%enum.E = { i64 tag, [N x i64] }`` with N the max payload arity over
     all variants; every slot is an 8-byte cell (scalars inline, aggregates
@@ -894,10 +930,12 @@ from __future__ import annotations
 
 import re
 import struct as _structmod
+import dataclasses
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import (Any, Dict, FrozenSet, Iterator, List, Optional, Sequence,
+                    Set, Tuple)
 
-from .mir import MirFunc
+from .mir import MirBlock, MirFunc
 from .cps_frames import is_suspending
 from .tile_shape_check import TILE_ARITY
 from .effect_tail import tail_resume_ids as _tail_resume_ids
@@ -1499,20 +1537,112 @@ def _enum_name(kind: str) -> str:
 
 
 def _strip_refinement(kind: str) -> str:
-    """The name-only form of a kind, as stored in module-wide variant cells
-    and inside refinement strings: refined enum kinds drop their refinement;
-    every other kind is unchanged.  Keeping nested enum references name-only
-    is what keeps refinement strings finite for recursive enums."""
+    """The name-only form of a kind, as stored in module-wide variant cells:
+    refined enum kinds drop their refinement; every other kind is
+    unchanged."""
     if _is_enum(kind):
         return _ENUM_PREFIX + _enum_name(kind)
     return kind
 
 
+# How deep a refinement string describes nested enum payloads.  A slot
+# holding an enum records that enum's OWN refinement (so `Some(Some(3))`
+# is `enum:Option{Some:enum:Option{Some:i64}}` and extraction knows the
+# inner representation exactly) down to this many levels; below it the
+# nested enum is name-only and its contents are read through the canonical
+# module-wide cells (with the `mixed` check).  The bound is what keeps
+# refinement strings finite for recursive enums: a list of depth 1000 still
+# has a kind of depth _MAX_REFINEMENT_DEPTH.  Tests monkeypatch this to 1 to
+# exercise the canonical path directly.
+_MAX_REFINEMENT_DEPTH = 3
+
+
+def _truncate_refinement(kind: str, depth: int) -> str:
+    """`kind` with nested enum refinements kept only `depth` levels deep
+    (0 = name-only); vec/fixed-vector element kinds are truncated through.
+    Non-enum kinds are unchanged."""
+    if _is_vec(kind):
+        return _vec_of(_truncate_refinement(_vec_elem(kind), depth))
+    if _is_fvec(kind):
+        return _fvec_of(_truncate_refinement(_fvec_elem(kind), depth))
+    if not _is_enum(kind):
+        return kind
+    ref = _enum_refinement(kind)
+    if ref is None:
+        return kind
+    if depth <= 0:
+        return _ENUM_PREFIX + _enum_name(kind)
+    return _format_enum_kind(
+        _enum_name(kind),
+        {v: tuple(_truncate_refinement(s, depth - 1) for s in slots)
+         for v, slots in ref.items()})
+
+
+def _slot_kind_for_store(kind: str) -> str:
+    """The kind a make_variant records for a stored payload: the value's
+    kind with one level of nesting spent on the enclosing enum."""
+    return _truncate_refinement(kind, _MAX_REFINEMENT_DEPTH - 1)
+
+
+def _repr_compatible(store: str, slot: str) -> bool:
+    """True when a value of kind `store` may be written into a payload slot
+    whose merged-flow kind is `slot` WITHOUT any representation change.
+    Scalars must be equal (i64 into an f64 slot would retype the bits).  A
+    Vec may be the vec bottom promoting to the slot's element kind (one
+    mx_vec pointer either way).  An enum value may have a SUBSET of the
+    slot's refinement (fewer constructible variants; each shared variant's
+    slots compatible in turn), because the union layout is the same for
+    every refinement of one enum; a name-only slot is the canonical
+    representation, which readers check against the `mixed` cells."""
+    if store == slot:
+        return True
+    if _is_vec(store) and _is_vec(slot):
+        return _join(store, slot) == slot
+    if _is_fvec(store) and _is_fvec(slot):
+        return _join(store, slot) == slot
+    if _is_enum(store) and _is_enum(slot):
+        if _enum_name(store) != _enum_name(slot):
+            return False
+        rl = _enum_refinement(slot)
+        if rl is None:
+            return True
+        rs = _enum_refinement(store)
+        if rs is None:
+            return False
+        for v, slots in rs.items():
+            other = rl.get(v)
+            if other is None or len(other) != len(slots):
+                return False
+            if not all(_repr_compatible(x, y) for x, y in zip(slots, other)):
+                return False
+        return True
+    return False
+
+
+def _split_top(body: str, sep: str) -> List[str]:
+    """Split `body` on `sep` outside braces (nested refinements)."""
+    parts: List[str] = []
+    depth = 0
+    cur: List[str] = []
+    for ch in body:
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+        if ch == sep and depth == 0:
+            parts.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    parts.append("".join(cur))
+    return parts
+
+
 def _enum_refinement(kind: str) -> Optional[Dict[str, Tuple[str, ...]]]:
     """Parse an enum kind's per-variant payload refinement, or None when the
     kind is name-only.  Format (canonical, variants sorted):
-    'enum:E{VarA:kind0,kind1;VarB:}' — slot kinds are themselves name-only
-    (no nested braces), so plain ;/,-splitting is exact."""
+    'enum:E{VarA:kind0,kind1;VarB:}' — a slot kind may itself be a refined
+    enum kind with its own braces, so splitting respects nesting."""
     if not _is_enum(kind):
         return None
     base = kind[len(_ENUM_PREFIX):]
@@ -1523,10 +1653,28 @@ def _enum_refinement(kind: str) -> Optional[Dict[str, Tuple[str, ...]]]:
     ref: Dict[str, Tuple[str, ...]] = {}
     if not body:
         return ref
-    for part in body.split(";"):
+    for part in _split_top(body, ";"):
         vname, _, slots = part.partition(":")
-        ref[vname] = tuple(s for s in slots.split(",") if s)
+        ref[vname] = tuple(s for s in _split_top(slots, ",") if s)
     return ref
+
+
+def _nested_slot_kinds(kind: str) -> Iterator[str]:
+    """Every payload slot kind reachable inside a refined enum kind, at any
+    nesting depth (through vec element kinds too)."""
+    if _is_vec(kind):
+        yield from _nested_slot_kinds(_vec_elem(kind))
+        return
+    if _is_fvec(kind):
+        yield from _nested_slot_kinds(_fvec_elem(kind))
+        return
+    ref = _enum_refinement(kind)
+    if not ref:
+        return
+    for slots in ref.values():
+        for sk in slots:
+            yield sk
+            yield from _nested_slot_kinds(sk)
 
 
 def _format_enum_kind(ename: str, ref: Dict[str, Tuple[str, ...]]) -> str:
@@ -1749,16 +1897,24 @@ def _join(a: str, b: str) -> str:
     same enum join their refinements pointwise per (variant, slot): the
     refinement records the value's actual payload REPRESENTATION, so a
     per-slot conflict (or a variant-arity mismatch) conflicts the whole
-    kind.  A name-only enum kind meeting a refined one is a CONFLICT, not a
-    bottom: name-only enum kinds never arise as value kinds in well-formed
-    flows (make_variant and variant_field always produce refined kinds), so
-    treating one as 'no information' could let two representations alias."""
+    kind.  A name-only enum kind meeting a refined one is the name-only
+    kind, the TOP for that enum: it arises only at the nesting cutoff
+    (_MAX_REFINEMENT_DEPTH) and means "the canonical representation", which
+    readers take from the module-wide cells under the `mixed` check.  It is
+    never a bottom: treating it as 'no information' could let two
+    representations alias."""
     if a == b:
         return a
     if a == I64:
         return b
     if b == I64:
         return a
+    if _is_enum(a) and _is_enum(b) and _enum_name(a) == _enum_name(b):
+        ra, rb = _enum_refinement(a), _enum_refinement(b)
+        if ra is None:
+            return a
+        if rb is None:
+            return b
     if _is_vec(a) and _is_vec(b):
         e = _join(_vec_elem(a), _vec_elem(b))
         return CONFLICT if e == CONFLICT else _vec_of(e)
@@ -1781,8 +1937,7 @@ def _join(a: str, b: str) -> str:
         if ename != _enum_name(b):
             return CONFLICT
         ra, rb = _enum_refinement(a), _enum_refinement(b)
-        if ra is None or rb is None:
-            return CONFLICT
+        assert ra is not None and rb is not None  # name-only handled above
         merged: Dict[str, Tuple[str, ...]] = dict(ra)
         for v, slots in rb.items():
             cur = merged.get(v)
@@ -3582,6 +3737,7 @@ def _infer_kinds(info: _Info, sigs: Dict[str, _Sig], structs: _StructTable,
                  traits: _TraitTable, scopes: _ScopeTable,
                  module_names: Set[str], gtable: "_GlobalTable",
                  assume_final: bool = False,
+                 one_way: FrozenSet[str] = frozenset(),
                  ) -> Tuple[Dict[str, str], bool]:
     """One inner fixpoint over a function.  Returns (kinds, global_changed)
     where global_changed reports promotions written into shared cells
@@ -3590,7 +3746,13 @@ def _infer_kinds(info: _Info, sigs: Dict[str, _Sig], structs: _StructTable,
 
     ``assume_final``: trait-call receivers still at the i64 bottom are
     treated as genuinely-int receivers (the driver sets this only after the
-    unassuming fixpoint has converged, so nothing else can promote them)."""
+    unassuming fixpoint has converged, so nothing else can promote them).
+
+    ``one_way``: callee names whose signature does NOT flow back into this
+    function's call arguments (and whose conflicted return does not flow
+    into the result).  The kind-specialization probe (_specialize_by_kind)
+    uses it to see each call site's own argument kinds for a callee whose
+    merged signature has conflicted, so the sites can be grouped."""
     kinds: Dict[str, str] = {}
     global_changed = False
 
@@ -4273,38 +4435,50 @@ def _infer_kinds(info: _Info, sigs: Dict[str, _Sig], structs: _StructTable,
                     else:
                         sig = sigs.get(callee)
                         if sig is not None and len(sig.params) == len(args):
-                            for a, pk in zip(args, sig.params):
-                                changed = mark(a, pk) or changed
-                            changed = mark(dst, sig.ret) or changed
+                            if callee in one_way:
+                                if sig.ret != CONFLICT:
+                                    changed = mark(dst, sig.ret) or changed
+                            else:
+                                for a, pk in zip(args, sig.params):
+                                    changed = mark(a, pk) or changed
+                                changed = mark(dst, sig.ret) or changed
                 elif rk == "make_variant":
                     ename, vname = rhs[1], rhs[2]
                     # The dst kind carries this site's refinement: the actual
                     # per-slot representation of the value built here (nested
                     # enum payloads are recorded name-only; their contents go
                     # through the canonical module cells instead).
-                    site_ref = {vname: tuple(_strip_refinement(get(a))
+                    site_ref = {vname: tuple(_slot_kind_for_store(get(a))
                                              for a in args)}
                     changed = mark(
                         dst, _format_enum_kind(ename, site_ref)) or changed
-                    # Vec payloads learn back from the destination: once
-                    # this value has merged with another site's (a return
-                    # joining `Some(Vec.new())` with `Some(strings)`), the
-                    # slot's element kind is the join, and the fresh Vec
-                    # here is still at the vec bottom (vec:i64, nothing
-                    # pushed).  Promoting it is the same element promotion
-                    # a push performs and costs no representation change
-                    # (a vec is one mx_vec pointer whatever it holds).
+                    # Vec and enum payloads learn back from the destination:
+                    # once this value has merged with another site's (a
+                    # return joining `Some(Vec.new())` with `Some(strings)`,
+                    # or `Some(Some(n))` with `Some(None)`), the slot kind is
+                    # the join, and the value stored here is a
+                    # representation-compatible subset of it (the vec bottom
+                    # before any push; an enum with fewer constructible
+                    # variants).  Promoting it changes no bytes — a vec is
+                    # one mx_vec pointer whatever it holds, and every
+                    # refinement of one enum shares one union layout.
                     # Scalars are NOT back-propagated: `Some(3)` merged
                     # with `Some(2.5)` must keep demoting (retyping the
                     # literal would print 3.0 where the interpreter prints
-                    # 3), which the post-fixpoint check enforces.
+                    # 3), which the post-fixpoint check enforces.  Nor is a
+                    # NAME-ONLY slot (the depth cutoff of a recursive enum):
+                    # it is compatible with any refinement of its enum, and
+                    # joining it into the argument would strip the
+                    # argument's own refinement, which its make_variant
+                    # site needs.
                     dref = _enum_refinement(get(dst)) or {}
                     dslots = dref.get(vname)
                     if dslots is not None and len(dslots) == len(args):
                         for a, sk in zip(args, dslots):
-                            ak = get(a)
-                            if _is_vec(ak) and _is_vec(sk) and ak != sk \
-                                    and _join(ak, sk) == sk:
+                            if _is_enum(sk) and _enum_refinement(sk) is None:
+                                continue
+                            tk = _slot_kind_for_store(get(a))
+                            if tk != sk and _repr_compatible(tk, sk):
                                 changed = mark(a, sk) or changed
                     # One-way: store kinds also accumulate into the
                     # module-wide per-(variant, slot) cells backing canon();
@@ -4324,13 +4498,13 @@ def _infer_kinds(info: _Info, sigs: Dict[str, _Sig], structs: _StructTable,
                         slots = ref.get(vname)
                         if slots is not None and rhs[1] < len(slots):
                             sk = slots[rhs[1]]
-                            if _is_enum(sk):
-                                # Nested enum extraction crosses a boxing
-                                # boundary: the boxed value's own refinement
-                                # was stripped, so the result assumes the
-                                # canonical module-wide representation (the
-                                # consistency check demotes if any store
-                                # disagrees with it).
+                            if _is_enum(sk) and _enum_refinement(sk) is None:
+                                # Nested enum extraction below the
+                                # refinement depth cutoff: the boxed value's
+                                # own refinement was stripped, so the result
+                                # assumes the canonical module-wide
+                                # representation (the consistency check
+                                # demotes if any store disagrees with it).
                                 sk = variants.canon_kind(_enum_name(sk))
                             changed = mark(dst, sk) or changed
                         # variant absent from the refinement: the arm is
@@ -5705,12 +5879,12 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                     continue
                 for i, a in enumerate(args):
                     sk = ref[vname][i]
-                    store_k = _strip_refinement(ty(a))
+                    store_k = _slot_kind_for_store(ty(a))
                     if sk == CONFLICT or store_k == CONFLICT:
                         probs.append(
                             f"payload slot {i} of enum {ename or 'anon'!r} "
                             f"variant {vname!r} has conflicting kinds")
-                    elif store_k != sk:
+                    elif not _repr_compatible(store_k, sk):
                         probs.append(
                             f"heterogeneous payload slot {i} of enum "
                             f"{ename or 'anon'!r}: variant {vname!r} stores "
@@ -5772,11 +5946,12 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                             f"variant into aggregate kind {ty(dst)}")
                     continue
                 sk = ref[vname][idx]
-                if _is_enum(sk):
-                    # Nested extraction reads through the canonical cells:
-                    # sound only when every store into the nested enum agrees
-                    # with them (otherwise the representation is per-value
-                    # and was lost at the boxing boundary).
+                if _is_enum(sk) and _enum_refinement(sk) is None:
+                    # Nested extraction below the refinement depth cutoff
+                    # reads through the canonical cells: sound only when
+                    # every store into the nested enum agrees with them
+                    # (otherwise the representation is per-value and was
+                    # lost at the boxing boundary).
                     nested = _enum_name(sk)
                     mixed = variants.mixed_slots_of(nested)
                     if mixed:
@@ -5799,7 +5974,10 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                         f"enum {ename or 'anon'!r} payload slot {idx} holds "
                         f"a closure ({sk}) (its env pointer may outlive the "
                         "creating frame)")
-                elif ty(dst) != sk:
+                elif ty(dst) != sk and not (
+                        _is_enum(sk) and _repr_compatible(sk, ty(dst))):
+                    # (An extracted nested enum may flow on into a value
+                    # with a wider refinement; same layout, no coercion.)
                     probs.append(
                         f"variant_field {idx} of enum {ename or 'anon'!r} "
                         f"variant {vname!r}: result {dst!r} is {ty(dst)}, "
@@ -5865,27 +6043,32 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
     # reaching THIS function through its own values still need every slot of
     # every refinement to be emittable (a refined kind can arrive through a
     # signature without any local variant op).
-    for k in sorted(set(kinds.values())):
-        ref = _enum_refinement(k)
-        if not ref:
-            continue
-        ename = _enum_name(k)
-        for v in sorted(ref):
-            for i, sk in enumerate(ref[v]):
-                if _is_closure(sk) or sk == KONT:
-                    probs.append(
-                        f"enum {ename or 'anon'!r} payload slot {i} holds a "
-                        f"closure ({sk}) (its env pointer may outlive the "
-                        "creating frame)")
-                elif sk == CONFLICT:
-                    probs.append(
-                        f"enum {ename or 'anon'!r} variant {v!r} payload "
-                        f"slot {i} has conflicting kinds")
-                elif _is_agg(sk) and _kind_size(sk, structs, variants) is None:
-                    probs.append(
-                        f"enum {ename or 'anon'!r} variant {v!r} payload "
-                        f"slot {i} boxes a value of {sk} whose layout is "
-                        "infinite")
+    # Nested refinements are walked too: a slot kind can itself carry a
+    # refinement whose own slots must be emittable.
+    seen_enum_kinds: Set[str] = set()
+    for k0 in sorted(set(kinds.values())):
+        for k in [k0, *_nested_slot_kinds(k0)]:
+            ref = _enum_refinement(k)
+            if not ref or k in seen_enum_kinds:
+                continue
+            seen_enum_kinds.add(k)
+            ename = _enum_name(k)
+            for v in sorted(ref):
+                for i, sk in enumerate(ref[v]):
+                    if _is_closure(sk) or sk == KONT:
+                        probs.append(
+                            f"enum {ename or 'anon'!r} payload slot {i} holds a "
+                            f"closure ({sk}) (its env pointer may outlive the "
+                            "creating frame)")
+                    elif sk == CONFLICT:
+                        probs.append(
+                            f"enum {ename or 'anon'!r} variant {v!r} payload "
+                            f"slot {i} has conflicting kinds")
+                    elif _is_agg(sk) and _kind_size(sk, structs, variants) is None:
+                        probs.append(
+                            f"enum {ename or 'anon'!r} variant {v!r} payload "
+                            f"slot {i} boxes a value of {sk} whose layout is "
+                            "infinite")
     # RANGE VALUES: __range materializes a fixed int vector natively, but
     # the interpreter's range is a plain Python list whose repr ("[0, 1]")
     # differs from a vector's ("vector[0, 1]").  Restrict range values (and
@@ -9807,7 +9990,7 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                             note = "leaks by design"
                         lines.append(
                             f"  {box} = call ptr @malloc(i64 {max(size, 8)})"
-                            f"  ; boxed {ck} payload ({note})")
+                            f"  ; boxed {_strip_refinement(ck)} payload ({note})")
                         agg_copy(_agg_ty(ck), use(fv, lines), box, lines)
                         lines.append(f"  store ptr {box}, ptr {p}")
                     else:
@@ -10549,12 +10732,30 @@ def _emit_closure_types(mod: _ModuleState) -> Optional[str]:
 # Module driver
 # ---------------------------------------------------------------------------
 
-def emit_llvm(funcs: Sequence[MirFunc]) -> str:
-    """Emit one LLVM IR module (text) for a MIR module.
+@dataclass
+class _Prep:
+    """Everything the module driver knows before emission: the tables, the
+    per-function analyses and the converged kind/signature fixpoint."""
+    module_names: Set[str]
+    structs: _StructTable
+    closures: _ClosureTable
+    traits: _TraitTable
+    scopes: _ScopeTable
+    cells: "_CellTable"
+    gtable: "_GlobalTable"
+    infos: List[_Info]
+    variants: _VariantTable
+    sigs: Dict[str, _Sig]
+    kind_sets: Dict[str, Dict[str, str]]
+    candidates: List[_Info]
 
-    Direct functions get full definitions; everything else gets a
-    comment-only placeholder carrying its reasons (see module docstring).
-    """
+
+def _prepare(funcs: Sequence[MirFunc],
+             one_way: FrozenSet[str] = frozenset()) -> _Prep:
+    """Build the module tables, analyze every function and run the
+    module-wide kind/signature fixpoint.  ``one_way`` is the specialization
+    probe's set of callees whose signatures do not flow back into their
+    call sites (see _specialize_by_kind)."""
     # Fresh symbol-sanitizer registry per module: deterministic, injective
     # symbol mangling independent of previously-emitted modules.
     _sanitize_reset()
@@ -10574,6 +10775,364 @@ def emit_llvm(funcs: Sequence[MirFunc]) -> str:
                       cells, gtable)
              for f in funcs]
     variants = _build_variant_table(funcs, infos)
+
+    # Duplicate MIR function names (e.g. lambda counters restarting per
+    # enclosing function) would produce colliding symbols and ambiguous
+    # direct calls: demote every function carrying a duplicated name.
+    seen: Dict[str, int] = {}
+    for f in funcs:
+        seen[f.name] = seen.get(f.name, 0) + 1
+    for info in infos:
+        if seen[info.f.name] > 1:
+            info.add_reason(
+                f"duplicate function name {info.f.name!r} in module (ambiguous symbol)")
+
+    # Module-wide kind/signature fixpoint (params/ret and struct field cells
+    # promoted monotonically; callers and callees feed each other).  Two
+    # phases: the first never assumes anything about trait-call receivers
+    # still at the i64 bottom; once it converges, the second treats those
+    # receivers as genuinely int (nothing else can promote them anymore)
+    # and keeps iterating so the late resolutions' kinds propagate.
+    sigs: Dict[str, _Sig] = {
+        info.f.name: _Sig(params=[I64] * len(info.params)) for info in infos}
+    kind_sets: Dict[str, Dict[str, str]] = {}
+    candidates = [info for info in infos if not info.reasons]
+    for assume_final in (False, True):
+        for _round in range(12):
+            changed = False
+            for info in candidates:
+                kinds, cell_changed = _infer_kinds(
+                    info, sigs, structs, variants, closures, traits, scopes,
+                    module_names, gtable, assume_final=assume_final,
+                    one_way=one_way)
+                changed = changed or cell_changed
+                if kind_sets.get(info.f.name) != kinds:
+                    kind_sets[info.f.name] = kinds
+                    changed = True
+                own = sigs[info.f.name]
+                for i, p in enumerate(info.params):
+                    if p in info.promote_params:
+                        # promote_matrix'd param: the local kind is the
+                        # PROMOTED form; the sig keeps the caller-side kind
+                        # (joined at call sites only).
+                        continue
+                    nk = _join(own.params[i], kinds.get(p, I64))
+                    if nk != own.params[i]:
+                        own.params[i] = nk
+                        changed = True
+                for r in info.ret_vars:
+                    nk = _join(own.ret, kinds.get(r, I64))
+                    if nk != own.ret:
+                        own.ret = nk
+                        changed = True
+                resolved_calls = []
+                for (dst, callee, args) in info.calls:
+                    bname = _builtin_name(callee, module_names)
+                    if bname in _NATIVE_RT_CALLS or bname in _FFI_CALLS \
+                            or bname == "assert":
+                        continue
+                    if callee.startswith(STATIC_CALL_PREFIX):
+                        sres, starget = _resolve_static_call(
+                            callee, traits, module_names)
+                        if sres == "func":
+                            resolved_calls.append((dst, starget, args))
+                        continue
+                    resolved_calls.append((dst, callee, args))
+                for (dst, cvar, args) in info.closure_calls:
+                    ck = kinds.get(cvar, I64)
+                    for m in _closure_members(ck):
+                        resolved_calls.append((dst, m, args))
+                for (dst, method, targs) in info.trait_calls:
+                    if not targs:
+                        continue
+                    res, target = _resolve_trait_call(
+                        method, kinds.get(targs[0], I64), traits, module_names,
+                        assume_final=assume_final)
+                    if res == "func":
+                        resolved_calls.append((dst, target, targs))
+                for (dst, callee, args) in resolved_calls:
+                    csig = sigs.get(callee)
+                    if csig is None or len(csig.params) != len(args):
+                        continue
+                    for i, a in enumerate(args):
+                        nk = _join(csig.params[i], kinds.get(a, I64))
+                        if nk != csig.params[i]:
+                            csig.params[i] = nk
+                            changed = True
+                    nk = _join(csig.ret, kinds.get(dst, I64))
+                    if nk != csig.ret:
+                        csig.ret = nk
+                        changed = True
+            if not changed:
+                break
+    return _Prep(module_names, structs, closures, traits, scopes, cells,
+                 gtable, infos, variants, sigs, kind_sets, candidates)
+
+
+# ---------------------------------------------------------------------------
+# Kind specialization (kind-polymorphic functions cloned per call-site kinds)
+# ---------------------------------------------------------------------------
+#
+# Signatures are joined two-way across every call site, so a helper such as
+# `fn is_none(o: Option) -> bool` reached with Option-of-string at one site
+# and Option-of-struct at another gets a CONFLICT parameter — and the
+# conflict flows back into both callers' arguments and on through them.
+# The HIR monomorphizer only clones functions declared with type
+# parameters; a plain `Option` parameter is generic in its payload without
+# saying so.  This pass clones such functions per distinct call-site kind
+# tuple, exactly the way the monomorphizer clones per type instantiation:
+#
+#   1. run the fixpoint; a function whose merged parameter kinds contain a
+#      conflict is a specialization candidate (if it is plain: not a lambda,
+#      not a handle-scope member, no closure/scope ops of its own — those
+#      are bound to their owner by name);
+#   2. run it again with those callees ONE-WAY (their signatures do not
+#      flow back into arguments), which shows each call site's own kinds;
+#   3. group the direct call sites by argument-kind tuple; two or more
+#      groups mean the conflict came from heterogeneous callers, so each
+#      group gets its own clone `f$kN` (the callee's self-calls stay inside
+#      the clone) and its sites are retargeted.  A site whose kinds are
+#      still conflicted (its caller is itself unspecialized) keeps calling
+#      the original, which stays polymorphic and demotes honestly, and gets
+#      another chance next round once its caller has been cloned;
+#   4. an original nothing references any more is dropped; runtime failure
+#      messages keep naming the original through MirFunc.origin_name.
+#
+# Rounds are bounded, the cloned MIR is byte-for-byte the original's body
+# under a new name, and every clone goes through the same fixpoint and
+# consistency checks as any function, so a wrong grouping can only demote,
+# never miscompile.
+
+_SPECIALIZE_ROUNDS = 4
+_SPECIALIZE_MAX_CLONES = 128
+
+
+def _specialization_blockers(f: MirFunc, info: _Info) -> Optional[str]:
+    """Why `f` cannot be cloned by kind, or None when it can."""
+    if info.is_lambda or info.is_scope_member:
+        return "lambda or handle-scope member"
+    if f.name == _MODULE_INIT or f.name == "main":
+        return "entry"
+    if info.suspending:
+        return "suspending"
+    for b in f.blocks:
+        for op in b.ops:
+            if op[0] == "let" and len(op) == 4 and op[2][0] in (
+                    "handle_scope", "try_scope", "make_closure"):
+                return f"owns a {op[2][0]}"
+    return None
+
+
+def _mentions_name(obj: Any, name: str) -> bool:
+    if isinstance(obj, str):
+        return obj == name
+    if isinstance(obj, (tuple, list)):
+        return any(_mentions_name(x, name) for x in obj)
+    return False
+
+
+def _refines_to(kind: str, joined: str) -> bool:
+    """True when a value of `kind` has exactly the native representation of
+    `joined`, its join with some other kind: equal kinds, or an enum whose
+    refinement is a variant-subset of `joined`'s with slots that refine in
+    turn.  Scalars and vec element kinds must be EQUAL: `i64` joining with
+    `f64` or `vec:i64` with `vec:f64` picks the float side because i64 is
+    the lattice bottom, and that join retypes int literals (the
+    "prints 10.0 for 10" wrong-code path), so such sites never share a
+    clone."""
+    if kind == joined:
+        return True
+    if _is_enum(kind) and _is_enum(joined) \
+            and _enum_name(kind) == _enum_name(joined):
+        rk, rj = _enum_refinement(kind), _enum_refinement(joined)
+        if rj is None:
+            return True
+        if rk is None:
+            return False
+        for v, slots in rk.items():
+            other = rj.get(v)
+            if other is None or len(other) != len(slots):
+                return False
+            if not all(_refines_to(x, y) for x, y in zip(slots, other)):
+                return False
+        return True
+    return False
+
+
+def _direct_call_sites(funcs: Sequence[MirFunc], module_names: Set[str],
+                       ) -> Dict[str, int]:
+    """Callee -> number of direct `call` ops naming a module function."""
+    counts: Dict[str, int] = {}
+    for f in funcs:
+        for b in f.blocks:
+            for op in b.ops:
+                if op[0] == "let" and len(op) == 4 and op[2][0] == "call" \
+                        and op[2][1] in module_names:
+                    counts[op[2][1]] = counts.get(op[2][1], 0) + 1
+    return counts
+
+
+def _specialize_by_kind(funcs: List[MirFunc]) -> List[MirFunc]:
+    memo: Dict[Tuple[str, Tuple[str, ...]], str] = {}
+    counters: Dict[str, int] = {}
+    clones_made = 0
+    for _round in range(_SPECIALIZE_ROUNDS):
+        module_names = {f.name for f in funcs}
+        closures = _build_closure_table(funcs)
+        scopes = _build_scope_table(funcs)
+        sites = _direct_call_sites(funcs, module_names)
+        by_name = {f.name: f for f in funcs}
+        candidates: Set[str] = set()
+        for f in funcs:
+            if sites.get(f.name, 0) < 2:
+                continue
+            probe_info = _Info(f=f)
+            probe_info.is_lambda = f.name in closures.targets
+            probe_info.is_scope_member = f.name in scopes.member_site
+            probe_info.suspending = is_suspending(f)
+            if _specialization_blockers(f, probe_info) is None:
+                candidates.add(f.name)
+        if not candidates:
+            return funcs
+        probe = _prepare(funcs, one_way=frozenset(candidates))
+        # callee -> [(group key, [(caller, call dst)])]; a site joins the
+        # first group whose per-position join it and the group both refine
+        # to (same representation), else opens a new group.
+        plan: Dict[str, List[Tuple[Tuple[str, ...], List[Tuple[str, str]]]]] = {}
+        # A function nothing calls (an unused library helper compiled
+        # along with its module) has parameters at the bottom, so its call
+        # sites describe no instantiation: they never open or join a group.
+        reached = {"main"}
+        for g in funcs:
+            for b in g.blocks:
+                for op in [*b.ops, b.term]:
+                    for h in module_names:
+                        if h != g.name and _mentions_name(op, h):
+                            reached.add(h)
+        for info in probe.infos:
+            if info.reasons or info.f.name not in reached:
+                continue
+            own = probe.sigs.get(info.f.name)
+            if own is not None and CONFLICT in own.params:
+                # This caller is itself polymorphic: its local kinds are
+                # not any one instantiation's, so its sites wait for the
+                # round in which it has been cloned.
+                continue
+            kinds = probe.kind_sets.get(info.f.name, {})
+            for (dst, callee, args) in info.calls:
+                if callee not in candidates or callee in info.def_count:
+                    continue
+                key = tuple(kinds.get(a, I64) for a in args)
+                if any(CONFLICT in k for k in key):
+                    continue
+                groups = plan.setdefault(callee, [])
+                for gi, (gkey, gsites) in enumerate(groups):
+                    if len(gkey) != len(key):
+                        continue
+                    joined = tuple(_join(a, b) for a, b in zip(key, gkey))
+                    if all(j != CONFLICT and _refines_to(a, j)
+                           and _refines_to(b, j)
+                           for a, b, j in zip(key, gkey, joined)):
+                        groups[gi] = (joined, gsites + [(info.f.name, dst)])
+                        break
+                else:
+                    groups.append((key, [(info.f.name, dst)]))
+        retarget: Dict[Tuple[str, str], str] = {}
+        new_funcs: List[MirFunc] = []
+        for callee in sorted(plan):
+            groups = plan[callee]
+            if len(groups) < 2:
+                continue
+            origin = by_name[callee]
+            for key, gsites in sorted(groups, key=lambda g: g[0]):
+                mk = (callee, key)
+                cname = memo.get(mk)
+                if cname is None:
+                    if clones_made >= _SPECIALIZE_MAX_CLONES:
+                        continue
+                    counters[callee] = counters.get(callee, 0) + 1
+                    cname = f"{callee}$k{counters[callee]}"
+                    memo[mk] = cname
+                    clones_made += 1
+                    blocks = [MirBlock(ops=list(b.ops), term=b.term)
+                              for b in origin.blocks]
+                    # Self-calls stay inside the clone (monomorphic
+                    # recursion; anything else conflicts and demotes).
+                    for b in blocks:
+                        b.ops = [
+                            ("let", op[1], ("call", cname), op[3])
+                            if (op[0] == "let" and len(op) == 4
+                                and op[2] == ("call", callee)) else op
+                            for op in b.ops]
+                    new_funcs.append(dataclasses.replace(
+                        origin, name=cname, blocks=blocks,
+                        origin_name=origin.origin_name or origin.name))
+                for site in gsites:
+                    retarget[site] = cname
+        if not retarget:
+            return funcs
+        callers = {caller for (caller, _d) in retarget}
+        rewritten: List[MirFunc] = []
+        for f in funcs:
+            if f.name not in callers:
+                rewritten.append(f)
+                continue
+            blocks = []
+            for b in f.blocks:
+                ops = []
+                for op in b.ops:
+                    if op[0] == "let" and len(op) == 4 and op[2][0] == "call":
+                        target = retarget.get((f.name, op[1]))
+                        if target is not None:
+                            op = ("let", op[1], ("call", target), op[3])
+                    ops.append(op)
+                blocks.append(MirBlock(ops=ops, term=b.term))
+            rewritten.append(dataclasses.replace(f, blocks=blocks))
+        # Clones copy the ORIGINAL body; their inner call sites to other
+        # candidates resolve in a later round with concrete kinds.
+        funcs = rewritten + new_funcs
+        # Drop originals nothing mentions any more (a remaining mention is a
+        # conflicted call site, a closure/trait/static reference, or a
+        # perform default — all of which keep the polymorphic original),
+        # and clones a later round has superseded.
+        cloned = {c for (c, _k) in memo} | set(memo.values())
+        while True:
+            keep: List[MirFunc] = []
+            for f in funcs:
+                if f.name in cloned:
+                    mentioned = any(
+                        _mentions_name(op, f.name)
+                        for g in funcs if g is not f
+                        for b in g.blocks for op in [*b.ops, b.term])
+                    if not mentioned:
+                        continue
+                keep.append(f)
+            if len(keep) == len(funcs):
+                break
+            funcs = keep  # a dropped function may have been the last mention
+    return funcs
+
+
+def emit_llvm(funcs: Sequence[MirFunc]) -> str:
+    """Emit one LLVM IR module (text) for a MIR module.
+
+    Direct functions get full definitions; everything else gets a
+    comment-only placeholder carrying its reasons (see module docstring).
+    """
+    funcs = _specialize_by_kind(list(funcs))
+    prep = _prepare(funcs)
+    module_names = prep.module_names
+    structs = prep.structs
+    closures = prep.closures
+    traits = prep.traits
+    scopes = prep.scopes
+    cells = prep.cells
+    gtable = prep.gtable
+    infos = prep.infos
+    variants = prep.variants
+    sigs = prep.sigs
+    kind_sets = prep.kind_sets
+    candidates = prep.candidates
 
     def dep_names(info: _Info, kinds: Dict[str, str]) -> Set[str]:
         """Module functions this one references and cannot link without:
@@ -10637,95 +11196,6 @@ def emit_llvm(funcs: Sequence[MirFunc]) -> str:
             if res == "func" and target in module_names:
                 deps.add(target)
         return deps
-
-    # Duplicate MIR function names (e.g. lambda counters restarting per
-    # enclosing function) would produce colliding symbols and ambiguous
-    # direct calls: demote every function carrying a duplicated name.
-    seen: Dict[str, int] = {}
-    for f in funcs:
-        seen[f.name] = seen.get(f.name, 0) + 1
-    for info in infos:
-        if seen[info.f.name] > 1:
-            info.add_reason(
-                f"duplicate function name {info.f.name!r} in module (ambiguous symbol)")
-
-    # Module-wide kind/signature fixpoint (params/ret and struct field cells
-    # promoted monotonically; callers and callees feed each other).  Two
-    # phases: the first never assumes anything about trait-call receivers
-    # still at the i64 bottom; once it converges, the second treats those
-    # receivers as genuinely int (nothing else can promote them anymore)
-    # and keeps iterating so the late resolutions' kinds propagate.
-    sigs: Dict[str, _Sig] = {
-        info.f.name: _Sig(params=[I64] * len(info.params)) for info in infos}
-    kind_sets: Dict[str, Dict[str, str]] = {}
-    candidates = [info for info in infos if not info.reasons]
-    for assume_final in (False, True):
-        for _round in range(12):
-            changed = False
-            for info in candidates:
-                kinds, cell_changed = _infer_kinds(
-                    info, sigs, structs, variants, closures, traits, scopes,
-                    module_names, gtable, assume_final=assume_final)
-                changed = changed or cell_changed
-                if kind_sets.get(info.f.name) != kinds:
-                    kind_sets[info.f.name] = kinds
-                    changed = True
-                own = sigs[info.f.name]
-                for i, p in enumerate(info.params):
-                    if p in info.promote_params:
-                        # promote_matrix'd param: the local kind is the
-                        # PROMOTED form; the sig keeps the caller-side kind
-                        # (joined at call sites only).
-                        continue
-                    nk = _join(own.params[i], kinds.get(p, I64))
-                    if nk != own.params[i]:
-                        own.params[i] = nk
-                        changed = True
-                for r in info.ret_vars:
-                    nk = _join(own.ret, kinds.get(r, I64))
-                    if nk != own.ret:
-                        own.ret = nk
-                        changed = True
-                resolved_calls = []
-                for (dst, callee, args) in info.calls:
-                    bname = _builtin_name(callee, module_names)
-                    if bname in _NATIVE_RT_CALLS or bname in _FFI_CALLS \
-                            or bname == "assert":
-                        continue
-                    if callee.startswith(STATIC_CALL_PREFIX):
-                        sres, starget = _resolve_static_call(
-                            callee, traits, module_names)
-                        if sres == "func":
-                            resolved_calls.append((dst, starget, args))
-                        continue
-                    resolved_calls.append((dst, callee, args))
-                for (dst, cvar, args) in info.closure_calls:
-                    ck = kinds.get(cvar, I64)
-                    for m in _closure_members(ck):
-                        resolved_calls.append((dst, m, args))
-                for (dst, method, targs) in info.trait_calls:
-                    if not targs:
-                        continue
-                    res, target = _resolve_trait_call(
-                        method, kinds.get(targs[0], I64), traits, module_names,
-                        assume_final=assume_final)
-                    if res == "func":
-                        resolved_calls.append((dst, target, targs))
-                for (dst, callee, args) in resolved_calls:
-                    csig = sigs.get(callee)
-                    if csig is None or len(csig.params) != len(args):
-                        continue
-                    for i, a in enumerate(args):
-                        nk = _join(csig.params[i], kinds.get(a, I64))
-                        if nk != csig.params[i]:
-                            csig.params[i] = nk
-                            changed = True
-                    nk = _join(csig.ret, kinds.get(dst, I64))
-                    if nk != csig.ret:
-                        csig.ret = nk
-                        changed = True
-            if not changed:
-                break
 
     # A lambda whose closure is RETURNED by any function needs a heap env:
     # the pair crosses the creating frame's boundary, so a stack env would

@@ -229,10 +229,12 @@ def test_nothing_unaccounted_for(transcript):
 
 
 @needs_clang
-@pytest.mark.xfail(strict=True, reason=(
-    "std.solve inherits std.semver's native gaps (string indexing, per-module "
-    "enum payload kinds); see docs/glade_in_metaxu.md"))
 def test_native_prints_what_the_interpreter_printed(tmp_path, transcript):
+    # Native std.solve needed three backend fixes found by this module and
+    # std.semver (docs/glade_in_metaxu.md): string indexing, nested enum
+    # payload refinements, and kind specialization of helpers such as
+    # `is_none(o: Option)` that meet two payload kinds.  This differential
+    # is the pin.
     from metaxu.compiler.tests.test_codegen_llvm import llvm_from_source
     from metaxu.compiler.llvm_run import compile_and_run
     exit_code, stdout = compile_and_run(llvm_from_source(program()), "main",

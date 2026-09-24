@@ -307,7 +307,8 @@ def test_collections_example_emits_push_natively():
     declaration does have."""
     ir = emit_llvm_from_source(open(COLLECTIONS_MX).read())
     assert "%struct.List = type { ptr, i64 }  ; data, len" in ir
-    assert "define void @mx_push(" in ir
+    # `push` ends in an assignment, so it returns unit (i64 0).
+    assert "define i64 @mx_push(" in ir
     assert "has no field" not in ir
     assert ir.count("placeholder -- unsupported") == 1
     assert "@mx_empty: placeholder" in ir

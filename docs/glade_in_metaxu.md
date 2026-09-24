@@ -132,29 +132,52 @@ helpers mutate; and `std.map` moves a key to the end on overwrite,
 which would change which package the solver tries first, so the
 port keeps its own insertion-ordered tables.
 
-Compiling either module natively fails, and the reasons are the
-first two entries the rewrite adds to step 2:
+**Both modules compile and run natively.** Getting there took four
+backend fixes, each found by these two modules and each now pinned in
+`test_codegen_llvm.py`; the native differential tests in
+`test_std_semver.py` and `test_std_solve.py` are required passes.
 
-- **String indexing was not lowered** (fixed). `s[i]` and `s[a:b:c]`
-  on a string were interpreter-only, which made every helper in
-  `std.parse` and `std.string` interpreter-only too. They now lower to
+- **String indexing was not lowered.** `s[i]` and `s[a:b:c]` on a
+  string were interpreter-only, which made every helper in `std.parse`
+  and `std.string` interpreter-only too. They now lower to
   `mx_str_index` and `mx_str_slice` in the C runtime, fresh copies with
-  the interpreter's exact bounds diagnostic, and `std.parse`'s digit
-  loops run natively; `test_codegen_llvm.py` pins the differential. The
-  linear string builtins above remain the way to make that text code
-  fast rather than merely native.
-- **Enum payload kinds are per module, not per use.** The native
-  backend gives `Option`'s `Some` slot one value kind for the whole
-  compilation unit. `std.semver` puts ints, Vecs, Versions, Intervals,
-  Partials and Ranges into `Option`, so the slot's kind conflicts and
-  every function touching an `Option` demotes to a placeholder.
-  Generic enums need either monomorphization by payload kind (the
-  function-level `monomorphize.py` pass extended to enums) or a boxed
-  uniform payload. Until then the `Option` in a natively compiled file
-  must hold one kind.
+  the interpreter's exact bounds diagnostic. The linear string builtins
+  above remain the way to make that text code fast rather than merely
+  native.
+- **A nested enum lost its payload kinds.** `component_or_wild` returns
+  `Some(Some(n))` or `Some(None)`. The backend recorded the inner
+  `Option` name-only and read its payload back through the module-wide
+  `Option` cells, which conflict as soon as one file puts ints, Vecs
+  and structs into `Option`; that conflict then spread through
+  two-way signature unification into sixty functions. Nested enums now
+  keep their own refinement three levels deep, so the inner read is
+  exact and never touches the cells.
+- **Kind-polymorphic helpers conflicted.** `is_none(o: Option)` is
+  called with `Option` of string and `Option` of `Incompat`, and a
+  signature is one join over every call site. The backend now clones
+  such a function per call-site kind tuple before inference, the way
+  the HIR monomorphizer clones declared generics. The same pass fixes a
+  silent wrong answer: a helper reached with `Vec` of int and `Vec` of
+  float used to merge to float and print `10.0` for `10`.
+- **An assignment evaluated to the struct it wrote.** `record` ends in
+  an `if` whose arms are a `push` and a field assignment; the second
+  arm's value was the whole `Solver`, merged with unit, and the
+  function demoted. Assignments now evaluate to `()` on both engines.
 
-The native differential test for `std.semver` is a strict `xfail`
-naming both; it flips to a required pass when they land.
+What the two programs still leave as placeholders is `std.fail`'s
+higher-order handlers (`try_opt(f)` and friends call a closure passed as
+a parameter), which they import but never call.
+
+Two limits worth knowing before writing more library code:
+
+- A helper taking an empty `Vec` and one taking a `Vec` of strings get
+  two clones where one would do, because an empty `Vec` and a `Vec` of
+  ints have the same kind. Correct, just redundant.
+- A struct's field kinds are per declaration, not per use, so a
+  `std.map` holding strings in one place and `Version`s in another
+  would conflict the `Map` struct module-wide. `std.solve` avoids it
+  with its own parallel-`Vec` tables; glade proper will need either
+  struct specialization by field kinds or a boxed value type.
 
 ## Order of work
 

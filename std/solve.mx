@@ -896,10 +896,6 @@ fn solve(g: Graph, root: string, root_version: Version, prefer_names: Vec, prefe
 # ---------------------------------------------------------------------
 # explanations
 
-fn is_derived(o: Option) -> bool {
-    match o { None => false, Some(inc) => inc.kind == "derived" }
-}
-
 fn write_lines(inc: Incompat, lines: @mut Vec) -> () {
     if inc.kind != "derived" {
         lines.push(inc_describe(inc) + ".")
