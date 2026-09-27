@@ -56,6 +56,16 @@ with no section and uses it as the release notes.
 - Native backend: the ordering comparisons on strings (`<`, `<=`, `>`,
   `>=`) lower to `mx_str_cmp` (code point order, the interpreter's)
   instead of demoting the function.
+- Native effects: a handle whose every arm tail-resumes or never resumes
+  (every `std.stream`, `std.state`, `std.log` and IO-effect handler, and
+  exception-shaped handlers) now runs its body on the current stack and
+  answers each perform with a plain call of the arm, with no coroutine
+  and no context switch. A perform costs about 28 ns instead of about
+  850 ns, and the stream pipeline `sum(map(filter(iota(n))))` runs 27
+  times faster (`scripts/bench_effects.py`). Handlers that work after
+  the resume keep the coroutine path. `test_effect_direct.py` checks the
+  native program against the interpreter for the tail, abortive, nested,
+  cross-fiber abort and failing-arm shapes.
 - `std.process`'s record of a finished program is `Completed` (it was
   `Outcome`, which `std.solve` also declares).
 - `scripts/release.py`: one command to cut a release.

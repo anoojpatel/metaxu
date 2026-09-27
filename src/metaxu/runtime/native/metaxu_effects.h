@@ -65,6 +65,9 @@
  * |             |          const char *effect,                           |
  * |             |          const char *const *op_names,                  |
  * |             |          const int64_t *op_nparams, int64_t nops)      |
+ * | mx_handle_  | same signature; for a site whose every case            |
+ * | direct      |   tail-resumes or never resumes: body on the current    |
+ * |             |   stack, perform = a call of the case (see below)      |
  * | mx_perform  | int64_t (const char *effect, const char *op,           |
  * |             |          const int64_t *args, int64_t nargs)           |
  * | mx_perform_ | int64_t (const char *effect, const char *op,           |
@@ -279,6 +282,39 @@ int64_t mx_handle(mx_body_fn body, void *body_env,
                   const char *effect,
                   const char *const *op_names,
                   const int64_t *op_nparams, int64_t nops);
+
+/* DIRECT SCOPES.  mx_handle for a handle site whose EVERY case either
+ * tail-resumes its continuation exactly once or never resumes it
+ * (compiler/effect_tail.py, direct_case; the compiler emits this entry
+ * point only for such sites).  Such a scope needs no continuation at all:
+ *   - the body runs on the CURRENT stack (no coroutine, no 1 MiB stack);
+ *   - mx_perform, on finding a direct scope, CALLS the case right there on
+ *     the performing stack (busy set around the call, so the case's own
+ *     performs route outward exactly as before) with a stack-allocated
+ *     continuation record; a tail resume records its value and the call
+ *     returns it to the perform site -- no context switch;
+ *   - a case that returns without resuming ABORTS the scope: the perform
+ *     site unwinds to this mx_handle_direct (longjmp when the perform ran
+ *     on the scope's own fiber; otherwise an MX_EV_ABORT hop through each
+ *     intervening coroutine scope's owner until that fiber is reached,
+ *     the same route an escaped failure takes), which tears down every
+ *     scope pushed since and returns the case's value.
+ * Deep semantics are preserved by construction: a tail case's value IS
+ * the resume's value, and the body simply continues at the perform site,
+ * so the handle value is the body's completion value, exactly what the
+ * coroutine pump reports for the same program.  While a case runs, the
+ * pad chain is the one the scope was created under (a try inside the
+ * body never catches a failure raised by a case, as with mx_handle); when
+ * the case runs on a different fiber than the scope's, a failure it
+ * raises hops to the scope's fiber first and is raised there.  Routing,
+ * padding, arity checks, the single-shot rule and busy-flag behavior are
+ * identical to mx_handle; resuming a direct continuation with the general
+ * mx_resume is a compiler invariant violation and fatal. */
+int64_t mx_handle_direct(mx_body_fn body, void *body_env,
+                         mx_handler_fn handler, void *handler_env,
+                         const char *effect,
+                         const char *const *op_names,
+                         const int64_t *op_nparams, int64_t nops);
 
 int64_t mx_perform(const char *effect, const char *op,
                    const int64_t *args, int64_t nargs);

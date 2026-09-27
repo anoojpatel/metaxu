@@ -139,7 +139,12 @@ void __sanitizer_finish_switch_fiber(void *fake_stack_save,
  * body thread to _pump_scope: a catchable failure reached the bottom of a
  * body coroutine with no landing pad on it, so it must be re-raised on the
  * scope's OWNER stack (where an enclosing try's pad lives). */
-enum { MX_EV_DONE = 0, MX_EV_PERFORM = 1, MX_EV_ERROR = 2 };
+/* MX_EV_ABORT: a DIRECT scope (see mx_handle_direct) is being aborted, or
+ * a failure raised by its case must surface at its frame, and the
+ * initiating stack is a fiber other than the scope's own: the fiber hands
+ * the signal to its owner, which forwards it until the scope's fiber is
+ * reached (the same hop an escaped failure takes with MX_EV_ERROR). */
+enum { MX_EV_DONE = 0, MX_EV_PERFORM = 1, MX_EV_ERROR = 2, MX_EV_ABORT = 3 };
 
 typedef struct {
     const void *bottom;
@@ -162,6 +167,8 @@ struct mx_k {
     ucontext_t resume_ctx;  /* the parked perform site */
     int64_t resume_value;   /* handler -> body payload */
     int used;               /* single-shot flag; checked FIRST in mx_resume */
+    int direct;             /* a DIRECT scope's stack record: nothing parked;
+                             * only mx_resume_tail may consume it */
     mx_stackinfo stack;     /* the parked fiber's stack (ASan annotation) */
     struct mx_k *next;      /* scope's list, freed at teardown */
 };
@@ -208,6 +215,17 @@ struct mx_scope {
      * a scope runs at a time, so no other dispatch can intervene). */
     mx_k *tail_k;
     int64_t tail_value;
+    /* DIRECT scope (mx_handle_direct): no coroutine; the body runs on the
+     * stack that called mx_handle_direct, whose running fiber is
+     * `home_fiber` (NULL = the thread's root context).  Aborts and case
+     * failures must reach that fiber before they longjmp / raise. */
+    int direct;
+    mx_scope *home_fiber;
+    /* MX_EV_ABORT payload (set on the FIBER's scope that hands it off):
+     * the direct scope to unwind to, and whether the signal is an abort
+     * (its abort_value is set) or a case failure (g_raise_msg is set). */
+    mx_scope *ev_abort_target;
+    int ev_abort_raise;
     /* bookkeeping */
     mx_k *k_list;
     mx_scope *prev;                 /* global scope stack link */
@@ -252,6 +270,12 @@ static _Thread_local mx_scope *g_fiber = NULL;
  * resolves on the thread it was raised on.  Only ever read immediately
  * after a longjmp lands, and each raise heap-copies its own text. */
 static _Thread_local char *g_raise_msg = NULL;
+/* The DIRECT scope whose case is running on this fiber while that fiber
+ * is NOT the scope's home fiber (NULL otherwise).  A failure the case
+ * raises with no pad of its own must surface at the scope's frame -- on
+ * the home fiber, under the scope's owner pad chain -- so mx__raise_owned
+ * hops there instead of treating it as this fiber's body failure. */
+static _Thread_local mx_scope *g_direct_arm = NULL;
 
 static void mx__fatal(const char *msg) {
     /* stdout FIRST: abort() does not flush it, and a native program that
@@ -275,6 +299,7 @@ static void mx__switch(ucontext_t *save, ucontext_t *to, mx_stackinfo to_stack) 
      * target a frame on a parked coroutine stack. */
     mx_pad *my_pad = g_pad;
     mx_scope *my_fiber = g_fiber;
+    mx_scope *my_arm = g_direct_arm;  /* per-context, like the pad chain */
 #ifdef MX_ASAN
     void *fake = NULL;
     __sanitizer_start_switch_fiber(&fake, to_stack.bottom, to_stack.size);
@@ -289,6 +314,7 @@ static void mx__switch(ucontext_t *save, ucontext_t *to, mx_stackinfo to_stack) 
     g_cur = my;
     g_pad = my_pad;
     g_fiber = my_fiber;
+    g_direct_arm = my_arm;
 }
 
 /* Final switch away from a dying fiber (its fake stack is destroyed). */
@@ -393,6 +419,7 @@ static void mx__trampoline(unsigned int hi, unsigned int lo) {
     g_cur.bottom = s->stack;
     g_cur.size = MX_EFFECT_STACK_SIZE;
     g_pad = NULL;    /* a fresh fiber has no landing pads of its own */
+    g_direct_arm = NULL;
     g_fiber = s;
     int64_t v = s->body(s->body_env);
     s->ev_kind = MX_EV_DONE;
@@ -427,6 +454,35 @@ static mx_scope *mx__find_scope(const char *effect, const char *op,
         return s;
     }
     return NULL;
+}
+
+/* Deliver an abort (or a case failure, `raise` != 0 with the message in
+ * g_raise_msg) to the DIRECT scope `target`.  On target's home fiber: put
+ * the pad chain back to what the scope was created under and longjmp to
+ * its mx_handle_direct (abort) or raise there (failure).  On any other
+ * fiber: hand the signal to this fiber's owner as MX_EV_ABORT and abandon
+ * the fiber -- the owner (waiting in mx_handle / mx_resume / the pump)
+ * calls this again on its own stack, one hop closer.  Every fiber
+ * abandoned on the way is nested inside target's body and is freed by
+ * target's teardown, exactly like the coroutine abort cascade. */
+static _Noreturn void mx__continue_abort(mx_scope *target, int raise) {
+    if (g_fiber == target->home_fiber) {
+        g_pad = target->owner_pad;
+        if (raise) {
+            char *msg = g_raise_msg;
+            g_raise_msg = NULL;
+            mx__raise_owned(msg != NULL ? msg : mx__dup(""));
+        }
+        longjmp(target->abort_jmp, 1);
+    }
+    if (g_fiber == NULL)
+        mx__fatal("direct-scope abort reached the root context without "
+                  "finding the scope's fiber (scope stack corrupted)");
+    mx_scope *f = g_fiber;
+    f->ev_kind = MX_EV_ABORT;
+    f->ev_abort_target = target;
+    f->ev_abort_raise = raise;
+    mx__switch_dead(&f->handler_ctx, f->owner_stack);
 }
 
 typedef struct {
@@ -495,6 +551,8 @@ static mx_pump_result mx__pump_events(mx_scope *s) {
              * the recursive unwind would have seen. */
             mx__raise_owned(s->ev_error);
         }
+        if (s->ev_kind == MX_EV_ABORT)
+            mx__continue_abort(s->ev_abort_target, s->ev_abort_raise);
         /* MX_EV_PERFORM: next element's event -- loop, constant frame. */
     }
 }
@@ -565,6 +623,8 @@ int64_t mx_handle(mx_body_fn body, void *body_env,
          * (the interpreter keeps the frame until handle_scope's finally). */
         mx__raise_owned(s->ev_error);
     }
+    if (s->ev_kind == MX_EV_ABORT)
+        mx__continue_abort(s->ev_abort_target, s->ev_abort_raise);
     /* MX_EV_PERFORM: enter the event pump.  Tail-resuming cases loop
      * inside it at constant depth; a general resume recurses inside
      * mx_resume (the interpreter calls _pump_scope exactly once per
@@ -636,6 +696,50 @@ static int64_t mx__perform_impl(const char *effect, const char *op,
                   "handler case declares only %lld parameter(s)",
                   op, (long long)nargs, (long long)nparams);
     }
+    if (s->direct) {
+        /* DIRECT SCOPE (mx_handle_direct): every case of s tail-resumes or
+         * never resumes, so nothing needs parking.  Call the case right
+         * here on the performing stack with a stack-allocated record;
+         * busy is set around the call exactly as the pump sets it around
+         * a dispatch, so the case's own performs route outward.  The pad
+         * chain during the call is the scope's owner chain (a failure the
+         * case raises surfaces at the handle expression, never inside a
+         * try in the body -- the same as with the coroutine pump, whose
+         * cases run on the owner stack) when this is the scope's own
+         * fiber; on another fiber that chain is not ours to longjmp to,
+         * so it is empty and g_direct_arm routes a raise home. */
+        int64_t padded[MX_EFFECT_MAX_ARGS];
+        for (int64_t i = 0; i < nparams; i++)
+            padded[i] = (i < nargs) ? args[i] : 0; /* pad = UNIT = 0 */
+        mx_k dk;
+        memset(&dk, 0, sizeof dk);
+        dk.scope = s;
+        dk.direct = 1;
+        mx_pad *saved_pad = g_pad;
+        mx_scope *saved_arm = g_direct_arm;
+        int same_fiber = (g_fiber == s->home_fiber);
+        g_pad = same_fiber ? s->owner_pad : NULL;
+        g_direct_arm = same_fiber ? NULL : s;
+        s->tail_k = NULL;
+        s->busy = 1;
+        int64_t hres = s->handler(s->handler_env, op_index, padded, &dk);
+        s->busy = 0;
+        g_pad = saved_pad;
+        g_direct_arm = saved_arm;
+        if (s->tail_k == &dk) {
+            /* Tail resume: the case's value IS the resume's value (deep:
+             * the body continues here and its completion value becomes
+             * the handle value). */
+            s->tail_k = NULL;
+            return s->tail_value;
+        }
+        if (s->tail_k != NULL)
+            mx__fatal("tail resume of a foreign continuation "
+                      "(direct dispatch invariant violated)");
+        /* No resume: abort -- the case's value is the handle value. */
+        s->abort_value = hres;
+        mx__continue_abort(s, 0);
+    }
     mx_k *k = calloc(1, sizeof(mx_k));
     if (k == NULL)
         mx__fatal("out of memory (continuation)");
@@ -670,6 +774,9 @@ int64_t mx_resume(mx_k *k, int64_t value) {
         mx__fatal("resume: NULL continuation");
     if (k->used)
         mx__fatal("Continuation already consumed (single-shot violation)");
+    if (k->direct)
+        mx__fatal("general resume of a direct scope's continuation "
+                  "(compiler invariant violated: effect_tail.direct_case)");
     k->used = 1;
     mx_scope *s = k->scope;
     /* Re-arm the scope's delimitation while its body runs (the interpreter
@@ -701,6 +808,8 @@ int64_t mx_resume(mx_k *k, int64_t value) {
          * the interpreter's resume() `finally: frame["busy"] = was_busy`. */
         mx__raise_owned(s->ev_error);
     }
+    if (s->ev_kind == MX_EV_ABORT)
+        mx__continue_abort(s->ev_abort_target, s->ev_abort_raise);
     /* The body performed against this scope again: pump from here (the
      * interpreter's _pump_scope recursion -- one C recursion per GENERAL
      * resume on the owner stack; the pump's own tail loop handles any
@@ -739,6 +848,58 @@ int64_t mx_resume_tail(mx_k *k, int64_t value) {
     s->tail_k = k;
     s->tail_value = value;
     return 0;
+}
+
+int64_t mx_handle_direct(mx_body_fn body, void *body_env,
+                         mx_handler_fn handler, void *handler_env,
+                         const char *effect,
+                         const char *const *op_names,
+                         const int64_t *op_nparams, int64_t nops) {
+    /* A DIRECT scope (see the header): the compiler proved every case of
+     * this site tail-resumes or never resumes, so the body runs right
+     * here, on the caller's stack, and mx__perform_impl calls the cases at
+     * the perform sites.  Only the scope record is allocated: no coroutine
+     * stack, no contexts, no continuation list. */
+    for (int64_t i = 0; i < nops; i++) {
+        if (op_nparams[i] < 0 || op_nparams[i] > MX_EFFECT_MAX_ARGS)
+            mx__fatal("handler case declares more parameters than "
+                      "MX_EFFECT_MAX_ARGS");
+    }
+    mx_scope *volatile s = calloc(1, sizeof(mx_scope));
+    if (s == NULL)
+        mx__fatal("out of memory (scope)");
+    s->handler = handler;
+    s->handler_env = handler_env;
+    s->effect = effect;
+    s->op_names = op_names;
+    s->op_nparams = op_nparams;
+    s->nops = nops;
+    s->body = body;
+    s->body_env = body_env;
+    s->direct = 1;
+    s->home_fiber = g_fiber;
+    s->owner_pad = g_pad;
+    s->prev = g_top;
+    g_top = s;
+
+    if (setjmp(s->abort_jmp) != 0) {
+        /* A case returned without resuming: its value is the handle
+         * expression's value.  Everything pushed since -- scopes nested
+         * in the abandoned body, coroutine or direct -- is torn down with
+         * this scope (the interpreter's cascading _ScopeAbort). */
+        int64_t v = s->abort_value;
+        mx__teardown_to(s);
+        return v;
+    }
+
+    int64_t v = body(body_env);
+    /* Normal completion: the body returned, so every scope it pushed has
+     * completed structurally and s is the innermost live scope. */
+    if (g_top != s)
+        mx__fatal("scope stack corrupted (direct scope not innermost at "
+                  "completion)");
+    mx__teardown_to(s);
+    return v;
 }
 
 /* ------------------------------------------------------------------------
@@ -784,6 +945,17 @@ static _Noreturn void mx__raise_owned(char *owned) {
     if (g_pad != NULL) {
         g_raise_msg = owned;
         longjmp(g_pad->jb, 1);
+    }
+    if (g_direct_arm != NULL) {
+        /* Raised by a DIRECT scope's case running on a fiber other than
+         * the scope's own, with no pad of the case's own: the failure
+         * belongs at the scope's frame (under the pad chain the scope was
+         * created under, like a case failure with the coroutine pump), so
+         * hop to the scope's fiber first and raise it there. */
+        mx_scope *target = g_direct_arm;
+        g_direct_arm = NULL;
+        g_raise_msg = owned;
+        mx__continue_abort(target, 1);
     }
     if (g_fiber != NULL) {
         /* No pad on this coroutine: hand the failure to the scope's owner

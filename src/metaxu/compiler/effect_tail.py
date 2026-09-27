@@ -50,7 +50,8 @@ from typing import Iterable, Set
 
 from .mir import MirFunc
 
-__all__ = ["handler_case_fns", "tail_resume_ids", "program_tail_resume_ids"]
+__all__ = ["handler_case_fns", "tail_resume_ids", "program_tail_resume_ids",
+           "direct_case", "program_direct_cases"]
 
 
 def handler_case_fns(funcs: Iterable[MirFunc]) -> Set[str]:
@@ -108,6 +109,73 @@ def program_tail_resume_ids(funcs: Iterable[MirFunc]) -> frozenset:
         if f.name in cases:
             ids |= tail_resume_ids(f)
     return frozenset(ids)
+
+
+def direct_case(func: MirFunc) -> bool:
+    """True iff every path through this handler case either TAIL-resumes
+    its continuation exactly once or never resumes it, and the
+    continuation is used for nothing else.
+
+    Such a case never needs a real continuation: the native runtime can
+    run the scope's body on the CURRENT stack and turn each perform into a
+    plain call of the case (metaxu_effects.c, mx_handle_direct) -- a tail
+    resume returns the value to the perform site, and a case that returns
+    without resuming aborts the scope by unwinding to its handle.  The
+    interpreter needs no counterpart: nothing observable changes, only
+    where the frames live.
+
+    THE RULE (strict, like tail_resume_ids): the case's trailing ``__k``
+    parameter may appear ONLY as the continuation of a ``resume`` op that
+    ``tail_resume_ids`` marks.  Any other occurrence anywhere in the
+    function -- a non-tail resume (so a resume-then-continue arm, or
+    ``let a = resume(1); resume(2)``), a capture into a nested try/handle
+    body or a closure, a copy, a call argument, a terminator -- keeps the
+    case on the coroutine path.  A case with no resume at all (a pure
+    abort arm) is direct.
+    """
+    params = func.param_names()
+    if not params:
+        return False
+    kname = params[-1]
+    tail = tail_resume_ids(func)
+    for b in func.blocks:
+        for op in b.ops:
+            if op[0] == "params":
+                continue
+            if (op[0] == "let" and isinstance(op[2], tuple) and op[2]
+                    and op[2][0] == "resume"):
+                args = op[3]
+                if len(args) == 2 and args[0] == kname:
+                    if id(op) not in tail:
+                        return False
+                    if _mentions(args[1], kname):
+                        return False
+                    continue
+            if _mentions(op, kname):
+                return False
+        if _mentions(b.term, kname):
+            return False
+    return True
+
+
+def program_direct_cases(funcs: Iterable[MirFunc]) -> frozenset:
+    """Names of the handler-case functions ``direct_case`` accepts.  A
+    handle site whose EVERY case is in this set runs on the current stack
+    natively (the emitter checks the site, this reports the cases)."""
+    funcs = list(funcs)
+    cases = handler_case_fns(funcs)
+    return frozenset(f.name for f in funcs
+                     if f.name in cases and direct_case(f))
+
+
+def _mentions(x, name: str) -> bool:
+    """True iff the string ``name`` occurs anywhere inside the (nested)
+    tuple/list ``x`` -- the conservative "any other use" test."""
+    if isinstance(x, str):
+        return x == name
+    if isinstance(x, (tuple, list)):
+        return any(_mentions(y, name) for y in x)
+    return False
 
 
 def _returned_untouched(func: MirFunc, bi: int, oi: int, name: str) -> bool:

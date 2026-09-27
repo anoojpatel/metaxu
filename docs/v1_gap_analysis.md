@@ -465,6 +465,62 @@ Tests:
 interpreter 20k, non-tail differentials, single-shot on a consumed-then-
 tail-resumed continuation, ASan).
 
+## Effects: direct scopes (2026-09-27)
+
+What a perform cost natively after the trampoline was the context
+switch itself: glibc's `swapcontext` saves and restores the signal mask
+with a syscall on every switch, so a perform-resume pair was about
+850 ns (`scripts/bench_effects.py`, counter loop, 2M events), and the
+`sum(map(filter(iota(n))))` pipeline about 1.4 µs per element through
+three scopes. The interpreter is at about 86 µs per perform for scale.
+
+The fix follows the standard observation (Koka, Effekt) that a handler
+whose every arm either tail-resumes exactly once or never resumes needs
+no continuation at all. `effect_tail.direct_case` proves it per case
+(the trailing `__k` may appear only as the continuation of a
+tail-marked resume; a pure abort arm qualifies; a resume-then-continue
+arm, a double resume, or a `__k` captured into a try/handle body or a
+closure does not), the emitter calls `mx_handle_direct` for a site whose
+every case passes, and the runtime runs that body on the current stack
+and answers each perform by calling the case at the perform site with a
+stack-allocated continuation record. A tail resume records its value
+and the call returns it; a case that returns without resuming aborts
+by unwinding to the handle. When the perform ran on a nested
+coroutine's fiber the unwind hops fiber to owner until it reaches the
+scope's own fiber (a new `MX_EV_ABORT` event, checked at the same three
+wait points as `MX_EV_ERROR`), then longjmps there; a failure raised by
+such a case hops the same way and is raised under the pad chain the
+scope was created under, which keeps the documented rule that a try
+inside the body never catches a case's failure.
+
+Measured after (best of 3, same machine):
+
+| program | before | after |
+|---|---|---|
+| counter, one tail arm | 848 ns/event | 28 ns/event |
+| take-shaped arm (tail then abort) | 824 ns/event | 28 ns/event |
+| resume-then-continue arm | 2.1 µs/event | unchanged (coroutine path) |
+| stream pipeline, three scopes | 1423 ns/element | 52 ns/element |
+
+Nothing observable changed: the interpreter is untouched and is the
+oracle in `test_effect_direct.py`, which covers the tail, abortive and
+mixed shapes, nested direct scopes, a coroutine scope inside a direct
+body performing outward with a tail case and with an abort (the
+cross-fiber hop), two coroutine scopes deep, a direct scope inside a
+coroutine body, failures raised in the body and in the case (same fiber
+and across a fiber), a case performing outward and performing its own
+effect (busy routing), a hundred thousand scopes created and torn down,
+a million performs on one scope, and ASan runs of the hop cases.
+
+What remains on the coroutine path is what needs a real continuation:
+work after the resume (fold's `f(x, resume(()))`) and a stored
+continuation. The remaining cost of a direct perform is dynamic routing
+(a `strcmp` per op name on the scope walk and the dispatcher switch);
+interned op indices and static dispatch where the handler is lexically
+visible are the next steps, and a cheaper switch (a vendored assembly
+context switch instead of `swapcontext`) the one after for the
+coroutine shapes.
+
 ## Loudly-unsupported surface constructs (HIR triage)
 
 Update (2026-08-14): HIR lowering used to end in `return None` for any AST

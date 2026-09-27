@@ -460,6 +460,22 @@ ALGEBRAIC EFFECTS (increment 7):
     resumed value.  `resume` (only valid inside the handler case that
     received the continuation — its own trailing `__k` param) calls
     `mx_resume(k, value_word)`.
+  * DIRECT SCOPES: a handle site whose EVERY case either tail-resumes its
+    continuation exactly once or never resumes it (effect_tail.direct_case:
+    `__k` appears only as the continuation of a tail-marked resume; a
+    pure abort arm qualifies, a resume-then-continue arm, a double resume
+    or a `__k` captured into a try/handle body or closure does not) calls
+    `mx_handle_direct` instead of `mx_handle` — same arguments, same
+    dispatcher, same case functions.  The runtime then runs the body on
+    the CURRENT stack and answers each perform by calling the case right
+    there: no coroutine, no continuation record, no context switch, and a
+    case that returns without resuming unwinds to the handle (across
+    fiber boundaries by hopping owner to owner).  Nothing observable
+    changes — the interpreter is the oracle in test_effect_direct.py —
+    only the cost: ~28 ns per perform against ~850 ns through the
+    coroutine pump (scripts/bench_effects.py), which is every std.stream,
+    std.state, std.log and IO-effect shape.  Scopes with a non-tail arm
+    (fold's `f(x, resume(()))`) keep the coroutine path.
   * every value crossing the effect boundary travels as an opaque 8-byte
     WORD (i64 / f64 bitcast / str-vec ptrtoint — the Vec-element
     convention).  Because routing is DYNAMIC (by op name, innermost
@@ -939,7 +955,8 @@ from typing import (Any, Dict, FrozenSet, Iterator, List, Optional, Sequence,
 from .mir import MirBlock, MirFunc
 from .cps_frames import is_suspending
 from .tile_shape_check import TILE_ARITY
-from .effect_tail import tail_resume_ids as _tail_resume_ids
+from .effect_tail import (tail_resume_ids as _tail_resume_ids,
+                          program_direct_cases as _program_direct_cases)
 from .desugar import IMPL_SEP, parse_impl_method_name
 from .hir import (BUILTIN_CALL_PREFIX, STATIC_CALL_PREFIX, TRAIT_CALL_PREFIX,
                   is_tuple_struct as _is_tuple_struct)
@@ -1264,6 +1281,8 @@ _RT_SIGS = {
     # Algebraic effects runtime (metaxu_effects.c).
     "mx_handle": ("i64", ("ptr", "ptr", "ptr", "ptr", "ptr", "ptr", "ptr",
                           "i64")),
+    "mx_handle_direct": ("i64", ("ptr", "ptr", "ptr", "ptr", "ptr", "ptr",
+                                 "ptr", "i64")),
     "mx_perform": ("i64", ("ptr", "ptr", "ptr", "i64")),
     "mx_perform_or_default": ("i64", ("ptr", "ptr", "ptr", "i64", "ptr",
                                       "ptr")),
@@ -3220,6 +3239,11 @@ class _ScopeSite:
     # reading the owner's captured names out of one env block.
     kind: str = "handle"
     catch_fn: str = ""        # try sites only
+    # Every case of this handle site tail-resumes or never resumes
+    # (effect_tail.direct_case): the body runs on the current stack and
+    # each perform is a plain call of its case -- mx_handle_direct instead
+    # of mx_handle (see DIRECT SCOPES in the ALGEBRAIC EFFECTS section).
+    direct: bool = False
 
     def member_fns(self) -> Tuple[str, ...]:
         if self.kind == "try":
@@ -3462,6 +3486,13 @@ def _build_scope_table(funcs: Sequence[MirFunc]) -> _ScopeTable:
                     continue
                 table.sites[body_fn] = rec
                 table.sites_of_owner.setdefault(f.name, []).append(body_fn)
+    # 1b. Direct sites: every case tail-resumes or never resumes, so the
+    # scope needs no coroutine (effect_tail.direct_case, strict).
+    direct_cases = _program_direct_cases(funcs)
+    for rec in table.sites.values():
+        if rec.kind == "handle" and rec.cases and all(
+                hfn in direct_cases for (_o, _p, hfn) in rec.cases):
+            rec.direct = True
     # 2. Register members.
     for site, rec in table.sites.items():
         if rec.kind == "try":
@@ -10471,15 +10502,22 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                             f"ptr {p}")
                 _emit_scope_artifacts(site, rec, sigs, mod)
                 eg = mod.intern_string(rec.effect)
-                mod.runtime_syms.add("mx_handle")
+                # DIRECT SCOPES: every case tail-resumes or never resumes
+                # (effect_tail.direct_case), so the runtime runs the body
+                # on THIS stack and each perform becomes a call of its
+                # case -- no coroutine, no continuation record, no context
+                # switch.  Same arguments, same dispatcher, same cases.
+                entry = "mx_handle_direct" if rec.direct else "mx_handle"
+                mod.runtime_syms.add(entry)
                 v = fresh()
                 lines.append(
-                    f"  {v} = call i64 @mx_handle("
+                    f"  {v} = call i64 @{entry}("
                     f"ptr @{_scope_body_sym(site)}, ptr {envp}, "
                     f"ptr @{_scope_disp_sym(site)}, ptr {envp}, "
                     f"ptr {eg}, ptr @{_scope_ops_sym(site)}, "
                     f"ptr @{_scope_np_sym(site)}, i64 {len(rec.cases)})"
-                    f"  ; handle {rec.effect or '(any)'}")
+                    f"  ; handle {rec.effect or '(any)'}"
+                    f"{' (direct: tail-resumptive or abortive cases)' if rec.direct else ''}")
                 word_into(dst, v, lines)
             elif rk == "try_scope":
                 # DELIMITED FAILURE RECOVERY (docs/try_catch.md): fill the

@@ -2466,7 +2466,8 @@ def test_handle_scope_emits_runtime_call_and_shims():
     ir = llvm_from_source(_FX_ROUNDTRIP)
     assert count_placeholders(ir) == 0
     # runtime declares
-    assert "declare i64 @mx_handle(ptr, ptr, ptr, ptr, ptr, ptr, ptr, i64)" in ir
+    # The arm tail-resumes, so this site is a DIRECT scope (same signature).
+    assert "declare i64 @mx_handle_direct(ptr, ptr, ptr, ptr, ptr, ptr, ptr, i64)" in ir
     assert "declare i64 @mx_perform(ptr, ptr, ptr, i64)" in ir
     # `ask() -> resume(7)` is a TAIL-position resume (effect_tail.py), so
     # the trampolined form is declared and called instead of mx_resume.

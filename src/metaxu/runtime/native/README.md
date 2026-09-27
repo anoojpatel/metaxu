@@ -19,7 +19,11 @@ current inline lowering of runtime builtins.
   (`mx_handle` / `mx_perform` / `mx_resume`), matching the interpreter's
   parked-thread model; ASan fiber-annotated; leak-clean scheduler.  All
   scheduler state is `_Thread_local`, so each OS thread runs its own
-  independent instance (docs/threads_runtime.md)
+  independent instance (docs/threads_runtime.md).  `mx_handle_direct` is
+  the entry point for scopes whose every case tail-resumes or never
+  resumes (the compiler proves it): the body runs on the current stack
+  and a perform is a call of the case, about 28 ns against about 850 ns
+  through the coroutine pump (`scripts/bench_effects.py`)
 - `metaxu_threads.h` / `metaxu_threads.c` — pthreads-backed Thread/Mutex
   effect primitives (`mx_thread_spawn` / `mx_thread_join` /
   `mx_mutex_*`): real OS threads behind the `with EFFECT_*` mappings,
