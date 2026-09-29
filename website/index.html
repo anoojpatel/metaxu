@@ -162,6 +162,13 @@ a:focus-visible, button:focus-visible { outline: 2px solid var(--acc); outline-o
   font-weight: 700; color: #1b5f56;
   text-shadow: 0 0 10px rgba(33, 117, 106, .55);
 }
+/* the heaviest tier of the ramp: the arm cores, set above bold with a
+   tight glow, so the field reads as solid at its centre and thins
+   outward through bold, plain, the haze and the dust */
+.heroviz pre b.k {
+  font-weight: 800; color: #12463f;
+  text-shadow: 0 0 9px rgba(33, 117, 106, .55);
+}
 .thesis {
   font-size: 19.5px; line-height: 1.55; max-width: 34em;
   margin: 0 auto 14px; color: var(--fg); text-wrap: balance;
@@ -750,8 +757,13 @@ tile[2x2](5, 14; 14, 50)
 <script>
 /* The hero vortex: a four-arm spiral field sampled onto a character
    grid (the density ramp is the brightness) with a layer of particles
-   drifting along the flow.  The field turns slowly and breathes; the
-   pointer stirs it: a local glow, a swirl bend around the cursor, and
+   drifting along the flow.  Behind the arms lie two fainter layers, a
+   two-arm haze winding the other way and a scatter of dust; over them,
+   two offset echoes of the arms, the particles, the debris, the stars
+   and the fireworks.  The ramp's top tier is set heavier than bold, so
+   the field is solid at its centre and thins outward through nineteen
+   glyph weights.  The field turns slowly and breathes; the pointer
+   stirs it: a local glow, a swirl bend around the cursor, and
    horizontal position steering the spin speed and direction.  Reduced
    motion renders one static frame. */
 (function () {
@@ -760,7 +772,13 @@ tile[2x2](5, 14; 14, 50)
   var W = 72, H = 30, AX = 0.52;             // cell aspect: width/height
   // measured in Chromium at 13px Hasklig with the CSS tracking and
   // line-height above: 6.89px by 13.25px, so the sampled disc is round
-  var RAMP = ' `.,:;-=+*xX#%@';
+  var RAMP = " `.',:;-~=+!*oxX&#%@";      // nineteen steps, ASCII only
+  var LEVELS = RAMP.length - 1;
+  var EMPH = Math.round(LEVELS * 0.44);       // from here up: bold/italic
+  var HEAVY = Math.round(LEVELS * 0.86);      // from here up: the heavy tier
+  var DARK = 2;                               // ' ' ` . count as empty
+  var HAZE = " `'-~";                         // the counter-winding haze's ramp
+  var DUST = "`'.,";                          // specks in the dark cells
   var CX = W / 2 - 0.5, CY = H / 2 - 0.5;
   var RMAX = Math.min(CX * AX, CY) + 0.5;
   var reduced = window.matchMedia
@@ -824,16 +842,16 @@ tile[2x2](5, 14; 14, 50)
         var dx = (x - CX) * AX, dy = y - CY;
         var r = Math.sqrt(dx * dx + dy * dy);
         var th = Math.atan2(dy, dx);
-        var v = 0, rim = false;
+        var v = 0, rim = false, haze = 0;
         if (r <= RMAX) {
           var gx = (x - wx) * AX, gy = y - wy;
           var d2 = gx * gx + gy * gy;
           var g = Math.exp(-d2 / (7 * reach)) * wstr;    // the wound's reach
-          var edge = 1 - r / RMAX;           // arms die out at the rim
+          var edge = Math.pow(1 - r / RMAX, 0.75); // arms thin toward the rim
           // four arms, low pitch; the gamma (< 1) is what makes each
           // bright band WIDE instead of a thin ridge
           var band = Math.sin(4 * th + r * 0.6 - phase - g * 1.4);
-          var v0 = Math.pow(Math.max(0, band), 0.5) * edge * breath;
+          var v0 = Math.pow(Math.max(0, band), 0.38) * edge * breath;
           // the negative: the wound removes the arms around the pointer
           var wf = Math.exp(-d2 / (5 * reach)) * wstr * (1 - hole);
           v = v0 * (1 - wf);
@@ -851,34 +869,63 @@ tile[2x2](5, 14; 14, 50)
               delete consumed[key];
             }
           }
-        } else if (hole < 0.01) {
+          // the haze: two wide arms behind the field, winding the other
+          // way at half the rate, faint, drawn only where the arms leave
+          // room; the wound clears it too
+          var hb = Math.sin(2 * th - r * 0.45 + phase * 0.55);
+          haze = Math.pow(Math.max(0, hb), 1.6) * Math.pow(edge, 0.7)
+                 * 0.6 * (0.55 + 0.45 * breath) * (1 - wf) * (1 - hole);
+        } else if (hole < 0.01 && r > RMAX + 1.5) {
           row.push([' ', 0]); continue;
         }
         // the collapse: cross-fade into the black hole (its disk runs
         // past the spiral's rim, out to the grid's edge)
         if (hole > 0.01) v = v * (1 - hole) + horizonField(dx, dy, r, th) * hole;
-        var i2 = Math.round(v * (RAMP.length - 1));
-        if (i2 >= RAMP.length) i2 = RAMP.length - 1;
-        // the upper ramp is EMPHASISED: arm bodies and cores carry
-        // visible weight, as bold (1) or italic (2) depending on where a
-        // slow diagonal wave has reached; the wound's rim (6) wins
-        var em = i2 >= 8 ? style(x, y, t) : 0;
+        var i2 = Math.round(v * LEVELS);
+        if (i2 > LEVELS) i2 = LEVELS;
+        // the upper ramp is EMPHASISED: arm bodies carry visible weight,
+        // as bold (1) or italic (2) depending on where a slow diagonal
+        // wave has reached, and the cores go heavier still (8); the
+        // wound's rim (6) wins
+        var em = i2 >= HEAVY ? 8 : i2 >= EMPH ? style(x, y, t) : 0;
         if (rim && i2 >= 3) em = 6;
+        if (i2 <= DARK) {
+          // the layers behind the arms: the haze where it reaches, else
+          // dust -- sparse specks on a fixed hash of the cell, each
+          // fading in and out on its own slow phase
+          var hz = Math.round(haze * (HAZE.length - 1));
+          if (hz > i2) { row.push([HAZE[hz], 3]); continue; }
+          var hs = Math.sin(x * 12.9898 + y * 78.233) * 43758.5453;
+          hs -= Math.floor(hs);
+          if (hs > 0.84 && Math.sin(t * 0.0005 + hs * 40) > -0.1) {
+            row.push([DUST[Math.floor(hs * 100) % DUST.length], 4]); continue;
+          }
+        }
         row.push([RAMP[i2], em]);
       }
       grid.push(row);
     }
-    // the shadow layer: every visible arm cell casts a dim echo two
-    // columns right and one row down, into cells the field left dark
+    // the echo layers: every visible arm cell casts a dim echo two
+    // columns right and one row down, and the brighter cells a second,
+    // fainter one four columns right and two rows down, into cells the
+    // field left dark (over the dust, under everything else)
+    var MID = Math.round(LEVELS * 0.6);
     for (var sy = 0; sy < H; sy++) {
       for (var sx = 0; sx < W; sx++) {
-        var lvl = RAMP.indexOf(grid[sy][sx][0]);
-        if (lvl < 4) continue;
-        var tx = sx + 2, ty = sy + 1;
-        if (tx >= W || ty >= H) continue;
-        var under = grid[ty][tx];
-        if (under[1] === 0 && RAMP.indexOf(under[0]) <= 1) {
-          grid[ty][tx] = [lvl >= 9 ? ':' : '.', 3];
+        var cell0 = grid[sy][sx];
+        if (cell0[1] === 3 || cell0[1] === 4) continue;   // haze/dust cast nothing
+        var lvl = RAMP.indexOf(cell0[0]);
+        if (lvl < EMPH - 2) continue;
+        for (var e = 1; e <= 2; e++) {
+          if (e === 2 && lvl < MID) break;
+          var tx = sx + 2 * e, ty = sy + e;
+          if (tx >= W || ty >= H) continue;
+          var under = grid[ty][tx];
+          var empty = (under[1] === 0 && RAMP.indexOf(under[0]) <= DARK)
+                      || under[1] === 4;
+          if (empty) {
+            grid[ty][tx] = [e === 1 ? (lvl >= MID ? ':' : '.') : '`', 3];
+          }
         }
       }
     }
@@ -912,7 +959,7 @@ tile[2x2](5, 14; 14, 50)
         var kx = Math.round(st.x - sgn * k), ky = Math.round(st.y - slope * k);
         if (kx < 0 || kx >= W || ky < 0 || ky >= H) continue;
         var c0 = grid[ky][kx];
-        if (c0[1] === 0 && RAMP.indexOf(c0[0]) <= 2) {
+        if ((c0[1] === 0 && RAMP.indexOf(c0[0]) <= DARK) || c0[1] === 4) {
           grid[ky][kx] = [STAR_TAIL[k], k === 0 ? 7 : 4];   // bold head
         }
       }
@@ -940,10 +987,13 @@ tile[2x2](5, 14; 14, 50)
       }
     }
     // emit as tagged runs (RAMP, star and firework chars need no HTML
-    // escaping): b bold, i italic, s shadow, em star tail, strong
-    // firework, u wound rim, em>b star head
-    var OPEN = ['', '<b>', '<i>', '<s>', '<em>', '<strong>', '<u>', '<em><b>'];
-    var CLOSE = ['', '</b>', '</i>', '</s>', '</em>', '</strong>', '</u>', '</b></em>'];
+    // escaping -- the ramp holds an apostrophe, never < & or "): b bold,
+    // i italic, s shadow/haze/echo, em dust and star tail, strong
+    // firework, u wound rim, em>b star head, b.k the heavy core tier
+    var OPEN = ['', '<b>', '<i>', '<s>', '<em>', '<strong>', '<u>', '<em><b>',
+                '<b class="k">'];
+    var CLOSE = ['', '</b>', '</i>', '</s>', '</em>', '</strong>', '</u>', '</b></em>',
+                 '</b>'];
     var out = '';
     for (var y2 = 0; y2 < H; y2++) {
       var row2 = grid[y2], run = '', cur = 0;
@@ -1099,7 +1149,7 @@ tile[2x2](5, 14; 14, 50)
     }
     // the fade in and out: dips to a whisper, swells back (~18s cycle);
     // the hole burns at full brightness
-    var breath = (0.52 + 0.38 * Math.sin(t * 0.00035)) * (1 - hole) + 0.95 * hole;
+    var breath = (0.64 + 0.3 * Math.sin(t * 0.00035)) * (1 - hole) + 0.95 * hole;
     render(breath, t);
     // growth and shake while the hole is open
     if (hole > 0) {
