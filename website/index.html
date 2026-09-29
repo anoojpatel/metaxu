@@ -760,7 +760,8 @@ tile[2x2](5, 14; 14, 50)
    drifting along the flow.  Behind the arms lie two fainter layers, a
    two-arm haze winding the other way and a scatter of dust; over them,
    two offset echoes of the arms, the particles, the debris, the stars
-   and the fireworks.  The ramp's top tier is set heavier than bold, so
+   and the fireworks, and rings of bold particles that ripple along the
+   arms, driven by the hand.  The ramp's top tier is set heavier than bold, so
    the field is solid at its centre and thins outward through nineteen
    glyph weights.  The field turns slowly and breathes; the pointer
    stirs it: a local glow, a swirl bend around the cursor, and
@@ -800,6 +801,18 @@ tile[2x2](5, 14; 14, 50)
   // trails the pointer and heals about a second after it leaves.
   var wx = -1e3, wy = -1e3, wstr = 0, wRate = 0;
   var DEBRIS = [], consumed = {};
+  // Ripples: rings of bold particles that travel along the arms.  Left
+  // alone, one sets out from the centre every couple of seconds and
+  // climbs outward.  The pointer drives them: moving it spawns ripples
+  // at the pointer's own radius, sent outward when the hand moves away
+  // from the centre and inward when it moves toward it, and the speed
+  // of the hand (smoothed into `energy`) makes them more frequent,
+  // faster, wider and brighter.
+  var WAVES = [], nextWave = 1400, energy = 0, pmx = -1e3, pmy = -1e3;
+  function spawnWave(r, dir, amp) {
+    if (WAVES.length >= 9) WAVES.shift();
+    WAVES.push({ r: r, dir: dir, amp: amp });
+  }
   function spawnDebris(x, y) {
     var dx = (x - CX) * AX, dy = y - CY, r = Math.sqrt(dx * dx + dy * dy);
     DEBRIS.push({ r: r, th: Math.atan2(dy, dx),
@@ -842,7 +855,7 @@ tile[2x2](5, 14; 14, 50)
         var dx = (x - CX) * AX, dy = y - CY;
         var r = Math.sqrt(dx * dx + dy * dy);
         var th = Math.atan2(dy, dx);
-        var v = 0, rim = false, haze = 0;
+        var v = 0, rim = false, haze = 0, wv = 0;
         if (r <= RMAX) {
           var gx = (x - wx) * AX, gy = y - wy;
           var d2 = gx * gx + gy * gy;
@@ -869,6 +882,17 @@ tile[2x2](5, 14; 14, 50)
               delete consumed[key];
             }
           }
+          // the ripples: each wave is a gaussian in radius, felt only on
+          // the arms (v0 gates it), so it reads as a ring of particles
+          // climbing the spiral rather than a circle across the field
+          if (v0 > 0.28 && WAVES.length) {
+            var width = 0.7 + 0.9 * energy;
+            for (var wi = 0; wi < WAVES.length; wi++) {
+              var dw = r - WAVES[wi].r;
+              wv += WAVES[wi].amp * Math.exp(-dw * dw / width);
+            }
+            wv *= (1 - wf);
+          }
           // the haze: two wide arms behind the field, winding the other
           // way at half the rate, faint, drawn only where the arms leave
           // room; the wound clears it too
@@ -889,6 +913,11 @@ tile[2x2](5, 14; 14, 50)
         // wound's rim (6) wins
         var em = i2 >= HEAVY ? 8 : i2 >= EMPH ? style(x, y, t) : 0;
         if (rim && i2 >= 3) em = 6;
+        // a ripple crossing this cell: a bold particle, heavy at the crest
+        if (wv > 0.3) {
+          row.push([wv > 0.85 ? '@' : wv > 0.55 ? '*' : '+', wv > 0.85 ? 8 : 1]);
+          continue;
+        }
         if (i2 <= DARK) {
           // the layers behind the arms: the haze where it reaches, else
           // dust -- sparse specks on a fixed hash of the cell, each
@@ -1120,6 +1149,32 @@ tile[2x2](5, 14; 14, 50)
       wstr += (0 - wstr) * 0.04;
       if (wstr < 0.005) wstr = 0;
     }
+    // the ripples: the hand's speed (cells per second, smoothed) is the
+    // energy; its radial direction picks the way a new ripple travels
+    var vr = 0, hand = 0;
+    if (mx > -100 && pmx > -100 && dt > 0) {
+      var hvx = (mx - pmx) * AX / dt * 1000, hvy = (my - pmy) / dt * 1000;
+      hand = Math.sqrt(hvx * hvx + hvy * hvy);
+      var rdx = (mx - CX) * AX, rdy = my - CY, rl = Math.sqrt(rdx * rdx + rdy * rdy) || 1;
+      vr = (hvx * rdx + hvy * rdy) / rl;                // radial speed, signed
+    }
+    energy += (Math.min(1, hand / 45) - energy) * (hand > 0 ? 0.18 : 0.03);
+    if (t > nextWave) {
+      if (mx > -100 && pr <= RMAX) {
+        spawnWave(pr, vr < -3 ? -1 : 1, 0.55 + 0.7 * energy);
+        nextWave = t + 1800 / (1 + 5 * energy);
+      } else {
+        spawnWave(0.6, 1, 0.6);
+        nextWave = t + 2400 + Math.random() * 600;
+      }
+    }
+    for (var wv2 = WAVES.length - 1; wv2 >= 0; wv2--) {
+      var wave = WAVES[wv2];
+      wave.r += wave.dir * (4 + 9 * energy) * dt / 1000;
+      wave.amp *= 1 - dt * 0.00008;                  // fades a little en route
+      if (wave.r < -0.5 || wave.r > RMAX + 1 || wave.amp < 0.15) WAVES.splice(wv2, 1);
+    }
+    pmx = mx; pmy = my;
     speed += (targetSpeed - speed) * 0.05;
     // the spin: slow by default; with the hole open it winds up over a
     // few seconds to a top speed seven times the resting rate
