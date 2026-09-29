@@ -10,17 +10,23 @@ before a single timing is taken. Methodology inherited from
 benchmarks/contention/: -falign-functions=64 everywhere, alternating
 run order, medians.
 
-## Measured (2026-08-19, this container, clang -O2, 15 rounds,
-## post tail-resume trampoline AND inline Vec fast paths)
+## Measured (2026-09-29, this container, clang -O2, 11 rounds,
+## post direct scopes: tail-resumptive handlers run on the current stack)
 
 | benchmark | what it stresses | metaxu | C | ratio |
 | --- | --- | --- | --- | --- |
-| fib(35) | recursion, calls | 30.6 ms | 30.0 ms | **1.02x** |
-| mandelbrot 800² | float ALU, branches | 49.0 ms | 49.6 ms | **0.99x** |
-| orbit 20M steps | struct-per-step rebuild | 164.8 ms | 166.3 ms | **0.99x** |
-| nsieve 3×2M | Vec indexing | 82.8 ms | 75.9 ms | **1.09x** |
-| par_sum 40M ×(1+4 threads) | OS threads, join values | 59.2 ms | 56.8 ms | **1.04x** |
-| pipeline 200k (metaxu-only) | 3-stage effects pipeline | 166.1 ms | — | ~830 ns/element through 3 handlers |
+| fib(35) | recursion, calls | 29.7 ms | 29.7 ms | **1.00x** |
+| mandelbrot 800² | float ALU, branches | 50.1 ms | 49.0 ms | **1.02x** |
+| orbit 20M steps | struct-per-step rebuild | 171.0 ms | 176.2 ms | **0.97x** |
+| nsieve 3×2M | Vec indexing | 83.2 ms | 73.3 ms | **1.13x** |
+| par_sum 40M ×(1+4 threads) | OS threads, join values | 62.6 ms | 60.8 ms | **1.03x** |
+| pipeline 200k (metaxu-only) | 3-stage effects pipeline | 8.5 ms | — | ~42 ns/element through 3 handlers |
+
+Previous table (2026-08-19, 15 rounds, before direct scopes): fib 1.02x,
+mandelbrot 0.99x, orbit 0.99x, nsieve 1.09x, par_sum 1.04x, pipeline
+166.1 ms (~830 ns/element). The five races moved within noise; the
+pipeline row is the change (docs/v1_gap_analysis.md, "Effects: direct
+scopes").
 
 (Absolute ms move between runs on this shared container — an earlier
 table was taken under load and read 2.5x slower on the C SIDE of nsieve
@@ -57,10 +63,12 @@ Reading the results honestly:
   arrival: the handler pump dispatched each element RECURSIVELY, capping
   streams at ~4k elements natively (and ~10-20k in the interpreter). The
   tail-resume trampoline fixed both engines — pipelines are flat to 10M+
-  elements now — and the figure above works out to ~280 ns per handler
-  crossing (each element crosses filter, map and sum), the measured
-  price of a handler dispatch. Writing real programs remains this
-  compiler's best bug detector.
+  elements now. Direct scopes then removed the context switch: every
+  arm in filter, map and sum tail-resumes, so the body runs on the
+  current stack and each perform is a call of the arm. The figure above
+  works out to ~14 ns per handler crossing (each element crosses all
+  three), down from ~280 ns, the price of a `swapcontext` pair. Writing
+  real programs remains this compiler's best bug detector.
 
 ## Adding a benchmark
 

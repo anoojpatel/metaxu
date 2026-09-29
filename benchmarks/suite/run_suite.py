@@ -32,7 +32,7 @@ REPO = HERE.parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
 NATIVE = REPO / "src" / "metaxu" / "runtime" / "native"
-RT_FILES = ("metaxu_rt", "metaxu_effects", "metaxu_threads")
+RT_FILES = ("metaxu_rt", "metaxu_effects", "metaxu_threads", "metaxu_io")
 ALIGN = "-falign-functions=64"
 CFLAGS = ["-std=c11", "-O2", "-g", "-fPIC", "-Wall", "-Wextra",
           "-pthread", ALIGN]

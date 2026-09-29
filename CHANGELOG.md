@@ -62,7 +62,8 @@ with no section and uses it as the release notes.
   answers each perform with a plain call of the arm, with no coroutine
   and no context switch. A perform costs about 28 ns instead of about
   850 ns, and the stream pipeline `sum(map(filter(iota(n))))` runs 27
-  times faster (`scripts/bench_effects.py`). Handlers that work after
+  times faster (`scripts/bench_effects.py`); the showcase suite's
+  200k-element pipeline went from 166 ms to 8.5 ms. Handlers that work after
   the resume keep the coroutine path. `test_effect_direct.py` checks the
   native program against the interpreter for the tail, abortive, nested,
   cross-fiber abort and failing-arm shapes.

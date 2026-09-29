@@ -700,7 +700,7 @@ tile[2x2](5, 14; 14, 50)
     A Metaxu build asserts output equality with its twin before any
     timing runs. Both sides use the same clang
     at <span class="mono">-O2</span> with function alignment pinned; runs
-    alternate order; the ratio is a median of 15 rounds. What a table
+    alternate order; the ratio is a median of 11 rounds. What a table
     like this can and can't tell you is spelled out below it.</p>
 
     <div class="tablewrap">
@@ -712,19 +712,22 @@ tile[2x2](5, 14; 14, 50)
           </tr>
         </thead>
         <tbody>
-          <tr><td>fib(35)</td><td class="what">recursion, calls</td><td class="num">30.6 ms</td><td class="num">30.0 ms</td><td class="ratio">1.02x</td></tr>
-          <tr><td>mandelbrot 800&sup2;</td><td class="what">float ALU, branches</td><td class="num">49.0 ms</td><td class="num">49.6 ms</td><td class="ratio">0.99x</td></tr>
-          <tr><td>orbit 20M steps</td><td class="what">struct-per-step rebuild</td><td class="num">164.8 ms</td><td class="num">166.3 ms</td><td class="ratio">0.99x</td></tr>
-          <tr><td>nsieve 3&times;2M</td><td class="what">Vec indexing, bounds-checked</td><td class="num">82.8 ms</td><td class="num">75.9 ms</td><td class="ratio">1.09x</td></tr>
-          <tr><td>par_sum 40M &times; (1+4 thr)</td><td class="what">OS threads, join values</td><td class="num">59.2 ms</td><td class="num">56.8 ms</td><td class="ratio">1.04x</td></tr>
-          <tr><td>pipeline 200k</td><td class="what">3-stage effects pipeline (metaxu-only)</td><td class="num">166.1 ms</td><td class="num">&mdash;</td><td class="ratio">~830 ns/elem</td></tr>
+          <tr><td>fib(35)</td><td class="what">recursion, calls</td><td class="num">29.7 ms</td><td class="num">29.7 ms</td><td class="ratio">1.00x</td></tr>
+          <tr><td>mandelbrot 800&sup2;</td><td class="what">float ALU, branches</td><td class="num">50.1 ms</td><td class="num">49.0 ms</td><td class="ratio">1.02x</td></tr>
+          <tr><td>orbit 20M steps</td><td class="what">struct-per-step rebuild</td><td class="num">171.0 ms</td><td class="num">176.2 ms</td><td class="ratio">0.97x</td></tr>
+          <tr><td>nsieve 3&times;2M</td><td class="what">Vec indexing, bounds-checked</td><td class="num">83.2 ms</td><td class="num">73.3 ms</td><td class="ratio">1.13x</td></tr>
+          <tr><td>par_sum 40M &times; (1+4 thr)</td><td class="what">OS threads, join values</td><td class="num">62.6 ms</td><td class="num">60.8 ms</td><td class="ratio">1.03x</td></tr>
+          <tr><td>pipeline 200k</td><td class="what">3-stage effects pipeline (metaxu-only)</td><td class="num">8.5 ms</td><td class="num">&mdash;</td><td class="ratio">~42 ns/elem</td></tr>
         </tbody>
       </table>
     </div>
     <p class="pinned"><b>#</b> every number on this page is from a pinned
-    benchmark or test gate in the repository (benchmarks/suite, 2026-08-19,
-    clang -O2, 15 rounds). Absolute times vary on a shared container; the
-    paired, interleaved ratios are the stable signal.</p>
+    benchmark or test gate in the repository (benchmarks/suite, 2026-09-29,
+    clang -O2, 11 rounds). Absolute times vary on a shared container; the
+    paired, interleaved ratios are the stable signal. The pipeline row was
+    166 ms (about 830 ns per element) before handlers that only
+    tail-resume began running on the current stack; each element still
+    crosses three handlers, now at about 14 ns a crossing.</p>
     <p class="pinned" id="asterisks"><b># the asterisks.</b> These are microbenchmarks,
     and microbenchmarks reward whoever wrote them. The kernels are tiny
     and fit in cache. The C twins are straightforward ports, not code a
