@@ -103,6 +103,8 @@ _MATH_EXTERNS: Dict[str, Tuple[Tuple[str, ...], str]] = {
     "sqrt": ((F64,), F64),
     "sin": ((F64,), F64),
     "cos": ((F64,), F64),
+    "exp": ((F64,), F64),
+    "log": ((F64,), F64),
 }
 
 # Callees implemented by the vec/string/trait runtime: calling them means the

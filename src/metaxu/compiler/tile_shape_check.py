@@ -55,6 +55,10 @@ TILE_ARITY = {
     # f32/f16 conversions (Stage 1d/1f): f32 and f16 are tile ELEMENT
     # kinds only.
     "to_f32": 1, "to_f16": 1, "to_f64": 1,
+    # Higher-order ops: a Metaxu function per element (docs/gpu_tiles.md);
+    # the library (std/tile.mx) builds exp / row_max / sub_rows ... on them.
+    "map": 2, "zip": 3, "reduce_rows": 3, "reduce_cols": 3,
+    "broadcast_rows": 3, "broadcast_cols": 3,
 }
 
 
@@ -270,7 +274,48 @@ class _TileShapeChecker:
             if shape is None:
                 return None
             return _TileInfo(shape[0], shape[1], _lit_ekind(args[5]))
-        if op in ("add", "mul"):
+        if op == "map":
+            return infos[0]
+        if op in ("reduce_rows", "reduce_cols"):
+            t = infos[0]
+            if t is None:
+                return None
+            ik = _lit_ekind(args[1])
+            if t.ekind is not None and ik is not None:
+                if t.ekind == "int" and ik != "int":
+                    self.report(node, f"Tile.{op}: init must be an int for "
+                                      f"an int tile, got a {_kname(ik)}")
+                    return None
+                if t.ekind != "int" and ik != "f64":
+                    article = "an" if t.ekind != "f64" else "a"
+                    self.report(node, f"Tile.{op}: init must be a float for "
+                                      f"{article} {_kname(t.ekind)} tile, got "
+                                      f"a{'n' if ik == 'int' else ''} "
+                                      f"{_kname(ik)}")
+                    return None
+            return (_TileInfo(t.rows, 1, t.ekind) if op == "reduce_rows"
+                    else _TileInfo(1, t.cols, t.ekind))
+        if op in ("broadcast_rows", "broadcast_cols"):
+            t, v = infos[0], infos[1]
+            if t is not None and v is not None:
+                want = (t.rows, 1) if op == "broadcast_rows" else (1, t.cols)
+                if (v.rows, v.cols) != want:
+                    self.report(node, f"Tile.{op}: shape mismatch: expected "
+                                      f"a {want[0]}x{want[1]} "
+                                      f"{'column' if op == 'broadcast_rows' else 'row'} "
+                                      f"for a {t.rows}x{t.cols} tile, got "
+                                      f"{v.rows}x{v.cols}")
+                    return None
+                if t.ekind is not None and v.ekind is not None \
+                        and t.ekind != v.ekind:
+                    self.report(node, f"Tile.{op}: element kinds differ "
+                                      f"({_kname(t.ekind)} vs "
+                                      f"{_kname(v.ekind)})")
+                    return None
+                return _TileInfo(t.rows, t.cols,
+                                 t.ekind if t.ekind is not None else v.ekind)
+            return t
+        if op in ("add", "mul", "zip"):
             a, b = infos[0], infos[1]
             if a is not None and b is not None:
                 if (a.rows, a.cols) != (b.rows, b.cols):

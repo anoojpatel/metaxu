@@ -270,6 +270,22 @@ mx_vec  *mx_tile_to_vec(const mx_tile *t);
 mx_tile *mx_tile_add(const mx_tile *a, const mx_tile *b, int64_t ekind);
 mx_tile *mx_tile_mul(const mx_tile *a, const mx_tile *b, int64_t ekind);
 mx_tile *mx_tile_scale(const mx_tile *t, int64_t sword, int64_t ekind);
+/* The higher-order tile ops (docs/gpu_tiles.md): a word thunk per element,
+ * driven here in the interpreter's row-major order; `ekind` rounds f32/f16
+ * results to their width (the compiler lowers int/f64 maps today).
+ * Shape mismatches raise the interpreter's catchable message. */
+mx_tile *mx_tile_map(const mx_tile *t, mx_fvec_map_fn fn, void *env,
+                     int64_t ekind);
+mx_tile *mx_tile_zip(const mx_tile *t, const mx_tile *u, mx_fvec_zip_fn fn,
+                     void *env, int64_t ekind);
+mx_tile *mx_tile_reduce_rows(const mx_tile *t, int64_t init,
+                             mx_fvec_zip_fn fn, void *env, int64_t ekind);
+mx_tile *mx_tile_reduce_cols(const mx_tile *t, int64_t init,
+                             mx_fvec_zip_fn fn, void *env, int64_t ekind);
+mx_tile *mx_tile_broadcast_rows(const mx_tile *t, const mx_tile *v,
+                                mx_fvec_zip_fn fn, void *env, int64_t ekind);
+mx_tile *mx_tile_broadcast_cols(const mx_tile *t, const mx_tile *v,
+                                mx_fvec_zip_fn fn, void *env, int64_t ekind);
 mx_tile *mx_tile_dot(const mx_tile *a, const mx_tile *b, int64_t ekind);
 int64_t  mx_tile_sum(const mx_tile *t, int64_t ekind);
 mx_tile *mx_tile_to_f32(const mx_tile *t, int64_t src_ekind);

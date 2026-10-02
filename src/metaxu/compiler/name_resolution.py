@@ -94,6 +94,8 @@ DOTTED_BUILTIN_NAMES = frozenset({
     "Tile.load", "Tile.load_or", "Tile.store", "Tile.store_clipped",
     "Tile.load_rows", "Tile.store_rows", "Tile.to_f32", "Tile.to_f16",
     "Tile.to_f64",
+    "Tile.map", "Tile.zip", "Tile.reduce_rows", "Tile.reduce_cols",
+    "Tile.broadcast_rows", "Tile.broadcast_cols",
 })
 
 #: Option/Result are language-provided enums (`hir._from_orig_expr` builds

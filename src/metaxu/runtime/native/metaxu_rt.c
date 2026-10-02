@@ -791,6 +791,119 @@ static double mx_ekr(int64_t ekind, double x) {
 MX_TILE_EW(mx_tile_add, x + y, x + y)
 MX_TILE_EW(mx_tile_mul, x * y, x * y)
 
+/* -- Higher-order tile ops (docs/gpu_tiles.md) -----------------------------
+ * The per-site thunks the compiler emits take and return element WORDS;
+ * this runtime only drives the loops in the interpreter's pinned order
+ * (row-major; a reduction folds `init` through each row or column left to
+ * right) and rounds narrow results once (`ekind` 2 = f32, 3 = f16 -- the
+ * compiler lowers int/f64 maps today, so this is forward-compatible).
+ * Dynamic shape mismatches raise the interpreter's exact catchable text. */
+
+static int64_t mx_tile_round_word(int64_t w, int64_t ekind) {
+    if (ekind == 0) return w;
+    double x;
+    memcpy(&x, &w, sizeof x);
+    x = mx_ekr(ekind, x);
+    memcpy(&w, &x, sizeof w);
+    return w;
+}
+
+mx_tile *mx_tile_map(const mx_tile *t, mx_fvec_map_fn fn, void *env,
+                     int64_t ekind) {
+    mx_tile_check(t, "Tile.map");
+    if (fn == NULL) mx_rt_fail("Tile.map: NULL body function");
+    mx_tile *out = mx_tile_new(t->rows, t->cols);
+    int64_t n = t->rows * t->cols;
+    for (int64_t i = 0; i < n; i++)
+        out->elems[i] = mx_tile_round_word(fn(env, t->elems[i]), ekind);
+    return out;
+}
+
+mx_tile *mx_tile_zip(const mx_tile *t, const mx_tile *u, mx_fvec_zip_fn fn,
+                     void *env, int64_t ekind) {
+    mx_tile_check(t, "Tile.zip");
+    mx_tile_check(u, "Tile.zip");
+    if (fn == NULL) mx_rt_fail("Tile.zip: NULL body function");
+    if (t->rows != u->rows || t->cols != u->cols) {
+        mx_rt_raise("Tile.zip: shape mismatch: %lldx%lld vs %lldx%lld",
+                    (long long)t->rows, (long long)t->cols,
+                    (long long)u->rows, (long long)u->cols);
+    }
+    mx_tile *out = mx_tile_new(t->rows, t->cols);
+    int64_t n = t->rows * t->cols;
+    for (int64_t i = 0; i < n; i++)
+        out->elems[i] = mx_tile_round_word(fn(env, t->elems[i], u->elems[i]),
+                                           ekind);
+    return out;
+}
+
+static mx_tile *mx_tile_reduce(const char *op, const mx_tile *t, int64_t init,
+                               mx_fvec_zip_fn fn, void *env, int64_t ekind,
+                               int by_rows) {
+    mx_tile_check(t, op);
+    if (fn == NULL) mx_rt_fail("%s: NULL body function", op);
+    int64_t outer = by_rows ? t->rows : t->cols;
+    int64_t inner = by_rows ? t->cols : t->rows;
+    mx_tile *out = by_rows ? mx_tile_new(t->rows, 1) : mx_tile_new(1, t->cols);
+    int64_t init_w = mx_tile_round_word(init, ekind);
+    for (int64_t i = 0; i < outer; i++) {
+        int64_t acc = init_w;
+        for (int64_t j = 0; j < inner; j++) {
+            int64_t x = by_rows ? t->elems[i * t->cols + j]
+                                : t->elems[j * t->cols + i];
+            acc = mx_tile_round_word(fn(env, acc, x), ekind);
+        }
+        out->elems[i] = acc;
+    }
+    return out;
+}
+
+mx_tile *mx_tile_reduce_rows(const mx_tile *t, int64_t init,
+                             mx_fvec_zip_fn fn, void *env, int64_t ekind) {
+    return mx_tile_reduce("Tile.reduce_rows", t, init, fn, env, ekind, 1);
+}
+
+mx_tile *mx_tile_reduce_cols(const mx_tile *t, int64_t init,
+                             mx_fvec_zip_fn fn, void *env, int64_t ekind) {
+    return mx_tile_reduce("Tile.reduce_cols", t, init, fn, env, ekind, 0);
+}
+
+static mx_tile *mx_tile_broadcast(const char *op, const mx_tile *t,
+                                  const mx_tile *v, mx_fvec_zip_fn fn,
+                                  void *env, int64_t ekind, int by_rows) {
+    mx_tile_check(t, op);
+    mx_tile_check(v, op);
+    if (fn == NULL) mx_rt_fail("%s: NULL body function", op);
+    int64_t wr = by_rows ? t->rows : 1, wc = by_rows ? 1 : t->cols;
+    if (v->rows != wr || v->cols != wc) {
+        mx_rt_raise("%s: shape mismatch: expected a %lldx%lld %s for a "
+                    "%lldx%lld tile, got %lldx%lld",
+                    op, (long long)wr, (long long)wc,
+                    by_rows ? "column" : "row",
+                    (long long)t->rows, (long long)t->cols,
+                    (long long)v->rows, (long long)v->cols);
+    }
+    mx_tile *out = mx_tile_new(t->rows, t->cols);
+    for (int64_t i = 0; i < t->rows; i++) {
+        for (int64_t j = 0; j < t->cols; j++) {
+            int64_t s = by_rows ? v->elems[i] : v->elems[j];
+            out->elems[i * t->cols + j] = mx_tile_round_word(
+                fn(env, t->elems[i * t->cols + j], s), ekind);
+        }
+    }
+    return out;
+}
+
+mx_tile *mx_tile_broadcast_rows(const mx_tile *t, const mx_tile *v,
+                                mx_fvec_zip_fn fn, void *env, int64_t ekind) {
+    return mx_tile_broadcast("Tile.broadcast_rows", t, v, fn, env, ekind, 1);
+}
+
+mx_tile *mx_tile_broadcast_cols(const mx_tile *t, const mx_tile *v,
+                                mx_fvec_zip_fn fn, void *env, int64_t ekind) {
+    return mx_tile_broadcast("Tile.broadcast_cols", t, v, fn, env, ekind, 0);
+}
+
 mx_tile *mx_tile_scale(const mx_tile *t, int64_t sword, int64_t ekind) {
     mx_tile_check(t, "Tile.scale");
     mx_tile *out = mx_tile_new(t->rows, t->cols);

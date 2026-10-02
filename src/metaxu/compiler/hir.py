@@ -36,7 +36,7 @@ _BUILTIN_METHODS = frozenset({
     # `s.to_bytes()` (UTF-8 bytes as a Vec of ints) and `v.from_bytes()`.
     "to_bytes", "from_bytes",
     # math methods on numbers (runtime library)
-    "sqrt", "sin", "cos",
+    "sqrt", "sin", "cos", "exp", "log",
     # FFI: `x.as_ptr()` — raw pointer view of a string/vector's bytes
     # (interpreter shim over the simulated C heap; see mir_interp).
     "as_ptr",
@@ -151,7 +151,7 @@ BUILTIN_FUNCTION_NAMES = frozenset({
     # `raise(message)`: a catchable runtime failure carrying `message`
     # (what `try` binds), on both engines.
     "raise",
-    "sqrt", "sin", "cos", "neg", "not", "bnot",
+    "sqrt", "sin", "cos", "exp", "log", "max", "min", "neg", "not", "bnot",
     # FFI shims over the interpreter's simulated C heap
     "malloc", "free", "memcpy", "realloc",
     "ptr_read", "ptr_write", "as_ptr", "fopen", "fclose",

@@ -1037,8 +1037,16 @@ _SUPPORTED_BINOPS = (set(_ARITH_INT) | set(_CMP_INT) | set(_LOGIC)
 # Builtins --------------------------------------------------------------------
 
 _PRINT_BUILTINS = {"print", "println"}
-_MATH_EXTERNS = {"sqrt", "sin", "cos"}  # double -> double libc functions
-_INLINE_BUILTINS = {"neg", "not", "bnot"}
+_MATH_EXTERNS = {"sqrt", "sin", "cos", "exp", "log"}  # double -> double libc functions
+_INLINE_BUILTINS = {"neg", "not", "bnot", "max", "min"}
+# The higher-order tile ops (docs/gpu_tiles.md): a statically-known lambda
+# per element, driven by mx_tile_map and friends through a per-site word
+# thunk exactly like __vec_comprehension.  Element kinds I64 and F64 lower;
+# f32/f16 tiles demote (their lambdas run in narrow mode, which the native
+# scalar path does not model yet -- kernels and the interpreter do).
+_TILE_HOF = {"Tile.map": 1, "Tile.zip": 2, "Tile.reduce_rows": 2,
+             "Tile.reduce_cols": 2, "Tile.broadcast_rows": 2,
+             "Tile.broadcast_cols": 2}
 
 # Vec/string builtins now lowered to the NATIVE runtime (metaxu_rt.c, linked
 # by llvm_run): these mirror the interpreter's builtins exactly.  NAME
@@ -1081,7 +1089,10 @@ _NATIVE_RT_CALLS = {"Vec.new", "push", "pop", "len", "to_string",
                     "Tile.get", "Tile.rows", "Tile.cols", "Tile.load",
                     "Tile.load_or", "Tile.store", "Tile.store_clipped",
                     "Tile.load_rows", "Tile.store_rows",
-                    "Tile.to_f32", "Tile.to_f16", "Tile.to_f64"}
+                    "Tile.to_f32", "Tile.to_f16", "Tile.to_f64",
+                    "Tile.map", "Tile.zip", "Tile.reduce_rows",
+                    "Tile.reduce_cols", "Tile.broadcast_rows",
+                    "Tile.broadcast_cols"}
 
 # Extern C symbols the interpreter shims over its simulated heap
 # (mir_interp._ffi_*): natively these are DIRECT calls to the real libc
@@ -1111,7 +1122,8 @@ _FFI_CALLS = set(_EXTERN_C_SIGS) | _FFI_SHIMS
 _TRAIT_BUILTIN_FALLBACK = {"to_string", "int_to_str", "len", "push", "pop",
                            "split", "find", "replace", "trim", "join",
                            "to_bytes", "from_bytes",
-                           "sqrt", "sin", "cos", "assert"} | _FFI_CALLS
+                           "sqrt", "sin", "cos", "exp", "log", "max", "min",
+                           "assert"} | _FFI_CALLS
 
 # The linear string builtins' native symbols, argument kinds and result
 # kinds.  `to_bytes` gives the UTF-8 bytes of a string as a Vec of ints
@@ -1262,6 +1274,12 @@ _RT_SIGS = {
     "mx_fvec_binop": ("ptr", ("i64", "i64", "i64", "i64", "i64", "i64")),
     "mx_fvec_promote": ("ptr", ("ptr",)),
     "mx_fvec_map": ("ptr", ("ptr", "ptr", "ptr", "i64")),
+    "mx_tile_map": ("ptr", ("ptr", "ptr", "ptr", "i64")),
+    "mx_tile_zip": ("ptr", ("ptr", "ptr", "ptr", "ptr", "i64")),
+    "mx_tile_reduce_rows": ("ptr", ("ptr", "i64", "ptr", "ptr", "i64")),
+    "mx_tile_reduce_cols": ("ptr", ("ptr", "i64", "ptr", "ptr", "i64")),
+    "mx_tile_broadcast_rows": ("ptr", ("ptr", "ptr", "ptr", "ptr", "i64")),
+    "mx_tile_broadcast_cols": ("ptr", ("ptr", "ptr", "ptr", "ptr", "i64")),
     "mx_fvec_set_copy": ("ptr", ("ptr", "i64", "i64")),
     "mx_fvec_zip_map": ("ptr", ("ptr", "ptr", "ptr", "ptr", "i64")),
     "mx_fvec_to_str": ("ptr", ("ptr", "i64", "i64")),
@@ -4139,6 +4157,43 @@ def _infer_kinds(info: _Info, sigs: Dict[str, _Sig], structs: _StructTable,
             for a in args:
                 ch = mark(a, F64) or ch
             ch = mark(dst, F64) or ch
+        elif name in _TILE_HOF:
+            # Element kinds flow ONE WAY into the lambda's parameters (the
+            # comprehension contract); the result tile's kind is fixed by
+            # the op from the receiver's.  Only I64/F64 elements are
+            # pinned here -- f32/f16 demote in the consistency check.
+            tk = get(args[0])
+            fnvar = args[-1]
+            if _is_tile(tk):
+                elem, r, c = _tile_parts(tk)
+                ek = _tile_scalar(elem)
+                fk = get(fnvar)
+                lsig = sigs.get(_closure_lambda(fk)) if _is_closure(fk) \
+                    else None
+                if lsig is not None and len(lsig.params) == _TILE_HOF[name] \
+                        and elem in (I64, F64):
+                    for i in range(len(lsig.params)):
+                        nk = _join(lsig.params[i], ek)
+                        if nk != lsig.params[i]:
+                            lsig.params[i] = nk
+                            ch = True
+                            global_changed = True
+                if name == "Tile.map":
+                    ch = mark(dst, tk) or ch
+                elif name == "Tile.zip":
+                    ch = unify((dst, args[0], args[1])) or ch
+                elif name == "Tile.reduce_rows":
+                    ch = mark(args[1], ek) or ch
+                    ch = mark(dst, _tile_of(elem, r, 1)) or ch
+                elif name == "Tile.reduce_cols":
+                    ch = mark(args[1], ek) or ch
+                    ch = mark(dst, _tile_of(elem, 1, c)) or ch
+                elif name == "Tile.broadcast_rows":
+                    ch = mark(args[1], _tile_of(elem, r, 1)) or ch
+                    ch = mark(dst, tk) or ch
+                else:  # broadcast_cols
+                    ch = mark(args[1], _tile_of(elem, 1, c)) or ch
+                    ch = mark(dst, tk) or ch
         elif name.startswith("Tile."):
             ch = tile_builtin(name[len("Tile."):], dst, args) or ch
         return ch
@@ -4563,6 +4618,9 @@ def _infer_kinds(info: _Info, sigs: Dict[str, _Sig], structs: _StructTable,
                     elif bname == "neg":
                         if len(args) == 1:
                             changed = unify((dst, args[0])) or changed
+                    elif bname in ("max", "min"):
+                        if len(args) == 2:
+                            changed = unify((dst, args[0], args[1])) or changed
                     elif bname == "bnot":
                         pass  # `~x` is i64-only (the default kind)
                     elif bname in _PRINT_BUILTINS or bname == "not":
@@ -5401,6 +5459,67 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                 elif ty(args[1]) != I64:
                     probs.append(f"{name} offset {args[1]!r} is "
                                  f"{ty(args[1])}, not an int")
+            elif name in _TILE_HOF:
+                ka = ty(args[0])
+                if not _is_tile(ka):
+                    probs.append(f"{name} receiver {args[0]!r} has kind "
+                                 f"{ka}, not a Tile (its shape must be "
+                                 "statically known)")
+                    return
+                elem, r, c = _tile_parts(ka)
+                ek = _tile_scalar(elem)
+                if elem not in (I64, F64):
+                    probs.append(
+                        f"{name} over a tile of {elem} elements: narrow-mode "
+                        "lambda arithmetic is not lowered natively yet "
+                        "(f32/f16 maps run on the interpreter and in kernels)")
+                    return
+                fnvar = args[-1]
+                fk = ty(fnvar)
+                if not _is_closure(fk) or _is_dyn_closure(fk):
+                    probs.append(f"{name} body {fnvar!r} is not a "
+                                 "statically-known closure")
+                    return
+                lname = _closure_lambda(fk)
+                lsig = sigs.get(lname)
+                if lsig is None or lname not in module_names:
+                    probs.append(f"{name} body lambda {lname!r} unknown")
+                    return
+                if len(lsig.params) != _TILE_HOF[name]:
+                    probs.append(f"{name} body lambda {lname!r} takes "
+                                 f"{len(lsig.params)} parameters (expects "
+                                 f"{_TILE_HOF[name]})")
+                    return
+                if any(pk != ek for pk in lsig.params) or lsig.ret != ek:
+                    probs.append(
+                        f"{name} body lambda {lname!r} has kinds "
+                        f"{tuple(lsig.params)} -> {lsig.ret}; elements are {ek}")
+                    return
+                if name == "Tile.zip" and ty(args[1]) != ka:
+                    probs.append(f"{name} operands {ka} and {ty(args[1])} "
+                                 "differ")
+                elif name == "Tile.reduce_rows" or name == "Tile.reduce_cols":
+                    if ty(args[1]) != ek:
+                        probs.append(f"{name} init {args[1]!r} is "
+                                     f"{ty(args[1])}, elements are {ek}")
+                elif name == "Tile.broadcast_rows":
+                    if ty(args[1]) != _tile_of(elem, r, 1):
+                        probs.append(f"{name} vector {args[1]!r} is "
+                                     f"{ty(args[1])}, expected "
+                                     f"{_tile_of(elem, r, 1)}")
+                elif name == "Tile.broadcast_cols":
+                    if ty(args[1]) != _tile_of(elem, 1, c):
+                        probs.append(f"{name} vector {args[1]!r} is "
+                                     f"{ty(args[1])}, expected "
+                                     f"{_tile_of(elem, 1, c)}")
+                want = {"Tile.map": ka, "Tile.zip": ka,
+                        "Tile.reduce_rows": _tile_of(elem, r, 1),
+                        "Tile.reduce_cols": _tile_of(elem, 1, c),
+                        "Tile.broadcast_rows": ka,
+                        "Tile.broadcast_cols": ka}[name]
+                if ty(dst) != want:
+                    probs.append(f"{name} result {dst!r} is {ty(dst)}, "
+                                 f"expected {want}")
             elif top in ("add", "mul", "scale", "dot", "sum", "transpose",
                          "get", "to_vec", "rows", "cols", "to_f32",
                          "to_f16", "to_f64"):
@@ -6028,6 +6147,15 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                         probs.append(
                             f"neg of kind {ty(dst)} (the interpreter only "
                             "negates numbers)")
+                elif bname in ("max", "min"):
+                    if len(args) != 2:
+                        probs.append(f"{bname} with {len(args)} arguments "
+                                     "(expects 2)")
+                    elif ty(dst) not in (I64, F64) or any(
+                            ty(a) != ty(dst) for a in args):
+                        probs.append(
+                            f"{bname} of kinds {ty(args[0])}, {ty(args[1])} "
+                            f"-> {ty(dst)} (two ints or two floats)")
                 elif bname == "not":
                     if len(args) == 1 and ty(dst) != I64:
                         probs.append(f"not of kind {ty(dst)}")
@@ -8814,6 +8942,76 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                     "  ; total conversion; src ekind says how to read "
                     "the words")
                 setval(dst, v, lines)
+            elif name in _TILE_HOF:
+                # Per-site word thunk (the __vec_comprehension recipe):
+                # decode the element word(s) to the lambda's typed
+                # parameters -- pinned to the element kind, so a bitcast
+                # for f64 and the identity for int -- call the lambda with
+                # its env, encode the result back to a word.  The C
+                # runtime drives the loop in the interpreter's order.
+                tk = kind(opargs[0])
+                elem, _r, _c = _tile_parts(tk)
+                ek = _tile_scalar(elem)
+                fnvar = opargs[-1]
+                lname = _closure_lambda(kind(fnvar))
+                if lname not in emitted_names:
+                    raise _Unsupported(
+                        f"{name} body lambda {lname!r} is not emitted")
+                if lname in word_uniform:
+                    raise _Unsupported(
+                        f"{name} body lambda {lname!r} is on the "
+                        "word-uniform ABI")
+                nparams = _TILE_HOF[name]
+                mod.thunk_seq += 1
+                tsym = f"mx.tth.{mod.thunk_seq}"
+                wnames = ["%wa", "%wb"][:nparams]
+                tl = [f"define internal i64 @{tsym}(ptr %env, "
+                      + ", ".join(f"i64 {w}" for w in wnames)
+                      + f") {{  ; tile op thunk: {lname}", "entry:"]
+                typed = []
+                for i, w in enumerate(wnames):
+                    if ek == F64:
+                        tl.append(f"  %e{i} = bitcast i64 {w} to double")
+                        typed.append(f"double %e{i}")
+                    else:
+                        typed.append(f"i64 {w}")
+                tl.append(f"  %r = call {_llscalar(ek)} @{mangle(lname)}"
+                          f"(ptr %env, {', '.join(typed)})")
+                if ek == F64:
+                    tl.append("  %rw = bitcast double %r to i64")
+                    tl.append("  ret i64 %rw")
+                else:
+                    tl.append("  ret i64 %r")
+                tl.append("}")
+                mod.comp_thunks.setdefault(f.name, []).append("\n".join(tl))
+                base = use(fnvar, lines)
+                envpp = fresh()
+                lines.append(
+                    f"  {envpp} = getelementptr inbounds "
+                    f"{_CLOSURE_PAIR_TY}, ptr {base}, i32 0, i32 1")
+                envv = fresh()
+                lines.append(f"  {envv} = load ptr, ptr {envpp}")
+                sym = "mx_" + name.replace(".", "_").lower()
+                mod.runtime_syms.add(sym)
+                t0 = use(opargs[0], lines)
+                v = fresh()
+                if name == "Tile.map":
+                    lines.append(
+                        f"  {v} = call ptr @{sym}(ptr {t0}, ptr @{tsym}, "
+                        f"ptr {envv}, i64 {tflag(tk)})  ; {name} via {lname}")
+                elif name in ("Tile.reduce_rows", "Tile.reduce_cols"):
+                    iw = to_word(ek, use(opargs[1], lines), lines)
+                    lines.append(
+                        f"  {v} = call ptr @{sym}(ptr {t0}, i64 {iw}, "
+                        f"ptr @{tsym}, ptr {envv}, i64 {tflag(tk)})"
+                        f"  ; {name} via {lname}")
+                else:  # zip / broadcast_rows / broadcast_cols
+                    t1 = use(opargs[1], lines)
+                    lines.append(
+                        f"  {v} = call ptr @{sym}(ptr {t0}, ptr {t1}, "
+                        f"ptr @{tsym}, ptr {envv}, i64 {tflag(tk)})"
+                        f"  ; {name} via {lname}")
+                setval(dst, v, lines)
             else:  # rows / cols
                 a = use(opargs[0], lines)
                 sym = f"mx_tile_{top}"
@@ -10142,6 +10340,22 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                         lines.append(f"  {v} = fneg double {a}")
                     else:
                         lines.append(f"  {v} = sub i64 0, {a}")
+                    setval(dst, v, lines)
+                elif bname in ("max", "min"):
+                    # b when b > a (max) / b < a (min), else a: the
+                    # interpreter's tie and NaN behavior, as one compare
+                    # and one select.
+                    pa = use(opargs[0], lines)
+                    pb = use(opargs[1], lines)
+                    pc, v = fresh(), fresh()
+                    if kind(dst) == F64:
+                        pred = "ogt" if bname == "max" else "olt"
+                        lines.append(f"  {pc} = fcmp {pred} double {pb}, {pa}")
+                        lines.append(f"  {v} = select i1 {pc}, double {pb}, double {pa}")
+                    else:
+                        pred = "sgt" if bname == "max" else "slt"
+                        lines.append(f"  {pc} = icmp {pred} i64 {pb}, {pa}")
+                        lines.append(f"  {v} = select i1 {pc}, i64 {pb}, i64 {pa}")
                     setval(dst, v, lines)
                 elif bname == "not":
                     a = use(opargs[0], lines)

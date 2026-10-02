@@ -842,3 +842,198 @@ def test_native_f16_kernel_matches_interp(tmp_path):
     ir = assert_native_matches_interp(_F16_KERNEL_SRC, tmp_path)
     assert count_placeholders(ir) == 0
     assert "mx_tile_to_f16" in ir
+
+
+# ---------------------------------------------------------------------------
+# 7. Higher-order tile ops (docs/gpu_tiles.md): map / zip / reduce_rows /
+#    reduce_cols / broadcast_rows / broadcast_cols take a Metaxu function per
+#    element; f32/f16 elements reach it in NARROW MODE (every op rounds to
+#    the width), which is what std/tile.mx builds exp, row_max, sub_rows and
+#    the rest on.
+# ---------------------------------------------------------------------------
+
+_HOF_INT_SRC = """
+fn main() -> int {
+    let a = Tile.arange(2, 3);
+    print(Tile.map(a, fn(x: int) -> x * x));
+    let rs = Tile.reduce_rows(a, 0, fn(acc: int, x: int) -> acc + x);
+    print(rs);
+    let cs = Tile.reduce_cols(a, 100, fn(acc: int, x: int) -> acc - x);
+    print(cs);
+    print(Tile.zip(a, Tile.map(a, fn(x: int) -> x * x), fn(x: int, y: int) -> y - x));
+    print(Tile.broadcast_rows(a, rs, fn(x: int, s: int) -> x * 10 + s));
+    print(Tile.broadcast_cols(a, cs, fn(x: int, s: int) -> s - x));
+    print(Tile.reduce_rows(a, 0, fn(acc: int, x: int) -> max(acc, x)));
+    print(max(3, 7) + min(3, 7));
+    0
+}
+"""
+
+_HOF_INT_OUT = [
+    "tile[2x3](0, 1, 4; 9, 16, 25)",
+    "tile[2x1](3; 12)",
+    "tile[1x3](97, 95, 93)",          # 100 - (0+3), 100 - (1+4), 100 - (2+5)
+    "tile[2x3](0, 0, 2; 6, 12, 20)",
+    "tile[2x3](3, 13, 23; 42, 52, 62)",
+    "tile[2x3](97, 94, 91; 94, 91, 88)",
+    "tile[2x1](2; 5)",
+    "10",
+]
+
+
+def test_interp_higher_order_int_semantics():
+    result, out = interp_run(_HOF_INT_SRC)
+    assert result == 0
+    assert out.splitlines() == _HOF_INT_OUT
+
+
+def _f32(x):
+    import struct
+    return struct.unpack("f", struct.pack("f", x))[0]
+
+
+def _f16(x):
+    import struct
+    return struct.unpack("e", struct.pack("e", x))[0]
+
+
+def test_interp_narrow_mode_rounds_per_op():
+    # x*x + x on an f32 tile: in f32 arithmetic each step rounds, which
+    # differs from evaluating the body in f64 and rounding once at the end.
+    import math
+    src = """
+fn main() -> int {
+    let f = Tile.to_f32(Tile.filled(1, 2, 1.1));
+    print(Tile.map(f, fn(x: float) -> x * x + x));
+    print(Tile.map(f, fn(x: float) -> exp(x) - 1.0));
+    print(Tile.reduce_rows(f, 0.0, fn(acc: float, x: float) -> acc + x));
+    let h = Tile.to_f16(f);
+    print(Tile.map(h, fn(x: float) -> x * x + x));
+    print(Tile.map(Tile.filled(1, 1, 1.1), fn(x: float) -> x * x + x));
+    0
+}
+"""
+    result, out = interp_run(src)
+    x = _f32(1.1)
+    per_op = _f32(_f32(x * x) + x)
+    once = _f32(x * x + x)                     # the body in f64, rounded once
+    assert per_op != once                      # the two definitions differ here
+    assert out.splitlines()[0] == f"tile[1x2]({per_op!r}, {per_op!r})"
+    e = _f32(_f32(math.exp(x)) - 1.0)
+    assert out.splitlines()[1] == f"tile[1x2]({e!r}, {e!r})"
+    s = _f32(_f32(0.0 + x) + x)
+    assert out.splitlines()[2] == f"tile[1x1]({s!r})"
+    y = _f16(1.1)
+    h = _f16(_f16(y * y) + y)
+    assert out.splitlines()[3] == f"tile[1x2]({h!r}, {h!r})"
+    assert out.splitlines()[4] == f"tile[1x1]({1.1 * 1.1 + 1.1!r})"   # f64: no rounding
+
+
+def test_interp_higher_order_errors_are_loud():
+    # Shapes and element kinds the checker cannot see statically (a shape
+    # from a call, a Vec's runtime contents) are checked at run time,
+    # loudly and catchably, with the same wording the static check uses.
+    cases = [
+        ("Tile.zip(Tile.arange(2, 2), Tile.arange(pick(2, 3, false), 3), fn(a: int, b: int) -> a + b)",
+         "Tile.zip: shape mismatch: 2x2 vs 3x3"),
+        ("Tile.broadcast_rows(Tile.arange(2, 3), Tile.arange(pick(1, 2, true), 3), fn(a: int, b: int) -> a + b)",
+         "Tile.broadcast_rows: shape mismatch: expected a 2x1 column for a 2x3 tile, got 1x3"),
+        ("Tile.map(Tile.arange(1, 2), fn(x: int) -> 1.5)",
+         "Tile.map: the function must return an int for an int tile, got 'Float'"),
+        ("Tile.reduce_rows(Tile.from_vec(floats(), 1, 2), 0, fn(a: float, b: float) -> a + b)",
+         "Tile.reduce_rows: init must be a float for a float tile, got 'Int'"),
+        ("Tile.map(Tile.arange(1, 2), fn(x: int, y: int) -> x)",
+         "Tile.map: the function takes 2 parameter(s), expected 1"),
+    ]
+    for expr, msg in cases:
+        src = ("fn pick(a: int, b: int, flag: bool) -> int { if flag { a } else { b } }\n"
+               "fn floats() -> Vec { let @mut v = Vec.new(); v.push(1.5); v.push(2.5); v }\n"
+               "fn main() -> int {\n"
+               f"    let r = try {{ let t = {expr}; 0 }} catch e {{ print(e); 1 }};\n"
+               "    r\n}\n")
+        result, out = interp_run(src)
+        assert result == 1, (expr, out)
+        assert out.strip() == msg, (expr, out)
+
+
+@pytest.mark.parametrize("src, fragment", [
+    ("fn main() -> int { let t = Tile.zip(Tile.arange(2, 2), Tile.arange(3, 2), fn(a: int, b: int) -> a); 0 }",
+     "Tile.zip: shape mismatch: 2x2 vs 3x2"),
+    ("fn main() -> int { let t = Tile.broadcast_cols(Tile.arange(2, 3), Tile.arange(2, 1), fn(a: int, b: int) -> a); 0 }",
+     "Tile.broadcast_cols: shape mismatch: expected a 1x3 row for a 2x3 tile, got 2x1"),
+    ("fn main() -> int { let t = Tile.reduce_rows(Tile.arange(2, 3), 0.0, fn(a: int, b: int) -> a); 0 }",
+     "Tile.reduce_rows: init must be an int for an int tile, got a float"),
+    ("fn main() -> int { let t = Tile.add(Tile.reduce_rows(Tile.arange(2, 3), 0, fn(a: int, b: int) -> a), Tile.arange(1, 2)); 0 }",
+     "Tile.add: shape mismatch: 2x1 vs 1x2"),
+])
+def test_higher_order_shape_misuse_is_a_compile_error(src, fragment):
+    ctx = build_context_from_source(src)
+    with pytest.raises(TypeCheckError) as ei:
+        run_pipeline_ctx(ctx)
+    assert fragment in str(ei.value)
+
+
+_HOF_NATIVE_SRC = """
+fn main() -> int {
+    let a = Tile.arange(2, 3);
+    print(Tile.map(a, fn(x: int) -> x * x));
+    let rs = Tile.reduce_rows(a, 0, fn(acc: int, x: int) -> acc + x);
+    print(rs);
+    let cs = Tile.reduce_cols(a, 100, fn(acc: int, x: int) -> acc - x);
+    print(cs);
+    print(Tile.zip(a, Tile.map(a, fn(x: int) -> x * x), fn(x: int, y: int) -> y - x));
+    print(Tile.broadcast_rows(a, rs, fn(x: int, s: int) -> x * 10 + s));
+    print(Tile.broadcast_cols(a, cs, fn(x: int, s: int) -> s - x));
+    print(Tile.reduce_rows(a, 0, fn(acc: int, x: int) -> max(acc, x)));
+    print(max(3, 7) + min(3, 7));
+    let d = Tile.filled(2, 2, 1.1);
+    print(Tile.map(d, fn(x: float) -> x * x + x));
+    print(Tile.reduce_rows(d, 0.5, fn(acc: float, x: float) -> acc + exp(x) - log(x)));
+    print(Tile.broadcast_cols(d, Tile.reduce_cols(d, 0.0, fn(p: float, q: float) -> max(p, q)),
+                              fn(x: float, m: float) -> x - m));
+    let k = 3;
+    print(Tile.map(a, fn(x: int) -> x * k));
+    print(max(1.5, 2.5));
+    print(min(1.5, 2.5));
+    let r = try {
+        let bad = Tile.zip(a, Tile.arange(pick(2, 3, false), 3), fn(x: int, y: int) -> x + y);
+        0
+    } catch e { print(e); 1 };
+    r
+}
+fn pick(a: int, b: int, flag: bool) -> int { if flag { a } else { b } }
+"""
+
+
+def test_higher_order_int_and_f64_ops_lower_natively():
+    ir = llvm_from_source(_HOF_NATIVE_SRC)
+    assert count_placeholders(ir) == 0
+    for sym in ("mx_tile_map", "mx_tile_zip", "mx_tile_reduce_rows",
+                "mx_tile_reduce_cols", "mx_tile_broadcast_rows",
+                "mx_tile_broadcast_cols"):
+        assert f"@{sym}(" in ir, sym
+    assert "define internal i64 @mx.tth." in ir      # the per-site thunks
+    assert "call double @exp(double" in ir and "call double @log(double" in ir
+    assert "fcmp ogt double" in ir and "icmp sgt i64" in ir   # max, inline
+
+
+@needs_clang
+def test_native_higher_order_ops_match_interp(tmp_path):
+    # Captured scalars, math builtins, max/min, every op, and the catchable
+    # dynamic shape mismatch raise, byte for byte.
+    assert_native_matches_interp(_HOF_NATIVE_SRC, tmp_path)
+
+
+def test_narrow_mode_maps_demote_natively_with_a_reason():
+    # f32/f16 lambdas compute in narrow mode (per-op rounding); the native
+    # scalar path has no such kind yet, so these demote honestly instead of
+    # running the body in f64.
+    ir = llvm_from_source("""
+fn main() -> int {
+    let f = Tile.to_f32(Tile.filled(1, 2, 1.1));
+    print(Tile.map(f, fn(x: float) -> x * x + x));
+    0
+}
+""")
+    assert count_placeholders(ir) >= 1
+    assert "narrow-mode lambda arithmetic is not lowered natively yet" in ir
