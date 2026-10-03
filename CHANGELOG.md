@@ -69,6 +69,27 @@ with no section and uses it as the release notes.
   cross-fiber abort and failing-arm shapes.
 - `std.process`'s record of a finished program is `Completed` (it was
   `Outcome`, which `std.solve` also declares).
+- Tiles: four higher-order primitives, `Tile.map(t, f)`, `Tile.zip(t,
+  u, f)`, `Tile.reduce_rows/reduce_cols(t, init, f)` and
+  `Tile.broadcast_rows/broadcast_cols(t, v, f)`, each calling a Metaxu
+  function per element. Elements of f32 and f16 tiles reach the
+  function in narrow mode (every operation and math call rounds to the
+  width once), so a lambda computes what the device computes with no
+  new type syntax. `exp`, `log`, `max` and `min` are scalar builtins on
+  both engines. Natively, int and f64 lambdas lower to the C runtime;
+  f32 and f16 lambdas demote with a reason naming the gap.
+- `std.tile`: the elementwise and row/column vocabulary over those
+  primitives (`exp`, `sub`, `maximum`, `row_max`, `row_sum`,
+  `sub_rows`, `div_rows`, `softmax_rows`, ...), one line each, tested
+  against Python oracles in f64, f32 and f16.
+- `std.attention`: FlashAttention-2 (`attention8`, `causal_attention8`,
+  head dimension 8) over `std.tile` and the matrix-unit dots, with the
+  f64 `attention_ref` it is tested against.
+- Metal kernels inline library functions and lambdas (`mir_inline.py`):
+  a kernel written over `std.tile` is one device program. In the
+  per-simdgroup lowering the higher-order ops are strided across the 32
+  lanes (`MX_EACH`); the C++ shim stays bit-exact with the interpreter
+  in both lowerings, narrow-mode math included.
 - `scripts/release.py`: one command to cut a release.
 
 ## 0.1.0 (2026-09-23)

@@ -244,6 +244,56 @@ uv run python scripts/emit_metal_harness.py kernels.mx mm_kernel \
 python3 harness_mm.py    # on a Mac with mlx installed
 ```
 
+## Operations as functions
+
+The compiler knows a handful of structural tile operations and no
+more. Everything elementwise is a function you pass in: `Tile.map(t,
+f)` applies `f` to every element, `Tile.zip(t, u, f)` pairs two tiles
+of one shape, `Tile.reduce_rows(t, init, f)` and `Tile.reduce_cols`
+fold each row or column left to right into an R x 1 or 1 x C tile, and
+`Tile.broadcast_rows(t, v, f)` and `Tile.broadcast_cols` combine each
+element with its row's or column's entry of a vector tile. The
+function sees plain `float` or `int` values, and the result tile has
+the receiver's kind.
+
+Elements of f32 and f16 tiles reach the function in narrow mode: the
+value remembers its width, and every operation and math call on it
+rounds the result to that width once, so `x.exp() * 0.5` inside a
+`Tile.map` over an f32 tile computes what f32 arithmetic computes,
+with no new type syntax. `std.tile` is the vocabulary built this way,
+one line per operation; the row sums of a softmax below show the
+rounding at work, since one of them is the f32 just under 1:
+
+```metaxu
+from std.tile import softmax_rows, row_max, row_sum;
+
+fn main() -> int {
+    let @mut v = Vec.new();
+    v.push(1.0); v.push(2.0); v.push(3.0);
+    v.push(0.5); v.push(0.5); v.push(-4.0);
+    let t = Tile.to_f32(Tile.from_vec(v, 2, 3));
+    print(row_max(t));
+    print(softmax_rows(t));
+    print(row_sum(softmax_rows(t)));
+    print(Tile.map(t, fn(x: float) -> x * 0.5 + 1.0));
+    print(Tile.reduce_cols(Tile.arange(2, 3), 0, fn(a: int, b: int) -> a + b));
+    0
+}
+```
+```output
+tile[2x1](3.0; 0.5)
+tile[2x3](0.09003057330846786, 0.2447284758090973, 0.6652409434318542; 0.49723806977272034, 0.49723806977272034, 0.005523815751075745)
+tile[2x1](1.0; 0.9999999403953552)
+tile[2x3](1.5, 2.0, 2.5; 1.25, 1.25, -1.0)
+tile[1x3](3, 5, 7)
+```
+
+Inside a kernel these calls cost nothing: the Metal emitter inlines
+the library functions and the lambdas into one device program, so
+`softmax_rows(t)` becomes three loops over a threadgroup array. The
+same words run on the interpreter, in the C++ shim and on the device,
+and the interpreter remains the bit-exact reference for the shim.
+
 ## Matrix units
 
 A kernel whose `Tile.dot` multiplies 8x8 f32 or f16 tiles gets a
@@ -310,7 +360,37 @@ order. The device's matrix unit fuses the multiply and the add, so on
 a Mac the float tolerance the harness already applies is where that
 difference lands; a kernel that needs bit-exact device results can
 force the per-thread lowering with `METAXU_METAL_LOWERING=thread`.
-Elementwise work in the simdgroup lowering is done by one lane behind a
-barrier for now; distributing it across the lanes, inferred layouts,
-and threadgroup-memory tiling across instances are the rest of Stage 2
-(`docs/simdgroup_plan.md`).
+In the simdgroup lowering the higher-order operations are strided
+across the 32 lanes, each lane taking every 32nd element, behind a
+barrier; the older fixed operations still run on one lane. Inferred
+layouts and threadgroup-memory tiling across instances are the rest of
+Stage 2 (`docs/simdgroup_plan.md`).
+
+## Attention
+
+With the matrix units for the two products and `std.tile` for the
+online softmax between them, FlashAttention-2 is library code:
+`std.attention.attention8` owns one block of 8 query rows and streams
+the keys and values past it 8 at a time, keeping a running row maximum,
+a running denominator and an unnormalized output, and rescaling them
+when the maximum moves. The inner step is the algorithm as written in
+the paper:
+
+```metaxu norun
+let s = Tile.scale(Tile.dot(qb, Tile.transpose(kb)), qk_scale8());
+let m_new = maximum(m, row_max(s));
+let p = exp(sub_rows(s, m_new));
+let alpha = exp(sub(m, m_new));
+l = Tile.add(Tile.mul(l, alpha), row_sum(p));
+o = Tile.add(mul_rows(o, alpha), Tile.dot(p, vb));
+m = m_new;
+```
+
+`causal_attention8` skips the key blocks past the query block and
+masks the upper triangle of the diagonal one with a flag tile built
+from `Tile.arange`. Both are launched with `Gpu.launch(n / 8, ...)`
+over row-major [n, 8] buffers, and both are checked against
+`attention_ref`, the plain f64 definition in the same module, and bit
+for bit against the shim in either lowering (`test_std_attention.py`).
+Head dimension 8 is literal in this version; other block shapes are
+copies with other literals until const generics reach kernels.

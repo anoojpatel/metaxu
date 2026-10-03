@@ -2519,7 +2519,8 @@ class MirInterpreter:
                 f"Metal.launch: METAXU_METAL_LOWERING={lowering!r} is not "
                 "one of auto, thread, simdgroup")
         try:
-            kern = _emit(kfunc, simdgroup=choice[lowering])
+            kern = _emit(kfunc, simdgroup=choice[lowering],
+                         funcs=dict(self._funcs))
         except MslError as e:
             raise InterpError(
                 f"Metal.launch: kernel {kfunc.name!r} is outside the MSL "
@@ -3048,7 +3049,12 @@ def _f16(x: float) -> float:
     nearest-even — Python's 'e' struct format), returned as the widened
     double.  Every f16 tile op rounds through this; it matches the C
     runtime's (double)(_Float16)x bit for bit."""
-    return _structmod.unpack("e", _structmod.pack("e", x))[0]
+    try:
+        return _structmod.unpack("e", _structmod.pack("e", x))[0]
+    except OverflowError:
+        # IEEE round-to-nearest overflows to the signed infinity (what
+        # (_Float16)x and Metal's (half)x do); Python's pack raises instead.
+        return math.copysign(math.inf, x)
 
 
 # -- Narrow-mode scalars (docs/gpu_tiles.md, the higher-order tile ops) ------

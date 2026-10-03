@@ -231,6 +231,46 @@ per-lane register budget, swizzle bank-conflict freedom.
     round-accumulate order), so the shim leg stays bit-exact — pinned
     by an f16 matmul differential plus an independent blocked-
     accumulation ground truth in Python 'e' arithmetic.
+  * **1g (landed): higher-order primitives, narrow mode, `std.tile`,
+    `std.attention`.**  The per-op compiler surface stopped growing:
+    every elementwise and row/column operation is library code over
+    four structural primitives that call a Metaxu function per element
+    in row-major order: `Tile.map(t, f)`, `Tile.zip(t, u, f)`,
+    `Tile.reduce_rows(t, init, f)` / `Tile.reduce_cols` (R x 1 / 1 x C
+    results, folded left to right) and `Tile.broadcast_rows(t, v, f)` /
+    `Tile.broadcast_cols` (v is R x 1 / 1 x C).  Elements of f32 and
+    f16 tiles reach the function in NARROW MODE: the interpreter's
+    `MxF32` / `MxF16` are float subclasses whose every binop and math
+    call (`exp`, `log`, `sqrt`, `max`, `min`, ...) rounds the result to
+    the width once, a plain float or int meeting them rounds first, and
+    the result is stored back widened.  So a lambda computes exactly
+    what f32 or f16 arithmetic computes, the checker still sees `float`,
+    and there is no new type syntax.  The shape checker knows the
+    result shapes and the init / vector kinds; dynamic mismatches raise
+    the same words at run time.  `std/tile.mx` is the vocabulary (`exp`,
+    `log`, `sqrt`, `neg`, `sub`, `div`, `maximum`, `minimum`,
+    `row_max/row_sum/col_max/col_sum`, `add/sub/mul/div_rows`,
+    `add/sub/mul/div_cols`, `softmax_rows`, `neg_huge`), each a one-line
+    function, tested against Python oracles in f64, f32 and f16.
+    `std/attention.mx` is FlashAttention-2 over it (`attention8`,
+    `causal_attention8`: an 8-row query block streaming 8-row key and
+    value blocks with the online-softmax rescale; `attention_ref` the
+    f64 definition), checked against the reference and bit for bit
+    against the shim in both lowerings.  In MSL kernels the library and
+    the lambdas are INLINED: `mir_inline.py` flattens calls to module
+    functions into the kernel (renamed locals, parameter copies, `ret`
+    to copy-and-jump; recursion and `@mut` parameters refused), the
+    emitter types each lambda's ops from the element kinds and emits it
+    per element as a switch-machine, and reductions become sequential
+    `for` loops in the pinned order.  Narrow-mode math in the shim is a
+    `namespace metal` of `float exp(float)` etc. defined as the double
+    call rounded once, so the shim leg stays bit-exact with the
+    interpreter.  Natively, int and f64 maps lower through per-site
+    word thunks and `mx_tile_map/zip/reduce_*/broadcast_*`; f32 and
+    f16 maps DEMOTE with the reason "narrow-mode lambda arithmetic is
+    not lowered natively yet" (kernels, not the CPU path, are their
+    product).  `exp`, `log`, `max` and `min` joined the scalar builtins
+    on both engines along the way.
   * **Still open in Stage 1:** the `gpu` effect class (now that the
     Metal handler dispatches real launches), memory-space locality
     states (vacuous until threadgroup memory arrives in Stage 2), and
@@ -246,6 +286,13 @@ per-lane register budget, swizzle bank-conflict freedom.
     automatically for kernels with such a dot; kernels and `std/gpu.mx`
     unchanged; the shim emulates the collectives and stays bit-exact
     (status section of `docs/simdgroup_plan.md`).
+  * **Landed (2b):** lane-distributed elementwise work for the
+    higher-order ops: in the per-simdgroup body `MX_EACH(i, n)` is a
+    lane-strided loop (`for (i = lane; i < n; i += 32)`) followed by a
+    barrier, so a `Tile.map` over an 8x8 tile is two elements per lane
+    instead of 64 on lane 0; the per-thread body and the shim define
+    the macro as the whole loop, which keeps the comparison exact.
+    Reductions stay on lane 0 (the pinned left-to-right order).
 - **Stage 3 — expert surface:** Gluon-style explicit layout
   annotations, the autotuner (the benchmark harness's paired-run
   methodology as a per-kernel search with a shape-keyed cache),

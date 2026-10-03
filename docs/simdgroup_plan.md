@@ -195,12 +195,19 @@ body does, exactly:
   identically, `Tile.sum` reduces the published tile on every lane, so
   the switch-machine's control flow is uniform and every lane reaches
   every collective and every barrier.
-* Tiles are `threadgroup` arrays. Lane 0 does the elementwise work
-  (fills, loads, add/mul/scale, conversions, transposes, copies) and a
-  `threadgroup_barrier(mem_threadgroup)` publishes each written tile;
-  device stores are lane 0's too. Lanes 1 to 31 are idle for those ops
-  in this first increment; distributing them is the next step and
-  needs a shim that emulates lanes, which is why it was not folded in.
+* Tiles are `threadgroup` arrays. Lane 0 does the fixed elementwise
+  work (fills, loads, add/mul/scale, conversions, transposes, copies)
+  and a `threadgroup_barrier(mem_threadgroup)` publishes each written
+  tile; device stores are lane 0's too. The higher-order ops
+  (`Tile.map`, `zip`, `broadcast_rows`, `broadcast_cols`) are
+  distributed: their per-element body runs inside `MX_EACH(i, n)`,
+  which this lowering defines as `for (i = lane; i < n; i += 32)`, so
+  each lane takes every 32nd element and the barrier after the loop
+  publishes the tile. The reductions (`reduce_rows`, `reduce_cols`)
+  stay on lane 0 because their left-to-right fold order is part of the
+  pinned semantics. The shim defines `MX_EACH` as the whole loop, so
+  one emulated lane computes what 32 lanes compute together and the
+  comparison stays exact.
 * An eligible dot is the collective: `simdgroup_load` of both operands
   from the threadgroup tiles, `simdgroup_multiply_accumulate` into a
   zero-filled `simdgroup_float8x8` / `simdgroup_half8x8`,
@@ -221,7 +228,14 @@ Python ground truth; the whole kernel corpus forced through the new
 lowering; body and harness structure) and `test_metal_launch.py`
 (handler parity under the default, and under both overrides).
 
-Not done: lane-distributed elementwise loops, several simdgroups per
-threadgroup, threadgroup-memory tiling across instances (that is
-Option B territory), and measurement on a Mac, which the generated
-harness is for.
+`std.attention` is the first kernel that uses both parts together:
+the two 8x8 products per key block are the collective, and the
+online-softmax arithmetic between them is lane-strided `std.tile`
+code (`test_std_attention.py` pins the shim against the interpreter
+in this lowering and the per-thread one).
+
+Not done: lane distribution for the fixed elementwise ops (they could
+go through the same macro), several simdgroups per threadgroup,
+threadgroup-memory tiling across instances (that is Option B
+territory), and measurement on a Mac, which the generated harness is
+for.

@@ -1,0 +1,85 @@
+# std.tile — the elementwise and row/column vocabulary over tiles.
+#
+# Everything here is library code over four compiler primitives
+# (docs/gpu_tiles.md): `Tile.map`, `Tile.zip`, `Tile.reduce_rows` /
+# `Tile.reduce_cols` and `Tile.broadcast_rows` / `Tile.broadcast_cols`,
+# each calling a Metaxu function per element.  A new operation is a
+# one-line function, and it runs the same on every engine: elements of
+# f32 and f16 tiles reach the function in narrow mode, so `exp(x) * 0.5`
+# rounds per op exactly as the device does, and the interpreter stays the
+# bit-exact reference for the C++ shim (Metal's own fast-math exp sits
+# under the harness tolerance).  In a kernel these calls are inlined into
+# one tile program by the MSL emitter; outside kernels they are ordinary
+# calls.
+#
+# These are FLOAT tile functions: the reductions start from float
+# literals, so an int tile goes through the primitives directly
+# (`Tile.reduce_rows(t, 0, fn(a: int, b: int) -> a + b)`).
+
+export {
+    exp,
+    log,
+    sqrt,
+    neg,
+    sub,
+    div,
+    maximum,
+    minimum,
+    row_max,
+    row_sum,
+    col_max,
+    col_sum,
+    add_rows,
+    sub_rows,
+    mul_rows,
+    div_rows,
+    add_cols,
+    sub_cols,
+    mul_cols,
+    div_cols,
+    softmax_rows,
+    neg_huge
+}
+
+# Elementwise.  (Method position inside: a plain `exp(x)` here would
+# name THIS function, docs/name_precedence.md; `x.exp()` is the builtin.)
+fn exp(t) -> Tile { Tile.map(t, fn(x: float) -> x.exp()) }
+fn log(t) -> Tile { Tile.map(t, fn(x: float) -> x.log()) }
+fn sqrt(t) -> Tile { Tile.map(t, fn(x: float) -> x.sqrt()) }
+fn neg(t) -> Tile { Tile.map(t, fn(x: float) -> 0.0 - x) }
+fn sub(t, u) -> Tile { Tile.zip(t, u, fn(a: float, b: float) -> a - b) }
+fn div(t, u) -> Tile { Tile.zip(t, u, fn(a: float, b: float) -> a / b) }
+fn maximum(t, u) -> Tile { Tile.zip(t, u, fn(a: float, b: float) -> max(a, b)) }
+fn minimum(t, u) -> Tile { Tile.zip(t, u, fn(a: float, b: float) -> min(a, b)) }
+
+# The most negative finite f32 (also a finite f64): the start of a
+# running maximum, where `-inf` would need a literal the lexer has no
+# form for.  f16 tiles round it to -inf, which is fine as a maximum's
+# seed too.
+fn neg_huge() -> float { -340282346638528859811704183484516925440.0 }
+
+# Row and column reductions: R x 1 and 1 x C tiles, folded left to right
+# (the pinned order on every engine).
+fn row_max(t) -> Tile { Tile.reduce_rows(t, neg_huge(), fn(a: float, b: float) -> max(a, b)) }
+fn row_sum(t) -> Tile { Tile.reduce_rows(t, 0.0, fn(a: float, b: float) -> a + b) }
+fn col_max(t) -> Tile { Tile.reduce_cols(t, neg_huge(), fn(a: float, b: float) -> max(a, b)) }
+fn col_sum(t) -> Tile { Tile.reduce_cols(t, 0.0, fn(a: float, b: float) -> a + b) }
+
+# Row broadcasts: `v` is R x 1 and applies to every element of its row.
+fn add_rows(t, v) -> Tile { Tile.broadcast_rows(t, v, fn(x: float, s: float) -> x + s) }
+fn sub_rows(t, v) -> Tile { Tile.broadcast_rows(t, v, fn(x: float, s: float) -> x - s) }
+fn mul_rows(t, v) -> Tile { Tile.broadcast_rows(t, v, fn(x: float, s: float) -> x * s) }
+fn div_rows(t, v) -> Tile { Tile.broadcast_rows(t, v, fn(x: float, s: float) -> x / s) }
+
+# Column broadcasts: `v` is 1 x C and applies down its column.
+fn add_cols(t, v) -> Tile { Tile.broadcast_cols(t, v, fn(x: float, s: float) -> x + s) }
+fn sub_cols(t, v) -> Tile { Tile.broadcast_cols(t, v, fn(x: float, s: float) -> x - s) }
+fn mul_cols(t, v) -> Tile { Tile.broadcast_cols(t, v, fn(x: float, s: float) -> x * s) }
+fn div_cols(t, v) -> Tile { Tile.broadcast_cols(t, v, fn(x: float, s: float) -> x / s) }
+
+# A numerically stable softmax over each row: shift by the row maximum,
+# exponentiate, normalize by the row sum.
+fn softmax_rows(t) -> Tile {
+    let e = exp(sub_rows(t, row_max(t)));
+    div_rows(e, row_sum(e))
+}

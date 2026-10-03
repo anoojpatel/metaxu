@@ -675,12 +675,13 @@ def test_simdgroup_body_structure():
     assert "__acc +=" not in body
     # grid arithmetic: 32 threads per instance, one simdgroup per group
     assert k.grid(4) == (128, 32)
-    # the shim carries the emulation exactly when the lowering needs it
-    assert "namespace metal {" in k.cpp_wrapper()
+    # the shim carries the collective emulation exactly when the lowering
+    # needs it (the math shim, `namespace metal` too, is in every wrapper)
+    assert "simdgroup_matrix8x8" in k.cpp_wrapper()
     assert "(unsigned)pid * 32u" in k.cpp_wrapper()
     kt = emit_msl_kernel(_driver(_FMM8, "fmm8_kernel", 4, bufs), "fmm8_kernel",
                          simdgroup=False)
-    assert "namespace metal" not in kt.cpp_wrapper()
+    assert "simdgroup_matrix8x8" not in kt.cpp_wrapper()
     assert kt.grid(4) == (4, 4)
 
 
@@ -754,3 +755,151 @@ def test_forced_simdgroup_lowering_matches_interp_for_every_op(kernel_src, kerne
     for name in k.out_bufs:
         expect += vals[name]
     assert _run_shim(k, grid, bufs) == expect
+
+
+# ---------------------------------------------------------------------------
+# Higher-order tile ops and library helpers in kernels (docs/gpu_tiles.md):
+# helpers are inlined into the kernel (mir_inline), the function passed to
+# map / zip / reduce / broadcast is inlined per element, elementwise work
+# is shared by the lanes on the per-simdgroup path (MX_EACH), and the
+# narrow-mode rounding of f32/f16 lambdas is bit-exact against the shim.
+# ---------------------------------------------------------------------------
+
+_HOF_INT = """
+fn twice(t) -> Tile { Tile.map(t, fn(x: int) -> x * 2) }
+fn k_int(pid: int, v: Vec, out: Vec) -> () {
+    let t = Tile.load_or(v, pid * 6, 2, 3, 0);
+    let s = twice(t);
+    let rs = Tile.reduce_rows(s, 0, fn(acc: int, x: int) -> acc + x);
+    let cs = Tile.reduce_cols(s, 1000, fn(acc: int, x: int) -> acc - x);
+    let b = Tile.broadcast_rows(Tile.zip(t, s, fn(a: int, b: int) -> a + b), rs,
+                                fn(x: int, r: int) -> x * 10 + r);
+    let c = Tile.broadcast_cols(b, cs, fn(x: int, q: int) -> max(x, q) - min(x, pid));
+    Tile.store_clipped(out, pid * 6, c);
+    ()
+}
+"""
+
+_HOF_F32 = """
+fn k_f32(pid: int, v: Vec, out: Vec) -> () {
+    let t = Tile.to_f32(Tile.load_rows(v, pid * 8, 4, 2, 4, 0.0));
+    let m = Tile.reduce_rows(t, -3.0, fn(a: float, b: float) -> max(a, b));
+    let sh = Tile.broadcast_rows(t, m, fn(x: float, mm: float) -> x - mm);
+    let e = Tile.map(sh, fn(x: float) -> exp(x) * 0.5 + 0.25);
+    let l = Tile.reduce_rows(e, 0.0, fn(a: float, b: float) -> a + b);
+    let p = Tile.broadcast_rows(e, l, fn(x: float, s: float) -> x / s);
+    let q = Tile.zip(p, t, fn(a: float, b: float) -> if a > b { sqrt(a) } else { log(b + 2.0) });
+    Tile.store_rows(out, pid * 8, 4, q);
+    ()
+}
+"""
+
+_HOF_F16 = """
+fn k_f16(pid: int, v: Vec, out: Vec) -> () {
+    let t = Tile.to_f16(Tile.to_f32(Tile.load_rows(v, pid * 8, 4, 2, 4, 0.0)));
+    let e = Tile.map(t, fn(x: float) -> exp(x) * 0.5 + x);
+    let l = Tile.reduce_rows(e, 0.0, fn(a: float, b: float) -> a + b);
+    let p = Tile.broadcast_rows(e, l, fn(x: float, s: float) -> x / s);
+    Tile.store_rows(out, pid * 8, 4, Tile.to_f32(p));
+    ()
+}
+"""
+
+_LIB_SOFTMAX = """
+from std.tile import softmax_rows, col_sum, mul_cols;
+fn k_sm(pid: int, v: Vec, out: Vec) -> () {
+    let t = Tile.to_f32(Tile.load_rows(v, pid * 8, 4, 2, 4, 0.0));
+    let s = softmax_rows(t);
+    Tile.store_rows(out, pid * 8, 4, mul_cols(s, col_sum(s)));
+    ()
+}
+"""
+
+_HOF_VALS = [_f32r(0.37 * i - 1.3) for i in range(16)]
+
+
+def _hof_cases():
+    return [
+        (_HOF_INT, "k_int", {"v": list(range(1, 13)), "out": [0] * 12}),
+        (_HOF_F32, "k_f32", {"v": list(_HOF_VALS), "out": [0.0] * 16}),
+        (_HOF_F16, "k_f16", {"v": list(_HOF_VALS), "out": [0.0] * 16}),
+        (_LIB_SOFTMAX, "k_sm", {"v": list(_HOF_VALS), "out": [0.0] * 16}),
+    ]
+
+
+@needs_clangxx
+@pytest.mark.parametrize("kernel_src,kernel,bufs", _hof_cases(),
+                         ids=["int", "f32", "f16", "lib_softmax"])
+def test_higher_order_kernels_shim_matches_interp(kernel_src, kernel, bufs):
+    _differential(kernel_src, kernel, 2, bufs)
+
+
+@needs_clangxx
+@pytest.mark.parametrize("kernel_src,kernel,bufs", _hof_cases(),
+                         ids=["int", "f32", "f16", "lib_softmax"])
+def test_higher_order_kernels_simdgroup_shim_matches_interp(kernel_src, kernel, bufs):
+    # Forced per-simdgroup: elementwise ops become lane-shared MX_EACH
+    # loops; the shim (one lane per instance) redefines the macro as the
+    # whole loop, so the comparison is still exact.
+    src = _driver(kernel_src, kernel, 2, bufs)
+    k = emit_msl_kernel(src, kernel, simdgroup=True)
+    assert k.simdgroup
+    assert "MX_EACH(__i," in k.body
+    assert "#define MX_EACH(i, n) for (int i = (int)__lane; i < (n); i += 32)" in k.body
+    _res, out = interp_run(src)
+    toks, pos, expect = out.split(), 0, []
+    for name in bufs:
+        conv = float if k.buf_types[name] == "float" else int
+        n = len(bufs[name])
+        if name in k.out_bufs:
+            expect += [conv(x) for x in toks[pos:pos + n]]
+        pos += n
+    assert _run_shim(k, 2, bufs) == expect
+
+
+def test_higher_order_body_structure():
+    k = emit_msl_kernel(_driver(_LIB_SOFTMAX, "k_sm", 2, _hof_cases()[3][2]), "k_sm")
+    body = k.body
+    # helpers inlined: no call remains, their lambdas are per-element bodies
+    assert "softmax_rows" not in body and "std.tile" not in body
+    assert "metal::exp(" in body
+    assert "__ret_l" in body and "while (__run_l" in body
+    assert "MX_EACH(__i, 8)" in body
+    # per-thread: the macro is the plain loop
+    assert "#define MX_EACH(i, n) for (int i = 0; i < (n); i++)" in body
+    # the math shim is in the C++ wrapper with the narrow-mode definition
+    assert "static inline float exp(float x) { return (float)std::exp((double)x); }" in k.cpp_wrapper()
+    # no `$` from inlining survives into C identifiers
+    assert "$" not in body
+
+
+@pytest.mark.parametrize("body,fragment", [
+    # a tile op inside the function passed to map
+    ("fn k(pid: int, v: Vec) -> () { let t = Tile.load_or(v, 0, 1, 2, 0);"
+     " let u = Tile.map(t, fn(x: int) -> Tile.sum(Tile.filled(1, 1, x)));"
+     " Tile.store_clipped(v, 0, u); () }",
+     "inside the function is outside the kernel subset"),
+    # the function captures a tile
+    ("fn k(pid: int, v: Vec) -> () { let t = Tile.load_or(v, 0, 1, 2, 0);"
+     " let u = Tile.map(t, fn(x: int) -> x + Tile.sum(t));"
+     " Tile.store_clipped(v, 0, u); () }",
+     "captures the tile"),
+    # a non-literal reduction seed
+    ("fn k(pid: int, v: Vec) -> () { let t = Tile.load_or(v, 0, 1, 2, 0);"
+     " let u = Tile.reduce_rows(t, pid, fn(a: int, b: int) -> a + b);"
+     " Tile.store_clipped(v, 0, u); () }",
+     "init must be an int literal"),
+    # float scalar arithmetic stays outside kernels (lambdas are the place)
+    ("fn k(pid: int, v: Vec) -> () { let t = Tile.to_f32(Tile.load_or(v, 0, 1, 2, 0.0));"
+     " let s = 0.5 * 2.0; Tile.store_clipped(v, 0, Tile.scale(t, s)); () }",
+     "float scalar arithmetic is outside the kernel subset"),
+    # a recursive helper has no finite inlining
+    ("fn again(t, n: int) -> Tile { if n == 0 { t } else { again(Tile.map(t, fn(x: int) -> x + 1), n - 1) } }"
+     " fn k(pid: int, v: Vec) -> () { let t = Tile.load_or(v, 0, 1, 2, 0);"
+     " Tile.store_clipped(v, 0, again(t, 2)); () }",
+     "recursive call"),
+])
+def test_higher_order_misuse_is_rejected(body, fragment):
+    with pytest.raises(MslError) as ei:
+        emit_msl_kernel(_kernel_module(body), "k")
+    assert fragment in str(ei.value)

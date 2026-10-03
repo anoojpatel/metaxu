@@ -1,0 +1,145 @@
+# std.attention — FlashAttention-2 over tiles (docs/gpu_tiles.md).
+#
+# One launch instance owns one block of 8 query rows and streams the keys
+# and values past it in blocks of 8, keeping a running row maximum `m`, a
+# running denominator `l` and an unnormalized output `o`, and rescaling
+# both by `exp(m_old - m_new)` whenever the maximum moves.  Softmax is
+# therefore never materialized: the scores of one block live in an 8x8
+# tile, and the output is normalized once at the end.  The two matrix
+# products per block are 8x8 `Tile.dot`s, so on the per-simdgroup lowering
+# they run on the matrix units; the online-softmax arithmetic is
+# `std.tile` over the higher-order primitives, with f32 elements rounding
+# per op on every engine.
+#
+# Layouts: `q`, `k`, `v` and `out` are row-major [n, 8] matrices in Vecs
+# of f32-representable floats (head dimension 8: the block shape is
+# literal in this version; other shapes are a copy of these functions
+# with other literals until const generics reach kernels).  `n` must be a
+# multiple of 8 and travels in `meta[0]` (kernel parameters are buffers).
+# The scale is 1/sqrt(8).
+#
+#     perform Gpu.launch(n / 8, fn(pid: int) -> attention8(pid, q, k, v, out, meta))
+#
+# `causal_attention8` adds the causal mask: key blocks past the query
+# block are skipped, and on the diagonal block the upper triangle is
+# pushed to the most negative f32 before the softmax (a 0/1 mask tile
+# built from `Tile.arange`, no buffer needed).  `attention_ref` is the
+# plain f64 definition both are tested against.
+
+export {
+    attention8,
+    causal_attention8,
+    attention_ref
+}
+
+from std.tile import exp, maximum, row_max, row_sum, sub, sub_rows, mul_rows, div_rows, neg_huge;
+
+fn qk_scale8() -> float { 0.35355339059327373 }
+
+# A fresh 8x1 f32 column of x.
+fn col8(x: float) -> Tile {
+    Tile.map(Tile.to_f32(Tile.filled(8, 1, 0)), fn(v: float) -> v + x)
+}
+
+# The row count, carried in the meta buffer.
+fn rows_of(meta: Vec) -> int {
+    Tile.sum(Tile.load_or(meta, 0, 1, 1, 0))
+}
+
+fn attention8(pid: int, q: Vec, k: Vec, v: Vec, out: Vec, meta: Vec) -> () {
+    let n = rows_of(meta);
+    let qb = Tile.to_f32(Tile.load_rows(q, pid * 64, 8, 8, 8, 0.0));
+    let @mut m = col8(neg_huge());
+    let @mut l = col8(0.0);
+    let @mut o = Tile.to_f32(Tile.filled(8, 8, 0));
+    let @mut j = 0;
+    while j * 8 < n {
+        let kb = Tile.to_f32(Tile.load_rows(k, j * 64, 8, 8, 8, 0.0));
+        let vb = Tile.to_f32(Tile.load_rows(v, j * 64, 8, 8, 8, 0.0));
+        let s = Tile.scale(Tile.dot(qb, Tile.transpose(kb)), qk_scale8());
+        let m_new = maximum(m, row_max(s));
+        let p = exp(sub_rows(s, m_new));
+        let alpha = exp(sub(m, m_new));
+        l = Tile.add(Tile.mul(l, alpha), row_sum(p));
+        o = Tile.add(mul_rows(o, alpha), Tile.dot(p, vb));
+        m = m_new;
+        j = j + 1
+    };
+    Tile.store_rows(out, pid * 64, 8, div_rows(o, l));
+    ()
+}
+
+fn causal_attention8(pid: int, q: Vec, k: Vec, v: Vec, out: Vec, meta: Vec) -> () {
+    let qb = Tile.to_f32(Tile.load_rows(q, pid * 64, 8, 8, 8, 0.0));
+    let @mut m = col8(neg_huge());
+    let @mut l = col8(0.0);
+    let @mut o = Tile.to_f32(Tile.filled(8, 8, 0));
+    let @mut j = 0;
+    while j <= pid {
+        let kb = Tile.to_f32(Tile.load_rows(k, j * 64, 8, 8, 8, 0.0));
+        let vb = Tile.to_f32(Tile.load_rows(v, j * 64, 8, 8, 8, 0.0));
+        let raw = Tile.scale(Tile.dot(qb, Tile.transpose(kb)), qk_scale8());
+        let s = if j == pid { mask_upper8(raw) } else { raw };
+        let m_new = maximum(m, row_max(s));
+        let p = exp(sub_rows(s, m_new));
+        let alpha = exp(sub(m, m_new));
+        l = Tile.add(Tile.mul(l, alpha), row_sum(p));
+        o = Tile.add(mul_rows(o, alpha), Tile.dot(p, vb));
+        m = m_new;
+        j = j + 1
+    };
+    Tile.store_rows(out, pid * 64, 8, div_rows(o, l));
+    ()
+}
+
+# Scores above the diagonal of an 8x8 block become the most negative f32
+# (their exp is 0 and they never win the row maximum).  The flag tile
+# marks them from the element's row-major index: column > row.
+fn mask_upper8(s: Tile) -> Tile {
+    let above = Tile.to_f32(Tile.map(Tile.arange(8, 8), fn(i: int) -> if i % 8 > i / 8 { 1 } else { 0 }));
+    Tile.zip(s, above, fn(x: float, flag: float) -> if flag > 0.5 { neg_huge() } else { x })
+}
+
+# The plain definition: softmax(q k^T / sqrt(d)) v in f64, row by row,
+# over [n, d] row-major Vecs; `causal` masks keys after the query.
+fn attention_ref(q: Vec, k: Vec, v: Vec, n: int, d: int, causal: bool) -> Vec {
+    let @mut out = Vec.new();
+    let @mut df = 0.0;
+    let @mut t = 0;
+    while t < d { df = df + 1.0; t = t + 1 };
+    let scale = 1.0 / df.sqrt();
+    let @mut i = 0;
+    while i < n {
+        let limit = if causal { i + 1 } else { n };
+        let @mut scores = Vec.new();
+        let @mut mx = 0.0;
+        let @mut j = 0;
+        while j < limit {
+            let @mut dotp = 0.0;
+            let @mut c = 0;
+            while c < d { dotp = dotp + q[i * d + c] * k[j * d + c]; c = c + 1 };
+            let sc = dotp * scale;
+            scores.push(sc);
+            if j == 0 { mx = sc } else { if sc > mx { mx = sc } else { () } };
+            j = j + 1
+        };
+        let @mut denom = 0.0;
+        j = 0;
+        while j < limit {
+            let shifted = scores[j] - mx;
+            scores[j] = shifted.exp();
+            denom = denom + scores[j];
+            j = j + 1
+        };
+        let @mut c2 = 0;
+        while c2 < d {
+            let @mut acc = 0.0;
+            j = 0;
+            while j < limit { acc = acc + scores[j] * v[j * d + c2]; j = j + 1 };
+            out.push(acc / denom);
+            c2 = c2 + 1
+        };
+        i = i + 1
+    };
+    out
+}
