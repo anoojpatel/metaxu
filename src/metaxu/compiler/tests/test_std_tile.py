@@ -199,16 +199,21 @@ def test_library_shape_misuse_is_a_loud_runtime_error(expr, message):
     assert out.strip() == message
 
 
-def test_f64_library_lowers_natively():
-    ir = llvm_from_source(_program("Tile.to_f64"))
+@pytest.mark.parametrize("conv", ["Tile.to_f64", "Tile.to_f32", "Tile.to_f16"],
+                         ids=["f64", "f32", "f16"])
+def test_library_lowers_natively(conv):
+    ir = llvm_from_source(_program(conv))
     assert count_placeholders(ir) == 0
+    if conv != "Tile.to_f64":
+        # every lambda of the library is a narrow lambda here
+        assert "narrow lambda:" in ir
+        assert ("to float" if conv == "Tile.to_f32" else "to half") in ir
 
 
 @needs_clang
-def test_native_f64_library_matches_interp(tmp_path):
-    assert_native_matches_interp(_program("Tile.to_f64"), tmp_path)
-
-
-def test_f32_library_demotes_natively_with_the_narrow_mode_reason():
-    ir = llvm_from_source(_program("Tile.to_f32"))
-    assert "narrow-mode lambda arithmetic is not lowered natively yet" in ir
+@pytest.mark.parametrize("conv", ["Tile.to_f64", "Tile.to_f32", "Tile.to_f16"],
+                         ids=["f64", "f32", "f16"])
+def test_native_library_matches_interp(conv, tmp_path):
+    # The same oracle-checked program, natively: the narrow lambdas round
+    # per op exactly as the interpreter's narrow mode does.
+    assert_native_matches_interp(_program(conv), tmp_path)

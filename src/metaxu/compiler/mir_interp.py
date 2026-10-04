@@ -689,6 +689,11 @@ class MirInterpreter:
         self._funcs: Dict[str, MirFunc] = {}
         # ids of tail-position resume ops (filled by load(); see there).
         self._tail_resume_ids: frozenset = frozenset()
+        # Narrow-mode contexts (see _tile_call): the element width ("f32" /
+        # "f16") of each higher-order tile call in flight, or None for an
+        # int / f64 one.  While the top is a width, every float a `let`
+        # binds rounds to it.
+        self._narrow_ctx: List[Optional[str]] = []
         self._effect_handlers: Dict[str, EffectHandler] = {}
         self._builtins: Dict[str, Callable[..., Any]] = {}
         # Handler stacks are PER LOGICAL METAXU THREAD (_ThreadCtx, reached
@@ -1126,6 +1131,12 @@ class MirInterpreter:
                         k.scope.pending_k = None
                         raise _TailResume(k, self._lookup(args[1], env, f))
                 val = self._eval_rhs(rhs, args, env, f)
+                if self._narrow_ctx and type(val) is float:
+                    # Narrow mode (the higher-order tile ops): every float
+                    # this call binds is at the tile's element width.
+                    nk = self._narrow_ctx[-1]
+                    if nk is not None:
+                        val = _NARROW_ROUND[nk](val)
                 cur = env.get(dst)
                 if isinstance(cur, MxCell) and not isinstance(val, MxCell):
                     # Write THROUGH the shared cell so every frame that
@@ -2591,14 +2602,15 @@ class MirInterpreter:
     # `Tile.broadcast_cols(t, v, f)`: the structural primitives the library
     # builds every elementwise and row/column operation from (std/tile.mx:
     # exp, row_max, row_sum, sub_rows, ...).  `f` is any Metaxu function
-    # value of the right arity; elements of f32/f16 tiles reach it in
-    # narrow mode (MxF32/MxF16), so its arithmetic rounds per op exactly
-    # as the device does, and its result is checked against the tile's
-    # element kind and stored widened.  Reductions run in row-major order
-    # with `init` rounded to the width first: the pinned order natively
-    # and in kernels.
+    # value of the right arity; over an f32/f16 tile it runs in NARROW
+    # MODE (see the note at _NARROW_ROUND), so its arithmetic rounds per
+    # op exactly as the device does, and its result is checked against the
+    # tile's element kind and stored widened.  Reductions run in row-major
+    # order with `init` rounded to the width first: the pinned order
+    # natively and in kernels.
 
-    def _tile_call(self, op: str, f: Any, args: List[Any], arity: int) -> Any:
+    def _tile_call(self, op: str, ekind: str, f: Any, args: List[Any],
+                   arity: int) -> Any:
         if not isinstance(f, MxClosure):
             raise InterpError(
                 f"{op}: expected a function, got {_runtime_type_name(f)!r}")
@@ -2609,7 +2621,20 @@ class MirInterpreter:
         if n != arity:
             raise InterpError(
                 f"{op}: the function takes {n} parameter(s), expected {arity}")
-        return self._call_func(target, args, dict(f.captured))
+        rnd = _NARROW_ROUND.get(ekind)
+        captured = dict(f.captured)
+        if rnd is not None:
+            # Captured floats enter at the width too (the MSL emitter's
+            # "a float capture rounds at the bind"; natively the lambda
+            # prologue rounds them).
+            for k, v in captured.items():
+                if type(v) is float:
+                    captured[k] = rnd(v)
+        self._narrow_ctx.append(ekind if rnd is not None else None)
+        try:
+            return self._call_func(target, args, captured)
+        finally:
+            self._narrow_ctx.pop()
 
     @staticmethod
     def _tile_elem_result(op: str, ekind: str, v: Any) -> Any:
@@ -2651,7 +2676,7 @@ class MirInterpreter:
         out = tuple(
             self._tile_elem_result(
                 "Tile.map", t.ekind,
-                self._tile_call("Tile.map", f, [_narrow(t.ekind, x)], 1))
+                self._tile_call("Tile.map", t.ekind, f, [x], 1))
             for x in t.elements)
         return MxTile(t.rows, t.cols, out, t.ekind)
 
@@ -2669,8 +2694,7 @@ class MirInterpreter:
         out = tuple(
             self._tile_elem_result(
                 "Tile.zip", t.ekind,
-                self._tile_call("Tile.zip", f,
-                                [_narrow(t.ekind, x), _narrow(t.ekind, y)], 2))
+                self._tile_call("Tile.zip", t.ekind, f, [x, y], 2))
             for x, y in zip(t.elements, u.elements))
         return MxTile(t.rows, t.cols, out, t.ekind)
 
@@ -2688,9 +2712,7 @@ class MirInterpreter:
                     else t.elements[j * t.cols + i]
                 acc = self._tile_elem_result(
                     op, t.ekind,
-                    self._tile_call(op, f,
-                                    [_narrow(t.ekind, acc),
-                                     _narrow(t.ekind, x)], 2))
+                    self._tile_call(op, t.ekind, f, [acc, x], 2))
             out.append(acc)
         return (MxTile(t.rows, 1, tuple(out), t.ekind) if by_rows
                 else MxTile(1, t.cols, tuple(out), t.ekind))
@@ -2721,9 +2743,8 @@ class MirInterpreter:
                 s = v.elements[i] if by_rows else v.elements[j]
                 out.append(self._tile_elem_result(
                     op, t.ekind,
-                    self._tile_call(op, f,
-                                    [_narrow(t.ekind, t.elements[i * t.cols + j]),
-                                     _narrow(t.ekind, s)], 2)))
+                    self._tile_call(op, t.ekind, f,
+                                    [t.elements[i * t.cols + j], s], 2)))
         return MxTile(t.rows, t.cols, tuple(out), t.ekind)
 
     def _tile_broadcast_rows(self, t: Any, v: Any, f: Any) -> MxTile:
@@ -2925,9 +2946,6 @@ def _eval_binop(op: str, lv: Any, rv: Any) -> Any:
     # Fixed-size vectors: element-wise arithmetic with scalar broadcasting.
     if op in _VEC_ELEMENTWISE_OPS and (isinstance(lv, MxVector) or isinstance(rv, MxVector)):
         return _vec_elementwise(op, lv, rv)
-    nk = _narrow_kind(lv) or _narrow_kind(rv)
-    if nk is not None:
-        return _narrow_binop(op, lv, rv, nk)
     fn = _BINOPS.get(op)
     if fn is None:
         raise InterpError(f"Unknown binary operator: {op!r}")
@@ -3041,7 +3059,12 @@ def _f32(x: float) -> float:
     """Round a double to the nearest f32, returned as the widened double
     (the f32-representable value).  Every f32 tile op rounds through
     this; _F32_PACK round-trips through IEEE binary32 exactly."""
-    return _structmod.unpack("f", _structmod.pack("f", x))[0]
+    try:
+        return _structmod.unpack("f", _structmod.pack("f", x))[0]
+    except OverflowError:
+        # IEEE round-to-nearest overflows to the signed infinity, as
+        # (float)x and fptrunc do; Python's pack raises instead.
+        return math.copysign(math.inf, x)
 
 
 def _f16(x: float) -> float:
@@ -3057,81 +3080,28 @@ def _f16(x: float) -> float:
         return math.copysign(math.inf, x)
 
 
-# -- Narrow-mode scalars (docs/gpu_tiles.md, the higher-order tile ops) ------
+# -- Narrow mode (docs/gpu_tiles.md, the higher-order tile ops) --------------
 #
 # `Tile.map(t, f)` and its siblings call a Metaxu function on the ELEMENTS
-# of an f32 or f16 tile.  Inside that function every arithmetic step must
-# round to the element width, or two engines that round once per op (this
-# interpreter, the C++ shim, Metal) and one that evaluates the body in f64
-# would disagree.  The element therefore arrives as an MxF32 / MxF16: a
-# float whose value is the width-representable double, and whose every
-# binary operation and math call rounds its result back to the width.  A
-# plain float or int meeting a narrow value rounds to the width first
-# (exactly `(float)s` in C — the Tile.scale rule).  f32 and f16 never mix.
-# The language's type checker sees `float`; the mode is a property of the
-# VALUE, which is why no new type syntax was needed.  Results written back
-# into a tile are unwrapped to the widened double, so tiles, reprs and
-# `to_vec` are unchanged.
-
-class MxF32(float):
-    """A float in f32 mode: its value is f32-representable and every op
-    on it rounds to f32 once (see the narrow-mode note above)."""
-    __slots__ = ()
-
-
-class MxF16(float):
-    """A float in f16 mode (see MxF32)."""
-    __slots__ = ()
-
+# of an f32 or f16 tile.  Inside that call every float is at the element
+# width: the elements and `init` arrive rounded, captured floats are
+# rounded on entry, and every float a `let` binds (a literal, an
+# arithmetic result, a math call, a value read out of a Vec, the result
+# of a function the body calls) rounds to the width once before it is
+# bound.  That is exactly what a body typed `float` or `half` computes on
+# the device and in the C++ shim (`_run_ops` does the rounding; the mode
+# is a property of the CALL, pushed by `_tile_call`, not of values, so
+# the type checker still sees `float` and no new type syntax was needed).
+# +, -, * of two width-representable doubles are exact in f64 and round
+# once; / and sqrt are correctly rounded through f64 by the innocuous-
+# double-rounding bound (53 >= 2*24 + 2 and 2*11 + 2); exp and log are
+# the double libm call rounded once on every engine.  Results written
+# back into a tile are the widened doubles, so tiles, reprs and `to_vec`
+# are unchanged.  The LLVM backend compiles the same rule into the lambda
+# (codegen_llvm.py, "narrow lambdas"), and the MSL emitter types the body
+# at the element width.
 
 _NARROW_ROUND = {"f32": _f32, "f16": _f16}
-_NARROW_CLASS = {"f32": MxF32, "f16": MxF16}
-
-
-def _narrow_kind(x: Any) -> Optional[str]:
-    if isinstance(x, MxF32):
-        return "f32"
-    if isinstance(x, MxF16):
-        return "f16"
-    return None
-
-
-def _narrow(ekind: str, x: Any) -> Any:
-    """Wrap a tile element for a lambda call: f32/f16 elements become
-    narrow-mode floats; int and f64 elements are themselves."""
-    cls = _NARROW_CLASS.get(ekind)
-    if cls is None:
-        return x
-    return cls(_NARROW_ROUND[ekind](float(x)))
-
-
-def _narrow_binop(op: str, lv: Any, rv: Any, nk: str) -> Any:
-    lk, rk = _narrow_kind(lv), _narrow_kind(rv)
-    if lk is not None and rk is not None and lk != rk:
-        raise InterpError(
-            f"binary operator {op!r} mixes an f32 and an f16 value")
-    for v in (lv, rv):
-        if isinstance(v, bool) or not isinstance(v, (int, float)):
-            raise InterpError(
-                f"binary operator {op!r} cannot be applied to "
-                f"{_runtime_type_name(lv)} and {_runtime_type_name(rv)}")
-    fn = _BINOPS.get(op)
-    if fn is None:
-        raise InterpError(f"Unknown binary operator: {op!r}")
-    rnd = _NARROW_ROUND[nk]
-    # The other operand rounds to the width first; +, -, * are then exact
-    # in f64 and round once, and / is correctly rounded through f64 by the
-    # innocuous-double-rounding bound (53 >= 2*24 + 2 and 2*11 + 2).
-    a, b = rnd(float(lv)), rnd(float(rv))
-    try:
-        res = fn(a, b)
-    except TypeError:
-        raise InterpError(
-            f"binary operator {op!r} cannot be applied to "
-            f"{_runtime_type_name(lv)} and {_runtime_type_name(rv)}") from None
-    if isinstance(res, bool):
-        return res
-    return _NARROW_CLASS[nk](rnd(float(res)))
 
 
 def _tile_zero(ekind: str) -> Any:
@@ -3645,33 +3615,23 @@ def _make_math_method(name: str, fn: Callable[[float], float]) -> Callable[[Any]
             raise InterpError(
                 f"{name}: expected a number, got {_runtime_type_name(x)!r}")
         try:
-            r = fn(float(x)) if _narrow_kind(x) is not None else fn(x)
+            return fn(x)
         except (ValueError, OverflowError) as exc:
             raise InterpError(f"{name}: domain error for {x!r} ({exc})") from None
-        # Narrow mode: the double result rounds once to the width — the
-        # definition the C++ shim reproduces as (float)exp((double)x).
-        nk = _narrow_kind(x)
-        return _narrow(nk, r) if nk is not None else r
     return method
 
 
 def _make_pick_builtin(name: str, pick_second: Callable[[Any, Any], bool]):
     """`max(a, b)` / `min(a, b)`: b when `pick_second(a, b)`, else a — the
     same tie and NaN behavior on every engine (natively a compare and a
-    select).  Narrow-mode operands round the other side to their width,
-    like every binary operation on them."""
+    select)."""
     def builtin(a: Any, b: Any) -> Any:
         for v in (a, b):
             if not _is_number(v):
                 raise InterpError(
                     f"{name}: expected numbers, got "
                     f"{_runtime_type_name(a)!r} and {_runtime_type_name(b)!r}")
-        nk = _narrow_kind(a) or _narrow_kind(b)
-        if nk is not None:
-            if _narrow_kind(a) and _narrow_kind(b) and _narrow_kind(a) != nk:
-                raise InterpError(f"{name}: mixes an f32 and an f16 value")
-            a, b = _narrow(nk, a), _narrow(nk, b)
-        elif isinstance(a, float) != isinstance(b, float):
+        if isinstance(a, float) != isinstance(b, float):
             raise InterpError(
                 f"{name}: expected two ints or two floats, got "
                 f"{_runtime_type_name(a)!r} and {_runtime_type_name(b)!r}")

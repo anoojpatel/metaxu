@@ -910,6 +910,10 @@ fn main() -> int {
     let h = Tile.to_f16(f);
     print(Tile.map(h, fn(x: float) -> x * x + x));
     print(Tile.map(Tile.filled(1, 1, 1.1), fn(x: float) -> x * x + x));
+    let c = 0.1;
+    print(Tile.map(f, fn(x: float) -> x * 0.1));
+    print(Tile.map(f, fn(x: float) -> x + c));
+    print(Tile.map(f, fn(x: float) -> if x > 1.0 { 0.1 } else { x }));
     0
 }
 """
@@ -927,6 +931,15 @@ fn main() -> int {
     h = _f16(_f16(y * y) + y)
     assert out.splitlines()[3] == f"tile[1x2]({h!r}, {h!r})"
     assert out.splitlines()[4] == f"tile[1x1]({1.1 * 1.1 + 1.1!r})"   # f64: no rounding
+    # Narrow mode is the CALL's: a literal, a captured float and a value
+    # chosen by a branch are all at the width, not just the operands that
+    # came out of the tile (what a float-typed body computes on the device).
+    lit = _f32(x * _f32(0.1))
+    assert lit != _f32(x * 0.1)
+    assert out.splitlines()[5] == f"tile[1x2]({lit!r}, {lit!r})"
+    cap = _f32(x + _f32(0.1))
+    assert out.splitlines()[6] == f"tile[1x2]({cap!r}, {cap!r})"
+    assert out.splitlines()[7] == f"tile[1x2]({_f32(0.1)!r}, {_f32(0.1)!r})"
 
 
 def test_interp_higher_order_errors_are_loud():
@@ -1024,16 +1037,73 @@ def test_native_higher_order_ops_match_interp(tmp_path):
     assert_native_matches_interp(_HOF_NATIVE_SRC, tmp_path)
 
 
-def test_narrow_mode_maps_demote_natively_with_a_reason():
-    # f32/f16 lambdas compute in narrow mode (per-op rounding); the native
-    # scalar path has no such kind yet, so these demote honestly instead of
-    # running the body in f64.
-    ir = llvm_from_source("""
+_NARROW_NATIVE_SRC = """
+fn big() -> float { 3.5 }
+fn half_of(x: float) -> float { x * 0.5 }
 fn main() -> int {
+    let x = 0.1;
     let f = Tile.to_f32(Tile.filled(1, 2, 1.1));
-    print(Tile.map(f, fn(x: float) -> x * x + x));
+    print(Tile.map(f, fn(v: float) -> v + x * 3.0 + big()));
+    print(Tile.map(f, fn(v: float) -> v * v + v));
+    print(Tile.map(f, fn(v: float) -> exp(v) * 0.1 - log(v) / 7.0));
+    print(Tile.map(f, fn(v: float) -> if v > 1.0 { sqrt(v) } else { half_of(v) }));
+    print(Tile.zip(f, Tile.map(f, fn(v: float) -> v * 0.3), fn(a: float, b: float) -> max(a, b) - min(a, b)));
+    print(Tile.reduce_rows(f, 0.25, fn(acc: float, v: float) -> acc + v * 0.3));
+    print(Tile.broadcast_cols(f, Tile.reduce_cols(f, 0.0, fn(p: float, q: float) -> p + q),
+                              fn(v: float, s: float) -> v / s));
+    let h = Tile.to_f16(f);
+    print(Tile.map(h, fn(v: float) -> v * v + v));
+    print(Tile.map(h, fn(v: float) -> exp(v) * 0.1));
+    print(Tile.reduce_rows(h, 0.0, fn(a: float, b: float) -> a + b * 0.3));
+    print(Tile.broadcast_rows(h, Tile.reduce_rows(h, 0.0, fn(a: float, b: float) -> a + b),
+                              fn(v: float, s: float) -> v - s * x));
     0
 }
-""")
+"""
+
+
+def test_narrow_lambdas_lower_natively_with_per_op_rounding():
+    # The lambda of a map over an f32/f16 tile is compiled as a NARROW
+    # LAMBDA: its module calls are inlined and every f64 it binds rounds
+    # through float/half, the interpreter's narrow-mode rule.
+    ir = llvm_from_source(_NARROW_NATIVE_SRC)
+    assert count_placeholders(ir) == 0
+    assert "fptrunc double %a.v to float  ; narrow lambda: parameter v rounds to f32" in ir
+    assert "narrow lambda: capture x_" in ir
+    assert "to half  ; narrow lambda:" in ir
+    assert "fpext half" in ir and "fpext float" in ir
+    # the helper was inlined into the lambda, not called from it
+    assert "narrow lambda: c1$i" in ir
+    assert "call double @exp(double" in ir
+
+
+@needs_clang
+def test_native_narrow_lambdas_match_interp(tmp_path):
+    assert_native_matches_interp(_NARROW_NATIVE_SRC, tmp_path)
+
+
+@pytest.mark.parametrize("src,fragment", [
+    # the closure is also called directly: that call would compute in f64
+    ("fn main() -> int { let f = Tile.to_f32(Tile.filled(1, 2, 1.1));"
+     " let g = fn(v: float) -> v * v; print(g(2.0)); print(Tile.map(f, g)); 0 }",
+     "is also used by a call of it, which would compute in f64"),
+    # one function, two widths
+    ("fn main() -> int { let f = Tile.to_f32(Tile.filled(1, 2, 1.1));"
+     " let g = fn(v: float) -> v * v; print(Tile.map(f, g));"
+     " print(Tile.map(Tile.to_f16(f), g)); 0 }",
+     "applied to tiles of f32 and of f16 elements (one width per function)"),
+    # a recursive helper has no finite inlining
+    ("fn again(x: float, n: int) -> float { if n == 0 { x } else { again(x * 0.5, n - 1) } }"
+     " fn main() -> int { let f = Tile.to_f32(Tile.filled(1, 2, 1.1));"
+     " print(Tile.map(f, fn(v: float) -> again(v, 2))); 0 }",
+     "recursive call to 'again' cannot be inlined"),
+    # a function value called from inside the lambda
+    ("fn main() -> int { let f = Tile.to_f32(Tile.filled(1, 2, 1.1));"
+     " let k = fn(y: float) -> y * 0.5;"
+     " print(Tile.map(f, fn(v: float) -> k(v) + 1.0)); 0 }",
+     "calls a function value"),
+])
+def test_narrow_lambda_misuse_demotes_with_a_reason(src, fragment):
+    ir = llvm_from_source(src)
     assert count_placeholders(ir) >= 1
-    assert "narrow-mode lambda arithmetic is not lowered natively yet" in ir
+    assert fragment in ir

@@ -73,11 +73,22 @@ with no section and uses it as the release notes.
   u, f)`, `Tile.reduce_rows/reduce_cols(t, init, f)` and
   `Tile.broadcast_rows/broadcast_cols(t, v, f)`, each calling a Metaxu
   function per element. Elements of f32 and f16 tiles reach the
-  function in narrow mode (every operation and math call rounds to the
-  width once), so a lambda computes what the device computes with no
-  new type syntax. `exp`, `log`, `max` and `min` are scalar builtins on
-  both engines. Natively, int and f64 lambdas lower to the C runtime;
-  f32 and f16 lambdas demote with a reason naming the gap.
+  function in narrow mode (every float the function binds rounds to the
+  width once: elements, captures, literals, operation and math call
+  results), so a lambda computes what a `float` or `half` body computes
+  on the device, with no new type syntax. `exp`, `log`, `max` and `min`
+  are scalar builtins on both engines. Natively, f32 and f16 lambdas
+  compile as narrow lambdas: their module calls are inlined and every
+  float they bind is rounded through `float` or `half`, bit-exact with
+  the interpreter (`test_std_tile.py`, `test_std_attention.py`). A
+  lambda applied at two widths or also called directly demotes with a
+  reason.
+- Native backend: a small helper whose closures exist only to be a tile
+  op's function (every `std.tile` helper) is inlined into its callers
+  with a private lambda per call site, so one `exp` serves 8x8 and 8x1
+  tiles and f32 and f16 widths in one program; other closure-owning
+  functions are now cloned per call-site kinds together with their
+  lambdas instead of being excluded from kind specialization.
 - `std.tile`: the elementwise and row/column vocabulary over those
   primitives (`exp`, `sub`, `maximum`, `row_max`, `row_sum`,
   `sub_rows`, `div_rows`, `softmax_rows`, ...), one line each, tested

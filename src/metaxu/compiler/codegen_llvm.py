@@ -708,7 +708,11 @@ and vec leaves, so ``Option{None:}`` joins ``Option{Some:str}`` but
 ``vec:i64`` never joins ``vec:f64`` — and emits one clone ``f$kN`` per
 group, self-calls included.  Candidates are plain functions with at least
 two direct sites: not lambdas, handle-scope members, the entry points,
-suspending functions or owners of closure/scope ops (bound to their owner
+suspending functions or owners of scope ops (bound to their owner by
+name; a function that creates lambdas is cloned together with them, each
+clone getting private ``L$kN`` lambdas with their own kind cells, which is
+what lets a shape-generic ``std.tile`` helper serve 8x8 and 8x1 tiles)
+(scope ops are bound to their owner
 by name), and sites inside unreached or still-polymorphic callers wait for
 a later round.  Originals and superseded clones nothing mentions are
 dropped; runtime messages keep the original's name via
@@ -953,6 +957,7 @@ from typing import (Any, Dict, FrozenSet, Iterator, List, Optional, Sequence,
                     Set, Tuple)
 
 from .mir import MirBlock, MirFunc
+from .mir_inline import InlineError, inline_calls, inline_into_module
 from .cps_frames import is_suspending
 from .tile_shape_check import TILE_ARITY
 from .effect_tail import (tail_resume_ids as _tail_resume_ids,
@@ -1041,12 +1046,15 @@ _MATH_EXTERNS = {"sqrt", "sin", "cos", "exp", "log"}  # double -> double libc fu
 _INLINE_BUILTINS = {"neg", "not", "bnot", "max", "min"}
 # The higher-order tile ops (docs/gpu_tiles.md): a statically-known lambda
 # per element, driven by mx_tile_map and friends through a per-site word
-# thunk exactly like __vec_comprehension.  Element kinds I64 and F64 lower;
-# f32/f16 tiles demote (their lambdas run in narrow mode, which the native
-# scalar path does not model yet -- kernels and the interpreter do).
+# thunk exactly like __vec_comprehension.  Over an f32/f16 tile the lambda
+# is a NARROW LAMBDA (_narrow_lambdas / _Info.narrow): its module calls are
+# inlined and every f64 it binds rounds to the width, the interpreter's
+# narrow-mode rule.
 _TILE_HOF = {"Tile.map": 1, "Tile.zip": 2, "Tile.reduce_rows": 2,
              "Tile.reduce_cols": 2, "Tile.broadcast_rows": 2,
              "Tile.broadcast_cols": 2}
+# The LLVM type a narrow width rounds through (fptrunc / fpext pair).
+_NARROW_LLTY = {F32: "float", F16: "half"}
 
 # Vec/string builtins now lowered to the NATIVE runtime (metaxu_rt.c, linked
 # by llvm_run): these mirror the interpreter's builtins exactly.  NAME
@@ -2183,6 +2191,16 @@ class _Info:
     # __vec_comprehension, which reads the SOURCES directly and drives
     # mx_fvec_zip_map.  Every other use demotes (consistency check).
     zip_defs: Dict[str, Tuple[str, ...]] = field(default_factory=dict)
+    # NARROW LAMBDA (the higher-order tile ops over f32/f16 tiles): the
+    # element width this lambda computes at.  Every f64 value it binds
+    # (params, captures, each let) rounds to the width once, which is the
+    # interpreter's narrow-mode rule and what a float/half-typed body does
+    # on the device.  Module calls were inlined by _narrow_lambdas first.
+    narrow: Optional[str] = None
+    # Module-wide: lambda -> width for every narrow lambda, and lambda ->
+    # why it cannot be one (shared dicts, filled by _narrow_lambdas).
+    narrow_lambdas: Dict[str, str] = field(default_factory=dict)
+    narrow_bad: Dict[str, str] = field(default_factory=dict)
 
     def add_reason(self, r: str) -> None:
         if r not in self.reasons:
@@ -4160,8 +4178,9 @@ def _infer_kinds(info: _Info, sigs: Dict[str, _Sig], structs: _StructTable,
         elif name in _TILE_HOF:
             # Element kinds flow ONE WAY into the lambda's parameters (the
             # comprehension contract); the result tile's kind is fixed by
-            # the op from the receiver's.  Only I64/F64 elements are
-            # pinned here -- f32/f16 demote in the consistency check.
+            # the op from the receiver's.  f32/f16 elements are f64 at the
+            # language level (width-representable doubles); the lambda's
+            # per-op rounding is the narrow-lambda emission, not a kind.
             tk = get(args[0])
             fnvar = args[-1]
             if _is_tile(tk):
@@ -4170,8 +4189,7 @@ def _infer_kinds(info: _Info, sigs: Dict[str, _Sig], structs: _StructTable,
                 fk = get(fnvar)
                 lsig = sigs.get(_closure_lambda(fk)) if _is_closure(fk) \
                     else None
-                if lsig is not None and len(lsig.params) == _TILE_HOF[name] \
-                        and elem in (I64, F64):
+                if lsig is not None and len(lsig.params) == _TILE_HOF[name]:
                     for i in range(len(lsig.params)):
                         nk = _join(lsig.params[i], ek)
                         if nk != lsig.params[i]:
@@ -4836,6 +4854,31 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
     def ty(n: str) -> str:
         return kinds.get(n, I64)
 
+    if info.narrow is not None:
+        # A narrow lambda rounds every f64 IT binds; anything it would
+        # delegate to computes in f64 and must not be reachable from it.
+        # _narrow_lambdas inlined its module calls, so what is left are
+        # function values, trait dispatch and shared cells.
+        what = f"narrow ({info.narrow}) lambda {info.f.name!r}"
+        if info.closure_calls:
+            probs.append(f"{what} calls a function value "
+                         f"({info.closure_calls[0][1]!r}), which would "
+                         "compute in f64")
+        if info.trait_calls:
+            probs.append(f"{what} dispatches a trait method "
+                         f"({info.trait_calls[0][1]!r}), which would "
+                         "compute in f64")
+        for (_d, callee, _a) in info.calls:
+            if callee in module_names or callee.startswith(STATIC_CALL_PREFIX):
+                probs.append(f"{what} calls the module function "
+                             f"{callee!r}, which was not inlined")
+                break
+        if cells.cap_cells.get(info.f.name):
+            probs.append(f"{what} reads a mutable capture through a shared "
+                         "cell (its value cannot be rounded on entry)")
+        if info.f.name in word_uniform:
+            probs.append(f"{what} is on the word-uniform ABI")
+
     def check_boundary(kind: str, what: str) -> None:
         """A value crossing the effect boundary travels as one 8-byte
         word: word kinds directly; struct/enum/closure aggregates as a
@@ -5468,12 +5511,6 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                     return
                 elem, r, c = _tile_parts(ka)
                 ek = _tile_scalar(elem)
-                if elem not in (I64, F64):
-                    probs.append(
-                        f"{name} over a tile of {elem} elements: narrow-mode "
-                        "lambda arithmetic is not lowered natively yet "
-                        "(f32/f16 maps run on the interpreter and in kernels)")
-                    return
                 fnvar = args[-1]
                 fk = ty(fnvar)
                 if not _is_closure(fk) or _is_dyn_closure(fk):
@@ -5485,6 +5522,32 @@ def _check_consistency(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig]
                 if lsig is None or lname not in module_names:
                     probs.append(f"{name} body lambda {lname!r} unknown")
                     return
+                if elem in _NARROW_LLTY:
+                    # A narrow lambda: _narrow_lambdas found it from the
+                    # same site (else it says why not), and its closure
+                    # may serve nothing but tile ops of this width (a plain
+                    # call of it would compute in f64).
+                    why = info.narrow_bad.get(lname)
+                    if why is not None:
+                        probs.append(f"{name} over a tile of {elem} elements: "
+                                     f"the function {lname!r} cannot be a "
+                                     f"narrow lambda: {why}")
+                        return
+                    if info.narrow_lambdas.get(lname) != elem:
+                        probs.append(f"{name} over a tile of {elem} elements: "
+                                     f"the function {lname!r} was not marked "
+                                     f"a {elem} narrow lambda (its width is "
+                                     f"{info.narrow_lambdas.get(lname)})")
+                        return
+                    other = _closure_uses_outside_tile_ops(
+                        info.f, fnvar, elem, kinds)
+                    if other is not None:
+                        probs.append(f"{name} over a tile of {elem} elements: "
+                                     f"the function value {fnvar!r} is also "
+                                     f"used by {other}, which would compute "
+                                     "in f64 (a narrow lambda serves only "
+                                     f"tile ops over {elem} elements)")
+                        return
                 if len(lsig.params) != _TILE_HOF[name]:
                     probs.append(f"{name} body lambda {lname!r} takes "
                                  f"{len(lsig.params)} parameters (expects "
@@ -7835,7 +7898,30 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
         except KeyError:
             raise _Unsupported(f"use of {name!r} before its definition")
 
+    # NARROW LAMBDA (see _narrow_lambdas): every f64 this function binds
+    # rounds to the element width once, through the width's LLVM type.
+    nty = _NARROW_LLTY.get(info.narrow) if info.narrow is not None else None
+
+    def narrow_round(v: str, lines: List[str], what: str) -> str:
+        a, b = fresh(), fresh()
+        lines.append(f"  {a} = fptrunc double {v} to {nty}"
+                     f"  ; narrow lambda: {what} rounds to {info.narrow}")
+        lines.append(f"  {b} = fpext {nty} {a} to double")
+        return b
+
+    def narrow_entry(v: str, name: str, lines: List[str], what: str) -> str:
+        """The entry-block rounding of a param/capture: fixed names, so
+        the body (emitted first) can refer to %nr.<name>."""
+        t = f"%nrt.{_sanitize(name)}"
+        r = f"%nr.{_sanitize(name)}"
+        lines.append(f"  {t} = fptrunc double {v} to {nty}"
+                     f"  ; narrow lambda: {what} {name} rounds to {info.narrow}")
+        lines.append(f"  {r} = fpext {nty} {t} to double")
+        return r
+
     def setval(name: str, v: str, lines: List[str]) -> None:
+        if nty is not None and kind(name) == F64 and name not in aggset:
+            v = narrow_round(v, lines, name)
         if name in cellset:
             # Write THROUGH the shared cell: every frame that captured the
             # cell observes the new value (mir_interp's "let" on a cell).
@@ -9427,11 +9513,15 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
     # copy into their own storage.
     for p in info.params:
         if p not in slotset and p not in aggset and p not in cellset:
-            valmap[p] = f"%a.{_sanitize(p)}"
+            valmap[p] = (f"%nr.{_sanitize(p)}"
+                         if nty is not None and kind(p) == F64
+                         else f"%a.{_sanitize(p)}")
     if info.is_lambda or info.is_scope_member:
         for c in info.env_captures:
             if c not in slotset and c not in aggset and c not in cellset:
-                valmap[c] = f"%cap.{_sanitize(c)}"
+                valmap[c] = (f"%nr.{_sanitize(c)}"
+                             if nty is not None and kind(c) == F64
+                             else f"%cap.{_sanitize(c)}")
 
     # One env alloca per stack-env make_closure site, named and created in
     # the entry block (storage must dominate every use; the site itself may
@@ -10980,14 +11070,18 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
             # semantics (rebound params also copy back OUT on ret paths).
             agg_copy(_agg_ty(kind(p)), f"%a.{_sanitize(p)}",
                      struct_ref(p), entry)
-        elif p in cellset:
-            # A cell-backed parameter: seed the fresh cell with the
-            # incoming value (the caller passed by value, as always).
-            entry.append(
-                f"  store {llty(p)} %a.{_sanitize(p)}, ptr {cellp_ref(p)}"
-                f"  ; cell-backed parameter {p}")
-        elif p in slotset:
-            entry.append(f"  store {llty(p)} %a.{_sanitize(p)}, ptr {slot_ref(p)}")
+        else:
+            pa = f"%a.{_sanitize(p)}"
+            if nty is not None and kind(p) == F64:
+                pa = narrow_entry(pa, p, entry, "parameter")
+            if p in cellset:
+                # A cell-backed parameter: seed the fresh cell with the
+                # incoming value (the caller passed by value, as always).
+                entry.append(
+                    f"  store {llty(p)} {pa}, ptr {cellp_ref(p)}"
+                    f"  ; cell-backed parameter {p}")
+            elif p in slotset:
+                entry.append(f"  store {llty(p)} {pa}, ptr {slot_ref(p)}")
     if info.is_lambda or info.is_scope_member:
         # Reload captures from the env struct (the creator stored them at
         # the make_closure / handle_scope site, eagerly, by value).  A
@@ -11021,6 +11115,8 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
                 # cell with the captured value.
                 v = f"%capv.{_sanitize(cn)}"
                 entry.append(f"  {v} = load {_llscalar(ck)}, ptr {p}")
+                if nty is not None and ck == F64:
+                    v = narrow_entry(v, cn, entry, "capture")
                 entry.append(
                     f"  store {_llscalar(ck)} {v}, ptr {cellp_ref(cn)}"
                     f"  ; cell-backed capture {cn}: seeded from the env")
@@ -11029,7 +11125,13 @@ def _emit_function(info: _Info, kinds: Dict[str, str], sigs: Dict[str, _Sig],
             elif cn in slotset:
                 v = f"%capv.{_sanitize(cn)}"
                 entry.append(f"  {v} = load {_llscalar(ck)}, ptr {p}")
+                if nty is not None and ck == F64:
+                    v = narrow_entry(v, cn, entry, "capture")
                 entry.append(f"  store {_llscalar(ck)} {v}, ptr {slot_ref(cn)}")
+            elif nty is not None and ck == F64:
+                entry.append(
+                    f"  %cap.{_sanitize(cn)} = load double, ptr {p}")
+                narrow_entry(f"%cap.{_sanitize(cn)}", cn, entry, "capture")
             else:
                 entry.append(
                     f"  %cap.{_sanitize(cn)} = load {_llscalar(ck)}, ptr {p}")
@@ -11235,11 +11337,14 @@ class _Prep:
 
 
 def _prepare(funcs: Sequence[MirFunc],
-             one_way: FrozenSet[str] = frozenset()) -> _Prep:
+             one_way: FrozenSet[str] = frozenset(),
+             narrow: Optional[Dict[str, str]] = None,
+             narrow_bad: Optional[Dict[str, str]] = None) -> _Prep:
     """Build the module tables, analyze every function and run the
     module-wide kind/signature fixpoint.  ``one_way`` is the specialization
     probe's set of callees whose signatures do not flow back into their
-    call sites (see _specialize_by_kind)."""
+    call sites (see _specialize_by_kind); ``narrow`` / ``narrow_bad`` are
+    _narrow_lambdas' findings (lambda -> width, lambda -> refusal)."""
     # Fresh symbol-sanitizer registry per module: deterministic, injective
     # symbol mangling independent of previously-emitted modules.
     _sanitize_reset()
@@ -11258,6 +11363,13 @@ def _prepare(funcs: Sequence[MirFunc],
     infos = [_analyze(f, module_names, closures, scopes, traits,
                       cells, gtable)
              for f in funcs]
+    narrow = narrow if narrow is not None else {}
+    narrow_bad = narrow_bad if narrow_bad is not None else {}
+    for info in infos:
+        info.narrow_lambdas = narrow
+        info.narrow_bad = narrow_bad
+        if info.f.name in narrow and info.f.name not in narrow_bad:
+            info.narrow = narrow[info.f.name]
     variants = _build_variant_table(funcs, infos)
 
     # Duplicate MIR function names (e.g. lambda counters restarting per
@@ -11391,7 +11503,9 @@ _SPECIALIZE_ROUNDS = 4
 _SPECIALIZE_MAX_CLONES = 128
 
 
-def _specialization_blockers(f: MirFunc, info: _Info) -> Optional[str]:
+def _specialization_blockers(f: MirFunc, info: _Info,
+                             by_name: Optional[Dict[str, MirFunc]] = None
+                             ) -> Optional[str]:
     """Why `f` cannot be cloned by kind, or None when it can."""
     if info.is_lambda or info.is_scope_member:
         return "lambda or handle-scope member"
@@ -11402,9 +11516,57 @@ def _specialization_blockers(f: MirFunc, info: _Info) -> Optional[str]:
     for b in f.blocks:
         for op in b.ops:
             if op[0] == "let" and len(op) == 4 and op[2][0] in (
-                    "handle_scope", "try_scope", "make_closure"):
+                    "handle_scope", "try_scope"):
                 return f"owns a {op[2][0]}"
+    # The lambdas `f` creates are cloned with it; a scope site inside one
+    # of them names its member subfunctions, which a clone would not own.
+    if by_name is not None:
+        for ln in _owned_lambdas(f.name, by_name):
+            for b in by_name[ln].blocks:
+                for op in b.ops:
+                    if op[0] == "let" and len(op) == 4 and op[2][0] in (
+                            "handle_scope", "try_scope"):
+                        return f"owns a lambda ({ln}) that owns a {op[2][0]}"
     return None
+
+
+def _owned_lambdas(fname: str, by_name: Dict[str, MirFunc]) -> List[str]:
+    """The lambdas `fname` creates (make_closure targets), transitively
+    through lambdas that create lambdas, in first-seen order."""
+    out: List[str] = []
+    stack = [fname]
+    while stack:
+        f = by_name.get(stack.pop())
+        if f is None:
+            continue
+        for b in f.blocks:
+            for op in b.ops:
+                if op[0] == "let" and len(op) == 4 \
+                        and op[2][0] == "make_closure":
+                    ln = op[2][1]
+                    if ln in by_name and ln not in out and ln != fname:
+                        out.append(ln)
+                        stack.append(ln)
+    return out
+
+
+def _clone_blocks(f: MirFunc, ren: Dict[str, str]) -> List[MirBlock]:
+    """`f`'s blocks with direct calls and make_closure targets renamed
+    through `ren` (a clone's self-calls and its private lambdas)."""
+    blocks = []
+    for b in f.blocks:
+        ops = []
+        for op in b.ops:
+            if op[0] == "let" and len(op) == 4:
+                rhs = op[2]
+                if rhs[0] == "call" and len(rhs) == 2 and rhs[1] in ren:
+                    op = ("let", op[1], ("call", ren[rhs[1]]), op[3])
+                elif rhs[0] == "make_closure" and len(rhs) >= 2 \
+                        and rhs[1] in ren:
+                    op = ("let", op[1], (rhs[0], ren[rhs[1]], *rhs[2:]), op[3])
+            ops.append(op)
+        blocks.append(MirBlock(ops=ops, term=b.term))
+    return blocks
 
 
 def _mentions_name(obj: Any, name: str) -> bool:
@@ -11464,6 +11626,9 @@ def _specialize_by_kind(funcs: List[MirFunc]) -> List[MirFunc]:
     memo: Dict[Tuple[str, Tuple[str, ...]], str] = {}
     counters: Dict[str, int] = {}
     clones_made = 0
+    # Lambdas cloned along with their owners (originals and clones): they
+    # are dropped with the owner that stops mentioning them.
+    lambda_clones: Set[str] = set()
     for _round in range(_SPECIALIZE_ROUNDS):
         module_names = {f.name for f in funcs}
         closures = _build_closure_table(funcs)
@@ -11478,7 +11643,7 @@ def _specialize_by_kind(funcs: List[MirFunc]) -> List[MirFunc]:
             probe_info.is_lambda = f.name in closures.targets
             probe_info.is_scope_member = f.name in scopes.member_site
             probe_info.suspending = is_suspending(f)
-            if _specialization_blockers(f, probe_info) is None:
+            if _specialization_blockers(f, probe_info, by_name) is None:
                 candidates.add(f.name)
         if not candidates:
             return funcs
@@ -11545,22 +11710,26 @@ def _specialize_by_kind(funcs: List[MirFunc]) -> List[MirFunc]:
                     if clones_made >= _SPECIALIZE_MAX_CLONES:
                         continue
                     counters[callee] = counters.get(callee, 0) + 1
-                    cname = f"{callee}$k{counters[callee]}"
+                    sfx = f"$k{counters[callee]}"
+                    cname = f"{callee}{sfx}"
                     memo[mk] = cname
                     clones_made += 1
-                    blocks = [MirBlock(ops=list(b.ops), term=b.term)
-                              for b in origin.blocks]
                     # Self-calls stay inside the clone (monomorphic
-                    # recursion; anything else conflicts and demotes).
-                    for b in blocks:
-                        b.ops = [
-                            ("let", op[1], ("call", cname), op[3])
-                            if (op[0] == "let" and len(op) == 4
-                                and op[2] == ("call", callee)) else op
-                            for op in b.ops]
-                    new_funcs.append(dataclasses.replace(
-                        origin, name=cname, blocks=blocks,
-                        origin_name=origin.origin_name or origin.name))
+                    # recursion; anything else conflicts and demotes), and
+                    # the lambdas the function creates are cloned WITH it
+                    # (a lambda's kinds are its own cells, so a shape- or
+                    # width-generic helper such as std.tile.exp gets one
+                    # private lambda per instantiation).
+                    ren = {callee: cname}
+                    for ln in _owned_lambdas(callee, by_name):
+                        ren[ln] = f"{ln}{sfx}"
+                        lambda_clones.add(ln)
+                        lambda_clones.add(ren[ln])
+                    for src_name, dst_name in ren.items():
+                        src = by_name[src_name]
+                        new_funcs.append(dataclasses.replace(
+                            src, name=dst_name, blocks=_clone_blocks(src, ren),
+                            origin_name=src.origin_name or src.name))
                 for site in gsites:
                     retarget[site] = cname
         if not retarget:
@@ -11589,7 +11758,7 @@ def _specialize_by_kind(funcs: List[MirFunc]) -> List[MirFunc]:
         # conflicted call site, a closure/trait/static reference, or a
         # perform default — all of which keep the polymorphic original),
         # and clones a later round has superseded.
-        cloned = {c for (c, _k) in memo} | set(memo.values())
+        cloned = {c for (c, _k) in memo} | set(memo.values()) | lambda_clones
         while True:
             keep: List[MirFunc] = []
             for f in funcs:
@@ -11607,14 +11776,247 @@ def _specialize_by_kind(funcs: List[MirFunc]) -> List[MirFunc]:
     return funcs
 
 
+# ---------------------------------------------------------------------------
+# Narrow lambdas (the higher-order tile ops over f32/f16 tiles)
+# ---------------------------------------------------------------------------
+#
+# The interpreter runs the function a tile op applies to the elements of an
+# f32/f16 tile in NARROW MODE: elements, init and captured floats arrive
+# rounded to the width and every float a let binds rounds to it once
+# (mir_interp.py, _NARROW_ROUND).  Natively the same function is an
+# ordinary f64 lambda, so the rule is compiled into it instead:
+#
+#   1. a probe fixpoint finds every lambda a tile op applies over an
+#      f32/f16 tile (the receiver's tile kind names the width), and refuses
+#      one applied at two widths;
+#   2. its calls to module functions are inlined (mir_inline.py), because a
+#      callee frame would compute in f64 -- recursion, write-back
+#      parameters, and a body that ends up creating closures or scopes or
+#      performing effects are refused with the reason;
+#   3. _Info.narrow marks it, and _emit_function rounds its f64 params and
+#      captures on entry and every f64 let result through a
+#      fptrunc/fpext pair (float or half) -- the same once-per-op rounding
+#      the C runtime applies to the lambda's result, so int and f64 maps
+#      are unchanged and f32/f16 maps are now bit-exact with the
+#      interpreter instead of demoting.
+#
+# _check_consistency additionally demotes a narrow lambda that still calls
+# a function value or a trait method, and a tile-op site whose closure is
+# also used anywhere else (a plain call of it would compute in f64).
+
+# ---------------------------------------------------------------------------
+# Closure-owning helpers are inlined into their callers
+# ---------------------------------------------------------------------------
+#
+# `fn exp(t) -> Tile { Tile.map(t, fn(x: float) -> x.exp()) }` is called
+# with 8x8 and 8x1 tiles in one kernel: its parameter kind conflicts, and
+# kind specialization cannot regroup the sites either, because a site's
+# argument kind comes out of ANOTHER such helper (`exp(sub_rows(s, m))`)
+# and the one-way probe has no per-site return kinds.  Inlining dissolves
+# the question: the tile op lands in the caller with the site's concrete
+# receiver kind, and the inlined copy gets a PRIVATE lambda (`L$iN`), so a
+# helper applied to f32 and to f16 tiles leaves one narrow lambda per
+# width.  A function is inlined when it is a plain small function whose
+# closures exist only to be the function of a tile op (every make_closure
+# result is used solely as the last argument of a Tile.map/zip/reduce/
+# broadcast call, directly or through copies -- a closure that is returned,
+# stored or called keeps its owner as a function, so closure-returning
+# helpers and std.stream are untouched), with a body of value-level ops
+# only -- no scopes, effects, cells, struct allocation or field writes,
+# and no `match_fail` (its message names the enclosing function) -- that
+# nothing references other than by direct call, and that has no write-back
+# parameters (mir_inline refuses those).  The interpreter keeps the calls:
+# inlining is a native-only transform, like specialization, and the
+# differential tests are the proof it preserves behavior.
+
+_INLINE_HELPER_MAX_OPS = 48
+_INLINE_HELPER_ROUNDS = 4
+_INLINE_HELPER_BLOCKED_OPS = frozenset({"match_fail", "perform", "cell_wrap",
+                                        "promote_matrix"})
+_INLINE_HELPER_BLOCKED_RHS = frozenset({"handle_scope", "try_scope", "resume",
+                                        "alloc_struct", "field_set"})
+
+
+def _closures_only_feed_tile_ops(f: MirFunc, closure_vars: Set[str]) -> bool:
+    """True when every closure `f` creates (and every copy of it) is used
+    only as the function argument of a higher-order tile op."""
+    names = set(closure_vars)
+    changed = True
+    while changed:  # copies of a closure variable are closure variables
+        changed = False
+        for b in f.blocks:
+            for op in b.ops:
+                if op[0] == "let" and len(op) == 4 and op[2] == ("copy",) \
+                        and op[3] and op[3][0] in names \
+                        and op[1] not in names:
+                    names.add(op[1])
+                    changed = True
+    for b in f.blocks:
+        for op in b.ops:
+            if op[0] == "let" and len(op) == 4:
+                if op[1] in names:
+                    continue  # the closure's own def or a copy of it
+                rhs = op[2]
+                if rhs[0] == "call" and rhs[1] in _TILE_HOF and op[3] \
+                        and op[3][-1] in names \
+                        and not any(a in names for a in op[3][:-1]):
+                    continue
+            if any(_mentions_name(op, n) for n in names):
+                return False
+        if any(_mentions_name(b.term, n) for n in names):
+            return False
+    return True
+
+
+def _inline_closure_helpers(funcs: List[MirFunc]) -> List[MirFunc]:
+    for _round in range(_INLINE_HELPER_ROUNDS):
+        closures = _build_closure_table(funcs)
+        scopes = _build_scope_table(funcs)
+        cand: Set[str] = set()
+        for f in funcs:
+            if f.name in ("main", _MODULE_INIT) or f.name in closures.targets \
+                    or f.name in scopes.member_site or f.mut_params \
+                    or is_suspending(f):
+                continue
+            if sum(len(b.ops) for b in f.blocks) > _INLINE_HELPER_MAX_OPS:
+                continue
+            ok = True
+            closure_vars: Set[str] = set()
+            for b in f.blocks:
+                for op in b.ops:
+                    if op[0] in _INLINE_HELPER_BLOCKED_OPS:
+                        ok = False
+                    elif op[0] == "let" and len(op) == 4:
+                        rk = op[2][0]
+                        if rk in _INLINE_HELPER_BLOCKED_RHS:
+                            ok = False
+                        elif rk == "make_closure":
+                            closure_vars.add(op[1])
+                        elif rk == "call" and op[2][1] == f.name:
+                            ok = False  # self-recursive: no finite expansion
+            if ok and closure_vars and _closures_only_feed_tile_ops(
+                    f, closure_vars):
+                cand.add(f.name)
+        # Only direct calls may mention a candidate (a closure reference, a
+        # perform default or a trait table would keep needing the function).
+        called: Set[str] = set()
+        for g in funcs:
+            for b in g.blocks:
+                for op in [*b.ops, b.term]:
+                    is_call = op[0] == "let" and len(op) == 4 \
+                        and op[2][0] == "call" and len(op[2]) == 2
+                    for n in list(cand):
+                        if is_call and op[2][1] == n:
+                            if g.name != n:
+                                called.add(n)
+                        elif _mentions_name(op, n):
+                            cand.discard(n)
+        cand &= called
+        if not cand:
+            return funcs
+        try:
+            new_funcs = inline_into_module(funcs, cand)
+        except InlineError:
+            return funcs  # mutual recursion or a rebound parameter: leave as is
+        if {f.name for f in new_funcs} == {f.name for f in funcs}:
+            return funcs
+        funcs = new_funcs
+    return funcs
+
+
+def _narrow_lambdas(funcs: List[MirFunc]
+                    ) -> Tuple[List[MirFunc], Dict[str, str], Dict[str, str]]:
+    """(funcs with narrow lambdas' module calls inlined, lambda -> width,
+    lambda -> why it cannot be narrow)."""
+    narrow: Dict[str, str] = {}
+    bad: Dict[str, str] = {}
+    if not any(op[0] == "let" and len(op) == 4 and op[2][0] == "call"
+               and op[2][1] in _TILE_HOF
+               for f in funcs for b in f.blocks for op in b.ops):
+        return funcs, narrow, bad
+    probe = _prepare(funcs)
+    for info in probe.infos:
+        kinds = probe.kind_sets.get(info.f.name, {})
+        for (_dst, callee, args) in info.calls:
+            if callee not in _TILE_HOF or not args:
+                continue
+            tk = kinds.get(args[0], I64)
+            if not _is_tile(tk):
+                continue
+            elem = _tile_parts(tk)[0]
+            if elem not in _NARROW_LLTY:
+                continue
+            fk = kinds.get(args[-1], I64)
+            if not _is_closure(fk) or _is_dyn_closure(fk):
+                continue
+            lname = _closure_lambda(fk)
+            prev = narrow.setdefault(lname, elem)
+            if prev != elem:
+                bad[lname] = (f"it is applied to tiles of {prev} and of "
+                              f"{elem} elements (one width per function)")
+    if not narrow:
+        return funcs, narrow, bad
+    by_name = {f.name: f for f in funcs}
+    out: List[MirFunc] = []
+    for f in funcs:
+        if f.name not in narrow or f.name in bad:
+            out.append(f)
+            continue
+        try:
+            nf = inline_calls(f, by_name)
+        except InlineError as e:
+            bad[f.name] = str(e)
+            out.append(f)
+            continue
+        for b in nf.blocks:
+            for op in b.ops:
+                if op[0] == "let" and len(op) == 4 and op[2][0] in (
+                        "make_closure", "handle_scope", "try_scope"):
+                    bad[f.name] = (f"its body (module calls inlined) creates "
+                                   f"a {op[2][0]}")
+                elif op[0] == "perform":
+                    bad[f.name] = "its body (module calls inlined) performs " \
+                                  "an effect"
+        out.append(f if f.name in bad else nf)
+    return out, narrow, bad
+
+
+def _closure_uses_outside_tile_ops(f: MirFunc, fnvar: str, elem: str,
+                                   kinds: Dict[str, str]) -> Optional[str]:
+    """How `fnvar` (a narrow lambda's closure) is used in `f` other than
+    as the function of a tile op over `elem` elements, or None."""
+    for b in f.blocks:
+        for op in b.ops:
+            if op[0] == "let" and len(op) == 4:
+                if op[1] == fnvar:
+                    continue  # its own definition (make_closure or a copy)
+                rhs = op[2]
+                if rhs[0] == "call" and rhs[1] in _TILE_HOF and op[3] \
+                        and op[3][-1] == fnvar:
+                    tk = kinds.get(op[3][0], I64)
+                    if _is_tile(tk) and _tile_parts(tk)[0] == elem:
+                        continue
+                    return f"{rhs[1]} over {tk}"
+                if _mentions_name(op, fnvar):
+                    return (f"a call of it" if rhs[0] == "call"
+                            and rhs[1] == fnvar else f"the {rhs[0]} of {op[1]!r}")
+            elif _mentions_name(op, fnvar):
+                return f"a {op[0]} op"
+        if _mentions_name(b.term, fnvar):
+            return "a return or branch"
+    return None
+
+
 def emit_llvm(funcs: Sequence[MirFunc]) -> str:
     """Emit one LLVM IR module (text) for a MIR module.
 
     Direct functions get full definitions; everything else gets a
     comment-only placeholder carrying its reasons (see module docstring).
     """
-    funcs = _specialize_by_kind(list(funcs))
-    prep = _prepare(funcs)
+    funcs = _inline_closure_helpers(list(funcs))
+    funcs = _specialize_by_kind(funcs)
+    funcs, narrow, narrow_bad = _narrow_lambdas(funcs)
+    prep = _prepare(funcs, narrow=narrow, narrow_bad=narrow_bad)
     module_names = prep.module_names
     structs = prep.structs
     closures = prep.closures

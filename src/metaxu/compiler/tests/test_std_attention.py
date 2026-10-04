@@ -15,11 +15,14 @@ from __future__ import annotations
 
 import math
 import random
+import re
 
 import pytest
 
 from metaxu.compiler.emit_msl import emit_msl_kernel
-from metaxu.compiler.tests.test_codegen_llvm import interp_run
+from metaxu.compiler.tests.test_codegen_llvm import (
+    assert_native_matches_interp, count_placeholders, interp_run,
+    llvm_from_source, needs_clang)
 from metaxu.compiler.tests.test_msl_emitter import _f32r, _run_shim, needs_clangxx
 
 N, D = 16, 8
@@ -157,6 +160,32 @@ def test_shim_matches_interp_bit_for_bit(kernel, simdgroup):
     k = emit_msl_kernel(src, f"std.attention.{kernel}", **kw)
     assert k.simdgroup is (True if simdgroup is None else simdgroup)
     assert _run_shim(k, N // 8, bufs) == expect
+
+
+@pytest.mark.parametrize("kernel", ["attention8", "causal_attention8"])
+def test_kernels_compile_natively(kernel):
+    # The CPU-handler program (kernel through std.gpu's sequential grid,
+    # plus the f64 reference) compiles natively: the std.tile helpers are
+    # inlined at each site with a private narrow lambda (so `exp` serves
+    # 8x8 and 8x1 tiles), the 8x8 dots are the C runtime's.  The only
+    # placeholders are std.tile functions this program never calls.
+    ir = llvm_from_source(_program(kernel, _inputs(), with_ref=True))
+    placeholders = re.findall(r"^; function @mx_(\S+): placeholder", ir, re.M)
+    assert placeholders and all(p.startswith("std_tile_") for p in placeholders), placeholders
+    assert "@mx_main: placeholder" not in ir
+    assert re.search(rf"^define \S+ @mx_std_attention_{kernel}\(", ir, re.M)
+    assert re.search(r"^define \S+ @mx_std_tile_exp_lambda1_i\d+\(", ir, re.M)
+    assert "@mx_std_tile_exp(" not in ir           # inlined away
+    assert "narrow lambda:" in ir and "to float" in ir
+
+
+@needs_clang
+@pytest.mark.parametrize("kernel", ["attention8", "causal_attention8"])
+def test_native_matches_interp(kernel, tmp_path):
+    # Native stdout == interpreter stdout, byte for byte: the f32 kernel's
+    # per-op rounding and the f64 reference alike.
+    assert_native_matches_interp(_program(kernel, _inputs(seed=3), with_ref=True),
+                                 tmp_path)
 
 
 @needs_clangxx

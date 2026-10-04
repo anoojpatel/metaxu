@@ -238,14 +238,18 @@ per-lane register budget, swizzle bank-conflict freedom.
     in row-major order: `Tile.map(t, f)`, `Tile.zip(t, u, f)`,
     `Tile.reduce_rows(t, init, f)` / `Tile.reduce_cols` (R x 1 / 1 x C
     results, folded left to right) and `Tile.broadcast_rows(t, v, f)` /
-    `Tile.broadcast_cols` (v is R x 1 / 1 x C).  Elements of f32 and
-    f16 tiles reach the function in NARROW MODE: the interpreter's
-    `MxF32` / `MxF16` are float subclasses whose every binop and math
-    call (`exp`, `log`, `sqrt`, `max`, `min`, ...) rounds the result to
-    the width once, a plain float or int meeting them rounds first, and
-    the result is stored back widened.  So a lambda computes exactly
-    what f32 or f16 arithmetic computes, the checker still sees `float`,
-    and there is no new type syntax.  The shape checker knows the
+    `Tile.broadcast_cols` (v is R x 1 / 1 x C).  Over an f32 or f16
+    tile the function runs in NARROW MODE, a property of the CALL, not
+    of values: the elements, `init` and captured floats arrive rounded
+    to the width, and every float the body binds (a literal, an
+    arithmetic result, a math call such as `exp`, `log`, `sqrt`, `max`,
+    `min`, a value read from a Vec, the result of a function it calls)
+    rounds to the width once before it is bound.  That is exactly what
+    a `float`- or `half`-typed body computes on the device, so a lambda
+    computes what f32 or f16 arithmetic computes, the checker still
+    sees `float`, and there is no new type syntax.  The interpreter
+    implements it as a rounding step on every `let` while a narrow tile
+    call is in flight (`mir_interp._tile_call`).  The shape checker knows the
     result shapes and the init / vector kinds; dynamic mismatches raise
     the same words at run time.  `std/tile.mx` is the vocabulary (`exp`,
     `log`, `sqrt`, `neg`, `sub`, `div`, `maximum`, `minimum`,
@@ -265,12 +269,27 @@ per-lane register budget, swizzle bank-conflict freedom.
     `for` loops in the pinned order.  Narrow-mode math in the shim is a
     `namespace metal` of `float exp(float)` etc. defined as the double
     call rounded once, so the shim leg stays bit-exact with the
-    interpreter.  Natively, int and f64 maps lower through per-site
-    word thunks and `mx_tile_map/zip/reduce_*/broadcast_*`; f32 and
-    f16 maps DEMOTE with the reason "narrow-mode lambda arithmetic is
-    not lowered natively yet" (kernels, not the CPU path, are their
-    product).  `exp`, `log`, `max` and `min` joined the scalar builtins
-    on both engines along the way.
+    interpreter.  Natively every map lowers through per-site word
+    thunks and `mx_tile_map/zip/reduce_*/broadcast_*`; the lambda of an
+    f32/f16 op is a NARROW LAMBDA (`codegen_llvm._narrow_lambdas`): a
+    probe fixpoint finds it from the receiver's tile kind, its calls to
+    module functions are inlined (a callee frame would compute in f64;
+    recursion is refused with the reason), and its emission rounds every
+    f64 parameter and capture on entry and every f64 `let` result
+    through an LLVM `fptrunc`/`fpext` pair (`float` or `half`), the
+    interpreter's rule compiled in.  A lambda applied at two widths, a
+    closure also called directly, or a narrow lambda that still calls a
+    function value demotes with a reason naming that.  Shape-generic
+    helpers are no obstacle either: a small function whose closures
+    exist only to be a tile op's function (every `std.tile` helper) is
+    inlined into its callers before kind inference, each copy with a
+    private lambda (`L$iN`), so `exp` serves 8x8 and 8x1 tiles and f32
+    and f16 widths in one program; larger closure-owning functions are
+    cloned per call-site kinds together with their lambdas
+    (`L$kN`).  `std.tile` in f64, f32 and f16 and both attention kernels
+    are differentially tested native == interpreter.  `exp`, `log`,
+    `max` and `min` joined the scalar builtins on both engines along
+    the way.
   * **Still open in Stage 1:** the `gpu` effect class (now that the
     Metal handler dispatches real launches), memory-space locality
     states (vacuous until threadgroup memory arrives in Stage 2), and

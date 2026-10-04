@@ -5300,9 +5300,10 @@ def test_std_stream_full_surface_census():
                "sum", "product", "count", "collect", "all_of", "any_of",
                "find", "map", "filter", "take", "skip", "chain"):
         # (?:_ho\d+)? accepts monomorphize's per-call-site clones of
-        # higher-order stdlib functions (dead originals are erased).
+        # higher-order stdlib functions, (?:_k\d+)? kind specialization's
+        # per-call-site-kind clones (dead originals are erased).
         assert re.search(
-            rf"^define (?:i64|void|ptr|double) @mx_std_stream_{fn}(?:_ho\d+)?\(",
+            rf"^define (?:i64|void|ptr|double) @mx_std_stream_{fn}(?:_ho\d+)?(?:_k\d+)?\(",
             ir, re.M), fn
     assert count_placeholders(ir) == 0
     # find's handle value is a boxed Option at the boundary.  The producer
@@ -8520,12 +8521,7 @@ def test_native_kind_specialization_differential(tmp_path):
     assert_native_matches_interp(_KIND_SPEC_SRC, tmp_path)
 
 
-def test_kind_specialization_keeps_the_polymorphic_original_for_conflicted_sites():
-    # `both` cannot be cloned (it owns a closure), so its call to `is_none`
-    # still carries a conflicted argument; that site keeps calling the
-    # original, which stays polymorphic and demotes honestly, while the
-    # concrete sites in main are served by clones.
-    ir = llvm_from_source("""
+_CLOSURE_OWNER_SRC = """
 struct P { a: int }
 fn is_none(o: Option) -> bool {
     match o { None -> true, Some(x) -> false }
@@ -8533,6 +8529,86 @@ fn is_none(o: Option) -> bool {
 fn both(o: Option) -> bool {
     let f = fn(q: Option) -> is_none(q);
     f(o)
+}
+fn main() -> int {
+    print(is_none(Some("s")));
+    print(is_none(Some(P { a: 2 })));
+    print(both(Some("s")));
+    print(both(Some(P { a: 2 })));
+    0
+}
+"""
+
+
+def test_closure_owning_helpers_are_cloned_with_private_lambdas():
+    # `both` creates a closure, which used to block kind specialization.
+    # It is now cloned per call-site kinds TOGETHER with its lambda
+    # (`both$lambda..$k1`, `..$k2`), so the two instantiations never meet
+    # in one kind cell and nothing demotes; `is_none` is cloned as before.
+    ir = llvm_from_source(_CLOSURE_OWNER_SRC)
+    assert count_placeholders(ir) == 0
+    assert "@mx_both(" not in ir and "; function @mx_both" not in ir
+    assert re.search(r"^define \S+ @mx_both_k1\(", ir, re.M)
+    assert re.search(r"^define \S+ @mx_both_k2\(", ir, re.M)
+    assert len(re.findall(r"^define \S+ @mx_both_lambda\d+_k[12]\(", ir, re.M)) == 2
+    assert re.search(r"^define \S+ @mx_is_none_k1\(", ir, re.M)
+    assert re.search(r"^define \S+ @mx_is_none_k2\(", ir, re.M)
+
+
+@needs_clang
+def test_native_cloned_closure_owner_matches_interp(tmp_path):
+    assert_native_matches_interp(_CLOSURE_OWNER_SRC, tmp_path)
+
+
+_TILE_HELPER_INLINE_SRC = """
+fn twice(t) -> Tile { Tile.map(t, fn(x: float) -> x * 2.0) }
+fn total(t) -> Tile { Tile.reduce_rows(t, 0.0, fn(a: float, b: float) -> a + b) }
+fn main() -> int {
+    let a = Tile.filled(2, 3, 1.5);
+    let b = Tile.to_f32(Tile.filled(4, 1, 0.1));
+    let h = Tile.to_f16(Tile.filled(1, 2, 0.1));
+    print(twice(a));
+    print(twice(total(a)));
+    print(twice(b));
+    print(total(twice(h)));
+    0
+}
+"""
+
+
+def test_tile_helpers_are_inlined_with_a_private_lambda_per_site():
+    # A helper whose closure exists only to be a tile op's function is
+    # inlined at every site (one lambda copy each, `twice$lambda..$iN`), so
+    # one source function serves a 2x3 f64 tile, a 2x1 f64 column, a 4x1
+    # f32 column (narrow lambda, float) and a 1x2 f16 tile (narrow lambda,
+    # half) without any kind cell seeing two shapes or widths.
+    ir = llvm_from_source(_TILE_HELPER_INLINE_SRC)
+    assert count_placeholders(ir) == 0
+    assert "@mx_twice(" not in ir and "@mx_total(" not in ir
+    assert len(re.findall(r"^define \S+ @mx_twice_lambda\d+_i\d+\(", ir, re.M)) == 4
+    assert len(re.findall(r"^define \S+ @mx_total_lambda\d+_i\d+\(", ir, re.M)) == 2
+    assert "fptrunc double %a.x to float  ; narrow lambda: parameter x rounds to f32" in ir
+    assert "fptrunc double %a.x to half  ; narrow lambda: parameter x rounds to f16" in ir
+
+
+@needs_clang
+def test_native_inlined_tile_helpers_match_interp(tmp_path):
+    assert_native_matches_interp(_TILE_HELPER_INLINE_SRC, tmp_path)
+
+
+def test_kind_specialization_keeps_the_polymorphic_original_for_conflicted_sites():
+    # `both` cannot be cloned or inlined here: it has a match (whose
+    # failure message names the function) and owns a try scope, so its
+    # call to `is_none` still carries a conflicted argument; that site
+    # keeps calling the original, which stays polymorphic and demotes
+    # honestly, while the concrete sites in main are served by clones.
+    ir = llvm_from_source("""
+struct P { a: int }
+fn is_none(o: Option) -> bool {
+    match o { None -> true, Some(x) -> false }
+}
+fn both(o: Option) -> bool {
+    try { is_none(o) } catch e { false }
 }
 fn main() -> int {
     print(is_none(Some("s")));

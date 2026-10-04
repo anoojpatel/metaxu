@@ -256,11 +256,14 @@ element with its row's or column's entry of a vector tile. The
 function sees plain `float` or `int` values, and the result tile has
 the receiver's kind.
 
-Elements of f32 and f16 tiles reach the function in narrow mode: the
-value remembers its width, and every operation and math call on it
-rounds the result to that width once, so `x.exp() * 0.5` inside a
-`Tile.map` over an f32 tile computes what f32 arithmetic computes,
-with no new type syntax. `std.tile` is the vocabulary built this way,
+Over an f32 or f16 tile the function runs in narrow mode: every float
+it binds, from the elements and any captured value to each literal and
+each operation or math call result, is rounded to that width once, so
+`x.exp() * 0.5` inside a `Tile.map` over an f32 tile computes what f32
+arithmetic computes, with no new type syntax. The same rule holds on
+the interpreter, in native binaries (the compiler rounds every float
+the lambda binds) and on the device, where the body is simply typed
+`float` or `half`. `std.tile` is the vocabulary built this way,
 one line per operation; the row sums of a softmax below show the
 rounding at work, since one of them is the f32 just under 1:
 
@@ -291,8 +294,11 @@ tile[1x3](3, 5, 7)
 Inside a kernel these calls cost nothing: the Metal emitter inlines
 the library functions and the lambdas into one device program, so
 `softmax_rows(t)` becomes three loops over a threadgroup array. The
-same words run on the interpreter, in the C++ shim and on the device,
-and the interpreter remains the bit-exact reference for the shim.
+native compiler inlines them too, giving each call site its own copy
+of the lambda, which is how one `exp` serves 8x8 and 8x1 tiles in the
+attention kernel. The same words run on the interpreter, in native
+binaries, in the C++ shim and on the device, and the interpreter
+remains the bit-exact reference for the other three.
 
 ## Matrix units
 
@@ -390,7 +396,8 @@ m = m_new;
 masks the upper triangle of the diagonal one with a flag tile built
 from `Tile.arange`. Both are launched with `Gpu.launch(n / 8, ...)`
 over row-major [n, 8] buffers, and both are checked against
-`attention_ref`, the plain f64 definition in the same module, and bit
-for bit against the shim in either lowering (`test_std_attention.py`).
+`attention_ref`, the plain f64 definition in the same module, bit for
+bit against the shim in either lowering, and bit for bit against the
+native binary (`test_std_attention.py`).
 Head dimension 8 is literal in this version; other block shapes are
 copies with other literals until const generics reach kernels.
